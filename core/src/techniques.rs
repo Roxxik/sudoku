@@ -48,6 +48,7 @@ pub struct TechniqueDef {
     pub cli_name: &'static str,
     pub difficulty: u32,
     pub find_all: fn(&Board) -> Vec<Step>,
+    pub find_first: fn(&Board) -> Option<Step>,
 }
 
 pub const REGISTRY: &[TechniqueDef] = &[
@@ -57,6 +58,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "naked-single",
         difficulty: 10,
         find_all: naked_single::find_all,
+        find_first: naked_single::find_first,
     },
     TechniqueDef {
         kind: TechniqueKind::HiddenSingle,
@@ -64,6 +66,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "hidden-single",
         difficulty: 15,
         find_all: hidden_single::find_all,
+        find_first: hidden_single::find_first,
     },
     TechniqueDef {
         kind: TechniqueKind::LockedCandidatesPointing,
@@ -71,6 +74,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "pointing",
         difficulty: 20,
         find_all: locked_candidates::find_pointing,
+        find_first: locked_candidates::find_first_pointing,
     },
     TechniqueDef {
         kind: TechniqueKind::LockedCandidatesClaiming,
@@ -78,6 +82,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "claiming",
         difficulty: 25,
         find_all: locked_candidates::find_claiming,
+        find_first: locked_candidates::find_first_claiming,
     },
     TechniqueDef {
         kind: TechniqueKind::NakedPair,
@@ -85,6 +90,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "naked-pair",
         difficulty: 30,
         find_all: naked_subset::find_pairs,
+        find_first: naked_subset::find_first_pair,
     },
     TechniqueDef {
         kind: TechniqueKind::HiddenPair,
@@ -92,6 +98,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "hidden-pair",
         difficulty: 35,
         find_all: hidden_subset::find_pairs,
+        find_first: hidden_subset::find_first_pair,
     },
     TechniqueDef {
         kind: TechniqueKind::NakedTriple,
@@ -99,6 +106,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "naked-triple",
         difficulty: 40,
         find_all: naked_subset::find_triples,
+        find_first: naked_subset::find_first_triple,
     },
     TechniqueDef {
         kind: TechniqueKind::HiddenTriple,
@@ -106,6 +114,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "hidden-triple",
         difficulty: 45,
         find_all: hidden_subset::find_triples,
+        find_first: hidden_subset::find_first_triple,
     },
     TechniqueDef {
         kind: TechniqueKind::NakedQuad,
@@ -113,6 +122,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "naked-quad",
         difficulty: 50,
         find_all: naked_subset::find_quads,
+        find_first: naked_subset::find_first_quad,
     },
     TechniqueDef {
         kind: TechniqueKind::HiddenQuad,
@@ -120,6 +130,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "hidden-quad",
         difficulty: 55,
         find_all: hidden_subset::find_quads,
+        find_first: hidden_subset::find_first_quad,
     },
     TechniqueDef {
         kind: TechniqueKind::XWing,
@@ -127,6 +138,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "x-wing",
         difficulty: 60,
         find_all: fish::find_x_wing,
+        find_first: fish::find_first_x_wing,
     },
     TechniqueDef {
         kind: TechniqueKind::XYWing,
@@ -134,6 +146,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "xy-wing",
         difficulty: 65,
         find_all: xy_wing::find_all,
+        find_first: xy_wing::find_first,
     },
     TechniqueDef {
         kind: TechniqueKind::XYZWing,
@@ -141,6 +154,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "xyz-wing",
         difficulty: 66,
         find_all: xy_wing::find_xyz_wing,
+        find_first: xy_wing::find_first_xyz_wing,
     },
     TechniqueDef {
         kind: TechniqueKind::WWing,
@@ -148,6 +162,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "w-wing",
         difficulty: 67,
         find_all: w_wing::find_all,
+        find_first: w_wing::find_first,
     },
     TechniqueDef {
         kind: TechniqueKind::Skyscraper,
@@ -155,6 +170,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "skyscraper",
         difficulty: 68,
         find_all: turbot::find_skyscraper,
+        find_first: turbot::find_first_skyscraper,
     },
     TechniqueDef {
         kind: TechniqueKind::TwoStringKite,
@@ -162,6 +178,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "two-string-kite",
         difficulty: 69,
         find_all: turbot::find_two_string_kite,
+        find_first: turbot::find_first_two_string_kite,
     },
     TechniqueDef {
         kind: TechniqueKind::Swordfish,
@@ -169,6 +186,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "swordfish",
         difficulty: 70,
         find_all: fish::find_swordfish,
+        find_first: fish::find_first_swordfish,
     },
     TechniqueDef {
         kind: TechniqueKind::EmptyRectangle,
@@ -176,6 +194,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "empty-rectangle",
         difficulty: 71,
         find_all: turbot::find_empty_rectangle,
+        find_first: turbot::find_first_empty_rectangle,
     },
     TechniqueDef {
         kind: TechniqueKind::FinnedXWing,
@@ -183,6 +202,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "finned-x-wing",
         difficulty: 73,
         find_all: fish::find_finned_x_wing,
+        find_first: fish::find_first_finned_x_wing,
     },
     TechniqueDef {
         kind: TechniqueKind::Jellyfish,
@@ -190,6 +210,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "jellyfish",
         difficulty: 75,
         find_all: fish::find_jellyfish,
+        find_first: fish::find_first_jellyfish,
     },
     TechniqueDef {
         kind: TechniqueKind::FinnedSwordfish,
@@ -197,6 +218,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "finned-swordfish",
         difficulty: 78,
         find_all: fish::find_finned_swordfish,
+        find_first: fish::find_first_finned_swordfish,
     },
     TechniqueDef {
         kind: TechniqueKind::FinnedJellyfish,
@@ -204,6 +226,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "finned-jellyfish",
         difficulty: 80,
         find_all: fish::find_finned_jellyfish,
+        find_first: fish::find_first_finned_jellyfish,
     },
 ];
 

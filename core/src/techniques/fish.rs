@@ -6,24 +6,68 @@ const MAX_FIN_PER_BASE: usize = 3;
 const MAX_TOTAL_FINS: usize = 5;
 
 pub fn find_x_wing(board: &Board) -> Vec<Step> {
-    find_fish(board, 2, TechniqueKind::XWing)
+    find_fish_all(board, 2, TechniqueKind::XWing)
 }
 
 pub fn find_swordfish(board: &Board) -> Vec<Step> {
-    find_fish(board, 3, TechniqueKind::Swordfish)
+    find_fish_all(board, 3, TechniqueKind::Swordfish)
 }
 
 pub fn find_jellyfish(board: &Board) -> Vec<Step> {
-    find_fish(board, 4, TechniqueKind::Jellyfish)
+    find_fish_all(board, 4, TechniqueKind::Jellyfish)
 }
 
-fn find_fish(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
-    let mut out = Vec::new();
-    for d in 1u8..=9 {
-        find_oriented(board, d, size, kind, UnitKind::Row, &mut out);
-        find_oriented(board, d, size, kind, UnitKind::Col, &mut out);
+pub fn find_first_x_wing(board: &Board) -> Option<Step> {
+    find_fish_first(board, 2, TechniqueKind::XWing)
+}
+
+pub fn find_first_swordfish(board: &Board) -> Option<Step> {
+    find_fish_first(board, 3, TechniqueKind::Swordfish)
+}
+
+pub fn find_first_jellyfish(board: &Board) -> Option<Step> {
+    find_fish_first(board, 4, TechniqueKind::Jellyfish)
+}
+
+fn find_fish_each<F: FnMut(Step) -> bool>(
+    board: &Board,
+    size: usize,
+    kind: TechniqueKind,
+    mut emit: F,
+) {
+    let mut keep_going = true;
+    'outer: for d in 1u8..=9 {
+        for base in [UnitKind::Row, UnitKind::Col] {
+            find_oriented_each(board, d, size, kind, base, |s| {
+                let cont = emit(s);
+                if !cont {
+                    keep_going = false;
+                }
+                cont
+            });
+            if !keep_going {
+                break 'outer;
+            }
+        }
     }
+}
+
+fn find_fish_all(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
+    let mut out = Vec::new();
+    find_fish_each(board, size, kind, |s| {
+        out.push(s);
+        true
+    });
     out
+}
+
+fn find_fish_first(board: &Board, size: usize, kind: TechniqueKind) -> Option<Step> {
+    let mut found = None;
+    find_fish_each(board, size, kind, |s| {
+        found = Some(s);
+        false
+    });
+    found
 }
 
 fn cell_at(base: UnitKind, b: usize, x: usize) -> usize {
@@ -34,17 +78,21 @@ fn cell_at(base: UnitKind, b: usize, x: usize) -> usize {
     }
 }
 
-fn find_oriented(
+fn find_oriented_each<F: FnMut(Step) -> bool>(
     board: &Board,
     digit: u8,
     size: usize,
     kind: TechniqueKind,
     base: UnitKind,
-    out: &mut Vec<Step>,
+    mut emit: F,
 ) {
     let bit = digit_to_bit(digit);
     let mut positions: [u16; 9] = [0; 9];
-    let mut viable_bases: Vec<usize> = Vec::new();
+    // viable_bases is at most 9 entries — stack-buffer to avoid a heap
+    // alloc per call. find_oriented_each runs 9 digits × 2 orientations
+    // per next_step in the hot path.
+    let mut viable_bases_buf: [usize; 9] = [0; 9];
+    let mut viable_len: usize = 0;
 
     for b in 0..9 {
         let mut placed = false;
@@ -65,18 +113,20 @@ fn find_oriented(
         positions[b] = pos;
         let n = pos.count_ones() as usize;
         if n >= 2 && n <= size {
-            viable_bases.push(b);
+            viable_bases_buf[viable_len] = b;
+            viable_len += 1;
         }
     }
 
-    if viable_bases.len() < size {
+    if viable_len < size {
         return;
     }
+    let viable_bases = &viable_bases_buf[..viable_len];
 
-    for_each_combination(&viable_bases, size, |combo| {
+    for_each_combination(viable_bases, size, |combo| {
         let union: u16 = combo.iter().map(|&b| positions[b]).fold(0, |a, b| a | b);
         if union.count_ones() as usize != size {
-            return;
+            return true;
         }
         let mut eliminations = Vec::new();
         let mut focus_cells: Vec<usize> = Vec::new();
@@ -106,50 +156,98 @@ fn find_oriented(
             }
         }
         if eliminations.is_empty() {
-            return;
+            return true;
         }
 
-        out.push(Step {
+        emit(Step {
             technique: kind,
             deductions: eliminations,
             focus_cells,
             focus_house: None,
-        });
+        })
     });
 }
 
 pub fn find_finned_x_wing(board: &Board) -> Vec<Step> {
-    find_finned_fish(board, 2, TechniqueKind::FinnedXWing)
+    find_finned_fish_all(board, 2, TechniqueKind::FinnedXWing)
 }
 
 pub fn find_finned_swordfish(board: &Board) -> Vec<Step> {
-    find_finned_fish(board, 3, TechniqueKind::FinnedSwordfish)
+    find_finned_fish_all(board, 3, TechniqueKind::FinnedSwordfish)
 }
 
 pub fn find_finned_jellyfish(board: &Board) -> Vec<Step> {
-    find_finned_fish(board, 4, TechniqueKind::FinnedJellyfish)
+    find_finned_fish_all(board, 4, TechniqueKind::FinnedJellyfish)
 }
 
-fn find_finned_fish(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
-    let mut out = Vec::new();
-    for d in 1u8..=9 {
-        find_finned_oriented(board, d, size, kind, UnitKind::Row, &mut out);
-        find_finned_oriented(board, d, size, kind, UnitKind::Col, &mut out);
+pub fn find_first_finned_x_wing(board: &Board) -> Option<Step> {
+    find_finned_fish_first(board, 2, TechniqueKind::FinnedXWing)
+}
+
+pub fn find_first_finned_swordfish(board: &Board) -> Option<Step> {
+    find_finned_fish_first(board, 3, TechniqueKind::FinnedSwordfish)
+}
+
+pub fn find_first_finned_jellyfish(board: &Board) -> Option<Step> {
+    find_finned_fish_first(board, 4, TechniqueKind::FinnedJellyfish)
+}
+
+fn find_finned_fish_each<F: FnMut(Step) -> bool>(
+    board: &Board,
+    size: usize,
+    kind: TechniqueKind,
+    mut emit: F,
+) {
+    let mut keep_going = true;
+    'outer: for d in 1u8..=9 {
+        for base in [UnitKind::Row, UnitKind::Col] {
+            find_finned_oriented_each(board, d, size, kind, base, |s| {
+                let cont = emit(s);
+                if !cont {
+                    keep_going = false;
+                }
+                cont
+            });
+            if !keep_going {
+                break 'outer;
+            }
+        }
     }
+}
+
+fn find_finned_fish_all(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
+    let mut out = Vec::new();
+    find_finned_fish_each(board, size, kind, |s| {
+        out.push(s);
+        true
+    });
     out
 }
 
-fn find_finned_oriented(
+fn find_finned_fish_first(board: &Board, size: usize, kind: TechniqueKind) -> Option<Step> {
+    let mut found = None;
+    find_finned_fish_each(board, size, kind, |s| {
+        found = Some(s);
+        false
+    });
+    found
+}
+
+fn find_finned_oriented_each<F: FnMut(Step) -> bool>(
     board: &Board,
     digit: u8,
     size: usize,
     kind: TechniqueKind,
     base: UnitKind,
-    out: &mut Vec<Step>,
+    mut emit: F,
 ) {
     let bit = digit_to_bit(digit);
     let mut positions: [u16; 9] = [0; 9];
-    let mut viable_bases: Vec<usize> = Vec::new();
+    // Same stack-buffer pattern as find_oriented_each. Finned fish gets hit
+    // hard in forced/needs benches because it's allowed in the filtered
+    // walk; per-call Vec allocs showed up at ~15% in the profile.
+    let mut viable_bases_buf: [usize; 9] = [0; 9];
+    let mut viable_len: usize = 0;
 
     for b in 0..9 {
         let mut placed = false;
@@ -170,47 +268,78 @@ fn find_finned_oriented(
         positions[b] = pos;
         let n = pos.count_ones() as usize;
         if n >= 2 && n <= size + MAX_FIN_PER_BASE {
-            viable_bases.push(b);
+            viable_bases_buf[viable_len] = b;
+            viable_len += 1;
         }
     }
 
-    if viable_bases.len() < size {
+    if viable_len < size {
         return;
     }
+    let viable_bases = &viable_bases_buf[..viable_len];
 
-    for_each_combination(&viable_bases, size, |combo| {
+    let mut keep_going = true;
+    for_each_combination(viable_bases, size, |combo| {
         let union: u16 = combo.iter().map(|&b| positions[b]).fold(0, |a, b| a | b);
         let union_count = union.count_ones() as usize;
         if union_count <= size {
-            return;
+            return true;
         }
         if union_count > size + MAX_TOTAL_FINS {
-            return;
+            return true;
         }
 
-        let union_cols: Vec<usize> = (0..9).filter(|x| union & (1 << x) != 0).collect();
-        for_each_combination(&union_cols, size, |cover| {
-            let cover_mask: u16 = cover.iter().map(|&x| 1u16 << x).fold(0, |a, b| a | b);
+        // union_cols: up to 9 ints. Build in-place to avoid a per-outer-combo heap alloc.
+        let mut union_cols_buf: [usize; 9] = [0; 9];
+        let mut union_cols_len: usize = 0;
+        for x in 0..9 {
+            if union & (1 << x) != 0 {
+                union_cols_buf[union_cols_len] = x;
+                union_cols_len += 1;
+            }
+        }
+        let union_cols = &union_cols_buf[..union_cols_len];
+        for_each_combination(union_cols, size, |cover| {
+            // Scalar accumulate: with a slice of unknown const-size, LLVM was
+            // autovectorizing the iter().map().fold() into AVX-512 (vpmovqw,
+            // vpsllvw…) and that setup cost dominated for size 2-4. A
+            // straight loop is faster here per perf annotate.
+            let mut cover_mask: u16 = 0;
+            for &x in cover {
+                cover_mask |= 1u16 << x;
+            }
             let fin_mask = union & !cover_mask;
             if fin_mask == 0 {
-                return;
+                return true;
             }
 
-            let mut fin_cells: Vec<usize> = Vec::new();
+            // fin_cells: at most MAX_TOTAL_FINS=5. Stack buffer.
+            let mut fin_cells_buf: [usize; MAX_TOTAL_FINS + 1] = [0; MAX_TOTAL_FINS + 1];
+            let mut fin_len: usize = 0;
+            let mut overflowed = false;
             for &b in combo {
                 for x in 0..9 {
                     if positions[b] & (1 << x) != 0 && fin_mask & (1 << x) != 0 {
-                        fin_cells.push(cell_at(base, b, x));
+                        if fin_len >= MAX_TOTAL_FINS {
+                            overflowed = true;
+                            break;
+                        }
+                        fin_cells_buf[fin_len] = cell_at(base, b, x);
+                        fin_len += 1;
                     }
                 }
+                if overflowed {
+                    break;
+                }
             }
-            if fin_cells.is_empty() || fin_cells.len() > MAX_TOTAL_FINS {
-                return;
+            if overflowed || fin_len == 0 {
+                return true;
             }
+            let fin_cells = &fin_cells_buf[..fin_len];
 
             let fin_box = box_of(fin_cells[0]);
             if !fin_cells.iter().all(|&c| box_of(c) == fin_box) {
-                return;
+                return true;
             }
 
             let mut eliminations = Vec::new();
@@ -233,7 +362,7 @@ fn find_finned_oriented(
                 }
             }
             if eliminations.is_empty() {
-                return;
+                return true;
             }
 
             let mut focus_cells: Vec<usize> = Vec::new();
@@ -245,13 +374,18 @@ fn find_finned_oriented(
                 }
             }
 
-            out.push(Step {
+            let cont = emit(Step {
                 technique: kind,
                 deductions: eliminations,
                 focus_cells,
                 focus_house: None,
             });
+            if !cont {
+                keep_going = false;
+            }
+            cont
         });
+        keep_going
     });
 }
 

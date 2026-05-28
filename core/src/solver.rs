@@ -53,7 +53,7 @@ pub fn next_step_filtered(board: &Board, allow: impl Fn(TechniqueKind) -> bool) 
         if !allow(def.kind) {
             continue;
         }
-        if let Some(s) = (def.find_all)(board).into_iter().next() {
+        if let Some(s) = (def.find_first)(board) {
             return Some(s);
         }
     }
@@ -71,6 +71,18 @@ pub fn apply_step(board: &mut Board, step: &Step) {
             Deduction::Eliminate { cell, digit } => {
                 board.eliminate(cell, digit);
             }
+        }
+    }
+}
+
+pub fn solve_solvable_only(mut board: Board) -> bool {
+    loop {
+        if board.is_solved() {
+            return true;
+        }
+        match next_step(&board) {
+            Some(step) => apply_step(&mut board, &step),
+            None => return false,
         }
     }
 }

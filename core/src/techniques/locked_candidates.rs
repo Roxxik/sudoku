@@ -5,6 +5,23 @@ use crate::techniques::{Deduction, HouseRef, Step, TechniqueKind};
 
 pub fn find_pointing(board: &Board) -> Vec<Step> {
     let mut out = Vec::new();
+    find_pointing_each(board, |s| {
+        out.push(s);
+        true
+    });
+    out
+}
+
+pub fn find_first_pointing(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_pointing_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
+}
+
+fn find_pointing_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for box_idx in 0..9usize {
         let unit = &BOX_UNITS[box_idx];
         for d in 1u8..=9 {
@@ -28,7 +45,7 @@ pub fn find_pointing(board: &Board) -> Vec<Step> {
                 let eliminations =
                     eliminate_along(&ROW_UNITS[line], box_idx, board, bit, d, |c| box_of(c));
                 if !eliminations.is_empty() {
-                    out.push(Step {
+                    let step = Step {
                         technique: TechniqueKind::LockedCandidatesPointing,
                         deductions: eliminations,
                         focus_cells: positions.clone(),
@@ -36,7 +53,10 @@ pub fn find_pointing(board: &Board) -> Vec<Step> {
                             kind: UnitKind::Box,
                             index: box_idx as u8,
                         }),
-                    });
+                    };
+                    if !emit(step) {
+                        return;
+                    }
                     continue;
                 }
             }
@@ -44,7 +64,7 @@ pub fn find_pointing(board: &Board) -> Vec<Step> {
                 let eliminations =
                     eliminate_along(&COL_UNITS[line], box_idx, board, bit, d, |c| box_of(c));
                 if !eliminations.is_empty() {
-                    out.push(Step {
+                    let step = Step {
                         technique: TechniqueKind::LockedCandidatesPointing,
                         deductions: eliminations,
                         focus_cells: positions,
@@ -52,16 +72,35 @@ pub fn find_pointing(board: &Board) -> Vec<Step> {
                             kind: UnitKind::Box,
                             index: box_idx as u8,
                         }),
-                    });
+                    };
+                    if !emit(step) {
+                        return;
+                    }
                 }
             }
         }
     }
-    out
 }
 
 pub fn find_claiming(board: &Board) -> Vec<Step> {
     let mut out = Vec::new();
+    find_claiming_each(board, |s| {
+        out.push(s);
+        true
+    });
+    out
+}
+
+pub fn find_first_claiming(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_claiming_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
+}
+
+fn find_claiming_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for line_idx in 0..9usize {
         for (kind, unit) in [
             (UnitKind::Row, &ROW_UNITS[line_idx]),
@@ -94,7 +133,7 @@ pub fn find_claiming(board: &Board) -> Vec<Step> {
                             }
                         });
                     if !eliminations.is_empty() {
-                        out.push(Step {
+                        let step = Step {
                             technique: TechniqueKind::LockedCandidatesClaiming,
                             deductions: eliminations,
                             focus_cells: positions,
@@ -102,13 +141,15 @@ pub fn find_claiming(board: &Board) -> Vec<Step> {
                                 kind,
                                 index: line_idx as u8,
                             }),
-                        });
+                        };
+                        if !emit(step) {
+                            return;
+                        }
                     }
                 }
             }
         }
     }
-    out
 }
 
 fn aligned_row(positions: &[usize]) -> Option<usize> {

@@ -1,8 +1,7 @@
 use crate::board::{Board, all_units, digit_to_bit};
 use crate::techniques::{Deduction, HouseRef, Step, TechniqueKind};
 
-pub fn find_all(board: &Board) -> Vec<Step> {
-    let mut out = Vec::new();
+fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for (kind, idx, unit) in all_units() {
         for d in 1u8..=9 {
             let bit = digit_to_bit(d);
@@ -20,23 +19,42 @@ pub fn find_all(board: &Board) -> Vec<Step> {
                 }
             }
             if !already_placed && count == 1 {
-                let house = HouseRef {
-                    kind,
-                    index: idx as u8,
-                };
-                out.push(Step {
+                let step = Step {
                     technique: TechniqueKind::HiddenSingle,
                     deductions: vec![Deduction::Place {
                         cell: location,
                         digit: d,
                     }],
                     focus_cells: vec![location],
-                    focus_house: Some(house),
-                });
+                    focus_house: Some(HouseRef {
+                        kind,
+                        index: idx as u8,
+                    }),
+                };
+                if !emit(step) {
+                    return;
+                }
             }
         }
     }
+}
+
+pub fn find_all(board: &Board) -> Vec<Step> {
+    let mut out = Vec::new();
+    find_each(board, |s| {
+        out.push(s);
+        true
+    });
     out
+}
+
+pub fn find_first(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
 }
 
 #[cfg(test)]

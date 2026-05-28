@@ -100,18 +100,24 @@ pub fn make_puzzle_forced(
 /// Some(false) if it is solvable without `target`. None if it isn't
 /// technique-solvable at all.
 fn solve_and_check_forced(board: &Board, target: TechniqueKind) -> Option<bool> {
-    let canonical = crate::solver::solve(board.clone());
-    if !canonical.solved {
-        return None;
-    }
     let mut b = board.clone();
     loop {
         if b.is_solved() {
             return Some(false);
         }
         match crate::solver::next_step_filtered(&b, |t| t != target) {
-            None => return Some(true),
             Some(s) => crate::solver::apply_step(&mut b, &s),
+            None => {
+                // Filtered walk is stuck. The puzzle is solvable iff the
+                // canonical solver can finish from here. Soundness of
+                // deductions: every filtered step we already applied is a
+                // true fact, so canonical-from-here agrees with canonical-
+                // from-original on solvability.
+                if crate::solver::solve_solvable_only(b) {
+                    return Some(true);
+                }
+                return None;
+            }
         }
     }
 }

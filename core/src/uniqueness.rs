@@ -12,80 +12,108 @@ pub fn solve_unique(board: &Board) -> Option<Board> {
     if backtrack_first(&mut work) { Some(work) } else { None }
 }
 
+/// Recursive backtracker with iterative unit-propagation.
+///
+/// Forced singles (cells with exactly one candidate) need no branching, so
+/// we place them in a loop without cloning the board or recursing. That
+/// eliminates two 243-byte memcpys (clone + restore) and a stack frame per
+/// forced single, which dominate when puzzles are mostly singles-solvable.
+///
+/// Only when the best cell has 2+ candidates do we fall back to the classic
+/// clone/place/recurse/restore branching loop.
 fn backtrack(board: &mut Board, count: &mut usize, limit: usize) {
-    if *count >= limit {
-        return;
-    }
-    let mut best: Option<(usize, u16)> = None;
-    let mut best_count: u32 = 10;
-    for i in 0..CELLS {
-        if !board.is_empty(i) {
-            continue;
-        }
-        let cs = board.candidates(i);
-        let n = popcount(cs);
-        if n == 0 {
+    loop {
+        if *count >= limit {
             return;
         }
-        if n < best_count {
-            best_count = n;
-            best = Some((i, cs));
-            if n == 1 {
-                break;
+        let mut best_cell: usize = CELLS;
+        let mut best_mask: u16 = 0;
+        let mut best_count: u32 = 10;
+        for i in 0..CELLS {
+            if !board.is_empty(i) {
+                continue;
             }
-        }
-    }
-    match best {
-        None => {
-            *count += 1;
-        }
-        Some((cell, mask)) => {
-            for d in iter_digits(mask) {
-                let backup = board.clone();
-                board.place(cell, d);
-                backtrack(board, count, limit);
-                *board = backup;
-                if *count >= limit {
-                    return;
+            let cs = board.candidates(i);
+            let n = popcount(cs);
+            if n == 0 {
+                return;
+            }
+            if n < best_count {
+                best_count = n;
+                best_cell = i;
+                best_mask = cs;
+                if n == 1 {
+                    break;
                 }
             }
         }
+        if best_cell == CELLS {
+            // No empty cells left — a complete solution.
+            *count += 1;
+            return;
+        }
+        if best_count == 1 {
+            // Forced placement. Apply in place and continue the loop;
+            // no clone/recurse/restore needed.
+            let d = iter_digits(best_mask).next().unwrap();
+            board.place(best_cell, d);
+            continue;
+        }
+        // Real branch point.
+        for d in iter_digits(best_mask) {
+            let backup = board.clone();
+            board.place(best_cell, d);
+            backtrack(board, count, limit);
+            *board = backup;
+            if *count >= limit {
+                return;
+            }
+        }
+        return;
     }
 }
 
 fn backtrack_first(board: &mut Board) -> bool {
-    let mut best: Option<(usize, u16)> = None;
-    let mut best_count: u32 = 10;
-    for i in 0..CELLS {
-        if !board.is_empty(i) {
+    loop {
+        let mut best_cell: usize = CELLS;
+        let mut best_mask: u16 = 0;
+        let mut best_count: u32 = 10;
+        for i in 0..CELLS {
+            if !board.is_empty(i) {
+                continue;
+            }
+            let cs = board.candidates(i);
+            let n = popcount(cs);
+            if n == 0 {
+                return false;
+            }
+            if n < best_count {
+                best_count = n;
+                best_cell = i;
+                best_mask = cs;
+                if n == 1 {
+                    break;
+                }
+            }
+        }
+        if best_cell == CELLS {
+            return true;
+        }
+        if best_count == 1 {
+            // Forced — apply and keep going.
+            let d = iter_digits(best_mask).next().unwrap();
+            board.place(best_cell, d);
             continue;
         }
-        let cs = board.candidates(i);
-        let n = popcount(cs);
-        if n == 0 {
-            return false;
-        }
-        if n < best_count {
-            best_count = n;
-            best = Some((i, cs));
-            if n == 1 {
-                break;
+        for d in iter_digits(best_mask) {
+            let backup = board.clone();
+            board.place(best_cell, d);
+            if backtrack_first(board) {
+                return true;
             }
+            *board = backup;
         }
-    }
-    match best {
-        None => true,
-        Some((cell, mask)) => {
-            for d in iter_digits(mask) {
-                let backup = board.clone();
-                board.place(cell, d);
-                if backtrack_first(board) {
-                    return true;
-                }
-                *board = backup;
-            }
-            false
-        }
+        return false;
     }
 }
 

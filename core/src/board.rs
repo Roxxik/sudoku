@@ -8,30 +8,61 @@ pub type Digit = u8;
 pub type CellIdx = usize;
 pub type Mask = u16;
 
-#[inline]
+#[inline(always)]
 pub const fn digit_to_bit(d: Digit) -> Mask {
     1u16 << (d as u16 - 1)
 }
 
-#[inline]
+#[inline(always)]
 pub const fn row_of(i: CellIdx) -> usize {
     i / 9
 }
 
-#[inline]
+#[inline(always)]
 pub const fn col_of(i: CellIdx) -> usize {
     i % 9
 }
 
-#[inline]
+#[inline(always)]
 pub const fn box_of(i: CellIdx) -> usize {
     (i / 9 / 3) * 3 + (i % 9) / 3
 }
 
-pub fn iter_digits(mask: Mask) -> impl Iterator<Item = Digit> {
-    (1u8..=9).filter(move |&d| mask & digit_to_bit(d) != 0)
+/// Iterate the set digits in `mask`, lowest bit first.
+/// Yields exactly `popcount(mask)` digits — no work for clear bits.
+#[inline]
+pub fn iter_digits(mask: Mask) -> DigitIter {
+    DigitIter {
+        mask: mask & ALL_DIGITS,
+    }
 }
 
+pub struct DigitIter {
+    mask: Mask,
+}
+
+impl Iterator for DigitIter {
+    type Item = Digit;
+
+    #[inline]
+    fn next(&mut self) -> Option<Digit> {
+        if self.mask == 0 {
+            return None;
+        }
+        let bit = self.mask & self.mask.wrapping_neg();
+        let d = bit.trailing_zeros() as Digit + 1;
+        self.mask &= self.mask - 1;
+        Some(d)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.mask.count_ones() as usize;
+        (n, Some(n))
+    }
+}
+
+#[inline(always)]
 pub fn popcount(mask: Mask) -> u32 {
     (mask & ALL_DIGITS).count_ones()
 }

@@ -3,19 +3,35 @@ use crate::techniques::{Deduction, HouseRef, Step, TechniqueKind};
 use crate::util::for_each_combination;
 
 pub fn find_pairs(board: &Board) -> Vec<Step> {
-    find_subset(board, 2, TechniqueKind::NakedPair)
+    find_subset_all(board, 2, TechniqueKind::NakedPair)
 }
 
 pub fn find_triples(board: &Board) -> Vec<Step> {
-    find_subset(board, 3, TechniqueKind::NakedTriple)
+    find_subset_all(board, 3, TechniqueKind::NakedTriple)
 }
 
 pub fn find_quads(board: &Board) -> Vec<Step> {
-    find_subset(board, 4, TechniqueKind::NakedQuad)
+    find_subset_all(board, 4, TechniqueKind::NakedQuad)
 }
 
-fn find_subset(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
-    let mut out = Vec::new();
+pub fn find_first_pair(board: &Board) -> Option<Step> {
+    find_subset_first(board, 2, TechniqueKind::NakedPair)
+}
+
+pub fn find_first_triple(board: &Board) -> Option<Step> {
+    find_subset_first(board, 3, TechniqueKind::NakedTriple)
+}
+
+pub fn find_first_quad(board: &Board) -> Option<Step> {
+    find_subset_first(board, 4, TechniqueKind::NakedQuad)
+}
+
+fn find_subset_each<F: FnMut(Step) -> bool>(
+    board: &Board,
+    size: usize,
+    kind: TechniqueKind,
+    mut emit: F,
+) {
     for (unit_kind, idx, unit) in all_units() {
         let candidate_cells: Vec<usize> = unit
             .iter()
@@ -31,10 +47,14 @@ fn find_subset(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
         if candidate_cells.len() < size {
             continue;
         }
+        let mut keep_going = true;
         for_each_combination(&candidate_cells, size, |combo| {
-            let union: u16 = combo.iter().map(|&c| board.candidates(c)).fold(0, |a, b| a | b);
+            let union: u16 = combo
+                .iter()
+                .map(|&c| board.candidates(c))
+                .fold(0, |a, b| a | b);
             if popcount(union) != size as u32 {
-                return;
+                return true;
             }
             let mut eliminations = Vec::new();
             for &cell in unit {
@@ -47,21 +67,45 @@ fn find_subset(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
                 }
             }
             if eliminations.is_empty() {
-                return;
+                return true;
             }
             let house = HouseRef {
                 kind: unit_kind,
                 index: idx as u8,
             };
-            out.push(Step {
+            let cont = emit(Step {
                 technique: kind,
                 deductions: eliminations,
                 focus_cells: combo.to_vec(),
                 focus_house: Some(house),
             });
+            if !cont {
+                keep_going = false;
+            }
+            cont
         });
+        if !keep_going {
+            return;
+        }
     }
+}
+
+fn find_subset_all(board: &Board, size: usize, kind: TechniqueKind) -> Vec<Step> {
+    let mut out = Vec::new();
+    find_subset_each(board, size, kind, |s| {
+        out.push(s);
+        true
+    });
     out
+}
+
+fn find_subset_first(board: &Board, size: usize, kind: TechniqueKind) -> Option<Step> {
+    let mut found = None;
+    find_subset_each(board, size, kind, |s| {
+        found = Some(s);
+        false
+    });
+    found
 }
 
 #[cfg(test)]

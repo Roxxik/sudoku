@@ -1,3 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["core", "cli"]
+
+[profile.release]
+debug = "line-tables-only"

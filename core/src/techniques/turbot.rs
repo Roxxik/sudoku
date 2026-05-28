@@ -8,18 +8,45 @@ use crate::techniques::{Deduction, Step, TechniqueKind};
 
 pub fn find_skyscraper(board: &Board) -> Vec<Step> {
     let mut out = Vec::new();
-    for d in 1u8..=9 {
-        find_skyscraper_oriented(board, d, UnitKind::Row, &mut out);
-        find_skyscraper_oriented(board, d, UnitKind::Col, &mut out);
-    }
+    find_skyscraper_each(board, |s| {
+        out.push(s);
+        true
+    });
     out
 }
 
-fn find_skyscraper_oriented(
+pub fn find_first_skyscraper(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_skyscraper_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
+}
+
+fn find_skyscraper_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
+    let mut keep_going = true;
+    'outer: for d in 1u8..=9 {
+        for base in [UnitKind::Row, UnitKind::Col] {
+            find_skyscraper_oriented_each(board, d, base, |s| {
+                let cont = emit(s);
+                if !cont {
+                    keep_going = false;
+                }
+                cont
+            });
+            if !keep_going {
+                break 'outer;
+            }
+        }
+    }
+}
+
+fn find_skyscraper_oriented_each<F: FnMut(Step) -> bool>(
     board: &Board,
     digit: u8,
     base: UnitKind,
-    out: &mut Vec<Step>,
+    mut emit: F,
 ) {
     let conjugates = conjugate_pairs_along(board, digit, base);
     let cross = |c: usize| match base {
@@ -51,15 +78,18 @@ fn find_skyscraper_oriented(
             } else {
                 (c1a, c2a)
             };
-            emit_two_endpoint_elim(
+            if let Some(step) = build_two_endpoint_elim(
                 board,
                 digit,
                 TechniqueKind::Skyscraper,
                 free1,
                 free2,
                 &[c1a, c1b, c2a, c2b],
-                out,
-            );
+            ) {
+                if !emit(step) {
+                    return;
+                }
+            }
         }
     }
 }
@@ -68,6 +98,23 @@ fn find_skyscraper_oriented(
 
 pub fn find_two_string_kite(board: &Board) -> Vec<Step> {
     let mut out = Vec::new();
+    find_two_string_kite_each(board, |s| {
+        out.push(s);
+        true
+    });
+    out
+}
+
+pub fn find_first_two_string_kite(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_two_string_kite_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
+}
+
+fn find_two_string_kite_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for d in 1u8..=9 {
         let row_pairs = conjugate_pairs_along(board, d, UnitKind::Row);
         let col_pairs = conjugate_pairs_along(board, d, UnitKind::Col);
@@ -84,27 +131,46 @@ pub fn find_two_string_kite(board: &Board) -> Vec<Step> {
                         // ar must lie in col c_idx? No — ar is in row r_idx. bc is in col c_idx.
                         // They share a box. ar_other in row r_idx, bc_other in col c_idx.
                         // Free ends are ar_other and bc_other.
-                        emit_two_endpoint_elim(
+                        if let Some(step) = build_two_endpoint_elim(
                             board,
                             d,
                             TechniqueKind::TwoStringKite,
                             ar_other,
                             bc_other,
                             &[a1, a2, b1, b2],
-                            &mut out,
-                        );
+                        ) {
+                            if !emit(step) {
+                                return;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    out
 }
 
 // ===== Empty Rectangle =====
 
 pub fn find_empty_rectangle(board: &Board) -> Vec<Step> {
     let mut out = Vec::new();
+    find_empty_rectangle_each(board, |s| {
+        out.push(s);
+        true
+    });
+    out
+}
+
+pub fn find_first_empty_rectangle(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_empty_rectangle_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
+}
+
+fn find_empty_rectangle_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for d in 1u8..=9 {
         let bit = digit_to_bit(d);
         for box_idx in 0..9 {
@@ -169,12 +235,15 @@ pub fn find_empty_rectangle(board: &Board) -> Vec<Step> {
                             v.push(r_other);
                             v
                         };
-                        out.push(Step {
+                        let step = Step {
                             technique: TechniqueKind::EmptyRectangle,
                             deductions: vec![Deduction::Eliminate { cell: elim_cell, digit: d }],
                             focus_cells: focus,
                             focus_house: None,
-                        });
+                        };
+                        if !emit(step) {
+                            return;
+                        }
                     }
 
                     // Symmetric: conjugate pair in a row outside the box with one endpoint at (r', er_col).
@@ -208,18 +277,20 @@ pub fn find_empty_rectangle(board: &Board) -> Vec<Step> {
                             v.push(c_other);
                             v
                         };
-                        out.push(Step {
+                        let step = Step {
                             technique: TechniqueKind::EmptyRectangle,
                             deductions: vec![Deduction::Eliminate { cell: elim_cell, digit: d }],
                             focus_cells: focus,
                             focus_house: None,
-                        });
+                        };
+                        if !emit(step) {
+                            return;
+                        }
                     }
                 }
             }
         }
     }
-    out
 }
 
 // ===== shared helpers =====
@@ -258,15 +329,14 @@ fn conjugate_pair_in_unit(board: &Board, unit: &[usize; 9], digit: u8) -> Option
     if count == 2 { Some(found) } else { None }
 }
 
-fn emit_two_endpoint_elim(
+fn build_two_endpoint_elim(
     board: &Board,
     digit: u8,
     kind: TechniqueKind,
     free1: usize,
     free2: usize,
     focus_cells: &[usize],
-    out: &mut Vec<Step>,
-) {
+) -> Option<Step> {
     let bit = digit_to_bit(digit);
     let mut eliminations = Vec::new();
     for c in 0..CELLS {
@@ -284,14 +354,14 @@ fn emit_two_endpoint_elim(
         }
     }
     if eliminations.is_empty() {
-        return;
+        return None;
     }
-    out.push(Step {
+    Some(Step {
         technique: kind,
         deductions: eliminations,
         focus_cells: focus_cells.to_vec(),
         focus_house: None,
-    });
+    })
 }
 
 #[cfg(test)]

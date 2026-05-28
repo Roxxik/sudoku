@@ -1,8 +1,7 @@
 use crate::board::{Board, CELLS, iter_digits, popcount};
 use crate::techniques::{Deduction, Step, TechniqueKind};
 
-pub fn find_all(board: &Board) -> Vec<Step> {
-    let mut out = Vec::new();
+fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for i in 0..CELLS {
         if !board.is_empty(i) {
             continue;
@@ -10,15 +9,35 @@ pub fn find_all(board: &Board) -> Vec<Step> {
         let mask = board.candidates(i);
         if popcount(mask) == 1 {
             let d = iter_digits(mask).next().unwrap();
-            out.push(Step {
+            let step = Step {
                 technique: TechniqueKind::NakedSingle,
                 deductions: vec![Deduction::Place { cell: i, digit: d }],
                 focus_cells: vec![i],
                 focus_house: None,
-            });
+            };
+            if !emit(step) {
+                return;
+            }
         }
     }
+}
+
+pub fn find_all(board: &Board) -> Vec<Step> {
+    let mut out = Vec::new();
+    find_each(board, |s| {
+        out.push(s);
+        true
+    });
     out
+}
+
+pub fn find_first(board: &Board) -> Option<Step> {
+    let mut found = None;
+    find_each(board, |s| {
+        found = Some(s);
+        false
+    });
+    found
 }
 
 #[cfg(test)]
@@ -46,5 +65,16 @@ mod tests {
         }
         let steps = find_all(&b);
         assert_eq!(steps.len(), 3);
+    }
+
+    #[test]
+    fn find_first_returns_one() {
+        let mut b = Board::empty();
+        for i in 0..3 {
+            for d in 1u8..=8 {
+                b.eliminate(i, d);
+            }
+        }
+        assert!(find_first(&b).is_some());
     }
 }
