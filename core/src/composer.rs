@@ -47,7 +47,7 @@ fn solvable_with(board: &Board, allowed: impl Fn(TechniqueKind) -> bool) -> bool
 impl Constructor for HiddenTripleConstructor {
     fn try_extend(&self, solution: &Board, _current: &Board, rng: &mut Rng) -> Option<Board> {
         let target = TechniqueKind::HiddenTriple;
-        let allowed = |t: TechniqueKind| self.spec.usages.contains_key(&t);
+        let allowed = |t: TechniqueKind| self.spec.is_in_scope(t);
         let allowed_without_target = |t: TechniqueKind| allowed(t) && t != target;
 
         // Step 1: pick the geometry — unit U, three "triple" cells {x,y,z},

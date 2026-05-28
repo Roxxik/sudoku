@@ -6,24 +6,34 @@ pub fn max_technique(trace: &[Step]) -> Option<TechniqueKind> {
 }
 
 pub fn deduction_counts(board: &Board) -> Vec<usize> {
+    deduction_counts_filtered(board, |_| true)
+}
+
+pub fn deduction_counts_filtered<F: Fn(TechniqueKind) -> bool>(
+    board: &Board,
+    allow: F,
+) -> Vec<usize> {
     let mut b = board.clone();
     let mut counts = Vec::new();
     loop {
         if b.is_solved() {
             return counts;
         }
-        let count = distinct_conclusion_count(&b);
+        let count = distinct_conclusion_count_filtered(&b, &allow);
         if count == 0 {
             return counts;
         }
         counts.push(count);
-        let step = next_step(&b).expect("count>0 means step exists");
+        let step = next_step_filtered(&b, &allow).expect("count>0 means step exists");
         apply_step(&mut b, &step);
     }
 }
 
-fn distinct_conclusion_count(board: &Board) -> usize {
-    let steps = all_techniques(board);
+fn distinct_conclusion_count_filtered<F: Fn(TechniqueKind) -> bool>(
+    board: &Board,
+    allow: F,
+) -> usize {
+    let steps = all_techniques_filtered(board, allow);
     let mut seen: Vec<Vec<Deduction>> = Vec::new();
     for s in &steps {
         if !seen.iter().any(|d| *d == s.deductions) {
@@ -41,8 +51,18 @@ pub struct SolveResult {
 }
 
 pub fn all_techniques(board: &Board) -> Vec<Step> {
+    all_techniques_filtered(board, |_| true)
+}
+
+pub fn all_techniques_filtered<F: Fn(TechniqueKind) -> bool>(
+    board: &Board,
+    allow: F,
+) -> Vec<Step> {
     let mut out = Vec::new();
     for def in REGISTRY {
+        if !allow(def.kind) {
+            continue;
+        }
         out.extend((def.find_all)(board));
     }
     out
@@ -87,7 +107,11 @@ pub fn solve_solvable_only(mut board: Board) -> bool {
     }
 }
 
-pub fn solve(mut board: Board) -> SolveResult {
+pub fn solve(board: Board) -> SolveResult {
+    solve_filtered(board, |_| true)
+}
+
+pub fn solve_filtered<F: Fn(TechniqueKind) -> bool>(mut board: Board, allow: F) -> SolveResult {
     let mut trace = Vec::new();
     loop {
         if board.is_solved() {
@@ -97,7 +121,7 @@ pub fn solve(mut board: Board) -> SolveResult {
                 solved: true,
             };
         }
-        match next_step(&board) {
+        match next_step_filtered(&board, &allow) {
             Some(step) => {
                 apply_step(&mut board, &step);
                 trace.push(step);

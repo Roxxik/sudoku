@@ -1,29 +1,47 @@
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use sudoku_core::{
-    Board, Deduction, GeneratedPuzzle, HiddenTripleConstructor, HouseRef, REGISTRY, Rng, Spec,
-    Step, TechniqueKind, all_techniques, apply_step, cell_name, construct_with, deduction_counts,
-    make_puzzle, make_puzzle_forced, make_puzzle_needing, max_technique, solve,
+    Board, CURRICULUM, Deduction, Family, GeneratedPuzzle, HiddenTripleConstructor, HouseRef,
+    REGISTRY, Rng, Spec, Step, TechniqueKind, Tier, all_techniques, all_techniques_filtered,
+    apply_step, cell_name, construct_with, deduction_counts, deduction_counts_filtered,
+    make_puzzle, make_puzzle_for_spec, make_puzzle_forced, make_puzzle_needing, max_technique,
+    solve, solve_filtered, stage_by_key,
 };
+
+const MAX_ATTEMPTS: usize = 10_000;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let interactive = pop_flag(&mut args, "--interactive") || pop_flag(&mut args, "-i");
+    let list_stages = pop_flag(&mut args, "--list-stages");
+    let full_trace = pop_flag(&mut args, "--full-trace");
+
+    // Legacy single-purpose flags.
     let needs = pop_string(&mut args, "--needs");
     let forced = pop_string(&mut args, "--forced");
     let construct = pop_string(&mut args, "--construct");
+
+    // Spec-driven flags.
+    let stage = pop_string(&mut args, "--stage");
+    let train = pop_string(&mut args, "--train");
+    let drill = pop_string(&mut args, "--drill");
+    let tier_arg = pop_string(&mut args, "--tier");
+    let family_arg = pop_string(&mut args, "--family");
+    let allow_arg = pop_string(&mut args, "--allow");
+    let require_arg = pop_string(&mut args, "--require");
+
+    if list_stages {
+        print_stages();
+        return;
+    }
+
     let seed: Option<u64> = match args.as_slice() {
         [] => None,
         [s] => match s.parse::<u64>() {
             Ok(n) => Some(n),
-            Err(_) => {
-                eprintln!("usage: sudoku [--interactive] [seed]");
-                std::process::exit(2);
-            }
+            Err(_) => usage_error(),
         },
-        _ => {
-            eprintln!("usage: sudoku [--interactive] [seed]");
-            std::process::exit(2);
-        }
+        _ => usage_error(),
     };
 
     let actual_seed = seed.unwrap_or_else(|| {
@@ -37,73 +55,75 @@ fn main() {
     println!("seed: {}", actual_seed);
 
     let mut rng = Rng::from_seed(actual_seed);
-    let out = if let Some(name) = construct.as_ref() {
-        match name.as_str() {
-            "hidden-triple" => {
-                let spec = Spec::allow_up_to(TechniqueKind::HiddenSingle)
-                    .require(TechniqueKind::HiddenTriple, 1);
-                let constructor = HiddenTripleConstructor::for_spec(spec);
-                match construct_with(&constructor, &mut rng, 1000) {
-                    Some((board, attempts)) => {
-                        println!("constructed after {} attempts", attempts);
-                        let solution = solve(board.clone()).board;
-                        let givens = (0..81).filter(|&i| !board.is_empty(i)).count();
-                        GeneratedPuzzle {
-                            puzzle: board,
-                            solution,
-                            givens,
-                        }
-                    }
-                    None => {
-                        eprintln!("constructor failed within 1000 attempts");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            other => {
-                eprintln!("no constructor for {:?}", other);
-                std::process::exit(2);
-            }
-        }
-    } else if let Some(name) = needs.as_ref() {
-        let target = parse_technique(name).unwrap_or_else(|| {
-            eprintln!("unknown technique name {:?}", name);
-            std::process::exit(2);
-        });
-        match make_puzzle_needing(&mut rng, target, 10_000) {
-            Some(fr) => {
-                println!("found after {} attempts", fr.attempts);
-                fr.puzzle
-            }
-            None => {
-                eprintln!("no puzzle requiring {} found in 10000 attempts", target.name());
-                std::process::exit(1);
-            }
-        }
-    } else if let Some(name) = forced.as_ref() {
-        let target = parse_technique(name).unwrap_or_else(|| {
-            eprintln!("unknown technique name {:?}", name);
-            std::process::exit(2);
-        });
-        match make_puzzle_forced(&mut rng, target, 10_000) {
-            Some(fr) => {
-                println!("forced after {} attempts", fr.attempts);
-                fr.puzzle
-            }
-            None => {
-                eprintln!("no puzzle FORCING {} found in 10000 attempts", target.name());
-                std::process::exit(1);
-            }
-        }
-    } else {
-        make_puzzle(&mut rng, true)
-    };
+
+    let spec_starts: usize = [&stage, &train, &drill, &tier_arg]
+        .iter()
+        .filter(|s| s.is_some())
+        .count();
+    if spec_starts > 1 {
+        eprintln!("--stage, --train, --drill, --tier are mutually exclusive");
+        std::process::exit(2);
+    }
+    let legacy: usize = [&construct, &needs, &forced]
+        .iter()
+        .filter(|s| s.is_some())
+        .count();
+    if legacy > 0
+        && (spec_starts > 0 || family_arg.is_some() || allow_arg.is_some() || require_arg.is_some())
+    {
+        eprintln!("--construct/--needs/--forced cannot be combined with --stage/--train/--drill/--tier/--family/--allow/--require");
+        std::process::exit(2);
+    }
+
+    let (out, display_spec): (GeneratedPuzzle, Option<Spec>) =
+        if let Some(name) = construct.as_ref() {
+            let (puzzle, spec) = run_construct(name, &mut rng);
+            (puzzle, Some(spec))
+        } else if let Some(name) = needs.as_ref() {
+            (run_needs(name, &mut rng), None)
+        } else if let Some(name) = forced.as_ref() {
+            (run_forced(name, &mut rng), None)
+        } else if spec_starts > 0
+            || family_arg.is_some()
+            || allow_arg.is_some()
+            || require_arg.is_some()
+        {
+            let spec = build_spec(
+                stage.as_deref(),
+                train.as_deref(),
+                drill.as_deref(),
+                tier_arg.as_deref(),
+                family_arg.as_deref(),
+                allow_arg.as_deref(),
+                require_arg.as_deref(),
+            );
+            let puzzle = run_spec(&spec, &mut rng);
+            (puzzle, Some(spec))
+        } else {
+            (make_puzzle(&mut rng, true), None)
+        };
+
+    // By default, restrict the displayed solve to whatever spec was in play —
+    // so a drill puzzle shows the drill path, not the canonical (cheapest-first)
+    // path that may use forbidden techniques. `--full-trace` opts out.
+    let restrict = if full_trace { None } else { display_spec.as_ref() };
 
     if interactive {
-        run_interactive(out);
+        run_interactive(out, restrict);
     } else {
-        run_batch(out);
+        run_batch(out, restrict);
     }
+}
+
+fn usage_error() -> ! {
+    eprintln!(
+        "usage: sudoku [--interactive] [--list-stages] \\\n\
+         \t[--stage <key> | --train <technique> | --drill <technique> | --tier <easy|medium|hard|master>] \\\n\
+         \t[--family <name>] [--allow t1,t2,...] [--require t=n,t=n,...] \\\n\
+         \t[--construct <name> | --needs <technique> | --forced <technique>] \\\n\
+         \t[seed]",
+    );
+    std::process::exit(2);
 }
 
 fn pop_flag(args: &mut Vec<String>, name: &str) -> bool {
@@ -131,6 +151,243 @@ fn parse_technique(name: &str) -> Option<TechniqueKind> {
         .iter()
         .find(|d| d.cli_name == name)
         .map(|d| d.kind)
+}
+
+fn parse_family(name: &str) -> Option<Family> {
+    match name {
+        "singles" => Some(Family::Singles),
+        "locked-candidates" => Some(Family::LockedCandidates),
+        "naked-subset" => Some(Family::NakedSubset),
+        "hidden-subset" => Some(Family::HiddenSubset),
+        "fish" => Some(Family::Fish),
+        "turbot-fish" => Some(Family::TurbotFish),
+        "wing" => Some(Family::Wing),
+        "finned-fish" => Some(Family::FinnedFish),
+        _ => None,
+    }
+}
+
+fn family_name(f: Family) -> &'static str {
+    match f {
+        Family::Singles => "singles",
+        Family::LockedCandidates => "locked-candidates",
+        Family::NakedSubset => "naked-subset",
+        Family::HiddenSubset => "hidden-subset",
+        Family::Fish => "fish",
+        Family::TurbotFish => "turbot-fish",
+        Family::Wing => "wing",
+        Family::FinnedFish => "finned-fish",
+    }
+}
+
+fn build_spec(
+    stage: Option<&str>,
+    train: Option<&str>,
+    drill: Option<&str>,
+    tier_arg: Option<&str>,
+    family_arg: Option<&str>,
+    allow_arg: Option<&str>,
+    require_arg: Option<&str>,
+) -> Spec {
+    let mut spec = if let Some(key) = stage {
+        let s = stage_by_key(key).unwrap_or_else(|| {
+            eprintln!("unknown stage {:?} (try --list-stages)", key);
+            std::process::exit(2);
+        });
+        Spec::for_stage(s)
+    } else if let Some(name) = train {
+        let t = parse_technique(name).unwrap_or_else(|| {
+            eprintln!("unknown technique {:?}", name);
+            std::process::exit(2);
+        });
+        Spec::train(t)
+    } else if let Some(name) = drill {
+        let t = parse_technique(name).unwrap_or_else(|| {
+            eprintln!("unknown technique {:?}", name);
+            std::process::exit(2);
+        });
+        Spec::drill(t)
+    } else if let Some(t) = tier_arg {
+        let tier = Tier::from_key(t).unwrap_or_else(|| {
+            eprintln!("unknown tier {:?} (easy|medium|hard|master)", t);
+            std::process::exit(2);
+        });
+        Spec::tier(tier)
+    } else {
+        Spec::empty()
+    };
+
+    if let Some(name) = family_arg {
+        let f = parse_family(name).unwrap_or_else(|| {
+            eprintln!(
+                "unknown family {:?} (singles|locked-candidates|naked-subset|hidden-subset|fish|turbot-fish|wing|finned-fish)",
+                name
+            );
+            std::process::exit(2);
+        });
+        spec = spec.require_family(f, 1);
+    }
+
+    if let Some(list) = allow_arg {
+        for tok in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let t = parse_technique(tok).unwrap_or_else(|| {
+                eprintln!("unknown technique in --allow: {:?}", tok);
+                std::process::exit(2);
+            });
+            spec = spec.allow(t);
+        }
+    }
+
+    if let Some(list) = require_arg {
+        for tok in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, count) = parse_require_token(tok);
+            let t = parse_technique(name).unwrap_or_else(|| {
+                eprintln!("unknown technique in --require: {:?}", name);
+                std::process::exit(2);
+            });
+            spec = spec.require(t, count);
+        }
+    }
+
+    spec
+}
+
+fn parse_require_token(tok: &str) -> (&str, usize) {
+    match tok.split_once('=') {
+        Some((name, n)) => {
+            let count = n.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("--require count must be a positive integer, got {:?}", n);
+                std::process::exit(2);
+            });
+            (name, count)
+        }
+        None => (tok, 1),
+    }
+}
+
+fn print_stages() {
+    println!("Training stages (use with --stage <key>):");
+    println!("  {:<22} {:<32} {}", "key", "label", "focus");
+    for s in CURRICULUM {
+        println!(
+            "  {:<22} {:<32} {} (diff {})",
+            s.key,
+            s.label,
+            s.focus.cli_name(),
+            s.focus.difficulty(),
+        );
+    }
+    println!();
+    println!("Tiers (use with --tier):");
+    for &t in Tier::ALL {
+        let ceiling = match t.ceiling() {
+            Some(c) => format!("through {} (diff {})", c.cli_name(), c.difficulty()),
+            None => "no cap".to_string(),
+        };
+        println!("  {:<8} {}", t.key(), ceiling);
+    }
+    println!();
+    println!("Families (use with --family):");
+    let mut printed: HashSet<Family> = HashSet::new();
+    for d in REGISTRY {
+        if printed.insert(d.family) {
+            let members: Vec<&'static str> = d
+                .family
+                .members()
+                .iter()
+                .map(|k| k.cli_name())
+                .collect();
+            println!("  {:<18} {}", family_name(d.family), members.join(", "));
+        }
+    }
+}
+
+fn run_construct(name: &str, rng: &mut Rng) -> (GeneratedPuzzle, Spec) {
+    match name {
+        "hidden-triple" => {
+            let spec = Spec::allow_up_to(TechniqueKind::HiddenSingle)
+                .require(TechniqueKind::HiddenTriple, 1);
+            let constructor = HiddenTripleConstructor::for_spec(spec.clone());
+            match construct_with(&constructor, rng, 1000) {
+                Some((board, attempts)) => {
+                    println!("constructed after {} attempts", attempts);
+                    let solution = solve(board.clone()).board;
+                    let givens = (0..81).filter(|&i| !board.is_empty(i)).count();
+                    (
+                        GeneratedPuzzle {
+                            puzzle: board,
+                            solution,
+                            givens,
+                        },
+                        spec,
+                    )
+                }
+                None => {
+                    eprintln!("constructor failed within 1000 attempts");
+                    std::process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("no constructor for {:?}", other);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_needs(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
+    let target = parse_technique(name).unwrap_or_else(|| {
+        eprintln!("unknown technique name {:?}", name);
+        std::process::exit(2);
+    });
+    match make_puzzle_needing(rng, target, MAX_ATTEMPTS) {
+        Some(fr) => {
+            println!("found after {} attempts", fr.attempts);
+            fr.puzzle
+        }
+        None => {
+            eprintln!(
+                "no puzzle requiring {} found in {} attempts",
+                target.name(),
+                MAX_ATTEMPTS
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_forced(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
+    let target = parse_technique(name).unwrap_or_else(|| {
+        eprintln!("unknown technique name {:?}", name);
+        std::process::exit(2);
+    });
+    match make_puzzle_forced(rng, target, MAX_ATTEMPTS) {
+        Some(fr) => {
+            println!("forced after {} attempts", fr.attempts);
+            fr.puzzle
+        }
+        None => {
+            eprintln!(
+                "no puzzle FORCING {} found in {} attempts",
+                target.name(),
+                MAX_ATTEMPTS
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_spec(spec: &Spec, rng: &mut Rng) -> GeneratedPuzzle {
+    match make_puzzle_for_spec(rng, spec, MAX_ATTEMPTS) {
+        Some(fr) => {
+            println!("satisfied spec after {} attempts", fr.attempts);
+            fr.puzzle
+        }
+        None => {
+            eprintln!("no puzzle satisfying spec found in {} attempts", MAX_ATTEMPTS);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn format_deductions(ds: &[Deduction]) -> String {
@@ -161,19 +418,34 @@ fn format_step(step: &Step) -> String {
     )
 }
 
-fn run_batch(out: GeneratedPuzzle) {
+fn run_batch(out: GeneratedPuzzle, restrict: Option<&Spec>) {
     println!("Puzzle ({} givens):", out.givens);
     print!("{}", out.puzzle);
     println!("line: {}", out.puzzle.to_line());
     println!();
 
-    let result = solve(out.puzzle.clone());
-    let counts = deduction_counts(&out.puzzle);
+    let (result, counts) = match restrict {
+        Some(spec) => {
+            // Show the baseline solve path — for drill specs that's singles + T,
+            // not the broader spec scope that includes Conceded techniques.
+            let allow = |t: TechniqueKind| spec.is_baseline(t);
+            (
+                solve_filtered(out.puzzle.clone(), allow),
+                deduction_counts_filtered(&out.puzzle, allow),
+            )
+        }
+        None => (solve(out.puzzle.clone()), deduction_counts(&out.puzzle)),
+    };
     let hardest = max_technique(&result.trace)
         .map(|t| t.name().to_string())
         .unwrap_or_else(|| "none".to_string());
+    let scope = match restrict {
+        Some(_) => " (restricted to spec)",
+        None => "",
+    };
     println!(
-        "Trace: {} steps, hardest: {}, max-branch {}",
+        "Trace{}: {} steps, hardest: {}, max-branch {}",
+        scope,
         result.trace.len(),
         hardest,
         counts.iter().copied().max().unwrap_or(0),
@@ -185,11 +457,19 @@ fn run_batch(out: GeneratedPuzzle) {
     println!();
 
     if result.solved {
-        println!("Solved with the techniques implemented so far.");
+        match restrict {
+            Some(_) => println!("Solved within the spec's allowed techniques."),
+            None => println!("Solved with the techniques implemented so far."),
+        }
     } else {
+        let suffix = match restrict {
+            Some(_) => "needs a technique outside the spec",
+            None => "needs a technique we haven't implemented yet",
+        };
         println!(
-            "STUCK after {} steps — needs a technique we haven't implemented yet:",
-            result.trace.len()
+            "STUCK after {} steps — {}:",
+            result.trace.len(),
+            suffix,
         );
         print!("{}", result.board);
     }
@@ -201,8 +481,11 @@ struct Conclusion {
     representative: Step,
 }
 
-fn collect_conclusions(board: &Board) -> Vec<Conclusion> {
-    let steps = all_techniques(board);
+fn collect_conclusions(board: &Board, restrict: Option<&Spec>) -> Vec<Conclusion> {
+    let steps = match restrict {
+        Some(spec) => all_techniques_filtered(board, |t| spec.is_in_scope(t)),
+        None => all_techniques(board),
+    };
 
     let mut out: Vec<Conclusion> = Vec::new();
     for step in steps {
@@ -262,7 +545,7 @@ fn format_conclusion(c: &Conclusion) -> String {
     format!("{} — {}", head, format_sightings(&c.sightings))
 }
 
-fn run_interactive(out: GeneratedPuzzle) {
+fn run_interactive(out: GeneratedPuzzle, restrict: Option<&Spec>) {
     let mut board = out.puzzle.clone();
     let mut step_num = 1usize;
     let stdin = std::io::stdin();
@@ -280,7 +563,7 @@ fn run_interactive(out: GeneratedPuzzle) {
             return;
         }
 
-        let conclusions = collect_conclusions(&board);
+        let conclusions = collect_conclusions(&board, restrict);
         if conclusions.is_empty() {
             println!("Stuck — no implemented technique applies. Needs more techniques.");
             return;

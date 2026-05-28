@@ -1,8 +1,10 @@
 use crate::board::{Board, CELLS, iter_digits, popcount};
 use crate::rng::Rng;
 use crate::solver::solve;
+use crate::spec::Spec;
 use crate::techniques::TechniqueKind;
 use crate::uniqueness;
+use crate::verifier::verify;
 
 pub struct GeneratedPuzzle {
     pub puzzle: Board,
@@ -163,6 +165,73 @@ pub fn make_puzzle_needing(
     None
 }
 
+/// Generate a puzzle satisfying every constraint expressed in `spec`:
+/// solvable using only allowed techniques, every `Forced` technique used at
+/// least the required number of times, and every `RequireAny` constraint met.
+///
+/// Strips cells in random order, reverting any strip that makes the puzzle
+/// unsolvable under the allowed set or non-unique. After exhausting the
+/// stripping budget, runs full verification; if forcing constraints aren't
+/// satisfied this attempt is discarded and a new random grid is tried.
+pub fn make_puzzle_for_spec(
+    rng: &mut Rng,
+    spec: &Spec,
+    max_attempts: usize,
+) -> Option<FilteredResult> {
+    for attempt in 1..=max_attempts {
+        let solution = random_full_grid(rng);
+        let mut puzzle = solution.clone();
+        let mut positions: Vec<usize> = (0..CELLS).collect();
+        rng.shuffle(&mut positions);
+
+        for i in positions {
+            if puzzle.is_empty(i) {
+                continue;
+            }
+            let mut candidate = puzzle.clone();
+            candidate.clear(i);
+            if uniqueness::count_solutions(&candidate, 2) != 1 {
+                continue;
+            }
+            // Cheap inner-loop check: still solvable using only the baseline
+            // (Allowed | Forced)? Conceded techniques may fire freely but the
+            // puzzle must not rely on them, so they don't count here.
+            if !solvable_with_baseline(&candidate, spec) {
+                continue;
+            }
+            puzzle = candidate;
+        }
+
+        // Maximally stripped under the allowed set. Now check forcing constraints.
+        if verify(&puzzle, spec).is_ok() {
+            let givens = (0..CELLS).filter(|&j| !puzzle.is_empty(j)).count();
+            return Some(FilteredResult {
+                puzzle: GeneratedPuzzle {
+                    puzzle,
+                    solution,
+                    givens,
+                },
+                attempts: attempt,
+            });
+        }
+        // Forcing constraints unmet — discard, try a new random grid.
+    }
+    None
+}
+
+fn solvable_with_baseline(board: &Board, spec: &Spec) -> bool {
+    let mut b = board.clone();
+    loop {
+        if b.is_solved() {
+            return true;
+        }
+        match crate::solver::next_step_filtered(&b, |t| spec.is_baseline(t)) {
+            None => return false,
+            Some(s) => crate::solver::apply_step(&mut b, &s),
+        }
+    }
+}
+
 pub fn make_puzzle(rng: &mut Rng, require_technique_solvable: bool) -> GeneratedPuzzle {
     let solution = random_full_grid(rng);
     let mut puzzle = solution.clone();
@@ -230,5 +299,28 @@ mod tests {
         let result = solve(out.puzzle.clone());
         assert!(result.solved, "puzzle marked technique-solvable should solve");
         assert_eq!(result.board.to_line(), out.solution.to_line());
+    }
+
+    #[test]
+    fn make_puzzle_for_spec_train_hidden_pair() {
+        let mut rng = Rng::from_seed(123);
+        let spec = Spec::train(TechniqueKind::HiddenPair);
+        let fr = make_puzzle_for_spec(&mut rng, &spec, 5000)
+            .expect("should find a hidden-pair train puzzle within 5000 attempts");
+        // Verify the spec is satisfied.
+        assert!(verify(&fr.puzzle.puzzle, &spec).is_ok());
+        // And solving with all techniques actually finishes.
+        let r = solve(fr.puzzle.puzzle.clone());
+        assert!(r.solved);
+    }
+
+    #[test]
+    fn make_puzzle_for_spec_require_family_fish() {
+        use crate::techniques::Family;
+        let mut rng = Rng::from_seed(2024);
+        let spec = Spec::allow_all().require_family(Family::Fish, 1);
+        let fr = make_puzzle_for_spec(&mut rng, &spec, 5000)
+            .expect("should find a fish-family puzzle within 5000 attempts");
+        assert!(verify(&fr.puzzle.puzzle, &spec).is_ok());
     }
 }
