@@ -71,7 +71,7 @@ pub fn cell_name(i: CellIdx) -> String {
     format!("R{}C{}", row_of(i) + 1, col_of(i) + 1)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnitKind {
     Row,
     Col,

@@ -139,22 +139,42 @@ impl Spec {
         Self::allow_up_to(t).require(t, 1)
     }
 
-    /// Drill-mode training: only singles plus the target form the baseline,
-    /// but every technique strictly between [`TechniqueKind::HiddenSingle`] and
-    /// `t` (by difficulty) is conceded — the puzzle must remain unsolvable
-    /// even when the avoid-target solver has the whole in-between toolbox.
-    /// Generation is much harder than `train` (and may fail for some
+    /// Drill-mode training: a small baseline plus the target, with every
+    /// technique strictly between the baseline ceiling and `t` (by difficulty)
+    /// conceded — the puzzle must remain unsolvable even when the avoid-target
+    /// solver has the whole in-between toolbox.
+    ///
+    /// The baseline ceiling scales with `t`'s difficulty, on the reasoning that
+    /// a solver learning a hard target already knows the easy propagation
+    /// techniques reflexively:
+    /// - `t` diff < 50: ceiling is HiddenSingle (singles only).
+    /// - `t` diff in 50..75: ceiling is LockedCandidatesClaiming (singles + LC).
+    /// - `t` diff ≥ 75: ceiling is NakedPair (singles + LC + naked pair).
+    ///
+    /// Generation is harder than `train` (and may still fail for some
     /// techniques) — fall back to `train` if needed.
     pub fn drill(t: TechniqueKind) -> Self {
-        let low = TechniqueKind::HiddenSingle.difficulty();
+        let ceiling = Self::drill_baseline_ceiling(t);
+        let low = ceiling.difficulty();
         let high = t.difficulty();
-        let mut spec = Self::allow_up_to(TechniqueKind::HiddenSingle).require(t, 1);
+        let mut spec = Self::allow_up_to(ceiling).require(t, 1);
         for def in REGISTRY {
             if def.difficulty > low && def.difficulty < high {
                 spec = spec.concede(def.kind);
             }
         }
         spec
+    }
+
+    fn drill_baseline_ceiling(t: TechniqueKind) -> TechniqueKind {
+        let d = t.difficulty();
+        if d >= 75 {
+            TechniqueKind::NakedPair
+        } else if d >= 50 {
+            TechniqueKind::LockedCandidatesClaiming
+        } else {
+            TechniqueKind::HiddenSingle
+        }
     }
 
     /// True if `t` is in the baseline (Allowed or Forced) — i.e., counts as
@@ -272,25 +292,74 @@ mod tests {
     }
 
     #[test]
-    fn drill_baseline_is_singles_plus_target_in_betweens_conceded() {
-        let s = Spec::drill(TechniqueKind::Swordfish);
-        // Baseline: singles and the target.
-        assert!(matches!(
-            s.usages.get(&TechniqueKind::NakedSingle),
-            Some(Usage::Allowed),
-        ));
+    fn drill_easy_target_keeps_singles_only_baseline() {
+        // Target diff < 50 → baseline ceiling stays at HiddenSingle.
+        let s = Spec::drill(TechniqueKind::NakedTriple);
         assert!(matches!(
             s.usages.get(&TechniqueKind::HiddenSingle),
             Some(Usage::Allowed),
         ));
         assert!(matches!(
+            s.usages.get(&TechniqueKind::NakedPair),
+            Some(Usage::Conceded),
+        ));
+        assert!(matches!(
+            s.usages.get(&TechniqueKind::NakedTriple),
+            Some(Usage::Forced { .. }),
+        ));
+    }
+
+    #[test]
+    fn drill_mid_target_lifts_baseline_to_locked_candidates() {
+        // Target diff in 50..75 → baseline includes LC, subsets still Conceded.
+        let s = Spec::drill(TechniqueKind::XYWing);
+        assert!(matches!(
+            s.usages.get(&TechniqueKind::LockedCandidatesPointing),
+            Some(Usage::Allowed),
+        ));
+        assert!(matches!(
+            s.usages.get(&TechniqueKind::LockedCandidatesClaiming),
+            Some(Usage::Allowed),
+        ));
+        assert!(matches!(
+            s.usages.get(&TechniqueKind::NakedPair),
+            Some(Usage::Conceded),
+        ));
+        assert!(matches!(
+            s.usages.get(&TechniqueKind::XYWing),
+            Some(Usage::Forced { .. }),
+        ));
+    }
+
+    #[test]
+    fn drill_hard_target_lifts_baseline_through_naked_pair() {
+        let s = Spec::drill(TechniqueKind::Swordfish);
+        // Baseline now reaches NakedPair for diff-75+ targets.
+        for in_baseline in [
+            TechniqueKind::NakedSingle,
+            TechniqueKind::HiddenSingle,
+            TechniqueKind::LockedCandidatesPointing,
+            TechniqueKind::LockedCandidatesClaiming,
+            TechniqueKind::NakedPair,
+        ] {
+            assert!(
+                matches!(s.usages.get(&in_baseline), Some(Usage::Allowed)),
+                "{:?} should be Allowed in drill(Swordfish), got {:?}",
+                in_baseline,
+                s.usages.get(&in_baseline),
+            );
+        }
+        assert!(matches!(
             s.usages.get(&TechniqueKind::Swordfish),
             Some(Usage::Forced { .. }),
         ));
-        // Everything strictly between HiddenSingle and Swordfish is conceded.
+        // Everything strictly between NakedPair and Swordfish stays Conceded.
         for in_between in [
-            TechniqueKind::NakedPair,
             TechniqueKind::HiddenPair,
+            TechniqueKind::NakedTriple,
+            TechniqueKind::HiddenTriple,
+            TechniqueKind::NakedQuad,
+            TechniqueKind::HiddenQuad,
             TechniqueKind::XWing,
             TechniqueKind::FinnedXWing,
             TechniqueKind::XYWing,
@@ -303,7 +372,6 @@ mod tests {
                 s.usages.get(&in_between),
             );
         }
-        // Techniques harder than the target are still out of scope.
         assert!(!s.usages.contains_key(&TechniqueKind::Jellyfish));
     }
 }

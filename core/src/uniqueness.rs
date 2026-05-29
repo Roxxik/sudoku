@@ -12,6 +12,66 @@ pub fn solve_unique(board: &Board) -> Option<Board> {
     if backtrack_first(&mut work) { Some(work) } else { None }
 }
 
+/// Collect up to `limit` complete solutions of `board`. Like
+/// [`count_solutions`] but keeps the grids, so callers can diff two
+/// completions against each other (e.g. to find the cells an alternate
+/// solution diverges on). Order matches the backtracker's search order.
+pub fn collect_solutions(board: &Board, limit: usize) -> Vec<Board> {
+    let mut out = Vec::with_capacity(limit);
+    let mut work = board.clone();
+    backtrack_collect(&mut work, &mut out, limit);
+    out
+}
+
+fn backtrack_collect(board: &mut Board, out: &mut Vec<Board>, limit: usize) {
+    loop {
+        if out.len() >= limit {
+            return;
+        }
+        let mut best_cell: usize = CELLS;
+        let mut best_mask: u16 = 0;
+        let mut best_count: u32 = 10;
+        for i in 0..CELLS {
+            if !board.is_empty(i) {
+                continue;
+            }
+            let cs = board.candidates(i);
+            let n = popcount(cs);
+            if n == 0 {
+                return;
+            }
+            if n < best_count {
+                best_count = n;
+                best_cell = i;
+                best_mask = cs;
+                if n == 1 {
+                    break;
+                }
+            }
+        }
+        if best_cell == CELLS {
+            // No empty cells left — a complete solution.
+            out.push(board.clone());
+            return;
+        }
+        if best_count == 1 {
+            let d = iter_digits(best_mask).next().unwrap();
+            board.place(best_cell, d);
+            continue;
+        }
+        for d in iter_digits(best_mask) {
+            let backup = board.clone();
+            board.place(best_cell, d);
+            backtrack_collect(board, out, limit);
+            *board = backup;
+            if out.len() >= limit {
+                return;
+            }
+        }
+        return;
+    }
+}
+
 /// Recursive backtracker with iterative unit-propagation.
 ///
 /// Forced singles (cells with exactly one candidate) need no branching, so

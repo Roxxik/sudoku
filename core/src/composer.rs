@@ -1,4 +1,4 @@
-use crate::board::{BOX_UNITS, Board, CELLS, COL_UNITS, PEERS, ROW_UNITS};
+use crate::board::{BOX_UNITS, Board, CELLS, COL_UNITS, PEERS, ROW_UNITS, UnitKind};
 use crate::generator::random_full_grid;
 use crate::rng::Rng;
 use crate::solver::{apply_step, next_step_filtered};
@@ -11,15 +11,75 @@ pub trait Constructor {
     fn try_extend(&self, solution: &Board, current: &Board, rng: &mut Rng) -> Option<Board>;
 }
 
-const SHUFFLES_PER_TEMPLATE: usize = 8;
+/// The geometry the hidden-subset constructor seeded for a successful build:
+/// the unit it confined the subset to, the subset cells, and the extra cell q.
+/// Returned by [`HiddenSubsetConstructor::try_extend_traced`] so callers can
+/// check whether the *forced* subset in the finished puzzle is actually the
+/// one that was seeded (vs. a different subset that emerged during stripping).
+#[derive(Debug, Clone)]
+pub struct SeedGeometry {
+    pub unit_kind: UnitKind,
+    pub unit_index: usize,
+    pub subset_cells: Vec<usize>,
+    pub q: usize,
+}
 
-pub struct HiddenTripleConstructor {
+/// Essence-seeded constructor for the hidden-subset family (hidden triple,
+/// hidden quad). Both share one geometry: `size` digits confined to `size`
+/// cells of a unit, with at least one of those cells carrying a non-subset
+/// candidate (so the subset is *hidden*, not naked, and there is an
+/// elimination to make). `size` is the only thing that changes between triple
+/// and quad — the invariant, the pinning, and the seed-gated strip-down are
+/// identical. See [`construct_hidden_subset`].
+pub struct HiddenSubsetConstructor {
     pub spec: Spec,
+    pub size: usize,
+    pub target: TechniqueKind,
+}
+
+impl HiddenSubsetConstructor {
+    pub fn triple(spec: Spec) -> Self {
+        Self { spec, size: 3, target: TechniqueKind::HiddenTriple }
+    }
+
+    pub fn quad(spec: Spec) -> Self {
+        Self { spec, size: 4, target: TechniqueKind::HiddenQuad }
+    }
+}
+
+impl Constructor for HiddenSubsetConstructor {
+    fn try_extend(&self, solution: &Board, _current: &Board, rng: &mut Rng) -> Option<Board> {
+        self.try_extend_traced(solution, rng).map(|(b, _)| b)
+    }
+}
+
+impl HiddenSubsetConstructor {
+    /// As [`Constructor::try_extend`], but also returns the seeded
+    /// [`SeedGeometry`] — for diagnostics that check seed-vs-forced fidelity.
+    pub fn try_extend_traced(
+        &self,
+        solution: &Board,
+        rng: &mut Rng,
+    ) -> Option<(Board, SeedGeometry)> {
+        construct_hidden_subset(&self.spec, self.size, self.target, solution, rng)
+    }
+}
+
+/// Back-compat alias: the original triple-only constructor. Delegates to the
+/// generalized [`HiddenSubsetConstructor`] with `size = 3`.
+pub struct HiddenTripleConstructor {
+    inner: HiddenSubsetConstructor,
 }
 
 impl HiddenTripleConstructor {
     pub fn for_spec(spec: Spec) -> Self {
-        Self { spec }
+        Self { inner: HiddenSubsetConstructor::triple(spec) }
+    }
+}
+
+impl Constructor for HiddenTripleConstructor {
+    fn try_extend(&self, solution: &Board, current: &Board, rng: &mut Rng) -> Option<Board> {
+        self.inner.try_extend(solution, current, rng)
     }
 }
 
@@ -44,117 +104,138 @@ fn solvable_with(board: &Board, allowed: impl Fn(TechniqueKind) -> bool) -> bool
     }
 }
 
-impl Constructor for HiddenTripleConstructor {
-    fn try_extend(&self, solution: &Board, _current: &Board, rng: &mut Rng) -> Option<Board> {
-        let target = TechniqueKind::HiddenTriple;
-        let allowed = |t: TechniqueKind| self.spec.is_in_scope(t);
-        let allowed_without_target = |t: TechniqueKind| allowed(t) && t != target;
+/// Build a puzzle whose forced hidden subset is *the seeded one* — generalizing
+/// from the original triple constructor (`size = 3`) to quads (`size = 4`).
+///
+/// Seed the geometry, then strip to a forced-subset puzzle.
+///
+/// NOTE (measured): this is NOT faithful — the forced subset is essentially
+/// never the seeded one. The seed is dissolved / dodged by the strip-down and
+/// the bottleneck forms elsewhere (0% seed-vs-forced fidelity across exact-cell
+/// and unit-level matching; gating the strip to drive the stall onto the seed
+/// builds 0/200k). The forced technique's location is an emergent global
+/// property of the minimal grid and cannot be placed by seeding. See the
+/// `seed_fidelity` example. Kept as the working prototype: it produces *some*
+/// forced subset, just not the seeded one, so it offers no efficiency over the
+/// random-restart generator.
+fn construct_hidden_subset(
+    spec: &Spec,
+    size: usize,
+    target: TechniqueKind,
+    solution: &Board,
+    rng: &mut Rng,
+) -> Option<(Board, SeedGeometry)> {
+    let allowed = |t: TechniqueKind| spec.is_in_scope(t);
+    let allowed_without_target = |t: TechniqueKind| allowed(t) && t != target;
+    // Step 1: pick the geometry — unit U, `size` "subset" cells, and an extra
+    // empty q in U. (For a triple that's 3 cells; for a quad, 4.)
+    let (unit_kind, unit_index) = match rng.range(3) {
+        0 => (UnitKind::Row, rng.range(9)),
+        1 => (UnitKind::Col, rng.range(9)),
+        _ => (UnitKind::Box, rng.range(9)),
+    };
+    let unit: [usize; 9] = match unit_kind {
+        UnitKind::Row => ROW_UNITS[unit_index],
+        UnitKind::Col => COL_UNITS[unit_index],
+        UnitKind::Box => BOX_UNITS[unit_index],
+    };
+    let mut idx_order: Vec<usize> = (0..9).collect();
+    rng.shuffle(&mut idx_order);
+    let subset_cells: Vec<usize> = (0..size).map(|k| unit[idx_order[k]]).collect();
+    let q = unit[idx_order[size]];
+    let subset_digits: Vec<u8> = subset_cells.iter().map(|&c| solution.cell(c)).collect();
+    let d4 = solution.cell(q);
 
-        // Step 1: pick the geometry — unit U, three "triple" cells {x,y,z},
-        // and an extra empty q in U.
-        let unit: [usize; 9] = match rng.range(3) {
-            0 => ROW_UNITS[rng.range(9)],
-            1 => COL_UNITS[rng.range(9)],
-            _ => BOX_UNITS[rng.range(9)],
-        };
-        let mut idx_order: Vec<usize> = (0..9).collect();
-        rng.shuffle(&mut idx_order);
-        let triple_cells: [usize; 3] = [
-            unit[idx_order[0]],
-            unit[idx_order[1]],
-            unit[idx_order[2]],
-        ];
-        let q = unit[idx_order[3]];
-        let triple_digits: [u8; 3] = [
-            solution.cell(triple_cells[0]),
-            solution.cell(triple_cells[1]),
-            solution.cell(triple_cells[2]),
-        ];
-        let d4 = solution.cell(q);
+    let mut extras_order: Vec<usize> = (0..size).collect();
+    rng.shuffle(&mut extras_order);
 
-        let mut extras_order: Vec<usize> = (0..3).collect();
-        rng.shuffle(&mut extras_order);
+    for ei in extras_order {
+        let extras_cell = subset_cells[ei];
 
-        for ei in extras_order {
-            let extras_cell = triple_cells[ei];
+        // Step 2: keep d4 as a candidate at extras_cell so the subset is
+        // hidden, not naked. Every peer of extras_cell that holds d4 in
+        // the solution (and lies outside U) must be empty in the puzzle.
+        let must_be_empty: Vec<usize> = peers_holding_digit(solution, extras_cell, d4)
+            .into_iter()
+            .filter(|c| !unit.contains(c))
+            .collect();
 
-            // Step 2: keep d4 as a candidate at extras_cell so the triple is
-            // hidden, not naked. Every peer of extras_cell that holds d4 in
-            // the solution (and lies outside U) must be empty in the puzzle.
-            let must_be_empty: Vec<usize> = peers_holding_digit(solution, extras_cell, d4)
+        // Step 3: for each subset digit d, pin some peer-of-q outside U
+        // (and not in must_be_empty) as a given so d is eliminated from
+        // q's candidates.
+        let mut must_be_given: Vec<usize> = Vec::with_capacity(size);
+        let mut step3_ok = true;
+        for &d in &subset_digits {
+            let mut candidates: Vec<usize> = peers_holding_digit(solution, q, d)
                 .into_iter()
-                .filter(|c| !unit.contains(c))
+                .filter(|c| !unit.contains(c) && !must_be_empty.contains(c))
                 .collect();
-
-            // Step 3: for each triple digit d, pin some peer-of-q outside U
-            // (and not in must_be_empty) as a given so d is eliminated from
-            // q's candidates.
-            let mut must_be_given: Vec<usize> = Vec::with_capacity(3);
-            let mut step3_ok = true;
-            for &d in &triple_digits {
-                let mut candidates: Vec<usize> = peers_holding_digit(solution, q, d)
-                    .into_iter()
-                    .filter(|c| !unit.contains(c) && !must_be_empty.contains(c))
-                    .collect();
-                if candidates.is_empty() {
-                    step3_ok = false;
-                    break;
-                }
-                rng.shuffle(&mut candidates);
-                must_be_given.push(candidates[0]);
+            if candidates.is_empty() {
+                step3_ok = false;
+                break;
             }
-            if !step3_ok {
+            rng.shuffle(&mut candidates);
+            must_be_given.push(candidates[0]);
+        }
+        if !step3_ok {
+            continue;
+        }
+
+        // Build the seeded board: the solution with the subset cells, q, and
+        // the must_be_empty cells cleared.
+        let mut board = solution.clone();
+        for &c in &subset_cells {
+            board.clear(c);
+        }
+        board.clear(q);
+        for &c in &must_be_empty {
+            board.clear(c);
+        }
+
+        // Strippable cells: not pinned (must_be_given) and not in U. U cells
+        // outside the template stay as givens to preserve the "exactly size+1
+        // empties in U" invariant; the must_be_given pins keep the subset
+        // digits off q.
+        let mut strippable: Vec<usize> = (0..CELLS)
+            .filter(|i| !board.is_empty(*i))
+            .filter(|i| !must_be_given.contains(i))
+            .filter(|i| !unit.contains(i))
+            .collect();
+        rng.shuffle(&mut strippable);
+
+        let geom = SeedGeometry {
+            unit_kind,
+            unit_index,
+            subset_cells: subset_cells.clone(),
+            q,
+        };
+
+        // One strip-down pass (no multi-shuffle retry — measured useless: the
+        // passes are independent, so re-shuffling the same template just trades
+        // attempts for passes at constant total work).
+        for i in strippable {
+            let mut candidate = board.clone();
+            candidate.clear(i);
+            // Cheap uniqueness reject first (bounded backtrack) before the
+            // technique walks.
+            if uniqueness::count_solutions(&candidate, 2) != 1 {
                 continue;
             }
-
-            // Build the starting board.
-            let mut board = solution.clone();
-            for &c in &triple_cells {
-                board.clear(c);
+            // Fast path: walk without target. If it solves, target isn't
+            // required — commit the strip and continue.
+            if solvable_with(&candidate, allowed_without_target) {
+                board = candidate;
+                continue;
             }
-            board.clear(q);
-            for &c in &must_be_empty {
-                board.clear(c);
+            // Without-target walk got stuck. Confirm the candidate is still
+            // allowed-solvable, then we have a Forced(target) hit.
+            if solvable_with(&candidate, allowed) {
+                return Some((candidate, geom));
             }
-
-            // Strippable cells: not pinned (must_be_given) and not in U.
-            // U cells outside the template stay as givens to preserve the
-            // "exactly 4 empties in U" invariant.
-            let strippable_template: Vec<usize> = (0..CELLS)
-                .filter(|i| !board.is_empty(*i))
-                .filter(|i| !must_be_given.contains(i))
-                .filter(|i| !unit.contains(i))
-                .collect();
-
-            let initial_board = board.clone();
-            for _ in 0..SHUFFLES_PER_TEMPLATE {
-                let mut strippable = strippable_template.clone();
-                rng.shuffle(&mut strippable);
-                let mut board = initial_board.clone();
-
-                for i in strippable {
-                    let mut candidate = board.clone();
-                    candidate.clear(i);
-                    if uniqueness::count_solutions(&candidate, 2) != 1 {
-                        continue;
-                    }
-                    // Fast path: walk without target. If it solves, target
-                    // isn't required — commit the strip and continue.
-                    if solvable_with(&candidate, allowed_without_target) {
-                        board = candidate;
-                        continue;
-                    }
-                    // Without-target walk got stuck. Confirm the candidate is
-                    // still allowed-solvable, then we have a Forced(target) hit.
-                    if solvable_with(&candidate, allowed) {
-                        return Some(candidate);
-                    }
-                    // Not solvable at all — skip this strip.
-                }
-            }
+            // Not solvable at all — skip this strip.
         }
-        None
     }
+    None
 }
 
 pub fn construct_with(

@@ -3,6 +3,7 @@ pub mod composer;
 pub mod curriculum;
 pub mod generator;
 pub mod rng;
+pub mod search;
 pub mod solver;
 pub mod spec;
 pub mod techniques;
@@ -11,11 +12,18 @@ pub mod util;
 pub mod verifier;
 
 pub use board::{Board, cell_name};
-pub use composer::{Constructor, HiddenTripleConstructor, compose, construct_with};
+pub use composer::{
+    Constructor, HiddenSubsetConstructor, HiddenTripleConstructor, SeedGeometry, compose,
+    construct_with,
+};
 pub use curriculum::{CURRICULUM, Stage, Tier, stage_by_key};
 pub use generator::{
-    FilteredResult, GeneratedPuzzle, make_puzzle, make_puzzle_for_spec, make_puzzle_forced,
+    FilteredResult, GenStats, GeneratedPuzzle, Probe, make_puzzle, make_puzzle_for_spec,
+    make_puzzle_for_spec_with_search, make_puzzle_for_spec_with_stats, make_puzzle_forced,
     make_puzzle_needing, random_full_grid,
+};
+pub use search::{
+    DefaultHeuristic, Diag, Mutation, SearchResult, SearchStats, TargetHeuristic, local_search,
 };
 pub use rng::Rng;
 pub use solver::{
