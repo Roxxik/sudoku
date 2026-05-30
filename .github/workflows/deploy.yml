@@ -31,10 +31,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Install Trunk via cargo rather than a third-party action, so there's no
+      # Node-runtime action to keep off deprecation cycles. Cached by rust-cache.
       - name: Install Trunk
-        uses: jetli/trunk-action@v0.5.1
-        with:
-          version: latest
+        run: cargo install --locked trunk@0.21.14
 
       - name: Build web
         working-directory: ./web
