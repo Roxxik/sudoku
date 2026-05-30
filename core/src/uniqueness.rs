@@ -1,116 +1,136 @@
-use crate::board::{ALL_DIGITS, Board, CELLS, iter_digits, popcount};
+use crate::board::{ALL_DIGITS, Board, CELLS, PEERS, iter_digits, popcount};
+use std::simd::cmp::{SimdOrd, SimdPartialEq};
+use std::simd::num::SimdUint;
+use std::simd::{Mask, Simd};
 
-/// `[row, col, box]` unit index for each cell — lets the compact solver derive
-/// `candidates(i)` from three small bitmasks without div/mod in the hot loop.
-const CELL_UNITS: [[usize; 3]; 81] = build_cell_units();
+/// Width of the lanes the dense MRV scan loads at once. 96 = 6 × 16 covers all
+/// 81 cells with padding, and 16-wide u16 maps to one AVX512 / two AVX2 vectors
+/// on the host.
+const LANES: usize = 16;
+const PADDED: usize = 96; // 6 * LANES, >= 81
 
-const fn build_cell_units() -> [[usize; 3]; 81] {
-    let mut t = [[0usize; 3]; 81];
-    let mut i = 0;
-    while i < 81 {
-        let r = i / 9;
-        let c = i % 9;
-        t[i] = [r, c, (r / 3) * 3 + c / 3];
-        i += 1;
-    }
-    t
-}
+/// Sentinel bit stored in a cell's candidate slot once the cell is filled (or
+/// for the 81..96 padding lanes). It sits above the nine digit bits (0..8) so
+/// that clearing a digit bit on a peer never disturbs it, and the dense scan
+/// can recognise "this lane is not an empty cell" by testing this single bit.
+const FILLED: u16 = 0x200;
 
 /// A placement-only solver state, used by the existence/uniqueness search.
 ///
 /// The full [`Board`] keeps a per-cell candidate mask (162 B) so technique
 /// solvers can record arbitrary per-cell eliminations. A brute-force solver
 /// never does that — it only *places* digits and reads candidates implied by
-/// the placements — so its candidates are fully captured by per-unit
-/// "used-digit" masks (27 × u16 = 54 B). That makes `place` three mask writes
-/// instead of twenty peer updates, turns `candidates(i)` into a hot-cache
-/// computation instead of a scattered array load, and shrinks the state we
-/// clone at each branch. An `empties` bitset lets the MRV scan visit only the
-/// empty cells instead of walking all 81.
+/// the placements.
+///
+/// Earlier this state kept 27 per-unit "used-digit" masks and recomputed
+/// `candidates(i)` from three of them on every MRV visit, iterating only the
+/// empty cells via a `u128` bitset. Profiling showed that hot loop was split
+/// between the per-cell 3-load+OR+popcount and the *serial* `tzcnt` dependency
+/// chain walking the bitset. Both go away here: we keep a *dense* per-cell
+/// candidate array updated incrementally on `place` (clear one bit in each of
+/// the cell's 20 peers) and find the MRV cell with a branch-free SIMD min over
+/// all 96 lanes — no serial bit-walk, one load per cell, vectorised popcount.
 #[derive(Clone)]
 struct FastSolver {
-    cells: [u8; 81],
-    used_row: [u16; 9],
-    used_col: [u16; 9],
-    used_box: [u16; 9],
-    empties: u128,
+    /// Per-cell candidate bitmask (bits 0..8). A filled cell (and the 81..96
+    /// padding) instead carries the [`FILLED`] sentinel bit; its digit bits are
+    /// don't-care. Padded to [`PADDED`] so the scan can load full vectors.
+    cand: [u16; PADDED],
 }
 
 impl FastSolver {
     fn from_board(b: &Board) -> Self {
         let mut s = FastSolver {
-            cells: [0; 81],
-            used_row: [0; 9],
-            used_col: [0; 9],
-            used_box: [0; 9],
-            empties: 0,
+            cand: [FILLED; PADDED],
         };
+        // First mark every empty cell with the full digit set, then replay the
+        // givens through `place` so peers get their bits cleared incrementally.
+        for i in 0..CELLS {
+            if b.cell(i) == 0 {
+                s.cand[i] = ALL_DIGITS;
+            }
+        }
         for i in 0..CELLS {
             let d = b.cell(i);
-            if d == 0 {
-                s.empties |= 1u128 << i;
-            } else {
-                s.place(i, d); // empties bit is already clear here — the clear is a no-op
+            if d != 0 {
+                s.place(i, d);
             }
         }
         s
     }
 
     #[inline]
-    fn candidates(&self, i: usize) -> u16 {
-        // SAFETY: `i` is always a valid cell index (0..81 — it comes from the
-        // `empties` bitset, whose bits are 0..80, or from a cell we just chose),
-        // and every `CELL_UNITS` entry holds three unit indices in 0..9 by
-        // construction. So all four accesses are in bounds. Eliding the checks
-        // removes the ~18% of the hot scan the annotate attributed to `cmp/jae`
-        // bounds-check branches.
+    fn place(&mut self, i: usize, d: u8) {
+        let clear = !(1u16 << (d as u16 - 1));
+        // SAFETY: `i` is a valid cell index (0..81) and every `PEERS[i]` entry
+        // is a cell index in 0..81; `cand` has 96 slots, so all accesses are in
+        // bounds. Clearing a digit bit on a filled peer leaves its `FILLED`
+        // sentinel (bit 9) untouched, so the sentinel stays recognisable.
         unsafe {
-            let u = CELL_UNITS.get_unchecked(i);
-            ALL_DIGITS
-                & !(*self.used_row.get_unchecked(u[0])
-                    | *self.used_col.get_unchecked(u[1])
-                    | *self.used_box.get_unchecked(u[2]))
+            *self.cand.get_unchecked_mut(i) = FILLED;
+            for &p in PEERS.get_unchecked(i) {
+                *self.cand.get_unchecked_mut(p) &= clear;
+            }
         }
     }
 
+    /// Scan all cells with SIMD and return `(best_cell, best_count, best_mask)`.
+    /// `best_count` is the minimum candidate count over empty cells, with the
+    /// conventions: `0` => some empty cell is unsatisfiable (dead end), and a
+    /// returned `best_cell == usize::MAX` => no empty cells remain (solved).
     #[inline]
-    fn place(&mut self, i: usize, d: u8) {
-        // SAFETY: see `candidates` — `i` in 0..81, `CELL_UNITS` entries in 0..9.
-        unsafe {
-            let u = CELL_UNITS.get_unchecked(i);
-            let bit = 1u16 << (d as u16 - 1);
-            *self.cells.get_unchecked_mut(i) = d;
-            *self.used_row.get_unchecked_mut(u[0]) |= bit;
-            *self.used_col.get_unchecked_mut(u[1]) |= bit;
-            *self.used_box.get_unchecked_mut(u[2]) |= bit;
+    fn scan(&self) -> (usize, u32, u16) {
+        let digits = Simd::<u16, LANES>::splat(ALL_DIGITS);
+        let filled_bit = Simd::<u16, LANES>::splat(FILLED);
+        let penalty = Simd::<u16, LANES>::splat(100);
+        let zero = Simd::<u16, LANES>::splat(0);
+        let mut score = [Simd::<u16, LANES>::splat(0); PADDED / LANES];
+        // Keep a running per-lane minimum across all chunks and reduce it once
+        // at the end — one horizontal reduction instead of six.
+        let mut acc = penalty;
+        for (k, chunk) in score.iter_mut().enumerate() {
+            // SAFETY: k*LANES + LANES <= PADDED, so the load stays in bounds.
+            let v = Simd::<u16, LANES>::from_slice(unsafe {
+                self.cand.get_unchecked(k * LANES..k * LANES + LANES)
+            });
+            // popcount of the nine digit bits => candidate count (0..9).
+            let pc = (v & digits).count_ones();
+            // Filled / padding lanes carry the sentinel: push them out of the
+            // running with a large penalty so they never win the MRV min.
+            let is_filled: Mask<i16, LANES> = (v & filled_bit).simd_ne(zero);
+            let s = is_filled.select(penalty, pc);
+            acc = acc.simd_min(s);
+            *chunk = s;
         }
-        self.empties &= !(1u128 << i);
+        let best_count = acc.reduce_min();
+        if best_count == 0 {
+            return (usize::MAX, 0, 0); // dead end (some empty cell has no candidate)
+        }
+        if best_count >= 100 {
+            return (usize::MAX, 10, 0); // every cell filled — solved
+        }
+        // Locate the first lane whose score equals the minimum.
+        let target = Simd::<u16, LANES>::splat(best_count);
+        for (k, s) in score.iter().enumerate() {
+            let bm = s.simd_eq(target).to_bitmask();
+            if bm != 0 {
+                let i = k * LANES + bm.trailing_zeros() as usize;
+                // SAFETY: i < 81 here — it indexes a lane that matched a real
+                // (non-penalty) score, which only empty cells produce.
+                let mask = unsafe { *self.cand.get_unchecked(i) } & ALL_DIGITS;
+                return (i, best_count as u32, mask);
+            }
+        }
+        unreachable!()
     }
 
     /// True if the grid has at least one completion. Forced singles are applied
     /// in place (no clone); only a genuine branch clones the compact state.
     fn solve_first(&mut self) -> bool {
         loop {
-            let mut best_cell = usize::MAX;
-            let mut best_mask = 0u16;
-            let mut best_count = 10u32;
-            let mut e = self.empties;
-            while e != 0 {
-                let i = e.trailing_zeros() as usize;
-                e &= e - 1;
-                let cand = self.candidates(i);
-                let n = cand.count_ones();
-                if n == 0 {
-                    return false;
-                }
-                if n < best_count {
-                    best_count = n;
-                    best_cell = i;
-                    best_mask = cand;
-                    if n == 1 {
-                        break;
-                    }
-                }
+            let (best_cell, best_count, best_mask) = self.scan();
+            if best_count == 0 {
+                return false; // some empty cell is unsatisfiable
             }
             if best_cell == usize::MAX {
                 return true; // no empty cells left — solved
