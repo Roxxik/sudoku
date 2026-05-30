@@ -341,7 +341,7 @@ pub fn make_puzzle_for_spec_with_search(
                 for d in iter_digits(alts) {
                     let mut probe = candidate.clone();
                     probe.place(i, d);
-                    if uniqueness::solve_unique(&probe).is_some() {
+                    if uniqueness::has_solution(&probe) {
                         non_unique = true;
                         break;
                     }
