@@ -14,6 +14,7 @@ pub mod hidden_subset;
 pub mod locked_candidates;
 pub mod naked_single;
 pub mod naked_subset;
+pub mod phistomefel;
 pub mod turbot;
 pub mod w_wing;
 pub mod xy_wing;
@@ -48,6 +49,7 @@ pub enum TechniqueKind {
     FinnedSwordfish,
     Jellyfish,
     FinnedJellyfish,
+    PhistomefelRing,
 }
 
 /// Pedagogical grouping of techniques. Used by `Spec::allow_family` and
@@ -63,6 +65,7 @@ pub enum Family {
     TurbotFish,
     Wing,
     FinnedFish,
+    SetEquality,
     // Future families (not yet populated by any TechniqueDef):
     //   SingleDigitColoring  (Simple Coloring, Multi-Coloring)
     //   Chain                (XY-Chain, Remote Pairs, AIC, Grouped AIC)
@@ -105,6 +108,7 @@ pub struct TechniqueDef {
 //   85  FinnedSwordfish          FinnedFish
 //   90  Jellyfish                Fish
 //   95  FinnedJellyfish          FinnedFish
+//  135  PhistomefelRing          SetEquality
 //
 // Slots reserved for unimplemented techniques (insert at roughly these
 // difficulties, in the listed family, when adding):
@@ -323,6 +327,15 @@ pub const REGISTRY: &[TechniqueDef] = &[
         find_all: fish::find_finned_jellyfish,
         find_first: fish::find_first_finned_jellyfish,
     },
+    TechniqueDef {
+        kind: TechniqueKind::PhistomefelRing,
+        name: "Phistomefel Ring",
+        cli_name: "phistomefel-ring",
+        family: Family::SetEquality,
+        difficulty: 135,
+        find_all: phistomefel::find_all,
+        find_first: phistomefel::find_first,
+    },
 ];
 
 /// Number of distinct [`TechniqueKind`] variants. Every kind has exactly one
@@ -444,6 +457,7 @@ mod tests {
             Family::TurbotFish,
             Family::Wing,
             Family::FinnedFish,
+            Family::SetEquality,
         ];
         for f in implemented {
             assert!(!f.members().is_empty(), "family {:?} has no members", f);

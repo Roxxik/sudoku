@@ -36,6 +36,9 @@ struct Args {
     time_budget: f64,
     seed: u64,
     cache_path: String,
+    /// Forced-count for the target technique (default 1). `--require 2` asks for
+    /// a puzzle that needs the target at least twice.
+    require: usize,
     /// u9-seed unit-kind selection weights (row, col, box). Default uniform.
     /// To match a target house distribution T given measured per-kind yields y,
     /// set w_k = T_k / y_k (output kind freq ∝ w_k·y_k ∝ T_k).
@@ -62,6 +65,7 @@ fn parse_args() -> Args {
         time_budget: 120.0,
         seed: 1,
         cache_path: "core/cache/forced.jsonl".to_string(),
+        require: 1,
         kind_weights: [1.0, 1.0, 1.0],
     };
     let mut it = std::env::args().skip(1);
@@ -73,6 +77,7 @@ fn parse_args() -> Args {
             "--n" => out.n = it.next().and_then(|s| s.parse().ok()).unwrap_or(out.n),
             "--time-budget" => out.time_budget = it.next().and_then(|s| s.parse().ok()).unwrap_or(out.time_budget),
             "--seed" => out.seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(out.seed),
+            "--require" => out.require = it.next().and_then(|s| s.parse().ok()).unwrap_or(out.require),
             "--cache-path" => out.cache_path = it.next().unwrap_or(out.cache_path),
             "--kind-weights" => {
                 if let Some(s) = it.next() {
@@ -94,15 +99,17 @@ fn parse_args() -> Args {
     out
 }
 
-fn spec_for(target: TechniqueKind, mode: &str) -> Spec {
-    match mode {
+fn spec_for(target: TechniqueKind, mode: &str, require: usize) -> Spec {
+    let base = match mode {
         "drill" => Spec::drill(target),
         "train" => Spec::train(target),
         other => {
             eprintln!("unknown mode: {other} (use train|drill)");
             std::process::exit(2);
         }
-    }
+    };
+    // train/drill already force the target once; override the count if asked.
+    base.require(target, require)
 }
 
 /// Minimal append-only cache of found forced puzzles. One JSONL record per
@@ -527,11 +534,11 @@ fn report(label: &str, found: usize, wanted: usize, attempts: usize, secs: f64) 
 
 fn main() {
     let args = parse_args();
-    let spec = spec_for(args.target, &args.mode);
+    let spec = spec_for(args.target, &args.mode, args.require);
     let mut rec = Recorder::new(&args.cache_path);
     println!(
-        "gen_cache: target={} mode={} method={} n={} seed={} (budget {:.0}s/phase) -> {}",
-        args.target.cli_name(), args.mode, args.method, args.n, args.seed, args.time_budget, args.cache_path,
+        "gen_cache: target={} mode={} method={} require={} n={} seed={} (budget {:.0}s/phase) -> {}",
+        args.target.cli_name(), args.mode, args.method, args.require, args.n, args.seed, args.time_budget, args.cache_path,
     );
 
     let do_random = args.method == "random" || args.method == "both";

@@ -180,17 +180,28 @@ impl FastSolver {
                 self.place(best_cell, d);
                 continue;
             }
+            // best_count >= 2 here, so `m` has at least two bits: the loop runs
+            // at least twice and always reaches the `m == 0` tail below.
             let mut m = best_mask;
-            while m != 0 {
+            loop {
                 let d = m.trailing_zeros() as u8 + 1;
                 m &= m - 1;
+                if m == 0 {
+                    // Last alternative: if every earlier branch failed, this
+                    // grid's satisfiability *is* this branch's result, so place
+                    // in `self` and continue the outer loop (re-scan) instead of
+                    // cloning + recursing — saves one 192-byte clone and one
+                    // stack frame at every branch point.
+                    self.place(best_cell, d);
+                    break;
+                }
                 let mut child = self.clone();
                 child.place(best_cell, d);
                 if child.solve_first() {
                     return true;
                 }
             }
-            return false;
+            continue;
         }
     }
 }

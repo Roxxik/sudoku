@@ -1,0 +1,22 @@
+# Trunk config for the Sudoku web frontend.
+#   trunk serve            # dev server with hot reload (rebuilds wasm + assets)
+#   trunk build --release  # static bundle in web/dist for deployment
+#
+# The wasm crate, CSS, and app.js are declared as assets in index.html; the
+# wasm32 build picks up +simd128 from ../.cargo/config.toml.
+[build]
+target = "index.html"
+
+# Rebuild when the frontend OR the Rust sources behind the wasm bridge change.
+# Listing `watch` explicitly replaces Trunk's default (the html dir), so the web
+# assets are named here too; core and wasm live outside web/ so add their paths.
+[watch]
+watch = [
+  "index.html",
+  "app.js",
+  "style.css",
+  "../wasm/src",
+  "../wasm/Cargo.toml",
+  "../core/src",
+  "../core/Cargo.toml",
+]

@@ -1,7 +1,7 @@
 use crate::board::{Board, CELLS, cell_name, digit_to_bit, iter_digits, popcount};
 use crate::rng::Rng;
 use crate::solver::{apply_step, next_step_filtered, solve};
-use crate::spec::{Spec, Usage};
+use crate::spec::{Spec, TechniqueSet, Usage};
 use crate::techniques::{Deduction, REGISTRY, TechniqueKind};
 use crate::uniqueness;
 use crate::verifier::verify;
@@ -283,6 +283,16 @@ pub fn make_puzzle_for_spec_with_search(
 ) -> (Option<FilteredResult>, GenStats) {
     let mut stats = GenStats::default();
     let req = RequirementSummary::from_spec(spec);
+    // Baseline membership of every technique, computed once as a bitmask.
+    // `baseline_solve_tracked` queries this per technique per solve step (and
+    // runs once per unique strip, i.e. millions of times), so collapsing it to a
+    // `Copy` `u32` set — passed by value, queried with a register bit-test rather
+    // than a memory load — keeps the spec lookup out of the hot loop.
+    let baseline: TechniqueSet = REGISTRY
+        .iter()
+        .map(|def| def.kind)
+        .filter(|&k| spec.is_baseline(k))
+        .collect();
     let heuristic = crate::search::DefaultHeuristic::new(spec);
     let probe_target = crate::search::primary_target(spec);
     let mut trace_left = probe.trace;
@@ -324,7 +334,7 @@ pub fn make_puzzle_for_spec_with_search(
                 // below never mutate `puzzle`. On acceptance the board is already
                 // in its stripped state, so there is nothing to copy.
                 let orig = puzzle.cell(i);
-                puzzle.clear(i);
+                puzzle.clear_naked(i);
                 // Uniqueness gate, specialized to the strip context (NOT a
                 // drop-in for the general count_solutions used elsewhere, e.g.
                 // local_search — this relies on a loop-local invariant).
@@ -362,7 +372,7 @@ pub fn make_puzzle_for_spec_with_search(
                 }
                 // Augmented baseline check: solve with baseline techniques and
                 // track whether the trace meets the spec's requirement counts.
-                let outcome = baseline_solve_tracked(&puzzle, spec, &req);
+                let outcome = baseline_solve_tracked(&puzzle, baseline, &req);
                 if !outcome.solved {
                     puzzle.place(i, orig); // reject: undo the strip
                     continue;
@@ -693,25 +703,17 @@ fn fmt_deductions(ds: &[Deduction]) -> String {
 /// array indexed by kind — no allocation per call.
 fn baseline_solve_tracked(
     board: &Board,
-    spec: &Spec,
+    baseline: TechniqueSet,
     req: &RequirementSummary,
 ) -> BaselineOutcome {
     let mut b = board.clone();
     let mut counts = [0usize; NUM_TECHNIQUES];
-    // Precompute the baseline membership of every technique once. The filter is
-    // queried per technique per solve step (many times); reducing it to an array
-    // index here avoids re-hashing the `TechniqueKind` into `spec.usages` on each
-    // query. Identical result to calling `spec.is_baseline(t)` directly.
-    let mut baseline = [false; NUM_TECHNIQUES];
-    for def in REGISTRY {
-        baseline[kind_index(def.kind)] = spec.is_baseline(def.kind);
-    }
     loop {
         if b.is_solved() {
             let requirement_met = req.is_empty || requirement_met(&counts, req);
             return BaselineOutcome { solved: true, requirement_met };
         }
-        match next_step_filtered(&b, |t| baseline[kind_index(t)]) {
+        match next_step_filtered(&b, |t| baseline.contains(t)) {
             None => return BaselineOutcome { solved: false, requirement_met: false },
             Some(s) => {
                 counts[kind_index(s.technique)] += 1;

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Mobile-first: fit device width, no user zoom (the grid handles its own sizing). -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1b1b1f">
+  <title>Sudoku</title>
+  <link data-trunk rel="css" href="style.css">
+  <!-- Build the wasm bridge (sudoku-core via wasm-bindgen). Trunk generates the
+       glue, initializes it, and exposes the exports on `window.wasmBindings`. -->
+  <link data-trunk rel="rust" href="../wasm/Cargo.toml">
+  <!-- app.js is a plain script that reads `window.wasmBindings`; copy it as-is. -->
+  <link data-trunk rel="copy-file" href="app.js">
+</head>
+<body>
+  <main id="app">
+    <header class="topbar">
+      <button id="home" class="iconbtn" aria-label="Home">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+          <path fill="currentColor" d="M12 3.2 21 11h-2.8v9h-4.2v-5.6h-4V20H5.8v-9H3z"/>
+        </svg>
+      </button>
+      <h1>Sudoku</h1>
+      <div class="menu">
+        <button id="menuBtn" class="iconbtn" aria-label="Menu" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <circle cx="12" cy="5" r="2" fill="currentColor"/>
+            <circle cx="12" cy="12" r="2" fill="currentColor"/>
+            <circle cx="12" cy="19" r="2" fill="currentColor"/>
+          </svg>
+        </button>
+        <ul id="menuList" class="menu-list" hidden>
+          <li><button class="menu-item" data-action="generate">New puzzle</button></li>
+          <li><button class="menu-item" data-action="restart">Restart</button></li>
+        </ul>
+      </div>
+    </header>
+
+    <!-- 81 cells are injected by app.js. -->
+    <div id="board" class="board" role="grid" aria-label="Sudoku board"></div>
+
+    <div class="pad">
+      <div class="actions">
+        <button id="undo" class="key wide">Undo</button>
+        <button id="notes" class="key wide" aria-pressed="false">Notes</button>
+        <button id="erase" class="key wide">Erase</button>
+        <button id="hint" class="key wide">Hint</button>
+      </div>
+      <div class="digits">
+        <button class="key" data-digit="1">1</button>
+        <button class="key" data-digit="2">2</button>
+        <button class="key" data-digit="3">3</button>
+        <button class="key" data-digit="4">4</button>
+        <button class="key" data-digit="5">5</button>
+        <button class="key" data-digit="6">6</button>
+        <button class="key" data-digit="7">7</button>
+        <button class="key" data-digit="8">8</button>
+        <button class="key" data-digit="9">9</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Hint pop-up. Read-only: it lists the steps the solver can see and never
+       touches the board. Filled by app.js from the wasm bridge's output. -->
+  <dialog id="hintDialog" class="dialog">
+    <div class="dialog-head">
+      <h2 id="hintTitle">Hint</h2>
+      <button id="hintClose" class="iconbtn" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+          <path fill="currentColor" d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2"/>
+        </svg>
+      </button>
+    </div>
+    <div id="hintBody" class="dialog-body"></div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

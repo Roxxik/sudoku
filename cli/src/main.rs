@@ -16,6 +16,15 @@ fn main() {
     let list_stages = pop_flag(&mut args, "--list-stages");
     let full_trace = pop_flag(&mut args, "--full-trace");
 
+    // Load (don't generate): replay puzzles from a gen_cache jsonl file, or a
+    // single puzzle line, through the same trace viewer.
+    let cache = pop_string(&mut args, "--cache");
+    let puzzle_line = pop_string(&mut args, "--puzzle");
+    let index = pop_string(&mut args, "--index").map(|s| s.parse::<usize>().unwrap_or_else(|_| {
+        eprintln!("--index needs a positive integer");
+        std::process::exit(2);
+    }));
+
     // Legacy single-purpose flags.
     let needs = pop_string(&mut args, "--needs");
     let forced = pop_string(&mut args, "--forced");
@@ -46,8 +55,50 @@ fn main() {
     let allow_arg = pop_string(&mut args, "--allow");
     let require_arg = pop_string(&mut args, "--require");
 
+    // Generation attempt cap (rejection-sampling budget). Defaults to
+    // `MAX_ATTEMPTS`; raise it to chase rare specs like forced Phistomefel.
+    let max_attempts = pop_string(&mut args, "--max-attempts")
+        .map(|s| {
+            s.parse::<usize>().unwrap_or_else(|_| {
+                eprintln!("--max-attempts needs a positive integer");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or(MAX_ATTEMPTS);
+
     if list_stages {
         print_stages();
+        return;
+    }
+
+    if let Some(path) = cache.as_ref() {
+        run_cache_file(path, index, interactive, full_trace);
+        return;
+    }
+
+    if let Some(line) = puzzle_line.as_ref() {
+        // Restrict the trace to an explicit spec if the user gave one, else
+        // show the full (unrestricted) solve.
+        let has_spec = stage.is_some()
+            || train.is_some()
+            || drill.is_some()
+            || tier_arg.is_some()
+            || family_arg.is_some()
+            || allow_arg.is_some()
+            || require_arg.is_some();
+        let spec = has_spec.then(|| {
+            build_spec(
+                stage.as_deref(),
+                train.as_deref(),
+                drill.as_deref(),
+                tier_arg.as_deref(),
+                family_arg.as_deref(),
+                allow_arg.as_deref(),
+                require_arg.as_deref(),
+            )
+        });
+        let restrict = if full_trace { None } else { spec.as_ref() };
+        run_puzzle_line(line, restrict, interactive);
         return;
     }
 
@@ -121,7 +172,7 @@ fn main() {
         let (out, stats) = make_puzzle_for_spec_with_search(
             &mut rng,
             &spec,
-            MAX_ATTEMPTS,
+            max_attempts,
             0,
             None,
             Probe { classify: false, trace, force },
@@ -132,7 +183,7 @@ fn main() {
         );
         match out {
             Some(fr) => println!("generation also succeeded after {} attempts", fr.attempts),
-            None => println!("generation did not succeed in {} attempts", MAX_ATTEMPTS),
+            None => println!("generation did not succeed in {} attempts", max_attempts),
         }
         return;
     }
@@ -142,9 +193,9 @@ fn main() {
             let (puzzle, spec) = run_construct(name, &mut rng);
             (puzzle, Some(spec))
         } else if let Some(name) = needs.as_ref() {
-            (run_needs(name, &mut rng), None)
+            (run_needs(name, &mut rng, max_attempts), None)
         } else if let Some(name) = forced.as_ref() {
-            (run_forced(name, &mut rng), None)
+            (run_forced(name, &mut rng, max_attempts), None)
         } else if spec_starts > 0
             || family_arg.is_some()
             || allow_arg.is_some()
@@ -159,7 +210,7 @@ fn main() {
                 allow_arg.as_deref(),
                 require_arg.as_deref(),
             );
-            let puzzle = run_spec(&spec, &mut rng, search_iters, resume_threshold);
+            let puzzle = run_spec(&spec, &mut rng, search_iters, resume_threshold, max_attempts);
             (puzzle, Some(spec))
         } else {
             (make_puzzle(&mut rng, true), None)
@@ -183,6 +234,8 @@ fn usage_error() -> ! {
          \t[--stage <key> | --train <technique> | --drill <technique> | --tier <easy|medium|hard|master>] \\\n\
          \t[--family <name>] [--allow t1,t2,...] [--require t=n,t=n,...] \\\n\
          \t[--construct <name> | --needs <technique> | --forced <technique>] \\\n\
+         \t[--max-attempts <n>] \\\n\
+         \t[--cache <file.jsonl> [--index <n>] | --puzzle <line>] \\\n\
          \t[seed]",
     );
     std::process::exit(2);
@@ -235,6 +288,7 @@ fn parse_family(name: &str) -> Option<Family> {
         "turbot-fish" => Some(Family::TurbotFish),
         "wing" => Some(Family::Wing),
         "finned-fish" => Some(Family::FinnedFish),
+        "set-equality" => Some(Family::SetEquality),
         _ => None,
     }
 }
@@ -249,6 +303,7 @@ fn family_name(f: Family) -> &'static str {
         Family::TurbotFish => "turbot-fish",
         Family::Wing => "wing",
         Family::FinnedFish => "finned-fish",
+        Family::SetEquality => "set-equality",
     }
 }
 
@@ -407,12 +462,12 @@ fn run_construct(name: &str, rng: &mut Rng) -> (GeneratedPuzzle, Spec) {
     }
 }
 
-fn run_needs(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
+fn run_needs(name: &str, rng: &mut Rng, max_attempts: usize) -> GeneratedPuzzle {
     let target = parse_technique(name).unwrap_or_else(|| {
         eprintln!("unknown technique name {:?}", name);
         std::process::exit(2);
     });
-    match make_puzzle_needing(rng, target, MAX_ATTEMPTS) {
+    match make_puzzle_needing(rng, target, max_attempts) {
         Some(fr) => {
             println!("found after {} attempts", fr.attempts);
             fr.puzzle
@@ -421,19 +476,19 @@ fn run_needs(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
             eprintln!(
                 "no puzzle requiring {} found in {} attempts",
                 target.name(),
-                MAX_ATTEMPTS
+                max_attempts
             );
             std::process::exit(1);
         }
     }
 }
 
-fn run_forced(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
+fn run_forced(name: &str, rng: &mut Rng, max_attempts: usize) -> GeneratedPuzzle {
     let target = parse_technique(name).unwrap_or_else(|| {
         eprintln!("unknown technique name {:?}", name);
         std::process::exit(2);
     });
-    match make_puzzle_forced(rng, target, MAX_ATTEMPTS) {
+    match make_puzzle_forced(rng, target, max_attempts) {
         Some(fr) => {
             println!("forced after {} attempts", fr.attempts);
             fr.puzzle
@@ -442,7 +497,7 @@ fn run_forced(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
             eprintln!(
                 "no puzzle FORCING {} found in {} attempts",
                 target.name(),
-                MAX_ATTEMPTS
+                max_attempts
             );
             std::process::exit(1);
         }
@@ -454,11 +509,12 @@ fn run_spec(
     rng: &mut Rng,
     search_iters: usize,
     resume_threshold: Option<i64>,
+    max_attempts: usize,
 ) -> GeneratedPuzzle {
     let (out, stats) = make_puzzle_for_spec_with_search(
         rng,
         spec,
-        MAX_ATTEMPTS,
+        max_attempts,
         search_iters,
         resume_threshold,
         Probe::default(),
@@ -475,9 +531,108 @@ fn run_spec(
             fr.puzzle
         }
         None => {
-            eprintln!("no puzzle satisfying spec found in {} attempts", MAX_ATTEMPTS);
+            eprintln!("no puzzle satisfying spec found in {} attempts", max_attempts);
             std::process::exit(1);
         }
+    }
+}
+
+/// Extract a flat `"key":"value"` string field from one gen_cache jsonl line.
+/// The cache is hand-written JSON with no nesting or escapes, so a substring
+/// scan is enough (and avoids pulling in serde).
+fn json_str_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{}\":\"", key);
+    let start = line.find(&pat)? + pat.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Reconstruct the restrict-spec from a cache entry's mode/target, matching
+/// gen_cache's `spec_for`. Returns None for an unknown mode/target (full trace).
+fn spec_from_cache(mode: &str, target: &str) -> Option<Spec> {
+    let t = parse_technique(target)?;
+    match mode {
+        "train" => Some(Spec::train(t)),
+        "drill" => Some(Spec::drill(t)),
+        _ => None,
+    }
+}
+
+fn board_from_line(line: &str) -> Board {
+    Board::parse(line).unwrap_or_else(|e| {
+        eprintln!("bad puzzle line: {:?}", e);
+        std::process::exit(2);
+    })
+}
+
+fn generated_from(board: Board, solution: Option<Board>) -> GeneratedPuzzle {
+    let givens = (0..81).filter(|&i| !board.is_empty(i)).count();
+    let solution = solution.unwrap_or_else(|| solve(board.clone()).board);
+    GeneratedPuzzle { puzzle: board, solution, givens }
+}
+
+fn run_cache_file(path: &str, index: Option<usize>, interactive: bool, full_trace: bool) {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("cannot read {}: {}", path, e);
+        std::process::exit(1);
+    });
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        eprintln!("{} has no entries", path);
+        std::process::exit(1);
+    }
+
+    let selected: Vec<usize> = match index {
+        Some(n) => {
+            if n == 0 || n > lines.len() {
+                eprintln!("--index {} out of range (1..={})", n, lines.len());
+                std::process::exit(2);
+            }
+            vec![n - 1]
+        }
+        None => (0..lines.len()).collect(),
+    };
+
+    for i in selected {
+        let line = lines[i];
+        let puzzle = json_str_field(line, "puzzle").unwrap_or_else(|| {
+            eprintln!("entry {}: no \"puzzle\" field", i + 1);
+            std::process::exit(1);
+        });
+        let board = board_from_line(puzzle);
+        let solution = json_str_field(line, "solution").map(board_from_line);
+        let out = generated_from(board, solution);
+
+        let method = json_str_field(line, "method").unwrap_or("?");
+        let mode = json_str_field(line, "mode").unwrap_or("?");
+        let target = json_str_field(line, "target").unwrap_or("?");
+        let spec = spec_from_cache(mode, target);
+        let restrict = if full_trace { None } else { spec.as_ref() };
+
+        println!(
+            "=== entry {}/{} (method={}, mode={}, target={}) ===",
+            i + 1,
+            lines.len(),
+            method,
+            mode,
+            target,
+        );
+        if interactive {
+            run_interactive(out, restrict);
+        } else {
+            run_batch(out, restrict);
+        }
+        println!();
+    }
+}
+
+fn run_puzzle_line(line: &str, restrict: Option<&Spec>, interactive: bool) {
+    let out = generated_from(board_from_line(line), None);
+    if interactive {
+        run_interactive(out, restrict);
+    } else {
+        run_batch(out, restrict);
     }
 }
 

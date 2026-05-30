@@ -1,5 +1,10 @@
 # Use the host CPU's full instruction set for native (x86_64) builds.
-# wasm32 builds are unaffected — and wasm has popcnt as a core instruction
-# anyway, so count_ones() is always cheap there.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=native"]
+
+# Enable the SIMD-128 proposal for wasm so core's portable_simd code lowers to
+# v128 instructions instead of being scalarized. (popcnt is a core wasm
+# instruction either way, so count_ones() is always cheap.) All modern browsers
+# ship simd128; the .wasm won't run on engines that don't.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

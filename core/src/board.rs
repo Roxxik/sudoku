@@ -174,6 +174,63 @@ impl Board {
         self.recompute_candidates();
     }
 
+    /// Single-cell clear specialized to boards whose candidate masks are the
+    /// *naked* candidates (placements only, no technique eliminations) — the
+    /// strip-loop invariant. Removing the digit `d` at cell `i` changes only
+    /// cell `i`'s own candidates and, for `d`, those of `i`'s peers; nothing
+    /// else moves. So we touch `i` and its 20 peers instead of doing the
+    /// full-board `recompute_candidates`, producing byte-identical naked
+    /// candidates (the debug assertion cross-checks against the replay path).
+    ///
+    /// PRECONDITION: `candidates` equals the naked candidates implied by
+    /// `cells`. Calling this on a board carrying technique eliminations would
+    /// leave the off-peer eliminations in place, whereas `recompute_candidates`
+    /// would wipe them — so it is NOT a drop-in for the general `clear`.
+    pub fn clear_naked(&mut self, i: CellIdx) {
+        let d = self.cells[i];
+        if d == 0 {
+            return;
+        }
+        self.cells[i] = 0;
+        // Rebuild cell i's own candidates from the digits its filled peers hold.
+        let mut c = ALL_DIGITS;
+        for &peer in &PEERS[i] {
+            let pd = self.cells[peer];
+            if pd != 0 {
+                c &= !digit_to_bit(pd);
+            }
+        }
+        self.candidates[i] = c;
+        // Digit d was the only value removed from the board, so the only
+        // candidate any peer can regain is d — and only if no *other* filled
+        // peer of that peer still holds d (cell i, now empty, never blocks).
+        let bit = digit_to_bit(d);
+        for &p in &PEERS[i] {
+            if self.cells[p] != 0 {
+                continue;
+            }
+            let mut blocked = false;
+            for &pp in &PEERS[p] {
+                if self.cells[pp] == d {
+                    blocked = true;
+                    break;
+                }
+            }
+            if !blocked {
+                self.candidates[p] |= bit;
+            }
+        }
+        debug_assert!(
+            {
+                let mut replay = self.clone();
+                replay.recompute_candidates();
+                replay.candidates == self.candidates
+            },
+            "clear_naked diverged from recompute_candidates at cell {}",
+            i
+        );
+    }
+
     pub fn recompute_candidates(&mut self) {
         for i in 0..CELLS {
             self.candidates[i] = if self.cells[i] != 0 { 0 } else { ALL_DIGITS };

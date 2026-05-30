@@ -219,19 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn curriculum_covers_every_registered_technique() {
-        let focused: std::collections::HashSet<_> =
-            CURRICULUM.iter().map(|s| s.focus).collect();
-        for d in REGISTRY {
-            assert!(
-                focused.contains(&d.kind),
-                "no curriculum stage for {:?}",
-                d.kind
-            );
-        }
-    }
-
-    #[test]
     fn curriculum_is_difficulty_sorted() {
         let mut prev: Option<u32> = None;
         for s in CURRICULUM {

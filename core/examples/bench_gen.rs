@@ -114,6 +114,7 @@ fn family_label(f: Family) -> &'static str {
         Family::TurbotFish => "turbot-fish",
         Family::Wing => "wing",
         Family::FinnedFish => "finned-fish",
+        Family::SetEquality => "set-equality",
     }
 }
 

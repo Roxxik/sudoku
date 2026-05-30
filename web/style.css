@@ -1,0 +1,278 @@
+:root {
+  --bg: #1b1b1f;
+  --panel: #26262c;
+  --line: #3a3a42;
+  --line-strong: #6d6d78;
+  --cell: #2f2f37;
+  --cell-sel: #3a4d6b;
+  --cell-peer: #2a3340;
+  --cell-same: #4a3d2a;
+  --given: #e8e8ec;
+  --user: #7ab8ff;
+  --mark: #9a9aa6;
+  --accent: #7ab8ff;
+  --text: #e8e8ec;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#app {
+  max-width: 520px;
+  margin: 0 auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.topbar h1 {
+  flex: 1;
+  text-align: center;
+  margin: 0;
+  font-size: 1.3rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.iconbtn {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: manipulation;
+}
+.iconbtn:active { background: var(--panel); }
+
+.menu { position: relative; }
+
+.menu-list {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin: 4px 0 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 150px;
+  z-index: 10;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+.menu-list[hidden] { display: none; }
+
+.menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+.menu-item:active { background: var(--cell-sel); }
+
+/* The board is a square that scales with the viewport but caps on desktop. */
+.board {
+  width: 100%;
+  max-width: 480px;
+  margin: 0 auto;
+  aspect-ratio: 1 / 1;
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  grid-template-rows: repeat(9, 1fr);
+  background: var(--line);
+  border: 3px solid var(--line-strong);
+  border-radius: 6px;
+  overflow: hidden;
+  touch-action: manipulation;
+  user-select: none;
+}
+
+.cell {
+  position: relative;
+  background: var(--cell);
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: clamp(1.1rem, 6.5vw, 2rem);
+  line-height: 1;
+  cursor: pointer;
+  color: var(--user);
+}
+
+/* Drop the trailing edges so they don't double up with the board border. */
+.cell.col8 { border-right: none; }
+.cell.row8 { border-bottom: none; }
+
+/* Thick 3x3 box separators. */
+.cell.boxr { border-right: 2px solid var(--line-strong); }
+.cell.boxb { border-bottom: 2px solid var(--line-strong); }
+
+.cell.given { color: var(--given); font-weight: 600; }
+
+.cell.peer { background: var(--cell-peer); }
+.cell.same { background: var(--cell-same); }
+.cell.selected { background: var(--cell-sel); }
+
+/* Pencil marks: a 3x3 micro-grid filling the cell. */
+.cell .marks {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  font-size: clamp(0.45rem, 2.4vw, 0.7rem);
+  color: var(--mark);
+  pointer-events: none;
+}
+.cell .marks span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cell .value { z-index: 1; }
+
+/* ---- Input pad ---- */
+.pad {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.digits {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 6px;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.key {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 0;
+  font-size: 1.2rem;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.key:active { background: var(--cell-sel); }
+.key.wide { font-size: 1rem; }
+.key:disabled { opacity: 0.4; cursor: default; }
+
+#notes[aria-pressed="true"] {
+  background: var(--accent);
+  color: #10131a;
+  border-color: var(--accent);
+}
+
+/* Pen-locked digit (double-tapped, highlight mode active). */
+.key.active {
+  background: var(--accent);
+  color: #10131a;
+  border-color: var(--accent);
+}
+
+/* ---- Hint dialog ---- */
+.dialog {
+  width: min(92vw, 460px);
+  max-height: 80vh;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+}
+.dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 8px 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.dialog-head h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.dialog-body {
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+  max-height: calc(80vh - 56px);
+}
+
+/* A note for the solved / stuck / loading / error cases. */
+.hint-note {
+  margin: 0;
+  color: var(--mark);
+  line-height: 1.4;
+}
+
+/* One step per row: technique label on top, deductions beneath. */
+.hint-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hint-step {
+  padding: 10px 12px;
+  background: var(--cell);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.hint-step .tech {
+  font-weight: 600;
+}
+.hint-step .where {
+  color: var(--mark);
+  font-weight: 400;
+}
+.hint-step .deductions {
+  margin-top: 4px;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.95rem;
+  color: var(--user);
+}
