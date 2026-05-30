@@ -1,0 +1,6 @@
+# Pinned nightly: core uses #![feature(portable_simd)], whose API drifts between
+# nightlies (e.g. Mask::select moved into the Select trait around this date). Pin
+# so local builds and CI use the same toolchain. Bump deliberately, not implicitly.
+[toolchain]
+channel = "nightly-2026-05-29"
+targets = ["wasm32-unknown-unknown"]

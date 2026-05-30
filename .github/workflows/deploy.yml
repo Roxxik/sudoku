@@ -20,10 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # core uses #![feature(portable_simd)], which requires nightly.
+      # Toolchain (nightly + wasm target) is pinned in rust-toolchain.toml;
+      # @master reads it so CI matches local. core needs nightly for portable_simd.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-05-29
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo

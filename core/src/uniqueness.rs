@@ -1,7 +1,7 @@
 use crate::board::{ALL_DIGITS, Board, CELLS, PEERS, iter_digits, popcount};
 use std::simd::cmp::{SimdOrd, SimdPartialEq};
 use std::simd::num::SimdUint;
-use std::simd::{Mask, Simd};
+use std::simd::{Mask, Select, Simd};
 
 /// Width of the lanes the dense MRV scan loads at once. 96 = 6 × 16 covers all
 /// 81 cells with padding, and 16-wide u16 maps to one AVX512 / two AVX2 vectors
