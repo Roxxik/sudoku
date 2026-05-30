@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use crate::board::{
     BOX_UNITS, Board, CELLS, COL_UNITS, PEERS, ROW_UNITS, UnitKind, box_of, col_of,
     digit_to_bit, row_of,
@@ -237,8 +239,8 @@ fn find_empty_rectangle_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F)
                         };
                         let step = Step {
                             technique: TechniqueKind::EmptyRectangle,
-                            deductions: vec![Deduction::Eliminate { cell: elim_cell, digit: d }],
-                            focus_cells: focus,
+                            deductions: smallvec![Deduction::Eliminate { cell: elim_cell, digit: d }],
+                            focus_cells: focus.into(),
                             focus_house: None,
                         };
                         if !emit(step) {
@@ -279,8 +281,8 @@ fn find_empty_rectangle_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F)
                         };
                         let step = Step {
                             technique: TechniqueKind::EmptyRectangle,
-                            deductions: vec![Deduction::Eliminate { cell: elim_cell, digit: d }],
-                            focus_cells: focus,
+                            deductions: smallvec![Deduction::Eliminate { cell: elim_cell, digit: d }],
+                            focus_cells: focus.into(),
                             focus_house: None,
                         };
                         if !emit(step) {
@@ -358,8 +360,8 @@ fn build_two_endpoint_elim(
     }
     Some(Step {
         technique: kind,
-        deductions: eliminations,
-        focus_cells: focus_cells.to_vec(),
+        deductions: eliminations.into(),
+        focus_cells: focus_cells.to_vec().into(),
         focus_house: None,
     })
 }

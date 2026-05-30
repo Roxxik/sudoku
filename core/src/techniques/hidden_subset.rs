@@ -92,8 +92,8 @@ fn find_subset_each<F: FnMut(Step) -> bool>(
             };
             let cont = emit(Step {
                 technique: kind,
-                deductions: eliminations,
-                focus_cells: cells_in_subset,
+                deductions: eliminations.into(),
+                focus_cells: cells_in_subset.into(),
                 focus_house: Some(house),
             });
             if !cont {

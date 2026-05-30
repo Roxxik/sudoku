@@ -2,10 +2,10 @@ use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use sudoku_core::{
     Board, CURRICULUM, Deduction, Family, GeneratedPuzzle, HiddenTripleConstructor, HouseRef,
-    REGISTRY, Rng, Spec, Step, TechniqueKind, Tier, all_techniques, all_techniques_filtered,
+    Probe, REGISTRY, Rng, Spec, Step, TechniqueKind, Tier, all_techniques, all_techniques_filtered,
     apply_step, cell_name, construct_with, deduction_counts, deduction_counts_filtered,
-    make_puzzle, make_puzzle_for_spec, make_puzzle_forced, make_puzzle_needing, max_technique,
-    solve, solve_filtered, stage_by_key,
+    make_puzzle, make_puzzle_for_spec_with_search, make_puzzle_forced, make_puzzle_needing,
+    max_technique, solve, solve_filtered, stage_by_key,
 };
 
 const MAX_ATTEMPTS: usize = 10_000;
@@ -20,6 +20,22 @@ fn main() {
     let needs = pop_string(&mut args, "--needs");
     let forced = pop_string(&mut args, "--forced");
     let construct = pop_string(&mut args, "--construct");
+
+    // Probe: dump the avoid-walk trace for the first N substitutable no-req
+    // seeds the generator hits (debugging why a technique isn't forced).
+    let probe_trace = pop_string(&mut args, "--probe-trace");
+    // Probe: run targeted-strip forcing on the first N substitutable no-req
+    // seeds and print the survival-score progression (does it reach FORCED?).
+    let probe_force = pop_string(&mut args, "--probe-force");
+
+    // Local-search budget for spec generation (0 = off, the legacy
+    // rejection-only behavior). Mirrors the bench's --search-iters.
+    let search_iters = parse_probe_count(pop_string(&mut args, "--search-iters").as_deref(), "--search-iters");
+    let resume_threshold = pop_string(&mut args, "--resume-threshold")
+        .map(|s| s.parse::<i64>().unwrap_or_else(|_| {
+            eprintln!("--resume-threshold needs an integer");
+            std::process::exit(2);
+        }));
 
     // Spec-driven flags.
     let stage = pop_string(&mut args, "--stage");
@@ -75,6 +91,52 @@ fn main() {
         std::process::exit(2);
     }
 
+    // Probe mode: don't generate a puzzle to display — run the generator with
+    // the trace and/or forcing probe so it dumps example substitutable
+    // positions (and forcing attempts) along the way, then exit.
+    if probe_trace.is_some() || probe_force.is_some() {
+        let trace = parse_probe_count(probe_trace.as_deref(), "--probe-trace");
+        let force = parse_probe_count(probe_force.as_deref(), "--probe-force");
+        if spec_starts == 0
+            && family_arg.is_none()
+            && allow_arg.is_none()
+            && require_arg.is_none()
+        {
+            eprintln!("--probe-trace/--probe-force need a spec (e.g. --drill <technique>)");
+            std::process::exit(2);
+        }
+        let spec = build_spec(
+            stage.as_deref(),
+            train.as_deref(),
+            drill.as_deref(),
+            tier_arg.as_deref(),
+            family_arg.as_deref(),
+            allow_arg.as_deref(),
+            require_arg.as_deref(),
+        );
+        println!(
+            "probe: up to {} trace dump(s), {} forcing attempt(s) on substitutable no-req seeds",
+            trace, force,
+        );
+        let (out, stats) = make_puzzle_for_spec_with_search(
+            &mut rng,
+            &spec,
+            MAX_ATTEMPTS,
+            0,
+            None,
+            Probe { classify: false, trace, force },
+        );
+        println!(
+            "no-req attempts seen: {} (of {} total)",
+            stats.requirement_never_fired, stats.attempts,
+        );
+        match out {
+            Some(fr) => println!("generation also succeeded after {} attempts", fr.attempts),
+            None => println!("generation did not succeed in {} attempts", MAX_ATTEMPTS),
+        }
+        return;
+    }
+
     let (out, display_spec): (GeneratedPuzzle, Option<Spec>) =
         if let Some(name) = construct.as_ref() {
             let (puzzle, spec) = run_construct(name, &mut rng);
@@ -97,7 +159,7 @@ fn main() {
                 allow_arg.as_deref(),
                 require_arg.as_deref(),
             );
-            let puzzle = run_spec(&spec, &mut rng);
+            let puzzle = run_spec(&spec, &mut rng, search_iters, resume_threshold);
             (puzzle, Some(spec))
         } else {
             (make_puzzle(&mut rng, true), None)
@@ -132,6 +194,16 @@ fn pop_flag(args: &mut Vec<String>, name: &str) -> bool {
         true
     } else {
         false
+    }
+}
+
+fn parse_probe_count(arg: Option<&str>, name: &str) -> usize {
+    match arg {
+        None => 0,
+        Some(s) => s.parse().unwrap_or_else(|_| {
+            eprintln!("{} needs a non-negative integer", name);
+            std::process::exit(2);
+        }),
     }
 }
 
@@ -377,10 +449,29 @@ fn run_forced(name: &str, rng: &mut Rng) -> GeneratedPuzzle {
     }
 }
 
-fn run_spec(spec: &Spec, rng: &mut Rng) -> GeneratedPuzzle {
-    match make_puzzle_for_spec(rng, spec, MAX_ATTEMPTS) {
+fn run_spec(
+    spec: &Spec,
+    rng: &mut Rng,
+    search_iters: usize,
+    resume_threshold: Option<i64>,
+) -> GeneratedPuzzle {
+    let (out, stats) = make_puzzle_for_spec_with_search(
+        rng,
+        spec,
+        MAX_ATTEMPTS,
+        search_iters,
+        resume_threshold,
+        Probe::default(),
+    );
+    match out {
         Some(fr) => {
             println!("satisfied spec after {} attempts", fr.attempts);
+            if search_iters > 0 {
+                println!(
+                    "  (local search: {} recoveries, {} iterations)",
+                    stats.search_recoveries, stats.search_iterations,
+                );
+            }
             fr.puzzle
         }
         None => {
@@ -490,11 +581,11 @@ fn collect_conclusions(board: &Board, restrict: Option<&Spec>) -> Vec<Conclusion
     let mut out: Vec<Conclusion> = Vec::new();
     for step in steps {
         let sighting = (step.technique, step.focus_house);
-        if let Some(c) = out.iter_mut().find(|c| c.deductions == step.deductions) {
+        if let Some(c) = out.iter_mut().find(|c| c.deductions[..] == step.deductions[..]) {
             c.sightings.push(sighting);
         } else {
             out.push(Conclusion {
-                deductions: step.deductions.clone(),
+                deductions: step.deductions.to_vec(),
                 sightings: vec![sighting],
                 representative: step,
             });

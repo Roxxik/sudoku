@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use crate::board::{Board, CELLS, PEERS, iter_digits, popcount};
 use crate::techniques::{Deduction, Step, TechniqueKind};
 use crate::util::for_each_combination;
@@ -78,8 +80,8 @@ fn find_xyz_wing_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
             }
             let cont = emit(Step {
                 technique: TechniqueKind::XYZWing,
-                deductions: eliminations,
-                focus_cells: vec![pivot, a, b],
+                deductions: eliminations.into(),
+                focus_cells: smallvec![pivot, a, b],
                 focus_house: None,
             });
             if !cont {
@@ -166,8 +168,8 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                 }
                 let cont = emit(Step {
                     technique: TechniqueKind::XYWing,
-                    deductions: eliminations,
-                    focus_cells: vec![pivot, a, b],
+                    deductions: eliminations.into(),
+                    focus_cells: smallvec![pivot, a, b],
                     focus_house: None,
                 });
                 if !cont {
@@ -210,7 +212,7 @@ mod tests {
         let steps = find_all(&b);
         let step = steps
             .iter()
-            .find(|s| s.focus_cells == vec![pivot, wa, wb] || s.focus_cells == vec![pivot, wb, wa])
+            .find(|s| s.focus_cells[..] == [pivot, wa, wb] || s.focus_cells[..] == [pivot, wb, wa])
             .expect("expected an XY-Wing");
         assert!(
             step.deductions.iter().any(

@@ -219,7 +219,7 @@ fn stuck_state(board: &Board, spec: &Spec, target: TechniqueKind) -> Stuck {
             if let Some(h) = s.focus_house.as_ref() {
                 let mut cells = s.focus_cells.clone();
                 cells.sort_unstable();
-                instances.insert((h.kind, h.index, cells));
+                instances.insert((h.kind, h.index, cells.to_vec()));
             }
         }
         let forcing_unit_empties = instances.iter().next().map(|(kind, idx, _)| {

@@ -47,8 +47,8 @@ fn find_pointing_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                 if !eliminations.is_empty() {
                     let step = Step {
                         technique: TechniqueKind::LockedCandidatesPointing,
-                        deductions: eliminations,
-                        focus_cells: positions.clone(),
+                        deductions: eliminations.into(),
+                        focus_cells: positions.clone().into(),
                         focus_house: Some(HouseRef {
                             kind: UnitKind::Box,
                             index: box_idx as u8,
@@ -66,8 +66,8 @@ fn find_pointing_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                 if !eliminations.is_empty() {
                     let step = Step {
                         technique: TechniqueKind::LockedCandidatesPointing,
-                        deductions: eliminations,
-                        focus_cells: positions,
+                        deductions: eliminations.into(),
+                        focus_cells: positions.into(),
                         focus_house: Some(HouseRef {
                             kind: UnitKind::Box,
                             index: box_idx as u8,
@@ -135,8 +135,8 @@ fn find_claiming_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                     if !eliminations.is_empty() {
                         let step = Step {
                             technique: TechniqueKind::LockedCandidatesClaiming,
-                            deductions: eliminations,
-                            focus_cells: positions,
+                            deductions: eliminations.into(),
+                            focus_cells: positions.into(),
                             focus_house: Some(HouseRef {
                                 kind,
                                 index: line_idx as u8,

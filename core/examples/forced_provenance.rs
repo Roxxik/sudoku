@@ -104,7 +104,7 @@ fn instance_key(s: &Step) -> Option<InstanceKey> {
     let h = s.focus_house.as_ref()?;
     let mut cells = s.focus_cells.clone();
     cells.sort_unstable();
-    Some((h.kind, h.index, cells))
+    Some((h.kind, h.index, cells.to_vec()))
 }
 
 /// The set of target instances forced at the puzzle's first bottleneck: walk

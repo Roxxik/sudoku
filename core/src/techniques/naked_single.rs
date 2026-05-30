@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use crate::board::{Board, CELLS, iter_digits, popcount};
 use crate::techniques::{Deduction, Step, TechniqueKind};
 
@@ -11,8 +13,8 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
             let d = iter_digits(mask).next().unwrap();
             let step = Step {
                 technique: TechniqueKind::NakedSingle,
-                deductions: vec![Deduction::Place { cell: i, digit: d }],
-                focus_cells: vec![i],
+                deductions: smallvec![Deduction::Place { cell: i, digit: d }],
+                focus_cells: smallvec![i],
                 focus_house: None,
             };
             if !emit(step) {
@@ -52,7 +54,7 @@ mod tests {
         }
         let steps = find_all(&b);
         let step = steps.first().expect("should find naked single at cell 0");
-        assert_eq!(step.deductions, vec![Deduction::Place { cell: 0, digit: 9 }]);
+        assert_eq!(step.deductions[..], [Deduction::Place { cell: 0, digit: 9 }]);
     }
 
     #[test]

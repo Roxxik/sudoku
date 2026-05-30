@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use crate::board::{Board, all_units, digit_to_bit};
 use crate::techniques::{Deduction, HouseRef, Step, TechniqueKind};
 
@@ -21,11 +23,11 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
             if !already_placed && count == 1 {
                 let step = Step {
                     technique: TechniqueKind::HiddenSingle,
-                    deductions: vec![Deduction::Place {
+                    deductions: smallvec![Deduction::Place {
                         cell: location,
                         digit: d,
                     }],
-                    focus_cells: vec![location],
+                    focus_cells: smallvec![location],
                     focus_house: Some(HouseRef {
                         kind,
                         index: idx as u8,
@@ -70,6 +72,6 @@ mod tests {
         }
         let steps = find_all(&b);
         let step = steps.first().expect("should find hidden single for 7 in row 0");
-        assert_eq!(step.deductions, vec![Deduction::Place { cell: 0, digit: 7 }]);
+        assert_eq!(step.deductions[..], [Deduction::Place { cell: 0, digit: 7 }]);
     }
 }

@@ -1,4 +1,12 @@
+use smallvec::SmallVec;
+
 use crate::board::{Board, CellIdx, Digit, UnitKind};
+
+/// A step's deductions/focus cells are len==1 ~99.7% of the time (singles), so
+/// they live inline; only the rare multi-elimination (fish/subset) spills to
+/// the heap. Same in-memory size as `Vec`, but no allocation on the hot path.
+pub type Deductions = SmallVec<[Deduction; 1]>;
+pub type FocusCells = SmallVec<[CellIdx; 1]>;
 
 pub mod fish;
 pub mod hidden_single;
@@ -374,8 +382,8 @@ impl HouseRef {
 #[derive(Debug, Clone)]
 pub struct Step {
     pub technique: TechniqueKind,
-    pub deductions: Vec<Deduction>,
-    pub focus_cells: Vec<CellIdx>,
+    pub deductions: Deductions,
+    pub focus_cells: FocusCells,
     pub focus_house: Option<HouseRef>,
 }
 

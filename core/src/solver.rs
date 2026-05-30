@@ -34,7 +34,7 @@ fn distinct_conclusion_count_filtered<F: Fn(TechniqueKind) -> bool>(
     allow: F,
 ) -> usize {
     let steps = all_techniques_filtered(board, allow);
-    let mut seen: Vec<Vec<Deduction>> = Vec::new();
+    let mut seen: Vec<crate::techniques::Deductions> = Vec::new();
     for s in &steps {
         if !seen.iter().any(|d| *d == s.deductions) {
             seen.push(s.deductions.clone());

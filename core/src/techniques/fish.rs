@@ -161,8 +161,8 @@ fn find_oriented_each<F: FnMut(Step) -> bool>(
 
         emit(Step {
             technique: kind,
-            deductions: eliminations,
-            focus_cells,
+            deductions: eliminations.into(),
+            focus_cells: focus_cells.into(),
             focus_house: None,
         })
     });
@@ -376,8 +376,8 @@ fn find_finned_oriented_each<F: FnMut(Step) -> bool>(
 
             let cont = emit(Step {
                 technique: kind,
-                deductions: eliminations,
-                focus_cells,
+                deductions: eliminations.into(),
+                focus_cells: focus_cells.into(),
                 focus_house: None,
             });
             if !cont {

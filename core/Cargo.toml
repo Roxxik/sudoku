@@ -2,3 +2,9 @@
 name = "sudoku-core"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+# Inline-capacity vectors for hot, tiny Step fields (deductions/focus_cells are
+# len==1 ~99.7% of the time). `union` gives the tightest layout (same size as
+# Vec), spilling to the heap only for the rare large eliminations.
+smallvec = { version = "1.15", features = ["union"] }

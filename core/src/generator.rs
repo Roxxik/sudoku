@@ -1,4 +1,4 @@
-use crate::board::{Board, CELLS, cell_name, iter_digits, popcount};
+use crate::board::{Board, CELLS, cell_name, digit_to_bit, iter_digits, popcount};
 use crate::rng::Rng;
 use crate::solver::{apply_step, next_step_filtered, solve};
 use crate::spec::{Spec, Usage};
@@ -319,7 +319,34 @@ pub fn make_puzzle_for_spec_with_search(
                 }
                 let mut candidate = puzzle.clone();
                 candidate.clear(i);
-                if uniqueness::count_solutions(&candidate, 2) != 1 {
+                // Uniqueness gate, specialized to the strip context (NOT a
+                // drop-in for the general count_solutions used elsewhere, e.g.
+                // local_search — this relies on a loop-local invariant).
+                //
+                // `candidate` is `puzzle` (unique, its one solution is
+                // `solution`) with exactly one more cell `i` cleared. So
+                // `solution` is already a solution of `candidate`, and any
+                // *second* solution must differ at `i` (a solution agreeing at
+                // `i` would also solve `puzzle`, which is unique). Hence the
+                // board is non-unique iff some alternate digit at `i` — any
+                // candidate other than its solution value — also completes.
+                // Testing just those alternates skips re-deriving the solution
+                // we already hold (the whole `i = solution[i]` subtree), so it's
+                // strictly less search than count_solutions(&candidate, 2). A
+                // cell left as a naked single (no alternates) is proven unique
+                // with no backtracking at all.
+                let v_bit = digit_to_bit(solution.cell(i));
+                let alts = candidate.candidates(i) & !v_bit;
+                let mut non_unique = false;
+                for d in iter_digits(alts) {
+                    let mut probe = candidate.clone();
+                    probe.place(i, d);
+                    if uniqueness::solve_unique(&probe).is_some() {
+                        non_unique = true;
+                        break;
+                    }
+                }
+                if non_unique {
                     continue;
                 }
                 // Augmented baseline check: solve with baseline techniques and

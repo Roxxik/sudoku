@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use crate::board::{Board, CELLS, PEERS, all_units, digit_to_bit, iter_digits, popcount};
 use crate::techniques::{Deduction, HouseRef, Step, TechniqueKind};
 
@@ -108,8 +110,8 @@ fn try_link(
         };
         return Some(Step {
             technique: TechniqueKind::WWing,
-            deductions: eliminations,
-            focus_cells: vec![x, y, cx, cy],
+            deductions: eliminations.into(),
+            focus_cells: smallvec![x, y, cx, cy],
             focus_house: Some(house),
         });
     }
