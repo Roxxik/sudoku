@@ -1,7 +1,58 @@
-use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
-use crate::techniques::{Family, REGISTRY, TechniqueKind};
+use crate::techniques::{Family, NUM_TECHNIQUE_KINDS, REGISTRY, TechniqueKind};
+
+/// A set of technique kinds packed into a single `u32` bitmask, indexed by
+/// [`TechniqueKind::index`]. There are fewer than 32 kinds, so the whole set
+/// fits in one word — replacing `HashSet<TechniqueKind>` with no allocation,
+/// no hashing, and `Copy` semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TechniqueSet(u32);
+
+impl TechniqueSet {
+    pub const fn new() -> Self {
+        TechniqueSet(0)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, t: TechniqueKind) {
+        self.0 |= 1u32 << t.index();
+    }
+
+    #[inline]
+    pub fn contains(&self, t: TechniqueKind) -> bool {
+        self.0 & (1u32 << t.index()) != 0
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Raw bitmask, for callers that want to test membership directly.
+    #[inline]
+    pub fn bits(&self) -> u32 {
+        self.0
+    }
+
+    /// The contained kinds, in REGISTRY (difficulty) order.
+    pub fn iter(&self) -> impl Iterator<Item = TechniqueKind> + '_ {
+        REGISTRY
+            .iter()
+            .map(|d| d.kind)
+            .filter(move |&k| self.contains(k))
+    }
+}
+
+impl FromIterator<TechniqueKind> for TechniqueSet {
+    fn from_iter<I: IntoIterator<Item = TechniqueKind>>(iter: I) -> Self {
+        let mut set = TechniqueSet::new();
+        for k in iter {
+            set.insert(k);
+        }
+        set
+    }
+}
 
 /// How a single technique participates in a [`Spec`]. Two predicates run over
 /// these variants during verification:
@@ -36,14 +87,29 @@ impl Usage {
 /// without forcing a specific technique.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequireAny {
-    pub kinds: HashSet<TechniqueKind>,
+    pub kinds: TechniqueSet,
     pub count: NonZeroUsize,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Per-technique configuration for a generation/verification target.
+///
+/// `usages` is a dense array indexed by [`TechniqueKind::index`] rather than a
+/// `HashMap`: every membership query (`is_baseline`, `is_in_scope`) is a single
+/// array load with no hashing, which matters because the solver filters every
+/// technique on every step. `None` means "out of scope".
+#[derive(Debug, Clone)]
 pub struct Spec {
-    pub usages: HashMap<TechniqueKind, Usage>,
+    usages: [Option<Usage>; NUM_TECHNIQUE_KINDS],
     pub require_any: Vec<RequireAny>,
+}
+
+impl Default for Spec {
+    fn default() -> Self {
+        Spec {
+            usages: [None; NUM_TECHNIQUE_KINDS],
+            require_any: Vec::new(),
+        }
+    }
 }
 
 impl Spec {
@@ -52,44 +118,38 @@ impl Spec {
     }
 
     pub fn allow_all() -> Self {
-        let mut usages = HashMap::new();
+        let mut spec = Self::default();
         for def in REGISTRY {
-            usages.insert(def.kind, Usage::Allowed);
+            spec.usages[def.kind.index()] = Some(Usage::Allowed);
         }
-        Self {
-            usages,
-            require_any: Vec::new(),
-        }
+        spec
     }
 
     pub fn allow_up_to(t: TechniqueKind) -> Self {
         let cap = t.difficulty();
-        let mut usages = HashMap::new();
+        let mut spec = Self::default();
         for def in REGISTRY {
             if def.difficulty <= cap {
-                usages.insert(def.kind, Usage::Allowed);
+                spec.usages[def.kind.index()] = Some(Usage::Allowed);
             }
         }
-        Self {
-            usages,
-            require_any: Vec::new(),
-        }
+        spec
     }
 
     pub fn allow(mut self, t: TechniqueKind) -> Self {
-        self.usages.insert(t, Usage::Allowed);
+        self.usages[t.index()] = Some(Usage::Allowed);
         self
     }
 
     pub fn allow_family(mut self, family: Family) -> Self {
         for t in family.members() {
-            self.usages.entry(t).or_insert(Usage::Allowed);
+            self.usages[t.index()].get_or_insert(Usage::Allowed);
         }
         self
     }
 
     pub fn require(mut self, t: TechniqueKind, count: usize) -> Self {
-        self.usages.insert(t, Usage::forced(count));
+        self.usages[t.index()] = Some(Usage::forced(count));
         self
     }
 
@@ -98,7 +158,7 @@ impl Spec {
     /// hypothetical solver has access to it when proving the Forced
     /// techniques are unavoidable.
     pub fn concede(mut self, t: TechniqueKind) -> Self {
-        self.usages.insert(t, Usage::Conceded);
+        self.usages[t.index()] = Some(Usage::Conceded);
         self
     }
 
@@ -109,10 +169,10 @@ impl Spec {
     where
         I: IntoIterator<Item = TechniqueKind>,
     {
-        let set: HashSet<TechniqueKind> = kinds.into_iter().collect();
+        let set: TechniqueSet = kinds.into_iter().collect();
         assert!(!set.is_empty(), "require_one_of needs at least one technique");
-        for &k in &set {
-            self.usages.entry(k).or_insert(Usage::Allowed);
+        for k in set.iter() {
+            self.usages[k.index()].get_or_insert(Usage::Allowed);
         }
         self.require_any.push(RequireAny {
             kinds: set,
@@ -180,16 +240,33 @@ impl Spec {
     /// True if `t` is in the baseline (Allowed or Forced) — i.e., counts as
     /// "the solver actually relies on this" for the positive solvability
     /// check and for the displayed solution trace.
+    #[inline]
     pub fn is_baseline(&self, t: TechniqueKind) -> bool {
         matches!(
-            self.usages.get(&t),
+            self.usages[t.index()],
             Some(Usage::Allowed) | Some(Usage::Forced { .. }),
         )
     }
 
     /// True if `t` appears in the spec under any variant.
+    #[inline]
     pub fn is_in_scope(&self, t: TechniqueKind) -> bool {
-        self.usages.contains_key(&t)
+        self.usages[t.index()].is_some()
+    }
+
+    /// The configured [`Usage`] for `t`, or `None` if `t` is out of scope.
+    #[inline]
+    pub fn usage(&self, t: TechniqueKind) -> Option<Usage> {
+        self.usages[t.index()]
+    }
+
+    /// Iterate the in-scope `(technique, usage)` pairs, in REGISTRY (difficulty)
+    /// order. Replaces iterating a `HashMap` — and unlike the old map, the order
+    /// is now deterministic.
+    pub fn iter_usages(&self) -> impl Iterator<Item = (TechniqueKind, Usage)> + '_ {
+        REGISTRY
+            .iter()
+            .filter_map(move |def| self.usages[def.kind.index()].map(|u| (def.kind, u)))
     }
 }
 
@@ -200,10 +277,10 @@ mod tests {
     #[test]
     fn allow_up_to_includes_only_easier_or_equal() {
         let s = Spec::allow_up_to(TechniqueKind::HiddenSingle);
-        assert!(s.usages.contains_key(&TechniqueKind::NakedSingle));
-        assert!(s.usages.contains_key(&TechniqueKind::HiddenSingle));
-        assert!(!s.usages.contains_key(&TechniqueKind::NakedPair));
-        assert!(!s.usages.contains_key(&TechniqueKind::HiddenTriple));
+        assert!(s.is_in_scope(TechniqueKind::NakedSingle));
+        assert!(s.is_in_scope(TechniqueKind::HiddenSingle));
+        assert!(!s.is_in_scope(TechniqueKind::NakedPair));
+        assert!(!s.is_in_scope(TechniqueKind::HiddenTriple));
     }
 
     #[test]
@@ -211,11 +288,11 @@ mod tests {
         let s = Spec::allow_up_to(TechniqueKind::HiddenPair)
             .require(TechniqueKind::HiddenPair, 2);
         assert!(matches!(
-            s.usages.get(&TechniqueKind::HiddenPair),
+            s.usage(TechniqueKind::HiddenPair),
             Some(Usage::Forced { .. })
         ));
         assert!(matches!(
-            s.usages.get(&TechniqueKind::NakedSingle),
+            s.usage(TechniqueKind::NakedSingle),
             Some(Usage::Allowed)
         ));
     }
@@ -223,7 +300,7 @@ mod tests {
     #[test]
     fn empty_spec_lists_nothing() {
         let s = Spec::empty();
-        assert!(s.usages.is_empty());
+        assert!(s.iter_usages().next().is_none());
         assert!(s.require_any.is_empty());
     }
 
@@ -237,11 +314,11 @@ mod tests {
     fn allow_family_adds_all_members() {
         let s = Spec::empty().allow_family(Family::Wing);
         // Wing family contains XYWing, XYZWing, WWing in the current registry.
-        assert!(s.usages.contains_key(&TechniqueKind::XYWing));
-        assert!(s.usages.contains_key(&TechniqueKind::XYZWing));
-        assert!(s.usages.contains_key(&TechniqueKind::WWing));
+        assert!(s.is_in_scope(TechniqueKind::XYWing));
+        assert!(s.is_in_scope(TechniqueKind::XYZWing));
+        assert!(s.is_in_scope(TechniqueKind::WWing));
         // Non-Wing techniques should not be added.
-        assert!(!s.usages.contains_key(&TechniqueKind::Swordfish));
+        assert!(!s.is_in_scope(TechniqueKind::Swordfish));
     }
 
     #[test]
@@ -251,7 +328,7 @@ mod tests {
             .allow_family(Family::Wing);
         // Forced status must be preserved (entry not overwritten by Allowed).
         assert!(matches!(
-            s.usages.get(&TechniqueKind::XYWing),
+            s.usage(TechniqueKind::XYWing),
             Some(Usage::Forced { .. })
         ));
     }
@@ -261,12 +338,12 @@ mod tests {
         let s = Spec::allow_up_to(TechniqueKind::HiddenQuad).require_family(Family::Fish, 1);
         assert_eq!(s.require_any.len(), 1);
         let r = &s.require_any[0];
-        assert!(r.kinds.contains(&TechniqueKind::XWing));
-        assert!(r.kinds.contains(&TechniqueKind::Swordfish));
-        assert!(r.kinds.contains(&TechniqueKind::Jellyfish));
+        assert!(r.kinds.contains(TechniqueKind::XWing));
+        assert!(r.kinds.contains(TechniqueKind::Swordfish));
+        assert!(r.kinds.contains(TechniqueKind::Jellyfish));
         assert_eq!(r.count.get(), 1);
         // Fishes that weren't in allow_up_to(HiddenQuad) are now allowed.
-        assert!(s.usages.contains_key(&TechniqueKind::Swordfish));
+        assert!(s.is_in_scope(TechniqueKind::Swordfish));
     }
 
     #[test]
@@ -279,14 +356,14 @@ mod tests {
     fn train_is_broad() {
         let s = Spec::train(TechniqueKind::Swordfish);
         // Includes all techniques up to and including Swordfish.
-        assert!(s.usages.contains_key(&TechniqueKind::NakedSingle));
-        assert!(s.usages.contains_key(&TechniqueKind::XWing));
-        assert!(s.usages.contains_key(&TechniqueKind::Swordfish));
+        assert!(s.is_in_scope(TechniqueKind::NakedSingle));
+        assert!(s.is_in_scope(TechniqueKind::XWing));
+        assert!(s.is_in_scope(TechniqueKind::Swordfish));
         // Excludes harder ones.
-        assert!(!s.usages.contains_key(&TechniqueKind::Jellyfish));
+        assert!(!s.is_in_scope(TechniqueKind::Jellyfish));
         // And Swordfish is forced.
         assert!(matches!(
-            s.usages.get(&TechniqueKind::Swordfish),
+            s.usage(TechniqueKind::Swordfish),
             Some(Usage::Forced { .. })
         ));
     }
@@ -296,15 +373,15 @@ mod tests {
         // Target diff < 50 → baseline ceiling stays at HiddenSingle.
         let s = Spec::drill(TechniqueKind::NakedTriple);
         assert!(matches!(
-            s.usages.get(&TechniqueKind::HiddenSingle),
+            s.usage(TechniqueKind::HiddenSingle),
             Some(Usage::Allowed),
         ));
         assert!(matches!(
-            s.usages.get(&TechniqueKind::NakedPair),
+            s.usage(TechniqueKind::NakedPair),
             Some(Usage::Conceded),
         ));
         assert!(matches!(
-            s.usages.get(&TechniqueKind::NakedTriple),
+            s.usage(TechniqueKind::NakedTriple),
             Some(Usage::Forced { .. }),
         ));
     }
@@ -314,19 +391,19 @@ mod tests {
         // Target diff in 50..75 → baseline includes LC, subsets still Conceded.
         let s = Spec::drill(TechniqueKind::XYWing);
         assert!(matches!(
-            s.usages.get(&TechniqueKind::LockedCandidatesPointing),
+            s.usage(TechniqueKind::LockedCandidatesPointing),
             Some(Usage::Allowed),
         ));
         assert!(matches!(
-            s.usages.get(&TechniqueKind::LockedCandidatesClaiming),
+            s.usage(TechniqueKind::LockedCandidatesClaiming),
             Some(Usage::Allowed),
         ));
         assert!(matches!(
-            s.usages.get(&TechniqueKind::NakedPair),
+            s.usage(TechniqueKind::NakedPair),
             Some(Usage::Conceded),
         ));
         assert!(matches!(
-            s.usages.get(&TechniqueKind::XYWing),
+            s.usage(TechniqueKind::XYWing),
             Some(Usage::Forced { .. }),
         ));
     }
@@ -343,14 +420,14 @@ mod tests {
             TechniqueKind::NakedPair,
         ] {
             assert!(
-                matches!(s.usages.get(&in_baseline), Some(Usage::Allowed)),
+                matches!(s.usage(in_baseline), Some(Usage::Allowed)),
                 "{:?} should be Allowed in drill(Swordfish), got {:?}",
                 in_baseline,
-                s.usages.get(&in_baseline),
+                s.usage(in_baseline),
             );
         }
         assert!(matches!(
-            s.usages.get(&TechniqueKind::Swordfish),
+            s.usage(TechniqueKind::Swordfish),
             Some(Usage::Forced { .. }),
         ));
         // Everything strictly between NakedPair and Swordfish stays Conceded.
@@ -366,12 +443,12 @@ mod tests {
             TechniqueKind::WWing,
         ] {
             assert!(
-                matches!(s.usages.get(&in_between), Some(Usage::Conceded)),
+                matches!(s.usage(in_between), Some(Usage::Conceded)),
                 "{:?} should be Conceded under drill(Swordfish), got {:?}",
                 in_between,
-                s.usages.get(&in_between),
+                s.usage(in_between),
             );
         }
-        assert!(!s.usages.contains_key(&TechniqueKind::Jellyfish));
+        assert!(!s.is_in_scope(TechniqueKind::Jellyfish));
     }
 }

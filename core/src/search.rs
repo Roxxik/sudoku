@@ -137,7 +137,7 @@ fn avoid_walk(board: &Board, spec: &Spec, target: TechniqueKind) -> AvoidWalk {
 /// avoid walk targets one; conventionally that's the hardest one.
 pub fn primary_target(spec: &Spec) -> Option<TechniqueKind> {
     let mut best: Option<(TechniqueKind, u32)> = None;
-    for (&k, u) in &spec.usages {
+    for (k, u) in spec.iter_usages() {
         if matches!(u, Usage::Forced { .. }) {
             let d = k.difficulty();
             if best.map_or(true, |(_, bd)| d > bd) {

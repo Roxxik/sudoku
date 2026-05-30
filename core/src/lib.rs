@@ -33,7 +33,7 @@ pub use solver::{
     deduction_counts_filtered, max_technique, next_step, next_step_filtered, solve,
     solve_filtered,
 };
-pub use spec::{RequireAny, Spec, Usage};
+pub use spec::{RequireAny, Spec, TechniqueSet, Usage};
 pub use techniques::{
     Deduction, Family, HouseRef, REGISTRY, Step, TechniqueDef, TechniqueKind,
 };

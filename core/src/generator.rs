@@ -317,45 +317,57 @@ pub fn make_puzzle_for_spec_with_search(
                 if puzzle.is_empty(i) {
                     continue;
                 }
-                let mut candidate = puzzle.clone();
-                candidate.clear(i);
+                // Strip cell `i` in place and probe; restore it if the strip is
+                // rejected. Avoids cloning the whole board per candidate cell —
+                // `place(i, orig)` after `clear(i)` reconstructs the exact prior
+                // candidates (only this cell's value was removed), and the probes
+                // below never mutate `puzzle`. On acceptance the board is already
+                // in its stripped state, so there is nothing to copy.
+                let orig = puzzle.cell(i);
+                puzzle.clear(i);
                 // Uniqueness gate, specialized to the strip context (NOT a
                 // drop-in for the general count_solutions used elsewhere, e.g.
                 // local_search — this relies on a loop-local invariant).
                 //
-                // `candidate` is `puzzle` (unique, its one solution is
-                // `solution`) with exactly one more cell `i` cleared. So
-                // `solution` is already a solution of `candidate`, and any
-                // *second* solution must differ at `i` (a solution agreeing at
-                // `i` would also solve `puzzle`, which is unique). Hence the
+                // The stripped `puzzle` is the previous (unique, its one solution
+                // is `solution`) board with exactly one more cell `i` cleared. So
+                // `solution` is already a solution of it, and any *second*
+                // solution must differ at `i` (a solution agreeing at `i` would
+                // also solve the pre-strip board, which is unique). Hence the
                 // board is non-unique iff some alternate digit at `i` — any
                 // candidate other than its solution value — also completes.
                 // Testing just those alternates skips re-deriving the solution
                 // we already hold (the whole `i = solution[i]` subtree), so it's
-                // strictly less search than count_solutions(&candidate, 2). A
-                // cell left as a naked single (no alternates) is proven unique
-                // with no backtracking at all.
+                // strictly less search than count_solutions(.., 2). A cell left
+                // as a naked single (no alternates) is proven unique with no
+                // backtracking at all.
                 let v_bit = digit_to_bit(solution.cell(i));
-                let alts = candidate.candidates(i) & !v_bit;
+                let alts = puzzle.candidates(i) & !v_bit;
                 let mut non_unique = false;
-                for d in iter_digits(alts) {
-                    let mut probe = candidate.clone();
-                    probe.place(i, d);
-                    if uniqueness::has_solution(&probe) {
-                        non_unique = true;
-                        break;
+                if alts != 0 {
+                    // Hoist: build the compact solver from the stripped board
+                    // once, then clone+place per alternate digit instead of
+                    // rebuilding a Board + dense array for every probe.
+                    let probe = uniqueness::ExistenceProbe::from_board(&puzzle);
+                    for d in iter_digits(alts) {
+                        if probe.has_solution_with(i, d) {
+                            non_unique = true;
+                            break;
+                        }
                     }
                 }
                 if non_unique {
+                    puzzle.place(i, orig); // reject: undo the strip
                     continue;
                 }
                 // Augmented baseline check: solve with baseline techniques and
                 // track whether the trace meets the spec's requirement counts.
-                let outcome = baseline_solve_tracked(&candidate, spec, &req);
+                let outcome = baseline_solve_tracked(&puzzle, spec, &req);
                 if !outcome.solved {
+                    puzzle.place(i, orig); // reject: undo the strip
                     continue;
                 }
-                puzzle = candidate;
+                // Accept: `puzzle` is already in its stripped state.
                 if outcome.requirement_met {
                     best = Some(puzzle.clone());
                 }
@@ -477,8 +489,8 @@ impl RequirementSummary {
     fn from_spec(spec: &Spec) -> Self {
         let mut forced = [0usize; NUM_TECHNIQUES];
         let mut any_forced = false;
-        for (&k, usage) in &spec.usages {
-            if let Usage::Forced { count } = *usage {
+        for (k, usage) in spec.iter_usages() {
+            if let Usage::Forced { count } = usage {
                 forced[kind_index(k)] = count.get();
                 any_forced = true;
             }
@@ -486,10 +498,7 @@ impl RequirementSummary {
         let require_any: Vec<(u32, usize)> = spec
             .require_any
             .iter()
-            .map(|r| {
-                let mask: u32 = r.kinds.iter().fold(0u32, |m, &k| m | (1u32 << kind_index(k)));
-                (mask, r.count.get())
-            })
+            .map(|r| (r.kinds.bits(), r.count.get()))
             .collect();
         let is_empty = !any_forced && require_any.is_empty();
         Self { forced, require_any, is_empty }
@@ -689,12 +698,20 @@ fn baseline_solve_tracked(
 ) -> BaselineOutcome {
     let mut b = board.clone();
     let mut counts = [0usize; NUM_TECHNIQUES];
+    // Precompute the baseline membership of every technique once. The filter is
+    // queried per technique per solve step (many times); reducing it to an array
+    // index here avoids re-hashing the `TechniqueKind` into `spec.usages` on each
+    // query. Identical result to calling `spec.is_baseline(t)` directly.
+    let mut baseline = [false; NUM_TECHNIQUES];
+    for def in REGISTRY {
+        baseline[kind_index(def.kind)] = spec.is_baseline(def.kind);
+    }
     loop {
         if b.is_solved() {
             let requirement_met = req.is_empty || requirement_met(&counts, req);
             return BaselineOutcome { solved: true, requirement_met };
         }
-        match next_step_filtered(&b, |t| spec.is_baseline(t)) {
+        match next_step_filtered(&b, |t| baseline[kind_index(t)]) {
             None => return BaselineOutcome { solved: false, requirement_met: false },
             Some(s) => {
                 counts[kind_index(s.technique)] += 1;

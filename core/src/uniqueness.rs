@@ -15,6 +15,18 @@ const PADDED: usize = 96; // 6 * LANES, >= 81
 /// can recognise "this lane is not an empty cell" by testing this single bit.
 const FILLED: u16 = 0x200;
 
+/// Lane-local indices `[0, 1, ..., LANES-1]`, added to a per-chunk base to form
+/// each lane's global cell index for the packed single-pass MRV scan.
+const LANE_INDICES: [u16; LANES] = {
+    let mut a = [0u16; LANES];
+    let mut i = 0;
+    while i < LANES {
+        a[i] = i as u16;
+        i += 1;
+    }
+    a
+};
+
 /// A placement-only solver state, used by the existence/uniqueness search.
 ///
 /// The full [`Board`] keeps a per-cell candidate mask (162 B) so technique
@@ -59,6 +71,35 @@ impl FastSolver {
         s
     }
 
+    /// Build directly from a board's already-maintained candidate masks.
+    ///
+    /// A [`Board`] keeps an incremental per-cell candidate mask, so for an empty
+    /// cell `b.candidates(i)` is already `ALL_DIGITS` minus its peers' filled
+    /// digits — byte-for-byte the value [`from_board`](Self::from_board) would
+    /// reconstruct by replaying every given through `place`. Copying it is O(81)
+    /// instead of O(givens x 20).
+    ///
+    /// PRECONDITION: the board's candidate masks must equal the *naked*
+    /// candidates (no technique eliminations applied) — true for the strip
+    /// loop's freshly `recompute_candidates`'d boards. The debug assertion below
+    /// cross-checks against the replay path.
+    fn from_board_candidates(b: &Board) -> Self {
+        let mut s = FastSolver {
+            cand: [FILLED; PADDED],
+        };
+        for i in 0..CELLS {
+            if b.cell(i) == 0 {
+                s.cand[i] = b.candidates(i);
+            }
+        }
+        debug_assert_eq!(
+            s.cand,
+            FastSolver::from_board(b).cand,
+            "from_board_candidates diverged from the replay path"
+        );
+        s
+    }
+
     #[inline]
     fn place(&mut self, i: usize, d: u8) {
         let clear = !(1u16 << (d as u16 - 1));
@@ -80,48 +121,47 @@ impl FastSolver {
     /// returned `best_cell == usize::MAX` => no empty cells remain (solved).
     #[inline]
     fn scan(&self) -> (usize, u32, u16) {
-        let digits = Simd::<u16, LANES>::splat(ALL_DIGITS);
         let filled_bit = Simd::<u16, LANES>::splat(FILLED);
         let penalty = Simd::<u16, LANES>::splat(100);
         let zero = Simd::<u16, LANES>::splat(0);
-        let mut score = [Simd::<u16, LANES>::splat(0); PADDED / LANES];
-        // Keep a running per-lane minimum across all chunks and reduce it once
-        // at the end — one horizontal reduction instead of six.
-        let mut acc = penalty;
-        for (k, chunk) in score.iter_mut().enumerate() {
+        let seven = Simd::<u16, LANES>::splat(7);
+        let lane_idx = Simd::<u16, LANES>::from_array(LANE_INDICES);
+        // Single-pass MRV: pack each lane as `(score << 7) | global_index`. The
+        // global index is 0..95 (7 bits), the score 0..9 (or the 100 penalty),
+        // so one `reduce_min` yields both the minimum candidate count *and* the
+        // first lane achieving it (ties resolve to the lowest index) — no second
+        // locate pass, no stored per-chunk score array.
+        let mut acc = Simd::<u16, LANES>::splat(u16::MAX);
+        for k in 0..PADDED / LANES {
             // SAFETY: k*LANES + LANES <= PADDED, so the load stays in bounds.
             let v = Simd::<u16, LANES>::from_slice(unsafe {
                 self.cand.get_unchecked(k * LANES..k * LANES + LANES)
             });
-            // popcount of the nine digit bits => candidate count (0..9).
-            let pc = (v & digits).count_ones();
+            // popcount => candidate count (0..9) for empty cells (which carry
+            // only digit bits 0..8). Filled / padding lanes carry the FILLED
+            // sentinel and pop to 1 here, but are overwritten by the penalty
+            // below, so masking off the sentinel first would be wasted work.
+            let pc = v.count_ones();
             // Filled / padding lanes carry the sentinel: push them out of the
             // running with a large penalty so they never win the MRV min.
             let is_filled: Mask<i16, LANES> = (v & filled_bit).simd_ne(zero);
             let s = is_filled.select(penalty, pc);
-            acc = acc.simd_min(s);
-            *chunk = s;
+            let idx = lane_idx + Simd::<u16, LANES>::splat((k * LANES) as u16);
+            acc = acc.simd_min((s << seven) | idx);
         }
-        let best_count = acc.reduce_min();
+        let best = acc.reduce_min();
+        let best_count = best >> 7;
         if best_count == 0 {
             return (usize::MAX, 0, 0); // dead end (some empty cell has no candidate)
         }
         if best_count >= 100 {
             return (usize::MAX, 10, 0); // every cell filled — solved
         }
-        // Locate the first lane whose score equals the minimum.
-        let target = Simd::<u16, LANES>::splat(best_count);
-        for (k, s) in score.iter().enumerate() {
-            let bm = s.simd_eq(target).to_bitmask();
-            if bm != 0 {
-                let i = k * LANES + bm.trailing_zeros() as usize;
-                // SAFETY: i < 81 here — it indexes a lane that matched a real
-                // (non-penalty) score, which only empty cells produce.
-                let mask = unsafe { *self.cand.get_unchecked(i) } & ALL_DIGITS;
-                return (i, best_count as u32, mask);
-            }
-        }
-        unreachable!()
+        let i = (best & 0x7F) as usize;
+        // SAFETY: i < 81 here — it indexes the lane that won a real (non-penalty)
+        // score, which only empty cells produce.
+        let mask = unsafe { *self.cand.get_unchecked(i) } & ALL_DIGITS;
+        (i, best_count as u32, mask)
     }
 
     /// True if the grid has at least one completion. Forced singles are applied
@@ -161,6 +201,41 @@ impl FastSolver {
 /// probes need.
 pub fn has_solution(board: &Board) -> bool {
     FastSolver::from_board(board).solve_first()
+}
+
+/// A reusable existence-probe built once from a board, then cheaply cloned and
+/// extended with a single placement per probe.
+///
+/// The strip loop tests, for one cleared cell, several alternate digits against
+/// the *same* base board. Building the dense [`FastSolver`] once and cloning the
+/// compact 96-lane state per alternate avoids rebuilding a `Board` + dense array
+/// for every probe (the old `has_solution(&candidate.clone().place(i,d))` path).
+pub struct ExistenceProbe {
+    base: FastSolver,
+}
+
+impl ExistenceProbe {
+    pub fn from_board(board: &Board) -> Self {
+        // Strip-loop boards carry naked candidate masks, so the compact state
+        // can be copied straight from them (see `from_board_candidates`).
+        ExistenceProbe {
+            base: FastSolver::from_board_candidates(board),
+        }
+    }
+
+    /// True iff placing digit `d` (1..=9) at the (empty) cell `i` of the board
+    /// this probe was built from yields a grid with at least one completion.
+    ///
+    /// Equivalent to `has_solution(&b)` where `b` is the base board with `i` set
+    /// to `d`: `place` only clears bits / sets the FILLED sentinel and those ops
+    /// commute, so cloning the base and placing `i=d` reaches the same dense
+    /// state as rebuilding from a board that already has `i=d` given.
+    #[inline]
+    pub fn has_solution_with(&self, i: usize, d: u8) -> bool {
+        let mut s = self.base.clone();
+        s.place(i, d);
+        s.solve_first()
+    }
 }
 
 pub fn count_solutions(board: &Board, limit: usize) -> usize {
@@ -363,5 +438,84 @@ mod tests {
         let b = Board::parse(puzzle).unwrap();
         let sol = solve_unique(&b).unwrap();
         assert!(sol.is_solved());
+    }
+
+    /// Cross-check the SIMD existence solver against the canonical backtracker
+    /// over many pseudo-random partially-filled boards. `has_solution` must
+    /// agree with `count_solutions(.., 1) > 0` on every single board — this is
+    /// the safety net for the unsafe dense-array / SIMD scan code.
+    #[test]
+    fn has_solution_matches_count_solutions() {
+        use crate::rng::Rng;
+        let mut rng = Rng::from_seed(0xC0FFEE);
+        for _ in 0..2000 {
+            // Build a random partially-filled, internally-consistent board by
+            // placing a random number of givens; skip illegal placements.
+            let mut b = Board::empty();
+            let givens = rng.range(40) + 1;
+            for _ in 0..givens {
+                let cell = rng.range(CELLS);
+                if !b.is_empty(cell) {
+                    continue;
+                }
+                let cs = b.candidates(cell);
+                if cs == 0 {
+                    continue;
+                }
+                let choices: Vec<u8> = iter_digits(cs).collect();
+                let d = choices[rng.range(choices.len())];
+                b.place(cell, d);
+            }
+            let fast = has_solution(&b);
+            let canonical = count_solutions(&b, 1) > 0;
+            assert_eq!(fast, canonical, "mismatch on board {}", b.to_string());
+        }
+    }
+
+    /// Cross-check the strip-loop `ExistenceProbe` fast path (copy-from-board
+    /// constructor + clone+place per alternate) against the canonical
+    /// backtracker. Mirrors the strip loop's usage: clear one filled cell, then
+    /// probe each alternate digit. Run in a debug build, this also exercises the
+    /// `from_board_candidates` debug assertion.
+    #[test]
+    fn existence_probe_matches_count_solutions() {
+        use crate::rng::Rng;
+        let mut rng = Rng::from_seed(0x1234_5678);
+        for _ in 0..60 {
+            let mut b = Board::empty();
+            let givens = rng.range(50) + 5;
+            for _ in 0..givens {
+                let cell = rng.range(CELLS);
+                if !b.is_empty(cell) {
+                    continue;
+                }
+                let cs = b.candidates(cell);
+                if cs == 0 {
+                    continue;
+                }
+                let choices: Vec<u8> = iter_digits(cs).collect();
+                let d = choices[rng.range(choices.len())];
+                b.place(cell, d);
+            }
+            // Clear one filled cell to recreate the strip-loop shape.
+            let filled: Vec<usize> = (0..CELLS).filter(|&i| !b.is_empty(i)).collect();
+            if filled.is_empty() {
+                continue;
+            }
+            let i = filled[rng.range(filled.len())];
+            b.clear(i);
+            let probe = ExistenceProbe::from_board(&b);
+            for d in iter_digits(b.candidates(i)) {
+                let probe_says = probe.has_solution_with(i, d);
+                let mut placed = b.clone();
+                placed.place(i, d);
+                let canonical = count_solutions(&placed, 1) > 0;
+                assert_eq!(
+                    probe_says, canonical,
+                    "probe mismatch at cell {} digit {} on {}",
+                    i, d, b.to_string()
+                );
+            }
+        }
     }
 }

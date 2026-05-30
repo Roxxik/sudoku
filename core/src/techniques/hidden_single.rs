@@ -5,37 +5,54 @@ use crate::techniques::{Deduction, HouseRef, Step, TechniqueKind};
 
 fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
     for (kind, idx, unit) in all_units() {
-        for d in 1u8..=9 {
-            let bit = digit_to_bit(d);
-            let mut count = 0;
-            let mut location: usize = 0;
-            let mut already_placed = false;
+        // Single pass over the unit: `once` is the set of digits appearing as a
+        // candidate of at least one empty cell, `twice` the set appearing in two
+        // or more. A hidden single is a digit that occurs in exactly one empty
+        // cell, i.e. `once & !twice`. (A digit already placed in the unit can't
+        // be a candidate of any empty peer, so it never enters `once`; mask it
+        // out anyway for safety.) This replaces the old 9-digit x 9-cell sweep
+        // with one 9-cell sweep, while emitting the identical steps in the same
+        // order: ascending unit, then ascending digit, then the unique cell.
+        let mut placed = 0u16;
+        let mut once = 0u16;
+        let mut twice = 0u16;
+        for &cell in unit {
+            let v = board.cell(cell);
+            if v != 0 {
+                placed |= digit_to_bit(v);
+            } else {
+                let m = board.candidates(cell);
+                twice |= once & m;
+                once |= m;
+            }
+        }
+        let mut singles = once & !twice & !placed;
+        while singles != 0 {
+            let bit = singles & singles.wrapping_neg(); // lowest set candidate bit
+            singles &= singles - 1;
+            let d = bit.trailing_zeros() as u8 + 1;
+            // Exactly one empty cell in the unit carries this bit; find it.
+            let mut location = 0;
             for &cell in unit {
-                if board.cell(cell) == d {
-                    already_placed = true;
+                if board.is_empty(cell) && board.candidates(cell) & bit != 0 {
+                    location = cell;
                     break;
                 }
-                if board.is_empty(cell) && board.candidates(cell) & bit != 0 {
-                    count += 1;
-                    location = cell;
-                }
             }
-            if !already_placed && count == 1 {
-                let step = Step {
-                    technique: TechniqueKind::HiddenSingle,
-                    deductions: smallvec![Deduction::Place {
-                        cell: location,
-                        digit: d,
-                    }],
-                    focus_cells: smallvec![location],
-                    focus_house: Some(HouseRef {
-                        kind,
-                        index: idx as u8,
-                    }),
-                };
-                if !emit(step) {
-                    return;
-                }
+            let step = Step {
+                technique: TechniqueKind::HiddenSingle,
+                deductions: smallvec![Deduction::Place {
+                    cell: location,
+                    digit: d,
+                }],
+                focus_cells: smallvec![location],
+                focus_house: Some(HouseRef {
+                    kind,
+                    index: idx as u8,
+                }),
+            };
+            if !emit(step) {
+                return;
             }
         }
     }

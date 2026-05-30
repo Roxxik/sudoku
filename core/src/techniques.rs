@@ -325,7 +325,20 @@ pub const REGISTRY: &[TechniqueDef] = &[
     },
 ];
 
+/// Number of distinct [`TechniqueKind`] variants. Every kind has exactly one
+/// REGISTRY entry (asserted in tests), so this is both the registry length and
+/// the exclusive upper bound of `kind as usize` — the index space [`Spec`] uses
+/// for its dense, allocation-free technique tables.
+pub const NUM_TECHNIQUE_KINDS: usize = REGISTRY.len();
+
 impl TechniqueKind {
+    /// Dense index in `0..NUM_TECHNIQUE_KINDS`, the enum discriminant. Used to
+    /// address per-technique arrays and bitmasks without hashing.
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
     pub fn def(self) -> &'static TechniqueDef {
         REGISTRY
             .iter()

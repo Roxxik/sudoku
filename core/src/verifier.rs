@@ -1,8 +1,6 @@
-use std::collections::HashSet;
-
 use crate::board::Board;
 use crate::solver::{apply_step, next_step_filtered};
-use crate::spec::{Spec, Usage};
+use crate::spec::{Spec, TechniqueSet, Usage};
 use crate::techniques::TechniqueKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +21,7 @@ pub enum Violation {
     /// A `RequireAny` constraint didn't reach its required count of uses
     /// drawn from `kinds` — `actual` fell short of `required`.
     ForcedAnyShort {
-        kinds: HashSet<TechniqueKind>,
+        kinds: TechniqueSet,
         required: usize,
         actual: usize,
     },
@@ -41,8 +39,8 @@ pub fn verify(board: &Board, spec: &Spec) -> Result<(), Vec<Violation>> {
     // walk has access to Allowed and Conceded (everything in scope but T) —
     // so for the check to pass, T must beat the full sub-T toolbox the spec
     // grants the hypothetical solver.
-    for (&t, usage) in &spec.usages {
-        if let Usage::Forced { count } = *usage {
+    for (t, usage) in spec.iter_usages() {
+        if let Usage::Forced { count } = usage {
             let min_uses = min_required_uses_of(board, spec, |k| k == t);
             if min_uses < count.get() {
                 violations.push(Violation::ForcedTechniqueShort {
@@ -55,10 +53,10 @@ pub fn verify(board: &Board, spec: &Spec) -> Result<(), Vec<Violation>> {
     }
 
     for require in &spec.require_any {
-        let min_uses = min_required_uses_of(board, spec, |k| require.kinds.contains(&k));
+        let min_uses = min_required_uses_of(board, spec, |k| require.kinds.contains(k));
         if min_uses < require.count.get() {
             violations.push(Violation::ForcedAnyShort {
-                kinds: require.kinds.clone(),
+                kinds: require.kinds,
                 required: require.count.get(),
                 actual: min_uses,
             });

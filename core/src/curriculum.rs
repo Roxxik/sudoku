@@ -247,16 +247,16 @@ mod tests {
     fn tier_master_allows_all() {
         let s = Spec::tier(Tier::Master);
         for d in REGISTRY {
-            assert!(s.usages.contains_key(&d.kind), "missing {:?}", d.kind);
+            assert!(s.is_in_scope(d.kind), "missing {:?}", d.kind);
         }
     }
 
     #[test]
     fn tier_easy_only_singles() {
         let s = Spec::tier(Tier::Easy);
-        assert!(s.usages.contains_key(&TechniqueKind::NakedSingle));
-        assert!(s.usages.contains_key(&TechniqueKind::HiddenSingle));
-        assert!(!s.usages.contains_key(&TechniqueKind::NakedPair));
+        assert!(s.is_in_scope(TechniqueKind::NakedSingle));
+        assert!(s.is_in_scope(TechniqueKind::HiddenSingle));
+        assert!(!s.is_in_scope(TechniqueKind::NakedPair));
     }
 
     #[test]

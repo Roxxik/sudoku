@@ -253,8 +253,7 @@ pub fn construct_with(
 }
 
 pub fn compose(spec: &Spec, rng: &mut Rng) -> Option<Board> {
-    if let Some(crate::spec::Usage::Forced { .. }) = spec.usages.get(&TechniqueKind::HiddenTriple)
-    {
+    if let Some(crate::spec::Usage::Forced { .. }) = spec.usage(TechniqueKind::HiddenTriple) {
         let constructor = HiddenTripleConstructor::for_spec(spec.clone());
         for _ in 0..500 {
             let solution = random_full_grid(rng);

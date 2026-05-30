@@ -28,7 +28,12 @@ impl Rng {
     }
 
     pub fn range(&mut self, hi: usize) -> usize {
-        (self.next_u64() as usize) % hi
+        // Reduce in u64 *before* narrowing to usize. `next_u64() as usize` would
+        // truncate to 32 bits on wasm32 (usize = u32) but not on 64-bit hosts,
+        // making the shuffle — and every generated puzzle — differ by backend.
+        // Doing `% hi` in u64 keeps the result identical on 32- and 64-bit
+        // targets (and is a no-op change on 64-bit, where usize is already u64).
+        (self.next_u64() % hi as u64) as usize
     }
 
     pub fn shuffle<T>(&mut self, slice: &mut [T]) {
