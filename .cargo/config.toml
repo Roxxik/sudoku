@@ -8,3 +8,9 @@ rustflags = ["-C", "target-cpu=native"]
 # ship simd128; the .wasm won't run on engines that don't.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "target-feature=+simd128"]
+
+# WASI target, used to benchmark solver-lab on the real wasm+simd128 instruction
+# set (run under wasmtime) instead of the host's wide AVX — the ultimate
+# deployment target is wasm128, where vector width and op cost differ.
+[target.wasm32-wasip1]
+rustflags = ["-C", "target-feature=+simd128"]

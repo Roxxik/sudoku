@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>solver-lab bench</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        padding: 1.2rem;
+        max-width: 40rem;
+        line-height: 1.4;
+      }
+      h1 { font-size: 1.3rem; margin: 0 0 0.3rem; }
+      p.sub { margin: 0 0 1rem; opacity: 0.7; font-size: 0.9rem; }
+      .controls { display: flex; gap: 0.8rem; align-items: end; flex-wrap: wrap; margin-bottom: 1rem; }
+      label { display: flex; flex-direction: column; font-size: 0.85rem; gap: 0.2rem; }
+      input { font-size: 1.1rem; padding: 0.4rem; width: 6rem; }
+      button {
+        font-size: 1.2rem;
+        padding: 0.7rem 1.4rem;
+        border-radius: 0.6rem;
+        border: none;
+        background: #2563eb;
+        color: white;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; }
+      #status { margin: 0.8rem 0; font-weight: 600; min-height: 1.4rem; }
+      pre {
+        background: rgba(127,127,127,0.12);
+        padding: 0.8rem;
+        border-radius: 0.5rem;
+        overflow-x: auto;
+        font-size: 0.95rem;
+        white-space: pre;
+      }
+      .env { font-size: 0.78rem; opacity: 0.7; word-break: break-all; margin-top: 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>solver-lab bench</h1>
+    <p class="sub">train(HiddenQuad) strip loop — existence-prover variants, wasm+simd128.</p>
+
+    <div class="controls">
+      <label>attempts
+        <input id="attempts" type="number" value="1500" min="100" step="100" />
+      </label>
+      <label>seed
+        <input id="seed" type="number" value="1" min="1" />
+      </label>
+      <label>note (optional)
+        <input id="note" type="text" placeholder="e.g. Pixel 7" style="width: 9rem" />
+      </label>
+      <button id="run">Run benchmark</button>
+    </div>
+
+    <div id="status">loading wasm…</div>
+    <pre id="results"></pre>
+    <p class="env" id="env"></p>
+
+    <script>
+      // Variants are discovered from the wasm module at load time (see load()),
+      // so registering a prover in Rust needs no edit here. `variants` is filled
+      // with { name, idx } once the module is ready.
+      let variants = [];
+
+      const $ = (id) => document.getElementById(id);
+      const status = $("status");
+      const results = $("results");
+
+      // Identify the engine from the UA so a report back is unambiguous.
+      function engineLabel() {
+        const ua = navigator.userAgent;
+        if (/Firefox|FxiOS/.test(ua)) return "Firefox (SpiderMonkey)";
+        if (/EdgA?|Edge/.test(ua)) return "Edge (V8)";
+        if (/CriOS/.test(ua)) return "Chrome iOS (WebKit, no V8!)";
+        if (/Chrome|Chromium/.test(ua)) return "Chrome (V8)";
+        if (/Safari/.test(ua)) return "Safari (JavaScriptCore)";
+        return "unknown";
+      }
+      $("env").textContent = engineLabel() + " — " + navigator.userAgent;
+
+      // Persist the note across reloads (handy on a phone where you re-run a
+      // lot). localStorage may be unavailable in private mode — ignore failures.
+      try {
+        const saved = localStorage.getItem("solver-lab-note");
+        if (saved !== null) $("note").value = saved;
+        $("note").addEventListener("input", () => {
+          try { localStorage.setItem("solver-lab-note", $("note").value); } catch (e) {}
+        });
+      } catch (e) {}
+
+      let exports = null;
+      const decoder = new TextDecoder();
+
+      // Read variant `i`'s name out of the module's data segment.
+      function variantName(i) {
+        const ptr = exports.variant_name_ptr(i);
+        const len = exports.variant_name_len(i);
+        return decoder.decode(new Uint8Array(exports.memory.buffer, ptr, len));
+      }
+
+      async function load() {
+        try {
+          const resp = await fetch("solver_lab.wasm", { cache: "no-cache" });
+          const bytes = await resp.arrayBuffer();
+          if (!WebAssembly.validate(new Uint8Array(bytes))) {
+            throw new Error("module failed validation (simd128 unsupported?)");
+          }
+          const { instance } = await WebAssembly.instantiate(bytes, {});
+          exports = instance.exports;
+          const count = exports.variant_count();
+          variants = Array.from({ length: count }, (_, i) => ({ name: variantName(i), idx: i }));
+          // Show the registered approaches up front so the loaded wasm version
+          // is verifiable before running.
+          status.textContent =
+            count + " approaches registered: " + variants.map((v) => v.name).join(", ") +
+            " — tap Run benchmark";
+          $("run").disabled = false;
+        } catch (e) {
+          status.textContent = "load failed: " + e.message;
+        }
+      }
+
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      async function run() {
+        $("run").disabled = true;
+        results.textContent = "";
+        const attempts = Math.max(100, Number($("attempts").value) | 0);
+        const seed = Math.max(1, Number($("seed").value) | 0);
+
+        const header =
+          "engine: " + engineLabel() + "\n" +
+          variants.length + " approaches, " + attempts + " attempts/variant, seed " + seed + "\n\n" +
+          "variant".padEnd(14) + "ms".padStart(9) + "us/attempt".padStart(13) + "vs base".padStart(10) + "\n";
+        results.textContent = header;
+
+        let baseMs = null;
+        let baseFp = null;
+        const rows = [];
+        for (const { name, idx } of variants) {
+          status.textContent = "running " + name + "…";
+          await sleep(30); // let the DOM paint the status before the blocking call
+
+          // Warm up the JIT, then measure.
+          exports.bench(idx, Math.min(attempts, 400), seed);
+          const t0 = performance.now();
+          const fp = exports.bench(idx, attempts, seed) >>> 0;
+          const ms = performance.now() - t0;
+
+          let mismatch = false;
+          if (baseFp === null) baseFp = fp;
+          else if (fp !== baseFp) mismatch = true;
+
+          const speedup = baseMs === null ? 1 : baseMs / ms;
+          if (baseMs === null) baseMs = ms;
+          const us = (ms * 1000) / attempts;
+          rows.push({ variant: name, ms, us, vs_base: speedup, fp, mismatch });
+          results.textContent +=
+            name.padEnd(14) +
+            ms.toFixed(1).padStart(9) +
+            us.toFixed(1).padStart(13) +
+            (speedup.toFixed(2) + "x").padStart(10) +
+            (mismatch ? "  !! FINGERPRINT MISMATCH" : "") + "\n";
+          await sleep(30);
+        }
+
+        // Report back to the laptop so nothing has to be hand-typed.
+        status.textContent = "done — reporting…";
+        const payload = {
+          ts: new Date().toISOString(),
+          engine: engineLabel(),
+          ua: navigator.userAgent,
+          note: $("note").value || "",
+          attempts,
+          seed,
+          results: rows,
+        };
+        try {
+          const r = await fetch("/report", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          status.textContent = r.ok
+            ? "done — reported to laptop ✓"
+            : "done — report failed (HTTP " + r.status + "); read numbers above";
+        } catch (e) {
+          status.textContent = "done — report failed (" + e.message + "); read numbers above";
+        }
+        $("run").disabled = false;
+      }
+
+      $("run").disabled = true;
+      $("run").addEventListener("click", run);
+      load();
+    </script>
+  </body>
+</html>

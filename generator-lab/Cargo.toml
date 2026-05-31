@@ -1,0 +1,43 @@
+# Temporary generator testing-grounds crate (see generator-lab/README.md).
+#
+# Goal: a CLEAN-SLATE, spec-driven hidden-quad puzzle generator built ONLY for
+# benchmarking and tuning the performance-critical generation path — train/drill
+# generation by the `random` method (no local search, no construction). It
+# carries none of core's play-time baggage (no Step/Deduction/focus_cells, no
+# hint reporting): techniques mutate the board and report only which KIND fired,
+# which is all spec evaluation needs. PoC scope: the ladder up to HiddenQuad.
+#
+# Self-contained like solver-lab: it copies the minimal grid/rng/util primitives
+# from core so the hot path can be tuned in isolation. `core` is a dev-dependency
+# ONLY, for the faithfulness cross-check in tests/ (generated puzzles must pass
+# core's real `verify`).
+[package]
+name = "generator-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `lib` for the native examples + tests; `cdylib` for the wasm32 build that node
+# (V8) and browsers load and time with performance.now() — same dual-target shape
+# as solver-lab, so the mobile harness carries over.
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+# Off-by-default instrumentation hook (kept for parity with solver-lab; the
+# generator's phase split is done with Instant in the bench example).
+count = []
+
+# Mark the per-position phase-boundary functions `#[inline(never)]` so a sampling
+# profiler (e.g. Chrome/Firefox DevTools on a real phone, via the name section)
+# attributes time to distinct frames — from_board / any_alt_solves / baseline /
+# apply_clear / apply_place / clear_naked — instead of folding them into one
+# `attempt`. They are called ~once per stripped cell (not in the solver inner
+# loops), so the extra call overhead is <0.1% and the wasm still times like the
+# shipped build. Build the web wasm with this on for on-device profiling.
+profiling = []
+
+# Tests only: cross-check generated puzzles against core's real verifier/Spec so
+# we know train/drill generation is faithful. No production coupling.
+[dev-dependencies]
+sudoku-core = { path = "../core" }

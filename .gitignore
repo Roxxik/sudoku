@@ -1,2 +1,10 @@
 /target
 /web/dist
+# Bench wasm copied next to the mobile page by solver-lab/web/serve.sh, and the
+# results phones POST back.
+/solver-lab/web/solver_lab.wasm
+/solver-lab/web/results.jsonl
+
+# generator-lab: built wasm copied into web/, and phone-reported results
+generator-lab/web/generator_lab.wasm
+generator-lab/web/results.jsonl

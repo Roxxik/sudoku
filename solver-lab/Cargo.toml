@@ -1,0 +1,31 @@
+# Temporary testing-grounds crate (see solver-lab/README.md).
+#
+# Goal: benchmark several fast-solver variants against the *generator* workload
+# (random full grid -> strip to a minimal unique puzzle, gated by an existence
+# probe), pick a winner, and port it back into core::uniqueness. Deliberately
+# self-contained: it copies the minimal grid/rng primitives it needs from core
+# so each solver can be benchmarked in isolation without core's bloat.
+[package]
+name = "solver-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `lib` for the native example + tests; `cdylib` for the wasm32 build that node
+# (V8) and browsers load and time with performance.now().
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+
+# Off-by-default instrumentation: enables the global scan/place/clone counters
+# (src/counters.rs) read by `--example counts`. Left off, the `bump_*` calls
+# compile to nothing, so timing builds are never perturbed.
+[features]
+count = []
+
+# Tests only: cross-check the lab's ported primitives (baseline_solvable, the
+# grid) against core, so we know the strip trajectory stays faithful. No
+# production coupling — the lib and bench do not depend on core.
+[dev-dependencies]
+sudoku-core = { path = "../core" }

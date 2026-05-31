@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "cli", "wasm"]
+members = ["core", "cli", "wasm", "solver-lab", "generator-lab"]
 
 [profile.release]
 debug = "line-tables-only"
