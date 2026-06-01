@@ -44,7 +44,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
     for _ in 0..attempts {
         let t = Instant::now();
         let solution = random_full_grid(&mut rng);
-        let mut positions: Vec<usize> = (0..CELLS).collect();
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
         let mut bb = BitBoard::from_board(&solution);
         let mut placed = Placed::from_board(&solution);

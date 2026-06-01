@@ -91,6 +91,21 @@ impl Board {
         }
     }
 
+    /// Build a *complete* solution board directly from its 81 digits. Every cell
+    /// is filled, so the naked candidate masks are all zero — set them so
+    /// without the O(81×20) per-`place` peer maintenance. Used by
+    /// `random_full_grid`, whose bitboard fill produces the digits directly.
+    pub fn from_solved_cells(cells: [Digit; CELLS]) -> Self {
+        debug_assert!(
+            cells.iter().all(|&d| d != 0),
+            "from_solved_cells on an incomplete grid"
+        );
+        Self {
+            cells,
+            candidates: [0; CELLS],
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         let chars: Vec<char> = s
             .chars()
