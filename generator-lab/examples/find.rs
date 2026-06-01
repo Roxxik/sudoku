@@ -10,7 +10,7 @@ use generator_lab::spec_for_mode;
 fn main() {
     let mut mode = 0u32;
     let mut seed = 1u64;
-    let mut max = 200_000usize;
+    let mut max = 1_000_000usize;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {

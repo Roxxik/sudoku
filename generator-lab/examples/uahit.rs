@@ -130,6 +130,7 @@ fn main() {
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
         let spec = spec_for_mode(mode);
         let baseline = spec.baseline_mask();
+        let forced = spec.forced_mask();
         let mut rng = Rng::from_seed(1);
 
         let mut probes = 0u64;
@@ -202,7 +203,7 @@ fn main() {
                     cells[i] = orig;
                     bb.apply_place(i, orig, &mut placed);
                 } else {
-                    let outcome = bb.baseline(baseline);
+                    let outcome = bb.baseline(baseline, forced);
                     if !outcome.solved {
                         cells[i] = orig;
                         bb.apply_place(i, orig, &mut placed);

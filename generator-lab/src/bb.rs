@@ -769,7 +769,7 @@ impl BitBoard {
     /// anything changed. This is the banded solver's heart — no per-unit scan, no
     /// popcount; the only arithmetic is the occupancy gather and three box shifts.
     #[cfg_attr(prof_solver, inline(never))]
-    fn band_update_rm(&mut self) -> bool {
+    fn band_update_rm<const LC: bool, const TRACK: bool>(&mut self, fired: &mut u32) -> bool {
         let mut changed = false;
         for b in 0..3 {
             for d in 0..9 {
@@ -780,23 +780,30 @@ impl BitBoard {
                     BAND_CTR[2] += 1;
                 }
                 let mut live = (self.r[d] & self.unsolved_r)[b];
-                // Locked candidates: drop the triplets the within-band fixpoint kills.
-                let occ = triplet_occ(live);
-                let mut dropped = DROP_TRIP[occ];
-                if dropped != 0 {
-                    changed = true;
-                    #[cfg(feature = "count")]
-                    {
-                        prod = true;
+                // Locked candidates: drop the triplets the within-band fixpoint
+                // kills. Gated by the const `LC`: a spec whose baseline excludes
+                // locked candidates monomorphizes this block away entirely.
+                if LC {
+                    let occ = triplet_occ(live);
+                    let mut dropped = DROP_TRIP[occ];
+                    if dropped != 0 {
+                        changed = true;
+                        if TRACK {
+                            *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
+                        }
+                        #[cfg(feature = "count")]
+                        {
+                            prod = true;
+                        }
+                        while dropped != 0 {
+                            let t = dropped.trailing_zeros() as usize;
+                            dropped &= dropped - 1;
+                            let (rm, cm) = RM_LC_TRIP[b][t];
+                            self.r[d] &= !Simd::from_array(rm);
+                            self.c[d] &= !Simd::from_array(cm);
+                        }
+                        live = (self.r[d] & self.unsolved_r)[b];
                     }
-                    while dropped != 0 {
-                        let t = dropped.trailing_zeros() as usize;
-                        dropped &= dropped - 1;
-                        let (rm, cm) = RM_LC_TRIP[b][t];
-                        self.r[d] &= !Simd::from_array(rm);
-                        self.c[d] &= !Simd::from_array(cm);
-                    }
-                    live = (self.r[d] & self.unsolved_r)[b];
                 }
                 // Hidden singles in the three rows (each a contiguous 9-bit chunk).
                 for rr in 0..3 {
@@ -804,6 +811,9 @@ impl BitBoard {
                     if s != 0xFF {
                         self.place(rm_cell(b, 9 * rr + s as u32), d as u8 + 1);
                         changed = true;
+                        if TRACK {
+                            *fired |= 1 << HIDDEN_SINGLE;
+                        }
                         #[cfg(feature = "count")]
                         {
                             prod = true;
@@ -821,6 +831,9 @@ impl BitBoard {
                         let bit = (s / 3) * 9 + 3 * k as usize + s % 3;
                         self.place(rm_cell(b, bit as u32), d as u8 + 1);
                         changed = true;
+                        if TRACK {
+                            *fired |= 1 << HIDDEN_SINGLE;
+                        }
                         #[cfg(feature = "count")]
                         {
                             prod = true;
@@ -844,7 +857,7 @@ impl BitBoard {
     /// hidden singles in columns (the in-lane lines of this view). Boxes are
     /// already covered row-major, so only the three columns of each band are swept.
     #[cfg_attr(prof_solver, inline(never))]
-    fn band_update_cm(&mut self) -> bool {
+    fn band_update_cm<const LC: bool, const TRACK: bool>(&mut self, fired: &mut u32) -> bool {
         let mut changed = false;
         for b in 0..3 {
             for d in 0..9 {
@@ -855,22 +868,27 @@ impl BitBoard {
                     BAND_CTR[2] += 1;
                 }
                 let mut live = (self.c[d] & self.unsolved_c)[b];
-                let occ = triplet_occ(live);
-                let mut dropped = DROP_TRIP[occ];
-                if dropped != 0 {
-                    changed = true;
-                    #[cfg(feature = "count")]
-                    {
-                        prod = true;
+                if LC {
+                    let occ = triplet_occ(live);
+                    let mut dropped = DROP_TRIP[occ];
+                    if dropped != 0 {
+                        changed = true;
+                        if TRACK {
+                            *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
+                        }
+                        #[cfg(feature = "count")]
+                        {
+                            prod = true;
+                        }
+                        while dropped != 0 {
+                            let t = dropped.trailing_zeros() as usize;
+                            dropped &= dropped - 1;
+                            let (rm, cm) = CM_LC_TRIP[b][t];
+                            self.r[d] &= !Simd::from_array(rm);
+                            self.c[d] &= !Simd::from_array(cm);
+                        }
+                        live = (self.c[d] & self.unsolved_c)[b];
                     }
-                    while dropped != 0 {
-                        let t = dropped.trailing_zeros() as usize;
-                        dropped &= dropped - 1;
-                        let (rm, cm) = CM_LC_TRIP[b][t];
-                        self.r[d] &= !Simd::from_array(rm);
-                        self.c[d] &= !Simd::from_array(cm);
-                    }
-                    live = (self.c[d] & self.unsolved_c)[b];
                 }
                 // Hidden singles in the three columns (each a 9-bit chunk here).
                 for cc in 0..3 {
@@ -878,6 +896,9 @@ impl BitBoard {
                     if s != 0xFF {
                         self.place(cm_cell(b, 9 * cc + s as u32), d as u8 + 1);
                         changed = true;
+                        if TRACK {
+                            *fired |= 1 << HIDDEN_SINGLE;
+                        }
                         #[cfg(feature = "count")]
                         {
                             prod = true;
@@ -899,8 +920,20 @@ impl BitBoard {
     /// Run all band propagation to a fixpoint: naked singles (cross-digit sieve)
     /// drained first, then the fused row- and column-major band updates, looping
     /// until nothing changes. Returns the reason it stopped.
+    /// Prober entry: full dual-view closure (naked + hidden singles + both LC
+    /// orientations), no fired-tracking. Monomorphizes to the original hot loop.
     #[cfg_attr(prof_solver, inline(never))]
     fn propagate(&mut self) -> Prop {
+        let mut fired = 0u32;
+        self.propagate_g::<true, false>(&mut fired)
+    }
+
+    /// Generic propagation core. `LC` gates the locked-candidates step (a spec
+    /// whose baseline excludes LC compiles it away); `TRACK` records which cheap
+    /// kinds fired into `fired` (bit = kind index), for the baseline gate's
+    /// fired-or-not bookkeeping — gated off (and free) for the prober.
+    #[cfg_attr(prof_solver, inline(never))]
+    fn propagate_g<const LC: bool, const TRACK: bool>(&mut self, fired: &mut u32) -> Prop {
         #[cfg(feature = "count")]
         unsafe {
             BAND_CTR[0] += 1;
@@ -920,6 +953,9 @@ impl BitBoard {
                     break;
                 }
                 pbump(4);
+                if TRACK {
+                    *fired |= 1 << NAKED_SINGLE;
+                }
                 if !self.place_singles(singles) {
                     return Prop::Contradiction;
                 }
@@ -928,8 +964,8 @@ impl BitBoard {
             unsafe {
                 BAND_CTR[1] += 1;
             }
-            let mut changed = self.band_update_rm();
-            changed |= self.band_update_cm();
+            let mut changed = self.band_update_rm::<LC, TRACK>(fired);
+            changed |= self.band_update_cm::<LC, TRACK>(fired);
             if !changed {
                 return Prop::Stuck;
             }
@@ -1035,12 +1071,112 @@ impl BitBoard {
     // peak hot path and `exactly_one`/`nonzero` handle the cross-lane case); the
     // column-major view rides along in the clone unused.
 
-    /// Solve with the `allowed` toolbox, easiest-first, tallying which kinds
-    /// fired. Naked singles drain in bit-parallel waves; the rarer harder
-    /// techniques apply one step at a time. Clones the base, so the prober can
-    /// reuse it.
+    /// Baseline gate: solve `self` with the `allowed` toolbox, tallying which
+    /// kinds fired. The requirement check reads only the `forced` kinds' counts,
+    /// so those must be exact; the rest only need fired-or-not.
+    ///
+    /// Dispatches on the spec shape between a batched fast path and the discrete
+    /// reference engine. Both yield identical `solved` and identical counts for
+    /// every Forced kind, so the strip trajectory is invariant to the choice
+    /// (the `find` anchor and `bb_equiv` pin this). `forced` is the Forced-kind
+    /// membership mask: a Forced kind must be counted exactly and so can never be
+    /// folded into the batched closure, hence the fast path requires no cheap kind
+    /// (singles / locked candidates) be Forced.
+    ///
+    /// PRECONDITION — the baseline toolbox must be **confluent**: applying its
+    /// techniques to a fixpoint reaches the same closure regardless of order, so
+    /// `solved` and the per-kind firing counts are well-defined (not an artifact of
+    /// scan order). Confluence is what lets both engines reorder/batch freely.
+    ///
+    /// It fails when a harder technique can degenerate into a simpler deduction the
+    /// toolbox lacks: a locked-candidates or subset elimination can collapse a unit
+    /// to a lone candidate — a *naked* single (needs NakedSingle) — or a digit to a
+    /// lone cell — a *hidden* single (needs HiddenSingle). The guard below requires
+    /// **both** singles once anything above hidden single is in the baseline. A
+    /// baseline that is a single technique on its own (just NakedSingle, or just
+    /// HiddenSingle) has nothing that degenerates and is fine — so a one-single
+    /// baseline is supported, but LC/subsets without both singles are not.
     #[cfg_attr(feature = "profiling", inline(never))]
-    pub fn baseline(&self, allowed: Mask) -> Outcome {
+    pub fn baseline(&self, allowed: Mask, forced: Mask) -> Outcome {
+        const NS_BIT: Mask = 1 << NAKED_SINGLE;
+        const HS_BIT: Mask = 1 << HIDDEN_SINGLE;
+        const LCP_BIT: Mask = 1 << LC_POINTING;
+        const LCC_BIT: Mask = 1 << LC_CLAIMING;
+        const CHEAP: Mask = NS_BIT | HS_BIT | LCP_BIT | LCC_BIT;
+        // Anything above a hidden single can degenerate into either single, so if
+        // any such kind is in the baseline, BOTH singles must be too, else the
+        // toolbox is non-confluent (see PRECONDITION). Debug-only: release ignores
+        // it, and the generator runs in release.
+        const HARDER: Mask = !(NS_BIT | HS_BIT) & ((1 << NUM) - 1);
+        debug_assert!(
+            allowed & HARDER == 0 || allowed & (NS_BIT | HS_BIT) == (NS_BIT | HS_BIT),
+            "non-confluent baseline (mask {allowed:#b}): a technique above hidden \
+             single is allowed without both singles — a degenerate elimination it \
+             produces could be a naked or hidden single the toolbox cannot place, \
+             making the solved/counts verdict scan-order dependent. Not supported."
+        );
+
+        let has_ns = allowed & NS_BIT != 0;
+        let has_hs = allowed & HS_BIT != 0;
+        let has_lcp = allowed & LCP_BIT != 0;
+        let has_lcc = allowed & LCC_BIT != 0;
+        // The fused closure does naked+hidden singles always and BOTH locked-
+        // candidate orientations together. So the fast path needs singles present,
+        // LC present-both-or-absent-both (it cannot honor just one orientation),
+        // and no Forced cheap kind (those need exact discrete counts). Everything
+        // else — single-orientation LC, Forced singles/LC, singles-absent — routes
+        // to the proven discrete engine.
+        let fast = has_ns && has_hs && (has_lcp == has_lcc) && (forced & CHEAP == 0);
+        if !fast {
+            return self.baseline_discrete(allowed);
+        }
+        if has_lcp {
+            self.baseline_fast::<true>(allowed)
+        } else {
+            self.baseline_fast::<false>(allowed)
+        }
+    }
+
+    /// Fast baseline: the gated fused closure (naked + hidden singles, plus both
+    /// LC orientations iff `LC`) drives every cheap technique to its joint
+    /// fixpoint; when that stalls, the discrete subset ladder
+    /// (NakedPair..HiddenQuad) advances one step and the closure re-runs. The
+    /// cheap-fixpoint board at every subset-decision point is identical to what
+    /// the easiest-first reference reaches there (the {singles, LC} closure is
+    /// confluent), so each subset firing — and the Forced target's exact count —
+    /// matches the reference. Cheap kinds are recorded fired-or-not only (they are
+    /// never Forced on this path, so the generator never reads their counts).
+    fn baseline_fast<const LC: bool>(&self, allowed: Mask) -> Outcome {
+        bump(0);
+        let mut bb = self.clone();
+        let mut counts = [0u16; NUM];
+        let mut fired = 0u32;
+        let result = loop {
+            match bb.propagate_g::<LC, true>(&mut fired) {
+                // A board with a known solution never contradicts under sound
+                // techniques; fold Contradiction into baseline-unsolvable anyway.
+                Prop::Solved => break true,
+                Prop::Contradiction => break false,
+                Prop::Stuck => {}
+            }
+            match bb.step_subsets(allowed) {
+                Some(k) => counts[k] = counts[k].saturating_add(1),
+                None => break false,
+            }
+        };
+        for k in 0..NUM {
+            if fired & (1 << k) != 0 && counts[k] == 0 {
+                counts[k] = 1;
+            }
+        }
+        Outcome { solved: result, counts }
+    }
+
+    /// Discrete reference baseline: naked singles drain in bit-parallel waves; the
+    /// rarer harder techniques (hidden single, both LC orientations, subsets)
+    /// apply one easiest-first step at a time, each counted exactly. The general
+    /// engine for any spec the fast path cannot fold faithfully.
+    fn baseline_discrete(&self, allowed: Mask) -> Outcome {
         bump(0);
         let mut bb = self.clone();
         let mut counts = [0u16; NUM];
@@ -1061,6 +1197,32 @@ impl BitBoard {
                 None => return Outcome { solved: false, counts },
             }
         }
+    }
+
+    /// The discrete subset ladder, easiest-first, gated by `allowed`: returns the
+    /// kind index of the first subset technique that fires, or `None` if none do.
+    /// Used by the fast path after the fused closure stalls (singles + LC are
+    /// already drained by the closure, so only NakedPair..HiddenQuad remain).
+    fn step_subsets(&mut self, allowed: Mask) -> Option<usize> {
+        if allowed & (1 << NAKED_PAIR) != 0 && self.naked_subset(2) {
+            return Some(NAKED_PAIR);
+        }
+        if allowed & (1 << HIDDEN_PAIR) != 0 && self.hidden_subset(2) {
+            return Some(HIDDEN_PAIR);
+        }
+        if allowed & (1 << NAKED_TRIPLE) != 0 && self.naked_subset(3) {
+            return Some(NAKED_TRIPLE);
+        }
+        if allowed & (1 << HIDDEN_TRIPLE) != 0 && self.hidden_subset(3) {
+            return Some(HIDDEN_TRIPLE);
+        }
+        if allowed & (1 << NAKED_QUAD) != 0 && self.naked_subset(4) {
+            return Some(NAKED_QUAD);
+        }
+        if allowed & (1 << HIDDEN_QUAD) != 0 && self.hidden_subset(4) {
+            return Some(HIDDEN_QUAD);
+        }
+        None
     }
 
     /// Place every naked single (cell with exactly one candidate) in waves until

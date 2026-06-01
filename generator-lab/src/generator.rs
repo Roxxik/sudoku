@@ -100,6 +100,7 @@ pub fn board_from_cells(cells: &[Digit; CELLS]) -> Board {
 /// One full strip attempt for `spec`. Mirrors core's per-attempt body.
 pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
     let baseline = spec.baseline_mask();
+    let forced = spec.forced_mask();
     let solution = random_full_grid(rng);
     let mut positions: Vec<usize> = (0..CELLS).collect();
     rng.shuffle(&mut positions);
@@ -146,7 +147,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
         if alts == 0 {
             debug_assert!(
                 {
-                    let o = bb.baseline(baseline);
+                    let o = bb.baseline(baseline, forced);
                     o.solved && spec.requirement_met(&o.counts) == req_met
                 },
                 "alts==0 fast-path invariant broke at {i}"
@@ -169,7 +170,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
         }
 
         // Baseline gate + requirement counts (one tracked solve).
-        let outcome = bb.baseline(baseline);
+        let outcome = bb.baseline(baseline, forced);
         if !outcome.solved {
             cells[i] = orig;
             bb.apply_place(i, orig, &mut placed);

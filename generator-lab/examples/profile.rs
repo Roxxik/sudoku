@@ -36,6 +36,7 @@ struct Phases {
 fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
     let spec = spec_for_mode(mode);
     let baseline = spec.baseline_mask();
+    let forced = spec.forced_mask();
     let mut rng = Rng::from_seed(seed);
     let mut p = Phases::default();
     let run = Instant::now();
@@ -85,7 +86,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             }
 
             let tb = Instant::now();
-            let outcome = bb.baseline(baseline);
+            let outcome = bb.baseline(baseline, forced);
             p.baseline += tb.elapsed();
             if !outcome.solved {
                 cells[i] = orig;

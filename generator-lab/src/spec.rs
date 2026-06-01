@@ -34,6 +34,33 @@ impl Spec {
         Spec { usage: [None; NUM] }
     }
 
+    /// Start an explicit, empty spec and layer kinds with [`Spec::allow`] /
+    /// [`Spec::force`] / [`Spec::concede_kind`]. The generator must accept every
+    /// label combination, not just `train`/`drill`; this is how callers (and the
+    /// equivalence tests) build arbitrary specs to exercise the baseline gate.
+    pub fn explicit() -> Self {
+        Self::empty()
+    }
+
+    /// Mark kind `idx` `Allowed` (part of the baseline toolbox).
+    pub fn allow(mut self, idx: usize) -> Self {
+        self.usage[idx] = Some(Usage::Allowed);
+        self
+    }
+
+    /// Mark kind `idx` `Forced` with the given required firing `count`.
+    pub fn force(mut self, idx: usize, count: u16) -> Self {
+        self.usage[idx] = Some(Usage::Forced(count));
+        self
+    }
+
+    /// Mark kind `idx` `Conceded` (in scope for verify's avoid-walk, but not part
+    /// of the baseline solvability toolbox).
+    pub fn concede_kind(mut self, idx: usize) -> Self {
+        self.usage[idx] = Some(Usage::Conceded);
+        self
+    }
+
     /// Allow every kind with difficulty <= `target`'s difficulty.
     fn allow_up_to(target: usize) -> Self {
         let cap = DIFFICULTY[target];
@@ -101,6 +128,20 @@ impl Spec {
         let mut m = 0;
         for idx in 0..NUM {
             if self.usage[idx].is_some() {
+                m |= 1 << idx;
+            }
+        }
+        m
+    }
+
+    /// Membership bitmask of the Forced kinds — `1 << idx` set iff kind `idx`
+    /// is `Forced`. The baseline engine reads this to choose a strategy: it must
+    /// count every Forced kind exactly (the requirement check reads those counts),
+    /// so a Forced kind can never be folded into the batched fast-path closure.
+    pub fn forced_mask(&self) -> Mask {
+        let mut m = 0;
+        for idx in 0..NUM {
+            if matches!(self.usage[idx], Some(Usage::Forced(_))) {
                 m |= 1 << idx;
             }
         }
