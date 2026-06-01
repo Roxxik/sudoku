@@ -9,7 +9,7 @@
 //! passes [`verify`], the attempt succeeds. This is the exact gate sequence and
 //! `best`/requirement/verify logic from core, just stripped to bools + counts.
 
-use crate::bb::BitBoard;
+use crate::bb::{BitBoard, Placed};
 use crate::grid::{Board, CELLS, Digit, digit_to_bit, popcount};
 use crate::rng::Rng;
 use crate::spec::Spec;
@@ -113,6 +113,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
     // duplicate per-cell *candidate* array (and its upkeep) is gone, as is any
     // per-position `from_board` rebuild.
     let mut bb = BitBoard::from_board(&solution);
+    let mut placed = Placed::from_board(&solution);
     let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
 
     // `best` is the bare-grid snapshot of the most-stripped requirement-meeting
@@ -128,7 +129,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
         }
         let orig = cells[i];
         cells[i] = 0;
-        let cand = bb.apply_clear(i, orig, &cells);
+        let cand = bb.apply_clear(i, orig, &mut placed);
         debug_assert!(
             bb == BitBoard::from_board(&board_from_cells(&cells)),
             "bb desync after clear at {i}"
@@ -159,7 +160,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
         // Uniqueness gate.
         if bb.any_alt_solves(i, alts) {
             cells[i] = orig;
-            bb.apply_place(i, orig);
+            bb.apply_place(i, orig, &mut placed);
             debug_assert!(
                 bb == BitBoard::from_board(&board_from_cells(&cells)),
                 "bb desync after revert at {i}"
@@ -171,7 +172,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
         let outcome = bb.baseline(baseline);
         if !outcome.solved {
             cells[i] = orig;
-            bb.apply_place(i, orig);
+            bb.apply_place(i, orig, &mut placed);
             debug_assert!(
                 bb == BitBoard::from_board(&board_from_cells(&cells)),
                 "bb desync after revert at {i}"

@@ -43,7 +43,7 @@
 //! `tests/bb_equiv.rs` cross-checks the baseline against the scalar engine;
 //! the generator's `find 118329` anchor pins it end-to-end.
 
-use crate::grid::{ALL_DIGITS, BOX_UNITS, Board, COL_UNITS, CELLS, Digit, PEERS, ROW_UNITS, digit_to_bit, iter_digits};
+use crate::grid::{BOX_UNITS, Board, COL_UNITS, CELLS, PEERS, ROW_UNITS, iter_digits};
 use crate::techniques::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, LC_CLAIMING, LC_POINTING, Mask,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, Outcome,
@@ -450,6 +450,31 @@ struct Sieve {
     twos: B,
 }
 
+/// Per-digit *clue* positions in the row-major banding: bit for cell `i` of
+/// `r[d-1]` is set iff cell `i` holds the clue digit `d`. This is the one fact
+/// the candidate bands can't cheaply answer — which surviving peer holds which
+/// digit — so `apply_clear` reads it to recompute reopened candidates with band
+/// ops instead of a per-peer scan of the scalar grid. Kept *outside* `BitBoard`:
+/// the solver never touches it, so it must not bloat the per-branch clone in
+/// `solve_first`. Only the row-major banding is stored — `apply_clear` enumerates
+/// it to get clue *cells*, then indexes both peer-mask tables by cell.
+pub struct Placed {
+    r: [B; 9],
+}
+
+impl Placed {
+    pub fn from_board(b: &Board) -> Self {
+        let mut r = [[0u32; 4]; 9];
+        for cell in 0..CELLS {
+            let d = b.cell(cell);
+            if d != 0 {
+                r[(d - 1) as usize][rm_lane(cell)] |= 1u32 << rm_bit(cell);
+            }
+        }
+        Placed { r: r.map(Simd::from_array) }
+    }
+}
+
 /// Why band propagation stopped.
 enum Prop {
     /// Every cell is filled — a completion exists on this line.
@@ -487,69 +512,81 @@ impl BitBoard {
 
     /// Re-open cell `i` (which held digit `d0`) in both views, keeping
     /// `self == from_board(board_from_cells(cells))` without a scalar *candidate*
-    /// shadow — bb owns all candidate state. `cells` is the bare puzzle grid
-    /// (present cell = its digit, `0` = stripped), the one thing bb can't derive
-    /// itself: which digit a surviving peer holds. A clear only (a) re-opens cell
-    /// `i`'s column to its naked candidates (all digits no still-present peer
-    /// holds) and (b) restores `d0` to the empty peers no *other* present peer
-    /// still blocks. Returns cell `i`'s naked candidate mask (the strip's `alts`
-    /// source). The caller must already have set `cells[i] = 0`.
+    /// shadow — bb owns all candidate state. `placed` is the per-digit clue map
+    /// (the one thing bb can't derive: which digit a surviving peer holds); this
+    /// method drops cell `i` from it first, then re-opens candidates in two
+    /// places: the **cleared cell** (its column becomes its naked candidates —
+    /// every digit no still-present peer holds) and **its peers** (`d0` returns to
+    /// the empty peers no *other* present peer still blocks). Both are pure band
+    /// ops off `placed` — no per-peer scan of the scalar grid. Returns cell `i`'s
+    /// naked candidate mask (the strip's `alts` source).
     #[cfg_attr(feature = "profiling", inline(never))]
-    pub fn apply_clear(&mut self, i: usize, d0: u8, cells: &[Digit; CELLS]) -> u16 {
+    pub fn apply_clear(&mut self, i: usize, d0: u8, placed: &mut Placed) -> u16 {
         let (ir, ic) = (bit_r(i), bit_c(i));
-        // (a) cell i: filled -> empty, column = its naked candidates.
+        let e = (d0 - 1) as usize;
+        // Cell i stops being a clue before we read peer occupancy off `placed`.
+        placed.r[e] &= !ir;
+
+        // Phase 1: reopen cells
+        // The cleared cell: filled -> empty, its column = its naked candidates.
+        // Digit `d` survives iff no still-present peer holds it (`placed[d]` misses
+        // i's peer mask) — a banded test per digit, not a per-peer grid scan.
         self.unsolved_r |= ir;
         self.unsolved_c |= ic;
-        let mut cand: u16 = ALL_DIGITS;
-        for &p in &PEERS[i] {
-            let pd = cells[p];
-            if pd != 0 {
-                cand &= !digit_to_bit(pd);
+        let prr = peer_mask_r(i);
+        let mut cand: u16 = 0;
+        for d in 0..9 {
+            if !nonzero(placed.r[d] & prr) {
+                cand |= 1 << d;
             }
         }
-        for e in 0..9 {
-            if cand & (1 << e) != 0 {
-                self.r[e] |= ir;
-                self.c[e] |= ic;
+        for d in 0..9 {
+            if cand & (1 << d) != 0 {
+                self.r[d] |= ir;
+                self.c[d] |= ic;
             } else {
-                self.r[e] &= !ir;
-                self.c[e] &= !ic;
+                self.r[d] &= !ir;
+                self.c[d] &= !ic;
             }
         }
-        // (b) d0 was blocked at every peer by cell i, so its bit there was 0;
-        // set it on each empty peer no other present peer still holds d0 (pure OR).
-        let e = (d0 - 1) as usize;
-        for &p in &PEERS[i] {
-            if cells[p] != 0 {
-                continue; // p still holds its clue
-            }
-            let mut blocked = false;
-            for &pp in &PEERS[p] {
-                if cells[pp] == d0 {
-                    blocked = true;
-                    break;
-                }
-            }
-            if !blocked {
-                self.r[e] |= bit_r(p);
-                self.c[e] |= bit_c(p);
+
+        // Phase 2: reopen peers
+        // Its peers: d0 was blocked at every peer by cell i, so its bit there was
+        // 0; set it on each empty peer no *other* present peer still holds d0. A
+        // clue d0 forbids d0 across its whole unit, i.e. exactly over its peer
+        // mask, so the cells still blocked from d0 are the union of the surviving
+        // d0 clues' peer masks (cell i is already dropped from `placed`). The
+        // reopened peers are i's empty peers outside that union — all band ops.
+        let mut blk_r = ZERO;
+        let mut blk_c = ZERO;
+        for lane in 0..3 {
+            let mut w = placed.r[e][lane];
+            while w != 0 {
+                let q = rm_cell(lane, w.trailing_zeros());
+                blk_r |= peer_mask_r(q);
+                blk_c |= peer_mask_c(q);
+                w &= w - 1;
             }
         }
+        self.r[e] |= prr & self.unsolved_r & !blk_r;
+        self.c[e] |= peer_mask_c(i) & self.unsolved_c & !blk_c;
         cand
     }
 
     /// Mirror `b.place(i, d0)` (the strip's revert) onto both views: cell `i`
-    /// goes empty -> filled (column cleared) and `d0` leaves every peer.
+    /// goes empty -> filled (column cleared), `d0` leaves every peer, and `i`
+    /// becomes a clue again in `placed`.
     #[cfg_attr(feature = "profiling", inline(never))]
-    pub fn apply_place(&mut self, i: usize, d0: u8) {
+    pub fn apply_place(&mut self, i: usize, d0: u8, placed: &mut Placed) {
         let (ir, ic) = (bit_r(i), bit_c(i));
+        let e = (d0 - 1) as usize;
+        placed.r[e] |= ir;
         self.unsolved_r &= !ir;
         self.unsolved_c &= !ic;
-        for e in 0..9 {
-            self.r[e] &= !ir;
-            self.c[e] &= !ic;
+        for d in 0..9 {
+            self.r[d] &= !ir;
+            self.c[d] &= !ic;
         }
-        let e = (d0 - 1) as usize;
         self.r[e] &= !peer_mask_r(i);
         self.c[e] &= !peer_mask_c(i);
     }
@@ -581,6 +618,22 @@ impl BitBoard {
             }
         }
         m
+    }
+
+    /// THROWAWAY instrumentation: empty cells on this board.
+    pub fn count_empties(&self) -> u32 {
+        popcnt(self.unsolved_r)
+    }
+
+    /// THROWAWAY instrumentation: how many cells the unrestricted propagation
+    /// closure (singles + hidden singles + LC to fixpoint, NO branch) determines.
+    pub fn closure_solved(&self) -> u32 {
+        let before = popcnt(self.unsolved_r);
+        let mut s = self.clone();
+        match s.propagate() {
+            Prop::Contradiction => before, // dead line — treat as fully resolved
+            _ => before - popcnt(s.unsolved_r),
+        }
     }
 
     // --- prober (existence DFS) -------------------------------------------

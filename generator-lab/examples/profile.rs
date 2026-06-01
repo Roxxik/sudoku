@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use generator_lab::bb::BitBoard;
+use generator_lab::bb::{BitBoard, Placed};
 use generator_lab::generator::{board_from_cells, random_full_grid};
 use generator_lab::grid::{CELLS, Digit, digit_to_bit};
 use generator_lab::rng::Rng;
@@ -46,6 +46,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
         let mut positions: Vec<usize> = (0..CELLS).collect();
         rng.shuffle(&mut positions);
         let mut bb = BitBoard::from_board(&solution);
+        let mut placed = Placed::from_board(&solution);
         let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
         p.grid += t.elapsed();
 
@@ -59,7 +60,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             cells[i] = 0;
 
             let tbuild = Instant::now();
-            let cand = bb.apply_clear(i, orig, &cells);
+            let cand = bb.apply_clear(i, orig, &mut placed);
             p.build += tbuild.elapsed();
 
             let v_bit = digit_to_bit(orig);
@@ -79,7 +80,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             p.prober += tp.elapsed();
             if non_unique {
                 cells[i] = orig;
-                bb.apply_place(i, orig);
+                bb.apply_place(i, orig, &mut placed);
                 continue;
             }
 
@@ -88,7 +89,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             p.baseline += tb.elapsed();
             if !outcome.solved {
                 cells[i] = orig;
-                bb.apply_place(i, orig);
+                bb.apply_place(i, orig, &mut placed);
                 continue;
             }
             req_met = spec.requirement_met(&outcome.counts);
