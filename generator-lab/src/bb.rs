@@ -317,6 +317,23 @@ const fn build_band_keep() -> [u32; 512] {
     t
 }
 
+/// The triplets a band drops under locked-candidates, keyed on occupancy:
+/// `DROP_TRIP[occ] = occ & !BAND_KEEP_OCC[occ]` precomputed, so the per-scan LC
+/// check is one table load instead of a load + `not` + `and` (the `not` was the
+/// single hottest instruction in `band_update`). Nonzero only for the rare
+/// occupancies that actually have an LC elimination.
+const DROP_TRIP: [u32; 512] = build_drop_trip();
+
+const fn build_drop_trip() -> [u32; 512] {
+    let mut t = [0u32; 512];
+    let mut occ = 0usize;
+    while occ < 512 {
+        t[occ] = occ as u32 & !BAND_KEEP_OCC[occ];
+        occ += 1;
+    }
+    t
+}
+
 /// Hidden-single lookup for a 9-cell unit reduced to a 9-bit candidate mask: the
 /// lone bit's index if exactly one is set, else `0xFF`. A row, box, or column
 /// collapses to nine bits, so detecting (and locating) a hidden single is one
@@ -765,7 +782,7 @@ impl BitBoard {
                 let mut live = (self.r[d] & self.unsolved_r)[b];
                 // Locked candidates: drop the triplets the within-band fixpoint kills.
                 let occ = triplet_occ(live);
-                let mut dropped = occ as u32 & !BAND_KEEP_OCC[occ];
+                let mut dropped = DROP_TRIP[occ];
                 if dropped != 0 {
                     changed = true;
                     #[cfg(feature = "count")]
@@ -839,7 +856,7 @@ impl BitBoard {
                 }
                 let mut live = (self.c[d] & self.unsolved_c)[b];
                 let occ = triplet_occ(live);
-                let mut dropped = occ as u32 & !BAND_KEEP_OCC[occ];
+                let mut dropped = DROP_TRIP[occ];
                 if dropped != 0 {
                     changed = true;
                     #[cfg(feature = "count")]
