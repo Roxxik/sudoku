@@ -6,7 +6,9 @@
 
 #[cfg(feature = "count")]
 fn main() {
-    use generator_lab::bb::{CTR_NAMES, ctr_reset, ctr_snapshot};
+    use generator_lab::bb::{
+        CTR_NAMES, PCTR_NAMES, ctr_reset, ctr_snapshot, pctr_reset, pctr_snapshot,
+    };
     use generator_lab::generator::run_attempts;
     use generator_lab::rng::Rng;
     use generator_lab::spec_for_mode;
@@ -20,10 +22,12 @@ fn main() {
     println!("baseline anatomy: {attempts} attempts/mode, seed 1\n");
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
         ctr_reset();
+        pctr_reset();
         let spec = spec_for_mode(mode);
         let mut rng = Rng::from_seed(1);
         let _ = run_attempts(&mut rng, &spec, attempts);
         let c = ctr_snapshot();
+        let pc = pctr_snapshot();
         let per_att = |x: u64| x as f64 / attempts as f64;
         let bcalls = c[0].max(1);
         println!("== {label} ==  ({:.1} baseline-calls/attempt)", per_att(c[0]));
@@ -33,6 +37,16 @@ fn main() {
                 CTR_NAMES[i],
                 per_att(c[i]),
                 c[i] as f64 / bcalls as f64,
+            );
+        }
+        let acalls = pc[0].max(1);
+        println!("  -- prober ({:.1} alt-calls/attempt) --", per_att(pc[0]));
+        for i in 0..8 {
+            println!(
+                "  {:<20} {:>9.1}/att   {:>6.2}/alt-call",
+                PCTR_NAMES[i],
+                per_att(pc[i]),
+                pc[i] as f64 / acalls as f64,
             );
         }
         println!();

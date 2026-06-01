@@ -29,11 +29,14 @@ fn main() {
     let label = if mode == 0 { "train" } else { "drill" };
     let spec = spec_for_mode(mode);
     let mut rng = Rng::from_seed(seed);
+    let t0 = std::time::Instant::now();
     let (puzzle, stats) = generate(&mut rng, &spec, max);
+    let elapsed = t0.elapsed();
+    let us_per_attempt = elapsed.as_secs_f64() * 1e6 / stats.attempts.max(1) as f64;
     match puzzle {
         Some(p) => {
             println!(
-                "{label}(HiddenQuad): found a {}-given puzzle after {} attempts",
+                "{label}(HiddenQuad): found a {}-given puzzle after {} attempts ({us_per_attempt:.2} us/attempt)",
                 p.givens, stats.attempts
             );
             println!("{}", p.puzzle.to_line());
@@ -41,7 +44,7 @@ fn main() {
         }
         None => {
             eprintln!(
-                "{label}(HiddenQuad): no puzzle in {} attempts (never-fired {}, not-forced {})",
+                "{label}(HiddenQuad): no puzzle in {} attempts (never-fired {}, not-forced {}, {us_per_attempt:.2} us/attempt)",
                 stats.attempts, stats.never_fired, stats.not_forced
             );
             std::process::exit(1);

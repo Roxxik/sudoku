@@ -59,6 +59,60 @@ pub fn ctr_reset() {
     }
 }
 
+// --- prober anatomy counters (feature = "count") ------------------------------
+// Where does the existence-DFS cost go: propagation (singles waves) vs branching
+// (recursion / clones)? Single-threaded lab, so plain mutable statics — see
+// solver-lab/src/counters.rs.
+pub const PCTR_NAMES: [&str; 8] = [
+    "alt-calls", "alt-nonunique", "solve_first-nodes", "sieve-waves",
+    "place_singles-calls", "branch-points", "child-clones", "branch-digits",
+];
+#[cfg(feature = "count")]
+static mut PCTR: [u64; 8] = [0; 8];
+// SAFETY: single-threaded use only; reads/writes a `u64` by value, no aliasing.
+#[inline(always)]
+fn pbump(_i: usize) {
+    #[cfg(feature = "count")]
+    unsafe {
+        PCTR[_i] += 1;
+    }
+}
+#[cfg(feature = "count")]
+pub fn pctr_snapshot() -> [u64; 8] {
+    unsafe { PCTR }
+}
+#[cfg(feature = "count")]
+pub fn pctr_reset() {
+    unsafe {
+        PCTR = [0; 8];
+    }
+}
+
+/// One existence-DFS query (`any_alt_solves`): the board sparsity it ran on, the
+/// work it cost, and whether it found a 2nd solution. Lets a diagnostic see WHERE
+/// prober time concentrates (sparse vs dense boards; unique-proving vs
+/// alt-finding) instead of just totals.
+#[cfg(feature = "count")]
+#[derive(Clone, Copy)]
+pub struct AltStat {
+    pub empties: u16,
+    pub nodes: u32,
+    pub guesses: u32,
+    pub nonunique: bool,
+}
+#[cfg(feature = "count")]
+static mut ALT_STATS: Vec<AltStat> = Vec::new();
+#[cfg(feature = "count")]
+pub fn alt_stats() -> &'static [AltStat] {
+    unsafe { &*core::ptr::addr_of!(ALT_STATS) }
+}
+#[cfg(feature = "count")]
+pub fn alt_stats_reset() {
+    unsafe {
+        (*core::ptr::addr_of_mut!(ALT_STATS)).clear();
+    }
+}
+
 const PEER_MASK: [[u64; 2]; CELLS] = build_peer_mask();
 const BITS: [[u64; 2]; CELLS] = build_bits();
 /// 27 units (9 rows, 9 cols, 9 boxes) as cell lists, in scan order.
@@ -137,6 +191,13 @@ fn nonzero(x: B) -> bool {
 #[inline(always)]
 fn popcnt(x: B) -> u32 {
     x[0].count_ones() + x[1].count_ones()
+}
+/// Exactly one bit set across the 128-bit value — popcount-free (wasm/ARM lack a
+/// cheap 16-bit popcount). One lane holds a single power-of-two, the other empty.
+#[inline(always)]
+fn exactly_one(x: B) -> bool {
+    let (lo, hi) = (x[0], x[1]);
+    (hi == 0 && lo != 0 && lo & (lo - 1) == 0) || (lo == 0 && hi != 0 && hi & (hi - 1) == 0)
 }
 /// Lowest set bit's index in the 128-bit value.
 #[inline(always)]
@@ -278,16 +339,41 @@ impl BitBoard {
                 while g != 0 {
                     let c = base + g.trailing_zeros() as usize;
                     g &= g - 1;
-                    if nonzero(peers & bit(c)) {
-                        return false;
-                    }
                     peers |= peer_mask(c);
                 }
+            }
+            // Two singles of digit d that are peers => contradiction. peer_mask
+            // excludes the cell itself, so a group cell lands in `peers` iff
+            // another group cell peers it — one `any_true` for the whole group
+            // instead of one per placed cell.
+            if nonzero(peers & group) {
+                return false;
             }
             self.unsolved &= !group;
             self.board[d] &= !peers;
         }
         true
+    }
+
+    /// Place every box hidden single (a digit with exactly one placeable cell in
+    /// a box) found in one sweep of the 9 boxes; returns whether any were placed.
+    /// `pos` is recomputed fresh per (box,digit) so a placement earlier in the
+    /// sweep is reflected; the caller's loop re-drives naked-single draining +
+    /// this until neither makes progress. Popcount-free (`exactly_one`).
+    fn place_box_hidden_singles(&mut self) -> bool {
+        let mut found = false;
+        for u in 18..27 {
+            let um = unit_mask(u);
+            for d in 0..9 {
+                let pos = self.board[d] & um & self.unsolved;
+                if exactly_one(pos) {
+                    let c = trailing(pos) as usize;
+                    self.place(c, d as u8 + 1);
+                    found = true;
+                }
+            }
+        }
+        found
     }
 
     #[inline]
@@ -317,7 +403,9 @@ impl BitBoard {
 
     /// True iff the grid has at least one completion.
     fn solve_first(&mut self) -> bool {
+        pbump(2);
         loop {
+            pbump(3);
             let Sieve { ones, twos } = self.sieve();
             if nonzero(self.unsolved & !ones) {
                 return false;
@@ -327,20 +415,31 @@ impl BitBoard {
             }
             let singles = self.unsolved & ones & !twos;
             if nonzero(singles) {
+                pbump(4);
                 if !self.place_singles(singles) {
                     return false;
                 }
                 continue;
             }
+            // Stronger propagation before branching: box hidden singles. Naked
+            // singles alone leave ~578 guesses/att; adding box hidden singles cuts
+            // that to ~121 (4.8x). Boxes only (units 18..26) — the best single
+            // unit type, and the cheapest detector (9 units, not 27).
+            if self.place_box_hidden_singles() {
+                continue;
+            }
+            pbump(5);
             let (cell, mask) = self.branch_cell();
             let mut m = mask;
             loop {
                 let d = m.trailing_zeros() as u8 + 1;
                 m &= m - 1;
+                pbump(7);
                 if m == 0 {
                     self.place(cell, d);
                     break;
                 }
+                pbump(6);
                 let mut child = self.clone();
                 child.place(cell, d);
                 if child.solve_first() {
@@ -355,6 +454,7 @@ impl BitBoard {
     /// non-unique. Consumes a clone, so the base is untouched for the baseline.
     #[cfg_attr(feature = "profiling", inline(never))]
     pub fn any_alt_solves(&self, i: usize, alts: u16) -> bool {
+        pbump(0);
         let mut s = self.clone();
         let keep = bit(i);
         for d in 0..9 {
@@ -362,7 +462,22 @@ impl BitBoard {
                 s.board[d] &= !keep;
             }
         }
-        s.solve_first()
+        #[cfg(feature = "count")]
+        let (n0, g0, empties) = unsafe { (PCTR[2], PCTR[5], popcnt(self.unsolved) as u16) };
+        let r = s.solve_first();
+        if r {
+            pbump(1);
+        }
+        #[cfg(feature = "count")]
+        unsafe {
+            (*core::ptr::addr_of_mut!(ALT_STATS)).push(AltStat {
+                empties,
+                nodes: (PCTR[2] - n0) as u32,
+                guesses: (PCTR[5] - g0) as u32,
+                nonunique: r,
+            });
+        }
+        r
     }
 
     // --- baseline technique engine ----------------------------------------
