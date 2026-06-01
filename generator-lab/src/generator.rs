@@ -10,7 +10,7 @@
 //! `best`/requirement/verify logic from core, just stripped to bools + counts.
 
 use crate::bb::BitBoard;
-use crate::grid::{Board, CELLS, Digit, digit_to_bit, iter_digits, popcount};
+use crate::grid::{Board, CELLS, Digit, digit_to_bit, popcount};
 use crate::rng::Rng;
 use crate::spec::Spec;
 use crate::verify::verify;
@@ -42,9 +42,20 @@ fn fill(board: &mut Board, rng: &mut Rng) -> bool {
     let Some((cell, mask, _)) = best else {
         return true;
     };
-    let mut digits: Vec<u8> = iter_digits(mask).collect();
-    rng.shuffle(&mut digits);
-    for d in digits {
+    // Collect the candidate digits (ascending, == iter_digits order) into a stack
+    // array instead of a heap Vec — one fewer allocation per search node. The
+    // shuffle sees the same `n` elements in the same order, so the RNG stream and
+    // the produced grid are byte-identical to the Vec version.
+    let mut digits = [0u8; 9];
+    let mut n = 0;
+    let mut m = mask;
+    while m != 0 {
+        digits[n] = m.trailing_zeros() as Digit + 1;
+        m &= m - 1;
+        n += 1;
+    }
+    rng.shuffle(&mut digits[..n]);
+    for &d in &digits[..n] {
         let backup = board.clone();
         board.place(cell, d);
         if fill(board, rng) {
@@ -106,7 +117,11 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
 
     // `best` is the bare-grid snapshot of the most-stripped requirement-meeting
     // state; the candidate board is rebuilt from it only if the attempt succeeds.
+    // `req_met` carries the running requirement verdict of the current accepted
+    // board (see the `alts == 0` fast path below). The full grid is trivially
+    // baseline-solvable but fires nothing, so it starts false.
     let mut best: Option<[Digit; CELLS]> = None;
+    let mut req_met = false;
     for i in positions {
         if cells[i] == 0 {
             continue;
@@ -119,10 +134,30 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
             "bb desync after clear at {i}"
         );
 
-        // Uniqueness gate.
         let v_bit = digit_to_bit(orig);
         let alts = cand & !v_bit;
-        if alts != 0 && bb.any_alt_solves(i, alts) {
+
+        // Fast path: clearing `i` left it with only its own digit, i.e. `i` is
+        // still a naked single. The strip is therefore always valid — the
+        // baseline would re-place `i` immediately and reach a byte-identical
+        // closure — so it stays unique AND baseline-solvable, and the requirement
+        // verdict is unchanged. Both gates are skippable; just carry `req_met`.
+        if alts == 0 {
+            debug_assert!(
+                {
+                    let o = bb.baseline(baseline);
+                    o.solved && spec.requirement_met(&o.counts) == req_met
+                },
+                "alts==0 fast-path invariant broke at {i}"
+            );
+            if req_met {
+                best = Some(cells);
+            }
+            continue;
+        }
+
+        // Uniqueness gate.
+        if bb.any_alt_solves(i, alts) {
             cells[i] = orig;
             bb.apply_place(i, orig);
             debug_assert!(
@@ -143,10 +178,11 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
             );
             continue;
         }
-        if spec.requirement_met(&outcome.counts) {
+        // Accept the strip: `cells` and `bb` stay in the stripped state.
+        req_met = spec.requirement_met(&outcome.counts);
+        if req_met {
             best = Some(cells);
         }
-        // Accept the strip: `cells` and `bb` stay in the stripped state.
     }
 
     match best {

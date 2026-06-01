@@ -50,6 +50,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
         p.grid += t.elapsed();
 
         let mut best: Option<[Digit; CELLS]> = None;
+        let mut req_met = false;
         for i in positions {
             if cells[i] == 0 {
                 continue;
@@ -64,8 +65,17 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             let v_bit = digit_to_bit(orig);
             let alts = cand & !v_bit;
 
+            // Fast path: `i` still a naked single -> strip always valid, both
+            // gates skippable, requirement verdict carried (mirrors `attempt`).
+            if alts == 0 {
+                if req_met {
+                    best = Some(cells);
+                }
+                continue;
+            }
+
             let tp = Instant::now();
-            let non_unique = alts != 0 && bb.any_alt_solves(i, alts);
+            let non_unique = bb.any_alt_solves(i, alts);
             p.prober += tp.elapsed();
             if non_unique {
                 cells[i] = orig;
@@ -81,7 +91,8 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
                 bb.apply_place(i, orig);
                 continue;
             }
-            if spec.requirement_met(&outcome.counts) {
+            req_met = spec.requirement_met(&outcome.counts);
+            if req_met {
                 best = Some(cells);
             }
         }
