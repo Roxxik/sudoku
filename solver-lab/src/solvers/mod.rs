@@ -22,6 +22,7 @@
 use crate::grid::Board;
 use crate::rng::Rng;
 
+pub mod banded;
 pub mod batch;
 pub mod bitboard;
 pub mod bitboard_fb;
@@ -113,4 +114,5 @@ register!(
     bitboard::Probe,
     bitboard_simd::Probe,
     bitboard_fb::Probe,
+    banded::Probe,
 );

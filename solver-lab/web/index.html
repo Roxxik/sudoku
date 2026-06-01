@@ -51,6 +51,9 @@
       <label>seed
         <input id="seed" type="number" value="1" min="1" />
       </label>
+      <label>cooldown (s)
+        <input id="cooldown" type="number" value="1" min="0" step="0.5" />
+      </label>
       <label>note (optional)
         <input id="note" type="text" placeholder="e.g. Pixel 7" style="width: 9rem" />
       </label>
@@ -90,6 +93,11 @@
         if (saved !== null) $("note").value = saved;
         $("note").addEventListener("input", () => {
           try { localStorage.setItem("solver-lab-note", $("note").value); } catch (e) {}
+        });
+        const savedCd = localStorage.getItem("solver-lab-cooldown");
+        if (savedCd !== null) $("cooldown").value = savedCd;
+        $("cooldown").addEventListener("input", () => {
+          try { localStorage.setItem("solver-lab-cooldown", $("cooldown").value); } catch (e) {}
         });
       } catch (e) {}
 
@@ -132,17 +140,29 @@
         results.textContent = "";
         const attempts = Math.max(100, Number($("attempts").value) | 0);
         const seed = Math.max(1, Number($("seed").value) | 0);
+        // Thermal cooldown between variants so an earlier run's heat doesn't
+        // throttle a later one (running all 9 back-to-back skews the comparison).
+        const cooldownS = Math.max(0, Number($("cooldown").value) || 0);
+        const cooldownMs = cooldownS * 1000;
 
         const header =
           "engine: " + engineLabel() + "\n" +
-          variants.length + " approaches, " + attempts + " attempts/variant, seed " + seed + "\n\n" +
+          variants.length + " approaches, " + attempts + " attempts/variant, seed " + seed +
+          ", cooldown " + cooldownS + "s\n\n" +
           "variant".padEnd(14) + "ms".padStart(9) + "us/attempt".padStart(13) + "vs base".padStart(10) + "\n";
         results.textContent = header;
 
         let baseMs = null;
         let baseFp = null;
         const rows = [];
+        let firstVariant = true;
         for (const { name, idx } of variants) {
+          // Let the SoC cool between variants (skip before the first run).
+          if (!firstVariant && cooldownMs > 0) {
+            status.textContent = "cooling down " + cooldownS + "s…";
+            await sleep(cooldownMs);
+          }
+          firstVariant = false;
           status.textContent = "running " + name + "…";
           await sleep(30); // let the DOM paint the status before the blocking call
 
@@ -178,6 +198,7 @@
           note: $("note").value || "",
           attempts,
           seed,
+          cooldown_s: cooldownS,
           results: rows,
         };
         try {
