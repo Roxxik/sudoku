@@ -23,6 +23,7 @@ fn main() {
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
         ctr_reset();
         pctr_reset();
+        generator_lab::bb::band_ctr_reset();
         let spec = spec_for_mode(mode);
         let mut rng = Rng::from_seed(1);
         let _ = run_attempts(&mut rng, &spec, attempts);
@@ -49,6 +50,16 @@ fn main() {
                 pc[i] as f64 / acalls as f64,
             );
         }
+        let bc = generator_lab::bb::band_ctr_snapshot();
+        use generator_lab::bb::BAND_CTR_NAMES;
+        let pcalls = bc[0].max(1);
+        let passes = bc[1].max(1);
+        println!("  -- band_update ({:.1} propagate-calls/attempt) --", per_att(bc[0]));
+        for i in 0..4 {
+            println!("  {:<16} {:>10.1}/att   {:>6.2}/propagate", BAND_CTR_NAMES[i], per_att(bc[i]), bc[i] as f64 / pcalls as f64);
+        }
+        println!("  band-passes/propagate {:.2}   bd-scans/pass {:.1}   PRODUCTIVE {:.1}%  (waste = rescans dirty-tracking could skip)",
+            bc[1] as f64 / pcalls as f64, bc[2] as f64 / passes as f64, 100.0 * bc[3] as f64 / bc[2].max(1) as f64);
         println!();
     }
 }

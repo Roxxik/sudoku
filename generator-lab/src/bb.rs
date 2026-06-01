@@ -110,6 +110,25 @@ pub fn pctr_reset() {
     }
 }
 
+// --- band_update scan metrics (feature = "count") -----------------------------
+// Sizes the dirty-band-tracking opportunity: 0 propagate-calls, 1 band-passes
+// (one rm+cm fixpoint iteration), 2 bd-scans (per-(band,digit) iterations across
+// rm+cm), 3 bd-productive (scans that actually dropped a triplet or placed a
+// single). waste = 1 - productive/scans = the rescans dirty-tracking could skip.
+pub const BAND_CTR_NAMES: [&str; 4] = ["propagate-calls", "band-passes", "bd-scans", "bd-productive"];
+#[cfg(feature = "count")]
+static mut BAND_CTR: [u64; 4] = [0; 4];
+#[cfg(feature = "count")]
+pub fn band_ctr_snapshot() -> [u64; 4] {
+    unsafe { BAND_CTR }
+}
+#[cfg(feature = "count")]
+pub fn band_ctr_reset() {
+    unsafe {
+        BAND_CTR = [0; 4];
+    }
+}
+
 /// One existence-DFS query (`any_alt_solves`): the board sparsity it ran on, the
 /// work it cost, and whether it found a 2nd solution. Lets a diagnostic see WHERE
 /// prober time concentrates (sparse vs dense boards; unique-proving vs
@@ -317,6 +336,39 @@ const fn build_single9() -> [u8; 512] {
     t
 }
 
+/// Fused 9-bit line lookup, read once per (band, digit) line and feeding BOTH
+/// locked-candidates and hidden-singles (which otherwise hit two tables on the
+/// same chunk). Bits 0..2 = triplet occupancy (bit `k` set iff the line's `k`-th
+/// 3-cell triplet holds a candidate); bits 4..7 = the hidden single's index 0..8
+/// if exactly one bit is set, else `0xF`. So a band's 9-bit LC occupancy is three
+/// `&7` reads OR'd together, and each line's hidden single is the high nibble.
+const ROWINFO: [u8; 512] = build_rowinfo();
+
+const fn build_rowinfo() -> [u8; 512] {
+    let mut t = [0u8; 512];
+    let mut v = 0usize;
+    while v < 512 {
+        let mut occ = 0u8;
+        if v & 0b000_000_111 != 0 {
+            occ |= 1;
+        }
+        if v & 0b000_111_000 != 0 {
+            occ |= 2;
+        }
+        if v & 0b111_000_000 != 0 {
+            occ |= 4;
+        }
+        let single = if v != 0 && v & (v - 1) == 0 {
+            v.trailing_zeros() as u8
+        } else {
+            0xF
+        };
+        t[v] = occ | (single << 4);
+        v += 1;
+    }
+    t
+}
+
 /// For a triplet dropped by row-major LC — band `b`, triplet `t = 3*r + k` — the
 /// cell masks to clear in BOTH views. Row-major: lane `b`, the 3 bits at
 /// `9*r + 3*k`. Col-major: the same three cells form a vertical-triplet — lane
@@ -413,24 +465,6 @@ fn first_rm(x: B) -> usize {
     } else {
         rm_cell(2, x[2].trailing_zeros())
     }
-}
-/// 9-bit triplet occupancy of one band's 27-bit candidate set: bit `3*r + k` set
-/// iff triplet (band-row `r`, box-column `k`) holds any candidate. `s` collapses
-/// each 3-cell triplet to its low bit; the gather lifts bits `9*r + 3*k` to
-/// `3*r + k`. Works on either view's bands — the triplet structure is identical.
-#[inline(always)]
-fn triplet_occ(m: u32) -> usize {
-    let s = m | (m >> 1) | (m >> 2);
-    let occ = (s & 1)
-        | ((s >> 3) & 1) << 1
-        | ((s >> 6) & 1) << 2
-        | ((s >> 9) & 1) << 3
-        | ((s >> 12) & 1) << 4
-        | ((s >> 15) & 1) << 5
-        | ((s >> 18) & 1) << 6
-        | ((s >> 21) & 1) << 7
-        | ((s >> 24) & 1) << 8;
-    occ as usize
 }
 
 /// The nine digit boards in both bandings, plus the empty-cell mask in both.
@@ -625,6 +659,22 @@ impl BitBoard {
         popcnt(self.unsolved_r)
     }
 
+    /// THROWAWAY instrumentation: the exact first-closure a probe pays — clone,
+    /// restrict cell `i` to `alts`, propagate ONCE to fixpoint (no branching).
+    /// Timing this isolates the closure cost from the branch cost in
+    /// `any_alt_solves` (which is closure + branch).
+    pub fn probe_closure_only(&self, i: usize, alts: u16) -> bool {
+        let mut s = self.clone();
+        let (kr, kc) = (bit_r(i), bit_c(i));
+        for d in 0..9 {
+            if alts & (1 << d) == 0 {
+                s.r[d] &= !kr;
+                s.c[d] &= !kc;
+            }
+        }
+        matches!(s.propagate(), Prop::Solved)
+    }
+
     /// THROWAWAY instrumentation: how many cells the unrestricted propagation
     /// closure (singles + hidden singles + LC to fixpoint, NO branch) determines.
     pub fn closure_solved(&self) -> u32 {
@@ -640,7 +690,8 @@ impl BitBoard {
 
     /// Naked-single sieve over the row-major boards: which cells admit exactly one
     /// digit (`ones & !twos`) and which admit none (`!ones`).
-    #[inline(always)]
+    #[cfg_attr(not(prof_solver), inline(always))]
+    #[cfg_attr(prof_solver, inline(never))]
     fn sieve(&self) -> Sieve {
         let mut ones = ZERO;
         let mut twos = ZERO;
@@ -655,7 +706,8 @@ impl BitBoard {
 
     /// Place a wave of naked singles (cells `singles`) into both views. Returns
     /// false if two singles of the same digit are peers (a contradiction).
-    #[inline]
+    #[cfg_attr(not(prof_solver), inline)]
+    #[cfg_attr(prof_solver, inline(never))]
     fn place_singles(&mut self, singles: B) -> bool {
         for d in 0..9 {
             // SAFETY: d in 0..9.
@@ -697,45 +749,97 @@ impl BitBoard {
     /// views) and the band is re-read so the next unit sees it. Returns whether
     /// anything changed. This is the banded solver's heart — no per-unit scan, no
     /// popcount; the only arithmetic is the occupancy gather and three box shifts.
+    #[cfg_attr(prof_solver, inline(never))]
     fn band_update_rm(&mut self) -> bool {
         let mut changed = false;
         for b in 0..3 {
             for d in 0..9 {
-                let mut live = (self.r[d] & self.unsolved_r)[b];
-                // Locked candidates: drop the triplets the within-band fixpoint kills.
-                let occ = triplet_occ(live);
-                let mut dropped = occ as u32 & !BAND_KEEP_OCC[occ];
-                if dropped != 0 {
-                    changed = true;
-                    while dropped != 0 {
-                        let t = dropped.trailing_zeros() as usize;
-                        dropped &= dropped - 1;
-                        let (rm, cm) = RM_LC_TRIP[b][t];
-                        self.r[d] &= !Simd::from_array(rm);
-                        self.c[d] &= !Simd::from_array(cm);
-                    }
-                    live = (self.r[d] & self.unsolved_r)[b];
+                #[cfg(feature = "count")]
+                let mut prod = false;
+                #[cfg(feature = "count")]
+                unsafe {
+                    BAND_CTR[2] += 1;
                 }
-                // Hidden singles in the three rows (each a contiguous 9-bit chunk).
-                for rr in 0..3 {
-                    let s = SINGLE9[((live >> (9 * rr)) & 0x1FF) as usize];
-                    if s != 0xFF {
-                        self.place(rm_cell(b, 9 * rr + s as u32), d as u8 + 1);
+                // One fused pass: read each line's ROWINFO once (occupancy + hidden
+                // single in one lookup), drive LC off the gathered occupancy and
+                // row hidden-singles off the high nibble; the box hidden-single
+                // still gathers triplet `k` from the raw chunks. Restart only when
+                // an LC drop or a placement fires (rare).
+                loop {
+                    let live = (self.r[d] & self.unsolved_r)[b];
+                    let r0 = live & 0x1FF;
+                    let r1 = (live >> 9) & 0x1FF;
+                    let r2 = (live >> 18) & 0x1FF;
+                    let info = [
+                        ROWINFO[r0 as usize],
+                        ROWINFO[r1 as usize],
+                        ROWINFO[r2 as usize],
+                    ];
+                    // Locked candidates from the gathered triplet occupancy.
+                    // (Widen before shifting: `<<6` on a u8 would drop bit 8.)
+                    let occ = (info[0] as usize & 7)
+                        | ((info[1] as usize & 7) << 3)
+                        | ((info[2] as usize & 7) << 6);
+                    let mut dropped = occ as u32 & !BAND_KEEP_OCC[occ];
+                    if dropped != 0 {
                         changed = true;
-                        live = (self.r[d] & self.unsolved_r)[b];
+                        #[cfg(feature = "count")]
+                        {
+                            prod = true;
+                        }
+                        while dropped != 0 {
+                            let t = dropped.trailing_zeros() as usize;
+                            dropped &= dropped - 1;
+                            let (rm, cm) = RM_LC_TRIP[b][t];
+                            self.r[d] &= !Simd::from_array(rm);
+                            self.c[d] &= !Simd::from_array(cm);
+                        }
+                        continue;
+                    }
+                    let mut fired = false;
+                    // Hidden singles in the three rows (high nibble of each line).
+                    for rr in 0..3 {
+                        let s = info[rr] >> 4;
+                        if s != 0xF {
+                            self.place(rm_cell(b, 9 * rr as u32 + s as u32), d as u8 + 1);
+                            changed = true;
+                            #[cfg(feature = "count")]
+                            {
+                                prod = true;
+                            }
+                            fired = true;
+                            break;
+                        }
+                    }
+                    if fired {
+                        continue;
+                    }
+                    // Hidden singles in the three boxes (gather triplet k of each row).
+                    for k in 0..3u32 {
+                        let bk = ((r0 >> (3 * k)) & 7)
+                            | (((r1 >> (3 * k)) & 7) << 3)
+                            | (((r2 >> (3 * k)) & 7) << 6);
+                        let s = SINGLE9[bk as usize] as usize;
+                        if s != 0xFF {
+                            let bit = (s / 3) as u32 * 9 + 3 * k + (s % 3) as u32;
+                            self.place(rm_cell(b, bit), d as u8 + 1);
+                            changed = true;
+                            #[cfg(feature = "count")]
+                            {
+                                prod = true;
+                            }
+                            fired = true;
+                            break;
+                        }
+                    }
+                    if !fired {
+                        break;
                     }
                 }
-                // Hidden singles in the three boxes (gather each box's 9 bits).
-                for k in 0..3 {
-                    let bk = ((live >> (3 * k)) & 7)
-                        | (((live >> (9 + 3 * k)) & 7) << 3)
-                        | (((live >> (18 + 3 * k)) & 7) << 6);
-                    let s = SINGLE9[bk as usize] as usize;
-                    if s != 0xFF {
-                        let bit = (s / 3) * 9 + 3 * k as usize + s % 3;
-                        self.place(rm_cell(b, bit as u32), d as u8 + 1);
-                        changed = true;
-                        live = (self.r[d] & self.unsolved_r)[b];
+                #[cfg(feature = "count")]
+                if prod {
+                    unsafe {
+                        BAND_CTR[3] += 1;
                     }
                 }
             }
@@ -747,31 +851,67 @@ impl BitBoard {
     /// tables on the col-major bands, giving box↔column LC ([`CM_LC_TRIP`]) and
     /// hidden singles in columns (the in-lane lines of this view). Boxes are
     /// already covered row-major, so only the three columns of each band are swept.
+    #[cfg_attr(prof_solver, inline(never))]
     fn band_update_cm(&mut self) -> bool {
         let mut changed = false;
         for b in 0..3 {
             for d in 0..9 {
-                let mut live = (self.c[d] & self.unsolved_c)[b];
-                let occ = triplet_occ(live);
-                let mut dropped = occ as u32 & !BAND_KEEP_OCC[occ];
-                if dropped != 0 {
-                    changed = true;
-                    while dropped != 0 {
-                        let t = dropped.trailing_zeros() as usize;
-                        dropped &= dropped - 1;
-                        let (rm, cm) = CM_LC_TRIP[b][t];
-                        self.r[d] &= !Simd::from_array(rm);
-                        self.c[d] &= !Simd::from_array(cm);
-                    }
-                    live = (self.c[d] & self.unsolved_c)[b];
+                #[cfg(feature = "count")]
+                let mut prod = false;
+                #[cfg(feature = "count")]
+                unsafe {
+                    BAND_CTR[2] += 1;
                 }
-                // Hidden singles in the three columns (each a 9-bit chunk here).
-                for cc in 0..3 {
-                    let s = SINGLE9[((live >> (9 * cc)) & 0x1FF) as usize];
-                    if s != 0xFF {
-                        self.place(cm_cell(b, 9 * cc + s as u32), d as u8 + 1);
+                // Fused: one ROWINFO lookup per column feeds both LC (occupancy)
+                // and the column hidden single (high nibble). No boxes in this view.
+                loop {
+                    let live = (self.c[d] & self.unsolved_c)[b];
+                    let info = [
+                        ROWINFO[(live & 0x1FF) as usize],
+                        ROWINFO[((live >> 9) & 0x1FF) as usize],
+                        ROWINFO[((live >> 18) & 0x1FF) as usize],
+                    ];
+                    let occ = (info[0] as usize & 7)
+                        | ((info[1] as usize & 7) << 3)
+                        | ((info[2] as usize & 7) << 6);
+                    let mut dropped = occ as u32 & !BAND_KEEP_OCC[occ];
+                    if dropped != 0 {
                         changed = true;
-                        live = (self.c[d] & self.unsolved_c)[b];
+                        #[cfg(feature = "count")]
+                        {
+                            prod = true;
+                        }
+                        while dropped != 0 {
+                            let t = dropped.trailing_zeros() as usize;
+                            dropped &= dropped - 1;
+                            let (rm, cm) = CM_LC_TRIP[b][t];
+                            self.r[d] &= !Simd::from_array(rm);
+                            self.c[d] &= !Simd::from_array(cm);
+                        }
+                        continue;
+                    }
+                    let mut fired = false;
+                    for cc in 0..3 {
+                        let s = info[cc] >> 4;
+                        if s != 0xF {
+                            self.place(cm_cell(b, 9 * cc as u32 + s as u32), d as u8 + 1);
+                            changed = true;
+                            #[cfg(feature = "count")]
+                            {
+                                prod = true;
+                            }
+                            fired = true;
+                            break;
+                        }
+                    }
+                    if !fired {
+                        break;
+                    }
+                }
+                #[cfg(feature = "count")]
+                if prod {
+                    unsafe {
+                        BAND_CTR[3] += 1;
                     }
                 }
             }
@@ -782,7 +922,12 @@ impl BitBoard {
     /// Run all band propagation to a fixpoint: naked singles (cross-digit sieve)
     /// drained first, then the fused row- and column-major band updates, looping
     /// until nothing changes. Returns the reason it stopped.
+    #[cfg_attr(prof_solver, inline(never))]
     fn propagate(&mut self) -> Prop {
+        #[cfg(feature = "count")]
+        unsafe {
+            BAND_CTR[0] += 1;
+        }
         loop {
             loop {
                 pbump(3);
@@ -802,6 +947,10 @@ impl BitBoard {
                     return Prop::Contradiction;
                 }
             }
+            #[cfg(feature = "count")]
+            unsafe {
+                BAND_CTR[1] += 1;
+            }
             let mut changed = self.band_update_rm();
             changed |= self.band_update_cm();
             if !changed {
@@ -810,7 +959,8 @@ impl BitBoard {
         }
     }
 
-    #[inline]
+    #[cfg_attr(not(prof_solver), inline)]
+    #[cfg_attr(prof_solver, inline(never))]
     fn branch_cell(&self) -> (usize, u16) {
         let mut ones = ZERO;
         let mut twos = ZERO;

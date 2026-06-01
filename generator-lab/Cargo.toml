@@ -41,3 +41,9 @@ profiling = []
 # we know train/drill generation is faithful. No production coupling.
 [dev-dependencies]
 sudoku-core = { path = "../core" }
+
+# `--cfg prof_solver` marks the solver internals (sieve/place_singles/band_update*
+# /propagate/branch_cell) #[inline(never)] so a profiler attributes per-function
+# self-time inside the otherwise-fully-inlined solve_first. Off in normal builds.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(prof_solver)'] }
