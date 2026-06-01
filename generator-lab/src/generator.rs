@@ -10,7 +10,7 @@
 //! `best`/requirement/verify logic from core, just stripped to bools + counts.
 
 use crate::bb::BitBoard;
-use crate::grid::{Board, CELLS, digit_to_bit, iter_digits, popcount};
+use crate::grid::{Board, CELLS, Digit, digit_to_bit, iter_digits, popcount};
 use crate::rng::Rng;
 use crate::spec::Spec;
 use crate::verify::verify;
@@ -73,55 +73,85 @@ pub enum Outcome {
     NeverFired,
 }
 
+/// Reconstruct a `Board` (cells + naked candidates) from a bare puzzle grid
+/// `cells` (present cell = its digit, `0` = stripped) — used to materialize a
+/// candidate `best`/`seed` for [`verify`] and for the desync cross-check.
+pub fn board_from_cells(cells: &[Digit; CELLS]) -> Board {
+    let mut b = Board::empty();
+    for (i, &d) in cells.iter().enumerate() {
+        if d != 0 {
+            b.place(i, d);
+        }
+    }
+    b
+}
+
 /// One full strip attempt for `spec`. Mirrors core's per-attempt body.
 pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
     let baseline = spec.baseline_mask();
     let solution = random_full_grid(rng);
-    let mut puzzle = solution.clone();
     let mut positions: Vec<usize> = (0..CELLS).collect();
     rng.shuffle(&mut positions);
 
-    // The shared bitboard is maintained incrementally across the strip: a
-    // clear_naked/place only touches cell i and its peers, so we refresh those
-    // 21 cells instead of rebuilding all 81 (`from_board`) each position.
-    let mut bb = BitBoard::from_board(&puzzle);
+    // `bb` is the single source of candidate truth (it already holds every
+    // candidate band). The only scalar shadow kept is the bare puzzle grid
+    // `cells` (present cell = its digit, `0` = stripped) — the one thing bb can't
+    // derive: which digit a surviving peer holds. `bb` is maintained
+    // incrementally — a clear/place only touches cell i and its peers — and
+    // `apply_clear` reads the reopened candidates straight off `cells`, so the
+    // duplicate per-cell *candidate* array (and its upkeep) is gone, as is any
+    // per-position `from_board` rebuild.
+    let mut bb = BitBoard::from_board(&solution);
+    let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
 
-    let mut best: Option<Board> = None;
+    // `best` is the bare-grid snapshot of the most-stripped requirement-meeting
+    // state; the candidate board is rebuilt from it only if the attempt succeeds.
+    let mut best: Option<[Digit; CELLS]> = None;
     for i in positions {
-        if puzzle.is_empty(i) {
+        if cells[i] == 0 {
             continue;
         }
-        let orig = puzzle.cell(i);
-        puzzle.clear_naked(i);
-        bb.apply_clear(&puzzle, i, orig);
-        debug_assert!(bb == BitBoard::from_board(&puzzle), "bb desync after clear at {i}");
+        let orig = cells[i];
+        cells[i] = 0;
+        let cand = bb.apply_clear(i, orig, &cells);
+        debug_assert!(
+            bb == BitBoard::from_board(&board_from_cells(&cells)),
+            "bb desync after clear at {i}"
+        );
 
         // Uniqueness gate.
-        let v_bit = digit_to_bit(solution.cell(i));
-        let alts = puzzle.candidates(i) & !v_bit;
+        let v_bit = digit_to_bit(orig);
+        let alts = cand & !v_bit;
         if alts != 0 && bb.any_alt_solves(i, alts) {
-            puzzle.place(i, orig);
+            cells[i] = orig;
             bb.apply_place(i, orig);
-            debug_assert!(bb == BitBoard::from_board(&puzzle), "bb desync after revert at {i}");
+            debug_assert!(
+                bb == BitBoard::from_board(&board_from_cells(&cells)),
+                "bb desync after revert at {i}"
+            );
             continue;
         }
 
         // Baseline gate + requirement counts (one tracked solve).
         let outcome = bb.baseline(baseline);
         if !outcome.solved {
-            puzzle.place(i, orig);
+            cells[i] = orig;
             bb.apply_place(i, orig);
-            debug_assert!(bb == BitBoard::from_board(&puzzle), "bb desync after revert at {i}");
+            debug_assert!(
+                bb == BitBoard::from_board(&board_from_cells(&cells)),
+                "bb desync after revert at {i}"
+            );
             continue;
         }
         if spec.requirement_met(&outcome.counts) {
-            best = Some(puzzle.clone());
+            best = Some(cells);
         }
-        // Accept the strip: `puzzle` and `bb` stay in the stripped state.
+        // Accept the strip: `cells` and `bb` stay in the stripped state.
     }
 
     match best {
-        Some(seed) => {
+        Some(snap) => {
+            let seed = board_from_cells(&snap);
             if verify(&seed, spec) {
                 let givens = seed.givens();
                 Outcome::Success(GeneratedPuzzle {

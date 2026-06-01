@@ -43,7 +43,7 @@
 //! `tests/bb_equiv.rs` cross-checks the baseline against the scalar engine;
 //! the generator's `find 118329` anchor pins it end-to-end.
 
-use crate::grid::{BOX_UNITS, Board, COL_UNITS, CELLS, PEERS, ROW_UNITS, iter_digits};
+use crate::grid::{ALL_DIGITS, BOX_UNITS, Board, COL_UNITS, CELLS, Digit, PEERS, ROW_UNITS, digit_to_bit, iter_digits};
 use crate::techniques::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, LC_CLAIMING, LC_POINTING, Mask,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, Outcome,
@@ -485,17 +485,28 @@ impl BitBoard {
         }
     }
 
-    /// Mirror `b.clear_naked(i)` (cell `i` held digit `d0`) onto both views
-    /// incrementally, keeping `self == from_board(b)` without a full rebuild.
-    /// A clear only (a) re-opens cell `i`'s whole candidate column and (b)
-    /// restores the cleared digit `d0` to the now-unblocked empty peers.
+    /// Re-open cell `i` (which held digit `d0`) in both views, keeping
+    /// `self == from_board(board_from_cells(cells))` without a scalar *candidate*
+    /// shadow — bb owns all candidate state. `cells` is the bare puzzle grid
+    /// (present cell = its digit, `0` = stripped), the one thing bb can't derive
+    /// itself: which digit a surviving peer holds. A clear only (a) re-opens cell
+    /// `i`'s column to its naked candidates (all digits no still-present peer
+    /// holds) and (b) restores `d0` to the empty peers no *other* present peer
+    /// still blocks. Returns cell `i`'s naked candidate mask (the strip's `alts`
+    /// source). The caller must already have set `cells[i] = 0`.
     #[cfg_attr(feature = "profiling", inline(never))]
-    pub fn apply_clear(&mut self, b: &Board, i: usize, d0: u8) {
+    pub fn apply_clear(&mut self, i: usize, d0: u8, cells: &[Digit; CELLS]) -> u16 {
         let (ir, ic) = (bit_r(i), bit_c(i));
         // (a) cell i: filled -> empty, column = its naked candidates.
         self.unsolved_r |= ir;
         self.unsolved_c |= ic;
-        let cand = b.candidates(i);
+        let mut cand: u16 = ALL_DIGITS;
+        for &p in &PEERS[i] {
+            let pd = cells[p];
+            if pd != 0 {
+                cand &= !digit_to_bit(pd);
+            }
+        }
         for e in 0..9 {
             if cand & (1 << e) != 0 {
                 self.r[e] |= ir;
@@ -506,15 +517,25 @@ impl BitBoard {
             }
         }
         // (b) d0 was blocked at every peer by cell i, so its bit there was 0;
-        // set it on peers that are now empty and can take d0 (pure OR).
-        let db = 1u16 << (d0 - 1);
+        // set it on each empty peer no other present peer still holds d0 (pure OR).
         let e = (d0 - 1) as usize;
         for &p in &PEERS[i] {
-            if b.cell(p) == 0 && b.candidates(p) & db != 0 {
+            if cells[p] != 0 {
+                continue; // p still holds its clue
+            }
+            let mut blocked = false;
+            for &pp in &PEERS[p] {
+                if cells[pp] == d0 {
+                    blocked = true;
+                    break;
+                }
+            }
+            if !blocked {
                 self.r[e] |= bit_r(p);
                 self.c[e] |= bit_c(p);
             }
         }
+        cand
     }
 
     /// Mirror `b.place(i, d0)` (the strip's revert) onto both views: cell `i`

@@ -3,19 +3,20 @@
 //! bottleneck is measured (not guessed) before any optimization.
 //!
 //! Phases:
-//!   - grid     : random full grid + position shuffle
-//!   - prober   : uniqueness gate (ExistenceProbe build + any_alt_solves)
+//!   - grid     : random full grid + position shuffle + initial bb
+//!   - bb-maint : apply_clear (reopen cell i, derived from solution + present)
+//!   - prober   : uniqueness gate (any_alt_solves)
 //!   - baseline : the strip gate-b tracked solve (solvability + requirement counts)
 //!   - verify   : irreplaceability check (only runs when a `best` exists)
-//!   - other    : clear_naked / place reverts / best clone (the remainder)
+//!   - other    : place reverts / `present` bookkeeping (the remainder)
 //!
 //! Usage: cargo run --release -p generator-lab --example profile -- [--attempts N=4000] [--seed S=1]
 
 use std::time::{Duration, Instant};
 
 use generator_lab::bb::BitBoard;
-use generator_lab::generator::random_full_grid;
-use generator_lab::grid::{CELLS, digit_to_bit};
+use generator_lab::generator::{board_from_cells, random_full_grid};
+use generator_lab::grid::{CELLS, Digit, digit_to_bit};
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
 use generator_lab::verify::verify;
@@ -42,32 +43,32 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
     for _ in 0..attempts {
         let t = Instant::now();
         let solution = random_full_grid(&mut rng);
-        let mut puzzle = solution.clone();
         let mut positions: Vec<usize> = (0..CELLS).collect();
         rng.shuffle(&mut positions);
-        let mut bb = BitBoard::from_board(&puzzle);
+        let mut bb = BitBoard::from_board(&solution);
+        let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
         p.grid += t.elapsed();
 
-        let mut best = None;
+        let mut best: Option<[Digit; CELLS]> = None;
         for i in positions {
-            if puzzle.is_empty(i) {
+            if cells[i] == 0 {
                 continue;
             }
-            let orig = puzzle.cell(i);
-            puzzle.clear_naked(i);
+            let orig = cells[i];
+            cells[i] = 0;
 
             let tbuild = Instant::now();
-            bb.apply_clear(&puzzle, i, orig);
+            let cand = bb.apply_clear(i, orig, &cells);
             p.build += tbuild.elapsed();
 
-            let v_bit = digit_to_bit(solution.cell(i));
-            let alts = puzzle.candidates(i) & !v_bit;
+            let v_bit = digit_to_bit(orig);
+            let alts = cand & !v_bit;
 
             let tp = Instant::now();
             let non_unique = alts != 0 && bb.any_alt_solves(i, alts);
             p.prober += tp.elapsed();
             if non_unique {
-                puzzle.place(i, orig);
+                cells[i] = orig;
                 bb.apply_place(i, orig);
                 continue;
             }
@@ -76,16 +77,17 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             let outcome = bb.baseline(baseline);
             p.baseline += tb.elapsed();
             if !outcome.solved {
-                puzzle.place(i, orig);
+                cells[i] = orig;
                 bb.apply_place(i, orig);
                 continue;
             }
             if spec.requirement_met(&outcome.counts) {
-                best = Some(puzzle.clone());
+                best = Some(cells);
             }
         }
 
-        if let Some(seed_board) = best {
+        if let Some(snap) = best {
+            let seed_board = board_from_cells(&snap);
             let tv = Instant::now();
             let ok = verify(&seed_board, &spec);
             p.verify += tv.elapsed();
