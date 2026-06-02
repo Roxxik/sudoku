@@ -79,4 +79,14 @@ mod wasm_exports {
         let (stats, _fp) = generator::run_attempts(&mut rng, &spec, attempts as usize);
         stats.successes as u32
     }
+
+    /// Grid-sensitive cross-backend determinism fingerprint (u32-truncated):
+    /// folds the solution grid + strip order of every attempt, so it diverges if
+    /// native and wasm ever disagree on the RNG/fill output (unlike `bench`'s
+    /// success-only fp). Must equal the native `determinism_fp` for the seed.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn det_fp(attempts: u32, seed: u32) -> u32 {
+        let mut rng = Rng::from_seed(seed as u64);
+        generator::determinism_fp(&mut rng, attempts as usize) as u32
+    }
 }

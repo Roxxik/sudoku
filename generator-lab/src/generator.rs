@@ -394,3 +394,28 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (GenStats, u64) {
     }
     (stats, fp)
 }
+
+/// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG
+/// stream. Unlike [`run_attempts`]'s fp (which only folds *successful* puzzles,
+/// so it is blind to the grids when nothing succeeds), this folds the full
+/// solution grid AND the shuffled strip order of every iteration — the two and
+/// only two RNG consumers of an attempt (the prober and baseline take no RNG).
+/// Native and wasm32 MUST return the same value; that is the guard that the
+/// Lemire `range`/shuffle and the bitboard fill are target-independent. It walks
+/// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so
+/// it is a faithful probe. This is a correctness guard, not a perf metric.
+pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
+    let mut fp: u64 = 0xcbf29ce484222325;
+    for _ in 0..n {
+        let solution = random_full_grid(rng);
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        for i in 0..CELLS {
+            fp ^= solution.cell(i) as u64;
+            fp = fp.wrapping_mul(0x100000001b3);
+            fp ^= positions[i] as u64;
+            fp = fp.wrapping_mul(0x100000001b3);
+        }
+    }
+    fp
+}

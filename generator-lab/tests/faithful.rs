@@ -136,3 +136,29 @@ fn train_hidden_quad_both_directions() {
     glab_generated_pass_core(Mode::Train, gt::HIDDEN_QUAD, 1, 2_000_000);
     core_generated_pass_glab(Mode::Train, gt::HIDDEN_QUAD, 1, 2_000_000);
 }
+
+/// Cross-backend + regression anchor for the RNG/fill stream. glab's bounded RNG
+/// (`range`) uses Lemire multiply-shift, so the stream intentionally DIVERGES
+/// from core's — faithfulness (the tests above) is preserved because it only
+/// requires verify-agreement, not an identical stream. This pins the
+/// grid-sensitive `determinism_fp` (solution grid + strip order of every
+/// attempt) per seed: the wasm `det_fp` export MUST return the same u32 truncation
+/// on-device, and any unintended change to the shuffle/fill trips this. If you
+/// change the RNG or fill on purpose, re-baseline these values.
+#[test]
+fn determinism_fp_pinned() {
+    use generator_lab::generator::determinism_fp;
+    for (seed, want) in [
+        (1u64, 0xeff10e346cad1dc9u64),
+        (2, 0xf6ea34a6fbad2d0d),
+        (3, 0x344ccb182c947cad),
+    ] {
+        let mut rng = GRng::from_seed(seed);
+        assert_eq!(
+            determinism_fp(&mut rng, 2000),
+            want,
+            "determinism_fp changed for seed {seed} — re-baseline if the RNG/fill change was intentional, \
+             and update the wasm det_fp guard"
+        );
+    }
+}

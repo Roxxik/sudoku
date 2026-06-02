@@ -54,6 +54,7 @@ fn main() {
     let family_arg = pop_string(&mut args, "--family");
     let allow_arg = pop_string(&mut args, "--allow");
     let require_arg = pop_string(&mut args, "--require");
+    let concede_arg = pop_string(&mut args, "--concede");
 
     // Generation attempt cap (rejection-sampling budget). Defaults to
     // `MAX_ATTEMPTS`; raise it to chase rare specs like forced Phistomefel.
@@ -85,7 +86,8 @@ fn main() {
             || tier_arg.is_some()
             || family_arg.is_some()
             || allow_arg.is_some()
-            || require_arg.is_some();
+            || require_arg.is_some()
+            || concede_arg.is_some();
         let spec = has_spec.then(|| {
             build_spec(
                 stage.as_deref(),
@@ -95,6 +97,7 @@ fn main() {
                 family_arg.as_deref(),
                 allow_arg.as_deref(),
                 require_arg.as_deref(),
+                concede_arg.as_deref(),
             )
         });
         let restrict = if full_trace { None } else { spec.as_ref() };
@@ -136,9 +139,13 @@ fn main() {
         .filter(|s| s.is_some())
         .count();
     if legacy > 0
-        && (spec_starts > 0 || family_arg.is_some() || allow_arg.is_some() || require_arg.is_some())
+        && (spec_starts > 0
+            || family_arg.is_some()
+            || allow_arg.is_some()
+            || require_arg.is_some()
+            || concede_arg.is_some())
     {
-        eprintln!("--construct/--needs/--forced cannot be combined with --stage/--train/--drill/--tier/--family/--allow/--require");
+        eprintln!("--construct/--needs/--forced cannot be combined with --stage/--train/--drill/--tier/--family/--allow/--require/--concede");
         std::process::exit(2);
     }
 
@@ -152,6 +159,7 @@ fn main() {
             && family_arg.is_none()
             && allow_arg.is_none()
             && require_arg.is_none()
+            && concede_arg.is_none()
         {
             eprintln!("--probe-trace/--probe-force need a spec (e.g. --drill <technique>)");
             std::process::exit(2);
@@ -164,6 +172,7 @@ fn main() {
             family_arg.as_deref(),
             allow_arg.as_deref(),
             require_arg.as_deref(),
+            concede_arg.as_deref(),
         );
         println!(
             "probe: up to {} trace dump(s), {} forcing attempt(s) on substitutable no-req seeds",
@@ -200,6 +209,7 @@ fn main() {
             || family_arg.is_some()
             || allow_arg.is_some()
             || require_arg.is_some()
+            || concede_arg.is_some()
         {
             let spec = build_spec(
                 stage.as_deref(),
@@ -209,6 +219,7 @@ fn main() {
                 family_arg.as_deref(),
                 allow_arg.as_deref(),
                 require_arg.as_deref(),
+                concede_arg.as_deref(),
             );
             let puzzle = run_spec(&spec, &mut rng, search_iters, resume_threshold, max_attempts);
             (puzzle, Some(spec))
@@ -232,7 +243,7 @@ fn usage_error() -> ! {
     eprintln!(
         "usage: sudoku [--interactive] [--list-stages] \\\n\
          \t[--stage <key> | --train <technique> | --drill <technique> | --tier <easy|medium|hard|master>] \\\n\
-         \t[--family <name>] [--allow t1,t2,...] [--require t=n,t=n,...] \\\n\
+         \t[--family <name>] [--allow t1,t2,...] [--require t=n,t=n,...] [--concede t1,t2,...] \\\n\
          \t[--construct <name> | --needs <technique> | --forced <technique>] \\\n\
          \t[--max-attempts <n>] \\\n\
          \t[--cache <file.jsonl> [--index <n>] | --puzzle <line>] \\\n\
@@ -315,6 +326,7 @@ fn build_spec(
     family_arg: Option<&str>,
     allow_arg: Option<&str>,
     require_arg: Option<&str>,
+    concede_arg: Option<&str>,
 ) -> Spec {
     let mut spec = if let Some(key) = stage {
         let s = stage_by_key(key).unwrap_or_else(|| {
@@ -373,6 +385,16 @@ fn build_spec(
                 std::process::exit(2);
             });
             spec = spec.require(t, count);
+        }
+    }
+
+    if let Some(list) = concede_arg {
+        for tok in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let t = parse_technique(tok).unwrap_or_else(|| {
+                eprintln!("unknown technique in --concede: {:?}", tok);
+                std::process::exit(2);
+            });
+            spec = spec.concede(t);
         }
     }
 
