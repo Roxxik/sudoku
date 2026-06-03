@@ -1,10 +1,19 @@
-//! Throughput of the warp vs generator-lab's sequential generator, on the SAME
-//! total work. v0 batches the gate scalar-per-lane, so this is expected to be
-//! roughly on par (or a touch slower from the interleaving overhead) — the point
-//! is a fair baseline to measure the packed kernel against later, and to confirm
-//! the warp produces identical aggregate yield.
+//! End-to-end throughput: the warp (packed W=8 SIMT prober) vs generator-lab's
+//! sequential scalar generator (lean `ProberBoard`), on the SAME total work and
+//! producing the SAME puzzles (one seed per logical lane => the warp's union is
+//! exactly the sequential run's; the yield assert pins it).
 //!
-//! Usage: cargo run --release -p generator-pack --example packbench -- [lanes=8] [attempts_per_lane=4000]
+//! `lanes` is the number of independent logical seed-streams, NOT a concurrency
+//! knob: the streaming driver keeps exactly W=8 attempts in flight regardless, so
+//! throughput is flat for `lanes >= 8` (the old macro-warp / FIFO-depth knob is
+//! gone). The warp's parallelism comes from running 8 INDEPENDENT seed streams at
+//! once, so this measures BATCH generation throughput (many puzzles), NOT
+//! single-puzzle `find` latency — a single seed stream is inherently sequential
+//! (attempts share one RNG stream; the uniqueness queries within an attempt are
+//! sequential). For the faithful single-stream scalar number, use the `bench`
+//! example.
+//!
+//! Usage: cargo run --release -p generator-lab --example packbench -- [lanes=8] [per_lane=4000]
 
 use generator_lab::generator::run_attempts;
 use generator_lab::rng::Rng;

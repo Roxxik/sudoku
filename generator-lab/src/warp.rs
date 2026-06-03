@@ -32,7 +32,7 @@
 //! outcome (`tests/equiv.rs` pins each lane byte-identical to its sequential run).
 
 use crate::bb::{BitBoard, Placed};
-use crate::generator::{board_from_cells, random_full_grid};
+use crate::generator::{GeneratedPuzzle, board_from_cells, random_full_grid};
 use crate::grid::{Board, CELLS, Digit, digit_to_bit};
 use crate::packed::{LANES, PackedProber, Probe};
 use crate::rng::Rng;
@@ -80,6 +80,9 @@ struct Lane {
     bb: BitBoard,
     placed: Placed,
     cells: [Digit; CELLS],
+    /// The full solution grid this attempt is stripping (cells before any strip),
+    /// kept so a success can report its solution like the scalar `generate`.
+    solution: [Digit; CELLS],
     positions: [usize; CELLS],
     pos_idx: usize,
     best: Option<[Digit; CELLS]>,
@@ -102,6 +105,7 @@ impl Lane {
             bb: BitBoard::from_board(&empty),
             placed: Placed::from_board(&empty),
             cells: [0; CELLS],
+            solution: [0; CELLS],
             positions: core::array::from_fn(|i| i),
             pos_idx: 0,
             best: None,
@@ -117,6 +121,7 @@ impl Lane {
     fn start_attempt(&mut self) {
         let solution = random_full_grid(&mut self.rng);
         self.cells = core::array::from_fn(|i| solution.cell(i));
+        self.solution = self.cells;
         self.bb = BitBoard::from_board(&solution);
         self.placed = Placed::from_board(&solution);
         self.positions = core::array::from_fn(|i| i);
@@ -134,10 +139,12 @@ impl Lane {
     /// uniqueness-gate decision (sets `pending`) or exhausts the attempt — in
     /// which case it finalizes and refills (looping) until either a gate is
     /// reached or its quota runs out (then it goes idle).
-    fn advance_to_gate(&mut self, spec: &Spec) {
+    fn advance_to_gate<F: FnMut(GeneratedPuzzle)>(&mut self, spec: &Spec, on_found: &mut F) {
         loop {
             if self.pos_idx >= CELLS {
-                self.finalize(spec);
+                if let Some(p) = self.finalize(spec) {
+                    on_found(p);
+                }
                 self.active = false;
                 if self.remaining > 0 {
                     self.start_attempt();
@@ -177,25 +184,29 @@ impl Lane {
     /// Finalize the current attempt: verify `best`, tally the outcome, fold the
     /// fingerprint — byte-identical to generator-lab's `run_attempts` per-outcome
     /// bookkeeping.
-    fn finalize(&mut self, spec: &Spec) {
+    fn finalize(&mut self, spec: &Spec) -> Option<GeneratedPuzzle> {
         match self.best {
             Some(snap) => {
                 let seed = board_from_cells(&snap);
                 if verify(&seed, spec) {
                     self.stats.successes += 1;
-                    self.stats.total_givens += seed.givens();
+                    let givens = seed.givens();
+                    self.stats.total_givens += givens;
                     for i in 0..CELLS {
                         self.fp ^= snap[i] as u64;
                         self.fp = self.fp.wrapping_mul(FNV_PRIME);
                     }
+                    Some(GeneratedPuzzle { puzzle: seed, solution: board_from_cells(&self.solution), givens })
                 } else {
                     self.stats.not_forced += 1;
                     self.fp = self.fp.wrapping_mul(FNV_PRIME);
+                    None
                 }
             }
             None => {
                 self.stats.never_fired += 1;
                 self.fp = self.fp.wrapping_mul(FNV_PRIME);
+                None
             }
         }
     }
@@ -274,7 +285,7 @@ pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: us
         if let Some(v) = verdict {
             let ll = slot_lane[slot];
             resolve_gate_with(&mut ls[ll], spec, baseline, forced, v);
-            ls[ll].advance_to_gate(spec);
+            ls[ll].advance_to_gate(spec, &mut |_| {}); // throughput bench: drop puzzles
             if ls[ll].pending.is_some() {
                 return Some(probe_of(&ls[ll]));
             }
@@ -291,7 +302,7 @@ pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: us
                 continue; // empty quota: nothing to stream
             }
             ls[ll].start_attempt();
-            ls[ll].advance_to_gate(spec);
+            ls[ll].advance_to_gate(spec, &mut |_| {}); // throughput bench: drop puzzles
             if ls[ll].pending.is_some() {
                 slot_lane[slot] = ll;
                 return Some(probe_of(&ls[ll]));
@@ -308,4 +319,55 @@ pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: us
         per_lane.push((lane.stats, lane.fp));
     }
     WarpResult { stats, per_lane }
+}
+
+/// Generate puzzles by racing the W=8 packed prober across independent seed streams
+/// until `target` puzzles have been produced, then stop. SIMD slot `s` owns one
+/// unbounded seed stream (`base_seed + s`) and the packed prober keeps all 8 slots
+/// in flight, so this harvests the warp's full per-core throughput — the realistic
+/// way to *use* the SIMT prober (batch generation of many puzzles). A single puzzle
+/// from a single seed is inherently sequential; for that use `generator::generate`.
+///
+/// Deterministic for a given `base_seed`. Returns the puzzles (each spec-verified,
+/// so safe to feed straight to core's verifier) and the aggregate attempt stats.
+/// In-flight slots are drained once `target` is reached, so a few attempts past the
+/// last find may run; the returned Vec is exactly `target` long (a single warp pass
+/// can surface more than one success).
+pub fn find_puzzles(base_seed: u64, spec: &Spec, target: usize) -> (Vec<GeneratedPuzzle>, Stats) {
+    let baseline = spec.baseline_mask();
+    let forced = spec.forced_mask();
+    let mut found: Vec<GeneratedPuzzle> = Vec::with_capacity(target);
+    if target == 0 {
+        return (found, Stats::default());
+    }
+
+    // One unbounded seed stream per SIMD slot (1:1, no lane pool to refill from).
+    let mut ls: Vec<Lane> =
+        (0..LANES).map(|s| Lane::new(Rng::from_seed(base_seed + s as u64), usize::MAX)).collect();
+    let mut prober = PackedProber::new();
+
+    prober.run_stream(|slot, verdict| {
+        if found.len() >= target {
+            return None; // enough found: let the in-flight slots drain
+        }
+        let lane = &mut ls[slot];
+        match verdict {
+            Some(v) => resolve_gate_with(lane, spec, baseline, forced, v),
+            None if !lane.active => lane.start_attempt(), // initial fill
+            None => {}
+        }
+        lane.advance_to_gate(spec, &mut |p| found.push(p));
+        if found.len() >= target {
+            return None;
+        }
+        // Unbounded quota ⇒ advance always parks the lane at a fresh gate.
+        if lane.pending.is_some() { Some(probe_of(lane)) } else { None }
+    });
+
+    found.truncate(target);
+    let mut stats = Stats::default();
+    for lane in &ls {
+        stats.add(&lane.stats);
+    }
+    (found, stats)
 }

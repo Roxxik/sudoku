@@ -53,9 +53,13 @@ generator-lab/check.sh [attempts=2000] [seed=1]
 # Native only:
 cargo run --release -p generator-lab --example bench -- --attempts 4000 --seed 1
 
-# Print one actual puzzle (feed to core's CLI/verifier to confirm the spec):
+# Print one actual puzzle (scalar, single seed; feed to core's CLI/verifier):
 cargo run --release -p generator-lab --example find -- --mode train --seed 1
 cargo run --release -p generator-lab --example find -- --mode drill --seed 1
+
+# Harvest N puzzles via the packed SIMT prober (races W=8 seed streams in parallel
+# until N are found); puzzle lines on stdout, summary on stderr:
+cargo run --release -p generator-lab --example findpar -- --mode train --count 10
 
 # Real-device ARM numbers (desktop wasm is a POOR proxy): serve the page over the
 # LAN, open on a phone, tap Run train / Run drill — results POST back to the
@@ -78,7 +82,8 @@ generator-lab/web/serve.sh [port=8000]
   per-core prober / ~1.55x end-to-end on native AVX. See `SIMT-ROADMAP.md`.
 - `src/verify.rs` — spec verification reduced to a bool.
 - `src/generator.rs` — the random strip-generate pipeline (scalar, per-lane reference).
-- `examples/bench.rs` `examples/find.rs` — native bench / single-puzzle.
+- `examples/bench.rs` `examples/find.rs` — native bench / scalar single-puzzle.
+- `examples/findpar.rs` — harvest N puzzles via the packed SIMT prober (`warp::find_puzzles`, W=8 seed streams in parallel).
 - `examples/probebench.rs` `examples/packbench.rs` — packed prober speedup (isolated
   / end-to-end) vs the scalar prober. The rest of `examples/` are the SIMT design
   microbenches indexed in `SIMT-ROADMAP.md`.
