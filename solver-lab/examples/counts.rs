@@ -3,7 +3,10 @@
 
 use solver_lab::counters::{reset, snapshot, snapshot_clone_split};
 use solver_lab::harness::fingerprint_run;
-use solver_lab::solvers::{UniqProber, banded, batch, bitboard_fb, bitboard_simd, light, lightbv};
+use solver_lab::solvers::{
+    UniqProber, banded, banded_nolc, banded_sl, banded_sl_nolc, batch, bitboard_fb, bitboard_simd,
+    light, lightbv,
+};
 
 fn run<P: UniqProber>(attempts: usize, seed: u64) {
     reset();
@@ -46,4 +49,7 @@ fn main() {
     run::<bitboard_simd::Probe>(attempts, seed);
     run::<bitboard_fb::Probe>(attempts, seed);
     run::<banded::Probe>(attempts, seed);
+    run::<banded_nolc::Probe>(attempts, seed);
+    run::<banded_sl::Probe>(attempts, seed);
+    run::<banded_sl_nolc::Probe>(attempts, seed);
 }

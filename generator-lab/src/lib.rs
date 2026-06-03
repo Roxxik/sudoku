@@ -26,6 +26,12 @@
 //! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.
 //! - [`verify`]: spec verification reduced to a bool (scalar, cold path).
 //! - [`generator`]: the random strip-generate pipeline.
+//! - [`packed`] / [`warp`] (native only): the packed/SIMT existence prober — a
+//!   warp of W=8 per-lane DFS searches (gather-free smear+ALU kernel) with
+//!   streaming refill, and the host driver that batches the strip loop's
+//!   uniqueness gates onto it. The scalar [`bb::ProberBoard`] prober is kept as
+//!   the shipped wasm path, the correctness oracle, and the perf bar (SIMT is a
+//!   native AVX play; on wasm simd128 the packing ceiling is too small to pay).
 
 #![feature(portable_simd)]
 
@@ -37,6 +43,13 @@ pub mod spec;
 pub mod techniques;
 pub mod util;
 pub mod verify;
+
+// The packed prober is an AVX (W=8) native play; the wasm cdylib build uses the
+// scalar prober via `wasm_exports`, so keep these out of the wasm binary.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod packed;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod warp;
 
 use spec::Spec;
 use techniques::HIDDEN_QUAD;

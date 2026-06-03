@@ -69,8 +69,27 @@ generator-lab/web/serve.sh [port=8000]
 - `src/techniques.rs` — gateable up-to-HiddenQuad engine: `solve_tracked`
   (baseline gate + requirement counts) and `min_target_uses` (verify avoid-walk).
 - `src/spec.rs` — compact `train`/`drill` spec.
-- `src/prober.rs` — the `bitboard-simd` existence prober (uniqueness gate).
+- `src/bb.rs` — the dual-banded bitboard core: the baseline technique engine, and
+  the lean single-layout no-LC `ProberBoard` existence prober (the uniqueness gate
+  + the shipped/wasm scalar path + the packed prober's correctness oracle).
+- `src/packed.rs` / `src/warp.rs` (native only) — the **packed/SIMT prober**: a warp
+  of W=8 per-lane DFS searches (gather-free smear+ALU kernel) with streaming refill,
+  and the host driver that batches the strip loop's uniqueness gates onto it. ~2.75x
+  per-core prober / ~1.55x end-to-end on native AVX. See `SIMT-ROADMAP.md`.
 - `src/verify.rs` — spec verification reduced to a bool.
-- `src/generator.rs` — the random strip-generate pipeline.
+- `src/generator.rs` — the random strip-generate pipeline (scalar, per-lane reference).
 - `examples/bench.rs` `examples/find.rs` — native bench / single-puzzle.
+- `examples/probebench.rs` `examples/packbench.rs` — packed prober speedup (isolated
+  / end-to-end) vs the scalar prober. The rest of `examples/` are the SIMT design
+  microbenches indexed in `SIMT-ROADMAP.md`.
+- `tests/equiv_warp.rs` — pins each warp lane byte-identical to the sequential run.
 - `web/` — node + SpiderMonkey runners, two-button browser page, LAN server.
+
+## SIMT prober
+
+The uniqueness gate is the generator's hot path. `src/packed.rs` + `src/warp.rs`
+pack W=8 independent existence searches per SIMD register on native AVX, fed by a
+streaming refill driver. `SIMT-ROADMAP.md` is the full design (cost model, layout,
+kernel, the measurement suite that validated it). The scalar `ProberBoard` is kept
+deliberately — it is the wasm/mobile path (SIMT is a native-only win), the packed
+prober's correctness oracle, and the perf bar.
