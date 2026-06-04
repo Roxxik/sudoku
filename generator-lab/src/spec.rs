@@ -7,7 +7,7 @@
 //! no spec in PoC scope uses it (train/drill(HiddenQuad) only Force a single
 //! kind). Add it when scope grows past HiddenSubset.
 
-use crate::techniques::{DIFFICULTY, HIDDEN_SINGLE, KindMask, NUM};
+use crate::technique_kinds::{DIFFICULTY, HIDDEN_SINGLE, KindMask, NUM};
 
 /// How a technique participates in a spec — mirrors core's `Usage`.
 ///

@@ -20,40 +20,43 @@
 //! - [`bb`]: the shared bitboard core — ONE transposed digit-board
 //!   representation for both the uniqueness prober (existence DFS) and the
 //!   baseline technique engine, so candidate propagation isn't duplicated.
+//! - [`technique_kinds`]: the shared taxonomy — kind indices, `KindMask`,
+//!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` both baseline engines return.
 //! - [`techniques`]: scalar reference engine — `solve_tracked` and
-//!   `min_target_uses` (verify's avoid-target walk, the cold path); also the
-//!   kind indices/masks the spec and `bb` share.
+//!   `min_target_uses` (verify's avoid-target walk, the cold path).
 //! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.
 //! - [`verify`]: spec verification reduced to a bool (scalar, cold path).
+//! - [`fill`]: the random full-grid filler (u128-bitboard MRV search), the first
+//!   half of every attempt.
 //! - [`generator`]: the random strip-generate pipeline.
-//! - [`packed`] / [`warp`] (native only): the packed/SIMT existence prober — a
-//!   warp of W=8 per-lane DFS searches (gather-free smear+ALU kernel) with
-//!   streaming refill, and the host driver that batches the strip loop's
-//!   uniqueness gates onto it. The scalar [`bb::ProberBoard`] prober is kept as
-//!   the shipped wasm path, the correctness oracle, and the perf bar (SIMT is a
-//!   native AVX play; on wasm simd128 the packing ceiling is too small to pay).
+//! - [`simt`] (native only): the SIMT stack — `simt::prober`, a warp of W=8
+//!   per-lane DFS searches (gather-free smear+ALU kernel) with streaming refill,
+//!   and `simt::host`, the driver that batches the strip loop's uniqueness gates
+//!   onto it. The scalar [`bb::ProberBoard`] prober is kept as the shipped wasm
+//!   path, the correctness oracle, and the perf bar (SIMT is a native AVX play;
+//!   on wasm simd128 the packing ceiling is too small to pay).
 
 #![feature(portable_simd)]
 
 pub mod bb;
 pub(crate) mod counters;
+pub mod fill;
 pub mod generator;
 pub mod grid;
 pub mod rng;
 pub mod spec;
+pub mod technique_kinds;
 pub mod techniques;
 pub mod util;
 pub mod verify;
 
 // The packed prober is an AVX (W=8) native play; the wasm cdylib build uses the
-// scalar prober via `wasm_exports`, so keep these out of the wasm binary.
+// scalar prober via `wasm_exports`, so keep the SIMT stack out of the wasm binary.
 #[cfg(not(target_arch = "wasm32"))]
-pub mod packed;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod warp;
+pub mod simt;
 
 use spec::Spec;
-use techniques::HIDDEN_QUAD;
+use technique_kinds::HIDDEN_QUAD;
 
 /// Build the PoC spec for a `mode`: 0 = train(HiddenQuad), else drill(HiddenQuad).
 pub fn spec_for_mode(mode: u32) -> Spec {

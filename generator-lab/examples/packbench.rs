@@ -18,7 +18,7 @@
 use generator_lab::generator::run_attempts;
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
-use generator_lab::warp::run_warp;
+use generator_lab::simt::host::run_warp;
 use std::time::Instant;
 
 fn main() {

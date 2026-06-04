@@ -1,4 +1,4 @@
-//! Packed SoA prober: the [`crate::warp`] batch point. Instead of K scalar
+//! Packed SoA prober: the [`crate::simt::host`] batch point. Instead of K scalar
 //! uniqueness queries, it lays them out across SIMD lanes and propagates them in
 //! lockstep — W=8 independent existence DFS searches, one per lane, fed by a
 //! work-stealing refill queue so a lane that reaches a verdict immediately pulls

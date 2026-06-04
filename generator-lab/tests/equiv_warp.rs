@@ -9,7 +9,7 @@
 use generator_lab::generator::run_attempts;
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
-use generator_lab::warp::run_warp;
+use generator_lab::simt::host::run_warp;
 
 /// For each `mode`, run a warp of several lanes and check every lane reproduces
 /// the sequential generator's `(stats, fp)` for its seed.

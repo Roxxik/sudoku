@@ -5,7 +5,7 @@
 //! Usage: cargo run --release --features profiling -p generator-pack --example packrun -- [W=64] [per_lane=4000]
 
 use generator_lab::spec_for_mode;
-use generator_lab::warp::run_warp;
+use generator_lab::simt::host::run_warp;
 
 fn main() {
     let mut args = std::env::args().skip(1);

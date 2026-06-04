@@ -3,7 +3,7 @@
 The design of the packed/SIMT existence prober: pack the generator's uniqueness
 prober **W puzzles per SIMD register** (one puzzle per lane) on native AVX. This
 began as a measurement-phase roadmap; the prober is now **built and landed** in
-this crate (`src/packed.rs` + `src/warp.rs`) — see *Implementation status* below.
+this crate (`src/simt/prober.rs` + `src/simt/host.rs`) — see *Implementation status* below.
 Every claim is backed by an example under `examples/` or `solver-lab/`, listed at
 the end so the numbers can be re-run rather than trusted from this doc.
 
@@ -172,7 +172,7 @@ the SIMT prober is now built:
 - **Kill switch — cleared.** `killswitch` (un-tuned integrated W=8 refill prober)
   beat the scalar prober by a clear per-core margin on real boards, so the residue
   (`S`) did not eat the closure win. Go.
-- **Built — `src/packed.rs` + `src/warp.rs`.** The W=8 packed-DFS prober:
+- **Built — `src/simt/prober.rs` + `src/simt/host.rs`.** The W=8 packed-DFS prober:
   1. `Probe`/`PackedProber` lift the bands to `Simd<u32, 8>` SoA, fed from
      `BitBoard::export_r`.
   2. Per-lane explicit DFS stacks; the gather-free `warp_pass` kernel (naked +

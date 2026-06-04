@@ -70,20 +70,26 @@ generator-lab/web/serve.sh [port=8000]
 ## Layout
 
 - `src/grid.rs` `src/rng.rs` `src/util.rs` — primitives copied from core.
-- `src/techniques.rs` — gateable up-to-HiddenQuad engine: `solve_tracked`
+- `src/technique_kinds.rs` — the shared taxonomy: kind indices, `KindMask`,
+  `DIFFICULTY`/`NAMES`, and the `SolveTrace` both baseline engines return.
+- `src/techniques.rs` — gateable up-to-HiddenQuad scalar engine: `solve_tracked`
   (baseline gate + requirement counts) and `min_target_uses` (verify avoid-walk).
 - `src/spec.rs` — compact `train`/`drill` spec.
-- `src/bb.rs` — the dual-banded bitboard core: the baseline technique engine, and
-  the lean single-layout no-LC `ProberBoard` existence prober (the uniqueness gate
-  + the shipped/wasm scalar path + the packed prober's correctness oracle).
-- `src/packed.rs` / `src/warp.rs` (native only) — the **packed/SIMT prober**: a warp
-  of W=8 per-lane DFS searches (gather-free smear+ALU kernel) with streaming refill,
-  and the host driver that batches the strip loop's uniqueness gates onto it. ~2.75x
-  per-core prober / ~1.55x end-to-end on native AVX. See `SIMT-ROADMAP.md`.
+- `src/bb/` (`mod` `layout` `prober`) — the dual-banded bitboard core: the baseline
+  technique engine (`mod`), the banding tables/helpers (`layout`), and the lean
+  single-layout no-LC `ProberBoard` existence prober (`prober`) — the uniqueness
+  gate + the shipped/wasm scalar path + the packed prober's correctness oracle.
+- `src/fill.rs` — the random full-grid filler (u128-bitboard MRV search), the first
+  half of every attempt.
+- `src/simt/` (`prober` `host`, native only) — the **packed/SIMT prober**: `prober`
+  is a warp of W=8 per-lane DFS searches (gather-free smear+ALU kernel) with
+  streaming refill, `host` is the driver that batches the strip loop's uniqueness
+  gates onto it. ~2.75x per-core prober / ~1.55x end-to-end on native AVX. See
+  `SIMT-ROADMAP.md`.
 - `src/verify.rs` — spec verification reduced to a bool.
 - `src/generator.rs` — the random strip-generate pipeline (scalar, per-lane reference).
 - `examples/bench.rs` `examples/find.rs` — native bench / scalar single-puzzle.
-- `examples/findpar.rs` — harvest N puzzles via the packed SIMT prober (`warp::find_puzzles`, W=8 seed streams in parallel).
+- `examples/findpar.rs` — harvest N puzzles via the packed SIMT prober (`simt::host::find_puzzles`, W=8 seed streams in parallel).
 - `examples/probebench.rs` `examples/packbench.rs` — packed prober speedup (isolated
   / end-to-end) vs the scalar prober. The rest of `examples/` are the SIMT design
   microbenches indexed in `SIMT-ROADMAP.md`.
@@ -92,7 +98,7 @@ generator-lab/web/serve.sh [port=8000]
 
 ## SIMT prober
 
-The uniqueness gate is the generator's hot path. `src/packed.rs` + `src/warp.rs`
+The uniqueness gate is the generator's hot path. `src/simt/prober.rs` + `src/simt/host.rs`
 pack W=8 independent existence searches per SIMD register on native AVX, fed by a
 streaming refill driver. `SIMT-ROADMAP.md` is the full design (cost model, layout,
 kernel, the measurement suite that validated it). The scalar `ProberBoard` is kept

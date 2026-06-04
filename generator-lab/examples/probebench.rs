@@ -16,7 +16,7 @@
 use generator_lab::bb::{BitBoard, Placed};
 use generator_lab::generator::random_full_grid;
 use generator_lab::grid::{CELLS, Digit, digit_to_bit};
-use generator_lab::packed::{PackedProber, Probe};
+use generator_lab::simt::prober::{PackedProber, Probe};
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
 use std::time::Instant;
@@ -104,7 +104,7 @@ fn main() {
     }
 
     let mode_name = if mode == 1 { "drill" } else { "train" };
-    println!("probebench: mode={mode_name}, W={}, {n} queries  (non-unique {:.1}%)", generator_lab::packed::LANES, 100.0 * nonunique as f64 / n as f64);
+    println!("probebench: mode={mode_name}, W={}, {n} queries  (non-unique {:.1}%)", generator_lab::simt::prober::LANES, 100.0 * nonunique as f64 / n as f64);
     println!("  verdict mismatches  scalar-vs-live {scalar_vs_real}  packed-vs-live {packed_vs_real}  packed-vs-scalar {packed_vs_scalar}   <- all MUST be 0\n");
 
     // ---- timing ----

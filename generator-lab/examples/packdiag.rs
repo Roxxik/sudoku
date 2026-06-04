@@ -12,9 +12,9 @@ fn main() {
 
 #[cfg(feature = "count")]
 fn main() {
-    use generator_lab::packed::{pstat_reset, pstat_snapshot};
+    use generator_lab::simt::prober::{pstat_reset, pstat_snapshot};
     use generator_lab::spec_for_mode;
-    use generator_lab::warp::run_warp;
+    use generator_lab::simt::host::run_warp;
 
     let mut args = std::env::args().skip(1);
     let lanes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);

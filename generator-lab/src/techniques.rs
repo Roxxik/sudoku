@@ -10,51 +10,16 @@
 //! it: [`solve_tracked`] (baseline gate + requirement counts) and
 //! [`min_target_uses`] (verify's avoid-target walk).
 //!
-//! Kinds are indexed in difficulty order; the index IS the kind and the bit
-//! `1 << index` is its membership bit in a [`KindMask`]. See [`crate::spec`].
+//! The shared taxonomy this engine speaks — the kind indices, `KindMask`,
+//! `DIFFICULTY`/`NAMES`, and the [`SolveTrace`] it returns — lives in
+//! [`crate::technique_kinds`]; this module is the scalar engine alone.
 
 use crate::grid::{
     BOX_UNITS, Board, COL_UNITS, CELLS, ROW_UNITS, UnitKind, all_units, box_of, col_of,
     digit_to_bit, iter_digits, popcount, row_of,
 };
+use crate::technique_kinds::{KindMask, NAKED_SINGLE, NUM, SolveTrace};
 use crate::util::for_each_combination;
-
-/// Number of technique kinds in PoC scope (NakedSingle .. HiddenQuad).
-pub const NUM: usize = 10;
-
-// Kind indices, difficulty order. The index is the kind; `1 << index` is its
-// membership bit in a `KindMask`.
-pub const NAKED_SINGLE: usize = 0;
-pub const HIDDEN_SINGLE: usize = 1;
-pub const LC_POINTING: usize = 2;
-pub const LC_CLAIMING: usize = 3;
-pub const NAKED_PAIR: usize = 4;
-pub const HIDDEN_PAIR: usize = 5;
-pub const NAKED_TRIPLE: usize = 6;
-pub const HIDDEN_TRIPLE: usize = 7;
-pub const NAKED_QUAD: usize = 8;
-pub const HIDDEN_QUAD: usize = 9;
-
-/// Difficulty of each kind, matching core's REGISTRY.
-pub const DIFFICULTY: [u32; NUM] = [10, 15, 20, 25, 30, 33, 36, 39, 42, 45];
-
-/// Human-readable names, for bench/diagnostic output.
-pub const NAMES: [&str; NUM] = [
-    "naked-single",
-    "hidden-single",
-    "lc-pointing",
-    "lc-claiming",
-    "naked-pair",
-    "hidden-pair",
-    "naked-triple",
-    "hidden-triple",
-    "naked-quad",
-    "hidden-quad",
-];
-
-/// A set of technique *kinds* as a bitmask (`1 << kind_index`). Distinct from
-/// [`crate::grid::DigitMask`], the 9-bit set of digits.
-pub type KindMask = u32;
 
 /// Each entry applies its kind's FIRST applicable step to the board, returning
 /// whether it changed anything. Difficulty order — index = kind.
@@ -81,13 +46,6 @@ fn step_once(b: &mut Board, allowed: KindMask) -> Option<usize> {
         }
     }
     None
-}
-
-/// The result of a tracked baseline solve: whether the `allowed` toolbox solved
-/// the board, and how many times each kind fired (for the requirement check).
-pub struct SolveTrace {
-    pub solved: bool,
-    pub counts: [u16; NUM],
 }
 
 /// Solve `board` using only the `allowed` toolbox, easiest-first, tallying each

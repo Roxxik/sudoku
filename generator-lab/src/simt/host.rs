@@ -1,7 +1,7 @@
 //! The attempt **warp**: K independent strip attempts driven in lockstep, with
 //! per-lane refill. This is the orchestration that "packs multiple attempts in
 //! parallel"; the uniqueness gate it batches is resolved by the packed-DFS prober
-//! (`crate::packed`, the gather-free W=8 smear+ALU kernel).
+//! ([`crate::simt::prober`], the gather-free W=8 smear+ALU kernel).
 //!
 //! ## The cheap/expensive split and on-demand refill
 //!
@@ -16,12 +16,12 @@
 //!     there with its `(cell, orig, alts)` pending. This is [`Lane::advance_to_gate`].
 //!
 //!   - **expensive (the gate):** the uniqueness prober + baseline. The pending
-//!     probe is handed to the packed prober ([`crate::packed`]), which runs it on
+//!     probe is handed to the packed prober ([`crate::simt::prober`]), which runs it on
 //!     one of its 8 SIMD slots alongside seven other lanes' probes. (The baseline
 //!     gate is still scalar per-lane — the remaining Amdahl half.)
 //!
 //! **Streaming, not a barrier.** The packed prober owns the loop ([`run_warp`]
-//! drives [`crate::packed::PackedProber::run_stream`]): each SIMD slot streams one
+//! drives [`crate::simt::prober::PackedProber::run_stream`]): each SIMD slot streams one
 //! logical lane's gates, and the moment a slot reaches a verdict the refill
 //! callback resolves it ([`resolve_gate_with`]: revert/keep + baseline), walks that
 //! lane to its next gate, and hands the new probe straight back — no two-phase
@@ -29,11 +29,11 @@
 //! its quota finalizes (verify) and its slot grabs the next unstarted lane, so at
 //! most 8 attempts are ever in flight yet the warp stays full while work remains.
 //! Logical lanes are independent, so the 8-slot interleave can't change any lane's
-//! outcome (`tests/equiv.rs` pins each lane byte-identical to its sequential run).
+//! outcome (`tests/equiv_warp.rs` pins each lane byte-identical to its sequential run).
 
 use crate::generator::{GeneratedPuzzle, Stats, StripState, board_from_cells, random_full_grid};
 use crate::grid::{Board, CELLS, Digit};
-use crate::packed::{LANES, PackedProber, Probe};
+use crate::simt::prober::{LANES, PackedProber, Probe};
 use crate::rng::Rng;
 use crate::spec::Spec;
 use crate::util::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
@@ -202,7 +202,7 @@ pub struct WarpResult {
 /// in flight, yet the warp stays full — no FIFO-depth knob, no oversubscription.
 /// Lanes are independent, so each logical lane's `(stats, fp)` is byte-identical to
 /// the sequential run from its seed regardless of how the 8 slots interleave
-/// (`tests/equiv.rs` pins this).
+/// (`tests/equiv_warp.rs` pins this).
 pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
     let baseline = spec.baseline_mask();
     let forced = spec.forced_mask();

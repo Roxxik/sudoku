@@ -16,7 +16,7 @@ use generator_lab::generator::generate as glab_generate;
 use generator_lab::grid::Board as GBoard;
 use generator_lab::rng::Rng as GRng;
 use generator_lab::spec::Spec as GSpec;
-use generator_lab::techniques as gt;
+use generator_lab::technique_kinds as gt;
 use generator_lab::verify::verify as glab_verify;
 
 use sudoku_core::{

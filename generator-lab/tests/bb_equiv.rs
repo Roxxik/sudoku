@@ -30,10 +30,10 @@ use generator_lab::grid::{Board, CELLS, digit_to_bit};
 use generator_lab::rng::Rng;
 use generator_lab::spec::Spec;
 use generator_lab::spec_for_mode;
-use generator_lab::techniques::{
+use generator_lab::technique_kinds::{
     HIDDEN_PAIR, HIDDEN_SINGLE, LC_CLAIMING, LC_POINTING, NAKED_PAIR, NAKED_SINGLE, NUM,
-    solve_tracked,
 };
+use generator_lab::techniques::solve_tracked;
 
 fn check_spec(label: &str, spec: &Spec, attempts: usize, min_compared: usize) {
     let baseline = spec.baseline_mask();

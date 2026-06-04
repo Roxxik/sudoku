@@ -63,7 +63,7 @@ mod layout;
 mod prober;
 
 use crate::grid::{Board, CELLS, iter_digits};
-use crate::techniques::{
+use crate::technique_kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
 };
@@ -345,7 +345,7 @@ impl BitBoard {
     }
 
     /// Export the row-major bands and the empty-cell mask as plain `[u32; 4]`
-    /// arrays — the candidate state the packed prober ([`crate::packed`]) needs to
+    /// arrays — the candidate state the packed prober ([`crate::simt::prober`]) needs to
     /// load a lane. The column-major view is redundant for naked-single
     /// propagation (peers and the sieve are all in-lane row-major), so it is not
     /// exported. This is exactly the [`ProberBoard`] half (the lean scalar prober

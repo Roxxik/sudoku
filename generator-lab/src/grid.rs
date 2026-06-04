@@ -9,7 +9,7 @@ pub const ALL_DIGITS: u16 = 0x1FF;
 pub type Digit = u8;
 pub type CellIdx = usize;
 /// A 9-bit set of digits: bit `d-1` set iff digit `d` is present (e.g. a cell's
-/// candidate mask). Distinct from [`crate::techniques::KindMask`], the set of
+/// candidate mask). Distinct from [`crate::technique_kinds::KindMask`], the set of
 /// technique *kinds*.
 pub type DigitMask = u16;
 

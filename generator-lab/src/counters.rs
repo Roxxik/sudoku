@@ -2,7 +2,7 @@
 //!
 //! Every diagnostic in the crate — baseline anatomy ([`crate::bb`] `CTR`), prober
 //! anatomy (`PCTR`), band-scan metrics (`BAND_CTR`), and the packed-DFS metrics
-//! ([`crate::packed`] `PSTAT`/`DSTAT`) — is the same shape: a fixed `[u64; N]` of
+//! ([`crate::simt::prober`] `PSTAT`/`DSTAT`) — is the same shape: a fixed `[u64; N]` of
 //! tallies that an example snapshots and resets around a measured run. The
 //! [`counter_block`] macro generates one such block (the backing static, the
 //! `snapshot`/`reset` readout, and the `inc`/`add` mutators), so each is one line
@@ -13,7 +13,7 @@
 //! absent (callers gate their `snapshot`/`reset` calls behind the feature too),
 //! so a production build pays nothing. The macro expands *inside the invoking
 //! module*, so the generated `snapshot`/`reset` keep their `crate::bb::…` /
-//! `crate::packed::…` paths that the example diagnostics import.
+//! `crate::simt::prober::…` paths that the example diagnostics import.
 
 /// Declare a counter block named `$static` of `$len` `u64` tallies. Generates, in
 /// the invoking module: `pub(crate)` `inc(i)` / `add(i, v)` mutators (no-ops when

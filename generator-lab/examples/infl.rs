@@ -22,10 +22,10 @@ fn main() {
 fn main() {
     use generator_lab::bb::{pctr_reset, pctr_snapshot};
     use generator_lab::generator::run_attempts;
-    use generator_lab::packed::{dstat_reset, dstat_snapshot};
+    use generator_lab::simt::prober::{dstat_reset, dstat_snapshot};
     use generator_lab::rng::Rng;
     use generator_lab::spec_for_mode;
-    use generator_lab::warp::run_warp;
+    use generator_lab::simt::host::run_warp;
 
     let mut args = std::env::args().skip(1);
     let w: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(16);
