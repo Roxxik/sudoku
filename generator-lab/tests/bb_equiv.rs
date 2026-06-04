@@ -258,9 +258,9 @@ fn check_fixture(label: &str, line: &str, spec: &Spec, expect_solved: bool) {
 fn fixture_hidden_single_only_baseline() {
     let hs = Spec::explicit()
         .force(HIDDEN_SINGLE, 1)
-        .concede_kind(NAKED_SINGLE)
-        .concede_kind(LC_POINTING)
-        .concede_kind(LC_CLAIMING);
+        .concede(NAKED_SINGLE)
+        .concede(LC_POINTING)
+        .concede(LC_CLAIMING);
     check_fixture("hs-only/hs-baseline", HS_ONLY, &hs, true);
     // Mirror: naked-single-only baseline cannot crack it (core: STUCK).
     let ns = Spec::explicit().force(NAKED_SINGLE, 1);
@@ -272,9 +272,9 @@ fn fixture_hidden_single_only_baseline() {
 fn fixture_naked_single_only_baseline() {
     let ns = Spec::explicit()
         .force(NAKED_SINGLE, 1)
-        .concede_kind(HIDDEN_SINGLE)
-        .concede_kind(LC_POINTING)
-        .concede_kind(LC_CLAIMING);
+        .concede(HIDDEN_SINGLE)
+        .concede(LC_POINTING)
+        .concede(LC_CLAIMING);
     check_fixture("ns-only/ns-baseline", NS_ONLY, &ns, true);
     // Mirror: hidden-single-only baseline cannot crack it (core: STUCK).
     let hs = Spec::explicit().force(HIDDEN_SINGLE, 1);

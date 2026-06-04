@@ -8,10 +8,13 @@ pub const ALL_DIGITS: u16 = 0x1FF;
 
 pub type Digit = u8;
 pub type CellIdx = usize;
-pub type Mask = u16;
+/// A 9-bit set of digits: bit `d-1` set iff digit `d` is present (e.g. a cell's
+/// candidate mask). Distinct from [`crate::techniques::KindMask`], the set of
+/// technique *kinds*.
+pub type DigitMask = u16;
 
 #[inline(always)]
-pub const fn digit_to_bit(d: Digit) -> Mask {
+pub const fn digit_to_bit(d: Digit) -> DigitMask {
     1u16 << (d as u16 - 1)
 }
 
@@ -39,14 +42,14 @@ pub enum UnitKind {
 
 /// Iterate the set digits in `mask`, lowest bit first.
 #[inline]
-pub fn iter_digits(mask: Mask) -> DigitIter {
+pub fn iter_digits(mask: DigitMask) -> DigitIter {
     DigitIter {
         mask: mask & ALL_DIGITS,
     }
 }
 
 pub struct DigitIter {
-    mask: Mask,
+    mask: DigitMask,
 }
 
 impl Iterator for DigitIter {
@@ -71,7 +74,7 @@ impl Iterator for DigitIter {
 }
 
 #[inline(always)]
-pub fn popcount(mask: Mask) -> u32 {
+pub fn popcount(mask: DigitMask) -> u32 {
     (mask & ALL_DIGITS).count_ones()
 }
 
@@ -80,7 +83,7 @@ pub fn popcount(mask: Mask) -> u32 {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Board {
     cells: [Digit; CELLS],
-    candidates: [Mask; CELLS],
+    candidates: [DigitMask; CELLS],
 }
 
 impl Board {
@@ -134,8 +137,14 @@ impl Board {
         self.cells[i]
     }
 
+    /// The 81 cell digits (0 = empty) as a flat array — for fingerprint folding.
     #[inline]
-    pub fn candidates(&self, i: CellIdx) -> Mask {
+    pub fn cells(&self) -> &[Digit; CELLS] {
+        &self.cells
+    }
+
+    #[inline]
+    pub fn candidates(&self, i: CellIdx) -> DigitMask {
         self.candidates[i]
     }
 

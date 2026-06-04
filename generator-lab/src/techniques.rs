@@ -11,7 +11,7 @@
 //! [`min_target_uses`] (verify's avoid-target walk).
 //!
 //! Kinds are indexed in difficulty order; the index IS the kind and the bit
-//! `1 << index` is its membership bit in a [`Mask`]. See [`crate::spec`].
+//! `1 << index` is its membership bit in a [`KindMask`]. See [`crate::spec`].
 
 use crate::grid::{
     BOX_UNITS, Board, COL_UNITS, CELLS, ROW_UNITS, UnitKind, all_units, box_of, col_of,
@@ -23,7 +23,7 @@ use crate::util::for_each_combination;
 pub const NUM: usize = 10;
 
 // Kind indices, difficulty order. The index is the kind; `1 << index` is its
-// membership bit in a `Mask`.
+// membership bit in a `KindMask`.
 pub const NAKED_SINGLE: usize = 0;
 pub const HIDDEN_SINGLE: usize = 1;
 pub const LC_POINTING: usize = 2;
@@ -52,8 +52,9 @@ pub const NAMES: [&str; NUM] = [
     "hidden-quad",
 ];
 
-/// A set of technique kinds as a bitmask (`1 << kind_index`).
-pub type Mask = u32;
+/// A set of technique *kinds* as a bitmask (`1 << kind_index`). Distinct from
+/// [`crate::grid::DigitMask`], the 9-bit set of digits.
+pub type KindMask = u32;
 
 /// Each entry applies its kind's FIRST applicable step to the board, returning
 /// whether it changed anything. Difficulty order — index = kind.
@@ -73,7 +74,7 @@ const STEPS: [fn(&mut Board) -> bool; NUM] = [
 /// Apply the easiest in-`allowed` technique that fires, returning its kind
 /// index, or `None` if no allowed technique applies (stuck).
 #[inline]
-fn step_once(b: &mut Board, allowed: Mask) -> Option<usize> {
+fn step_once(b: &mut Board, allowed: KindMask) -> Option<usize> {
     for idx in 0..NUM {
         if allowed & (1 << idx) != 0 && STEPS[idx](b) {
             return Some(idx);
@@ -82,9 +83,9 @@ fn step_once(b: &mut Board, allowed: Mask) -> Option<usize> {
     None
 }
 
-/// Outcome of a tracked baseline solve: whether the `allowed` toolbox solved the
-/// board, and how many times each kind fired (for the requirement check).
-pub struct Outcome {
+/// The result of a tracked baseline solve: whether the `allowed` toolbox solved
+/// the board, and how many times each kind fired (for the requirement check).
+pub struct SolveTrace {
     pub solved: bool,
     pub counts: [u16; NUM],
 }
@@ -100,7 +101,7 @@ pub struct Outcome {
 /// `solved` and every kind's count (hence `requirement_met`) are identical. The
 /// boards reaching here passed the uniqueness gate, so every naked single is a
 /// forced move of the unique solution and batch-placing can never conflict.
-pub fn solve_tracked(board: &Board, allowed: Mask) -> Outcome {
+pub fn solve_tracked(board: &Board, allowed: KindMask) -> SolveTrace {
     let mut b = board.clone();
     let mut counts = [0u16; NUM];
     let bat_singles = allowed & (1 << NAKED_SINGLE) != 0;
@@ -113,7 +114,7 @@ pub fn solve_tracked(board: &Board, allowed: Mask) -> Outcome {
             }
         }
         if b.is_solved() {
-            return Outcome { solved: true, counts };
+            return SolveTrace { solved: true, counts };
         }
         // No naked singles left: take one step from the rest of the ladder.
         // Mask naked single off when we already drained it, so we don't waste a
@@ -121,7 +122,7 @@ pub fn solve_tracked(board: &Board, allowed: Mask) -> Outcome {
         let rest = if bat_singles { allowed & !(1 << NAKED_SINGLE) } else { allowed };
         match step_once(&mut b, rest) {
             Some(idx) => counts[idx] = counts[idx].saturating_add(1),
-            None => return Outcome { solved: false, counts },
+            None => return SolveTrace { solved: false, counts },
         }
     }
 }
@@ -161,7 +162,7 @@ fn drain_naked_singles(b: &mut Board) -> u16 {
 ///
 /// `scope` is the full in-scope set (including the target); `target` is the
 /// bit(s) of the technique whose necessity is being proven.
-pub fn min_target_uses(board: &Board, scope: Mask, target: Mask) -> usize {
+pub fn min_target_uses(board: &Board, scope: KindMask, target: KindMask) -> usize {
     let mut b = board.clone();
     let non_target = scope & !target;
     let mut count = 0usize;

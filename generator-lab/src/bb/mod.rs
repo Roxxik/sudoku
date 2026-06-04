@@ -49,92 +49,65 @@
 //! technique never flips that) — so the generator fingerprint is invariant.
 //! `tests/bb_equiv.rs` cross-checks the baseline against the scalar engine;
 //! the generator's `find 118329` anchor pins it end-to-end.
+//!
+//! ## Module layout
+//! - [`layout`]: the banding maps, every precomputed lookup table, and the
+//!   `Simd<u32, 4>` helpers — pure data shared by the engine and the prober.
+//! - [`prober`]: the lean single-layout `ProberBoard` existence oracle and the
+//!   `BitBoard` methods that enter it (`any_alt_solves`, closure diagnostics).
+//! - this file (`mod`): the dual-view `BitBoard` itself — its I/O
+//!   (`from_board`/`apply_clear`/`apply_place`/`export_r`), the shared `Placed`
+//!   clue map, and the baseline technique engine.
 
-use crate::grid::{BOX_UNITS, Board, COL_UNITS, CELLS, PEERS, ROW_UNITS, iter_digits};
+mod layout;
+mod prober;
+
+use crate::grid::{Board, CELLS, iter_digits};
 use crate::techniques::{
-    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, LC_CLAIMING, LC_POINTING, Mask,
-    NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, Outcome,
+    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
+    NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
 };
 use crate::util::for_each_combination;
 use std::simd::Simd;
-use std::simd::cmp::SimdPartialEq;
 
-/// One v128 holds a digit's three 27-bit bands in lanes 0/1/2; lane 3 stays zero.
-type B = Simd<u32, 4>;
-const ZERO: B = Simd::from_array([0, 0, 0, 0]);
+// The banding layout (cell↔band maps, lookup tables, `B`/`ZERO` and the SIMD
+// helpers) lives in `layout`; re-export the cell-map fns the packed prober imports
+// as `crate::bb::{rm_lane, ..}`.
+pub(crate) use layout::{rm_bit, rm_cell, rm_lane};
+use layout::{
+    B, CM_LC_TRIP, DROP_TRIP, RM_LC_TRIP, SINGLE9, UNIT_CELLS, ZERO, at_least_two, bit_c, bit_r,
+    cm_bit, cm_cell, cm_lane, exactly_one, first_rm, nonzero, peer_mask_c, peer_mask_r, popcnt,
+    triplet_occ, unit_mask_r,
+};
+
+use crate::counters::counter_block;
 
 // --- optional baseline anatomy counters (feature = "count") -------------------
 // Count how often each technique is SCANNED per attempt (scan count × scan size
-// ≈ cost), to see what dominates `baseline` before optimizing it.
+// ≈ cost), to see what dominates `baseline` before optimizing it. `bump(i)` tallies.
 pub const CTR_NAMES: [&str; 8] = [
     "baseline-calls", "sieve-waves", "hidden_single", "lc_pointing", "lc_claiming",
     "naked_subset", "hidden_subset", "cell_candidates",
 ];
-#[cfg(feature = "count")]
-static CTR: [core::sync::atomic::AtomicU64; 8] = [const { core::sync::atomic::AtomicU64::new(0) }; 8];
-#[inline(always)]
-fn bump(_i: usize) {
-    #[cfg(feature = "count")]
-    CTR[_i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-#[cfg(feature = "count")]
-pub fn ctr_snapshot() -> [u64; 8] {
-    core::array::from_fn(|i| CTR[i].load(core::sync::atomic::Ordering::Relaxed))
-}
-#[cfg(feature = "count")]
-pub fn ctr_reset() {
-    for a in CTR.iter() {
-        a.store(0, core::sync::atomic::Ordering::Relaxed);
-    }
-}
+counter_block!(CTR: 8, inc = bump, add = ctr_add, snapshot = ctr_snapshot, reset = ctr_reset);
 
 // --- prober anatomy counters (feature = "count") ------------------------------
 // Where does the existence-DFS cost go: propagation (singles waves) vs branching
-// (recursion / clones)? Single-threaded lab, so plain mutable statics — see
-// solver-lab/src/counters.rs.
+// (recursion / clones)? `pbump(i)` tallies.
 pub const PCTR_NAMES: [&str; 8] = [
     "alt-calls", "alt-nonunique", "solve_first-nodes", "sieve-waves",
     "place_singles-calls", "branch-points", "child-clones", "branch-digits",
 ];
-#[cfg(feature = "count")]
-static mut PCTR: [u64; 8] = [0; 8];
-// SAFETY: single-threaded use only; reads/writes a `u64` by value, no aliasing.
-#[inline(always)]
-fn pbump(_i: usize) {
-    #[cfg(feature = "count")]
-    unsafe {
-        PCTR[_i] += 1;
-    }
-}
-#[cfg(feature = "count")]
-pub fn pctr_snapshot() -> [u64; 8] {
-    unsafe { PCTR }
-}
-#[cfg(feature = "count")]
-pub fn pctr_reset() {
-    unsafe {
-        PCTR = [0; 8];
-    }
-}
+counter_block!(PCTR: 8, inc = pbump, add = pctr_add, snapshot = pctr_snapshot, reset = pctr_reset);
 
 // --- band_update scan metrics (feature = "count") -----------------------------
 // Sizes the dirty-band-tracking opportunity: 0 propagate-calls, 1 band-passes
 // (one rm+cm fixpoint iteration), 2 bd-scans (per-(band,digit) iterations across
 // rm+cm), 3 bd-productive (scans that actually dropped a triplet or placed a
 // single). waste = 1 - productive/scans = the rescans dirty-tracking could skip.
+// `band_ctr_inc(i)` tallies.
 pub const BAND_CTR_NAMES: [&str; 4] = ["propagate-calls", "band-passes", "bd-scans", "bd-productive"];
-#[cfg(feature = "count")]
-static mut BAND_CTR: [u64; 4] = [0; 4];
-#[cfg(feature = "count")]
-pub fn band_ctr_snapshot() -> [u64; 4] {
-    unsafe { BAND_CTR }
-}
-#[cfg(feature = "count")]
-pub fn band_ctr_reset() {
-    unsafe {
-        BAND_CTR = [0; 4];
-    }
-}
+counter_block!(BAND_CTR: 4, inc = band_ctr_inc, add = band_ctr_add, snapshot = band_ctr_snapshot, reset = band_ctr_reset);
 
 /// One existence-DFS query (`any_alt_solves`): the board sparsity it ran on, the
 /// work it cost, and whether it found a 2nd solution. Lets a diagnostic see WHERE
@@ -161,339 +134,6 @@ pub fn alt_stats_reset() {
     }
 }
 
-// --- layout maps: cell <-> (lane, bit) for each banding -----------------------
-pub(crate) const fn rm_lane(cell: usize) -> usize {
-    (cell / 9) / 3
-}
-pub(crate) const fn rm_bit(cell: usize) -> usize {
-    ((cell / 9) % 3) * 9 + cell % 9
-}
-const fn cm_lane(cell: usize) -> usize {
-    (cell % 9) / 3
-}
-const fn cm_bit(cell: usize) -> usize {
-    ((cell % 9) % 3) * 9 + cell / 9
-}
-/// Inverse of (`rm_lane`, `rm_bit`): the cell at row-major position (lane, bit).
-#[inline(always)]
-pub(crate) fn rm_cell(lane: usize, bit: u32) -> usize {
-    let b = bit as usize;
-    (3 * lane + b / 9) * 9 + b % 9
-}
-/// Inverse of (`cm_lane`, `cm_bit`): the cell at column-major position (lane, bit).
-#[inline(always)]
-fn cm_cell(lane: usize, bit: u32) -> usize {
-    let b = bit as usize;
-    (b % 9) * 9 + (3 * lane + b / 9)
-}
-
-pub(crate) const BITS_R: [[u32; 4]; CELLS] = build_bits(true);
-const BITS_C: [[u32; 4]; CELLS] = build_bits(false);
-pub(crate) const PEER_MASK_R: [[u32; 4]; CELLS] = build_peer_mask(true);
-const PEER_MASK_C: [[u32; 4]; CELLS] = build_peer_mask(false);
-/// 27 units (9 rows, 9 cols, 9 boxes) as cell lists, in scan order.
-const UNIT_CELLS: [[usize; 9]; 27] = build_unit_cells();
-/// The 27 units as row-major masks. Rows 0..9, cols 9..18, boxes 18..27. (Only
-/// the row-major view needs unit masks: the baseline's fused closure does column
-/// work on the column-major bands' in-lane tables, and its discrete ladder scans
-/// every unit in the row-major view — columns cross-lane, which
-/// `exactly_one`/`nonzero` handle.)
-const UNIT_MASK_R: [[u32; 4]; 27] = build_unit_masks(true);
-
-const fn build_bits(row_major: bool) -> [[u32; 4]; CELLS] {
-    let mut b = [[0u32; 4]; CELLS];
-    let mut c = 0;
-    while c < CELLS {
-        let (lane, bit) = if row_major { (rm_lane(c), rm_bit(c)) } else { (cm_lane(c), cm_bit(c)) };
-        b[c][lane] = 1u32 << bit;
-        c += 1;
-    }
-    b
-}
-
-const fn build_peer_mask(row_major: bool) -> [[u32; 4]; CELLS] {
-    let mut m = [[0u32; 4]; CELLS];
-    let mut i = 0;
-    while i < CELLS {
-        let mut k = 0;
-        while k < 20 {
-            let p = PEERS[i][k];
-            let (lane, bit) = if row_major { (rm_lane(p), rm_bit(p)) } else { (cm_lane(p), cm_bit(p)) };
-            m[i][lane] |= 1u32 << bit;
-            k += 1;
-        }
-        i += 1;
-    }
-    m
-}
-
-const fn build_unit_cells() -> [[usize; 9]; 27] {
-    let mut u = [[0usize; 9]; 27];
-    let mut i = 0;
-    while i < 9 {
-        u[i] = ROW_UNITS[i];
-        u[9 + i] = COL_UNITS[i];
-        u[18 + i] = BOX_UNITS[i];
-        i += 1;
-    }
-    u
-}
-
-const fn build_unit_masks(row_major: bool) -> [[u32; 4]; 27] {
-    let mut m = [[0u32; 4]; 27];
-    let mut u = 0;
-    while u < 27 {
-        let mut k = 0;
-        while k < 9 {
-            let c = UNIT_CELLS[u][k];
-            let (lane, bit) = if row_major { (rm_lane(c), rm_bit(c)) } else { (cm_lane(c), cm_bit(c)) };
-            m[u][lane] |= 1u32 << bit;
-            k += 1;
-        }
-        u += 1;
-    }
-    m
-}
-
-/// Within-band locked-candidates self-elimination, fully precomputed.
-///
-/// A band is 9 **triplets** (3 band-rows × 3 box-columns, each a 3-cell minirow).
-/// Within one band, *all* a digit's locked-candidate eliminations are decided by
-/// the 9-bit "triplet occupancy" and only ever clear whole triplets:
-/// - **pointing**: a box-column confined to one band-row clears that row's other
-///   two triplets,
-/// - **claiming**: a band-row confined to one box-column clears that box's other
-///   two triplets.
-///
-/// `BAND_KEEP_OCC[occ]` is the locked-candidate fixpoint occupancy (the 9-bit set
-/// of *surviving* triplets) for every occupancy. The same table serves both
-/// views: in row-major bands it is box↔row LC, in col-major bands box↔column LC.
-/// Occupancy bit `3*r + k` is the triplet at band-row `r`, box-column `k`.
-const BAND_KEEP_OCC: [u32; 512] = build_band_keep();
-
-const fn build_band_keep() -> [u32; 512] {
-    let mut t = [0u32; 512];
-    let mut occ = 0usize;
-    while occ < 512 {
-        let mut keep = occ as u32; // 9-bit triplet occupancy
-        loop {
-            let mut next = keep;
-            // pointing: box-column k whose occupied triplets are a single band-row.
-            let mut k = 0;
-            while k < 3 {
-                let r0 = (next >> k) & 1;
-                let r1 = (next >> (3 + k)) & 1;
-                let r2 = (next >> (6 + k)) & 1;
-                if r0 + r1 + r2 == 1 {
-                    let r = if r0 == 1 { 0 } else if r1 == 1 { 1 } else { 2 };
-                    let mut kk = 0;
-                    while kk < 3 {
-                        if kk != k {
-                            next &= !(1 << (r * 3 + kk));
-                        }
-                        kk += 1;
-                    }
-                }
-                k += 1;
-            }
-            // claiming: band-row r whose occupied triplets are a single box-column.
-            let mut r = 0;
-            while r < 3 {
-                let c0 = (next >> (r * 3)) & 1;
-                let c1 = (next >> (r * 3 + 1)) & 1;
-                let c2 = (next >> (r * 3 + 2)) & 1;
-                if c0 + c1 + c2 == 1 {
-                    let k = if c0 == 1 { 0 } else if c1 == 1 { 1 } else { 2 };
-                    let mut rr = 0;
-                    while rr < 3 {
-                        if rr != r {
-                            next &= !(1 << (rr * 3 + k));
-                        }
-                        rr += 1;
-                    }
-                }
-                r += 1;
-            }
-            if next == keep {
-                break;
-            }
-            keep = next;
-        }
-        t[occ] = keep;
-        occ += 1;
-    }
-    t
-}
-
-/// The triplets a band drops under locked-candidates, keyed on occupancy:
-/// `DROP_TRIP[occ] = occ & !BAND_KEEP_OCC[occ]` precomputed, so the per-scan LC
-/// check is one table load instead of a load + `not` + `and` (the `not` was the
-/// single hottest instruction in `band_update`). Nonzero only for the rare
-/// occupancies that actually have an LC elimination.
-const DROP_TRIP: [u32; 512] = build_drop_trip();
-
-const fn build_drop_trip() -> [u32; 512] {
-    let mut t = [0u32; 512];
-    let mut occ = 0usize;
-    while occ < 512 {
-        t[occ] = occ as u32 & !BAND_KEEP_OCC[occ];
-        occ += 1;
-    }
-    t
-}
-
-/// Hidden-single lookup for a 9-cell unit reduced to a 9-bit candidate mask: the
-/// lone bit's index if exactly one is set, else `0xFF`. A row, box, or column
-/// collapses to nine bits, so detecting (and locating) a hidden single is one
-/// table load off the band value — the same band value the occupancy/LC read —
-/// instead of a per-unit `exactly_one` + `trailing` scan.
-const SINGLE9: [u8; 512] = build_single9();
-
-const fn build_single9() -> [u8; 512] {
-    let mut t = [0xFFu8; 512];
-    let mut v = 1usize;
-    while v < 512 {
-        if v & (v - 1) == 0 {
-            t[v] = v.trailing_zeros() as u8;
-        }
-        v += 1;
-    }
-    t
-}
-
-/// 9-bit row -> 3-bit triplet occupancy: bit `k` set iff the row's `k`-th
-/// 3-cell triplet (bits `3k..3k+2`) holds any candidate. Lets [`triplet_occ`]
-/// gather a band's 9-bit occupancy with three table loads instead of a long
-/// shift chain.
-const OCC3: [u8; 512] = build_occ3();
-
-const fn build_occ3() -> [u8; 512] {
-    let mut t = [0u8; 512];
-    let mut v = 0usize;
-    while v < 512 {
-        let mut o = 0u8;
-        if v & 0b000_000_111 != 0 {
-            o |= 1;
-        }
-        if v & 0b000_111_000 != 0 {
-            o |= 2;
-        }
-        if v & 0b111_000_000 != 0 {
-            o |= 4;
-        }
-        t[v] = o;
-        v += 1;
-    }
-    t
-}
-
-/// For a triplet dropped by row-major LC — band `b`, triplet `t = 3*r + k` — the
-/// cell masks to clear in BOTH views. Row-major: lane `b`, the 3 bits at
-/// `9*r + 3*k`. Col-major: the same three cells form a vertical-triplet — lane
-/// `k`, bits `{R, 9+R, 18+R}` with `R = 3*b + r`.
-const RM_LC_TRIP: [[([u32; 4], [u32; 4]); 9]; 3] = build_lc_trip(true);
-/// The col-major analogue: band `b` (column-stack), triplet `t = 3*cc + br`.
-/// Col-major: lane `b`, bits at `9*cc + 3*br`. Row-major: lane `br`, bits
-/// `{C, 9+C, 18+C}` with `C = 3*b + cc`.
-const CM_LC_TRIP: [[([u32; 4], [u32; 4]); 9]; 3] = build_lc_trip(false);
-
-const fn build_lc_trip(row_major: bool) -> [[([u32; 4], [u32; 4]); 9]; 3] {
-    let mut out = [[([0u32; 4], [0u32; 4]); 9]; 3];
-    let mut b = 0;
-    while b < 3 {
-        let mut t = 0;
-        while t < 9 {
-            let a = t / 3; // band-row (rm) or col-within-stack (cm)
-            let g = t % 3; // box-col (rm) or box-row (cm)
-            let mut rmask = [0u32; 4];
-            let mut cmask = [0u32; 4];
-            if row_major {
-                // row-major: cells global row R = 3b+a, cols 3g..3g+2.
-                rmask[b] = 0b111 << (a * 9 + 3 * g);
-                let big_r = 3 * b + a;
-                cmask[g] = (1 << big_r) | (1 << (9 + big_r)) | (1 << (18 + big_r));
-            } else {
-                // col-major: cells global col C = 3b+a, rows 3g..3g+2.
-                cmask[b] = 0b111 << (a * 9 + 3 * g);
-                let big_c = 3 * b + a;
-                rmask[g] = (1 << big_c) | (1 << (9 + big_c)) | (1 << (18 + big_c));
-            }
-            out[b][t] = (rmask, cmask);
-            t += 1;
-        }
-        b += 1;
-    }
-    out
-}
-
-#[inline(always)]
-fn bit_r(c: usize) -> B {
-    Simd::from_array(BITS_R[c])
-}
-#[inline(always)]
-fn bit_c(c: usize) -> B {
-    Simd::from_array(BITS_C[c])
-}
-#[inline(always)]
-fn peer_mask_r(c: usize) -> B {
-    Simd::from_array(PEER_MASK_R[c])
-}
-#[inline(always)]
-fn peer_mask_c(c: usize) -> B {
-    Simd::from_array(PEER_MASK_C[c])
-}
-#[inline(always)]
-fn unit_mask_r(u: usize) -> B {
-    Simd::from_array(UNIT_MASK_R[u])
-}
-#[inline(always)]
-fn nonzero(x: B) -> bool {
-    x.simd_ne(ZERO).any()
-}
-/// Total set bits across the three bands. `u32::count_ones` is one wasm/ARM
-/// instruction, so this stays cheap where an actual count is needed.
-#[inline(always)]
-fn popcnt(x: B) -> u32 {
-    x[0].count_ones() + x[1].count_ones() + x[2].count_ones()
-}
-/// Exactly one bit set across the whole banded value — popcount-free. Exactly one
-/// band is nonzero and that band holds a single power of two.
-#[inline(always)]
-fn exactly_one(x: B) -> bool {
-    let (a, b, c) = (x[0], x[1], x[2]);
-    let nz = (a != 0) as u32 + (b != 0) as u32 + (c != 0) as u32;
-    nz == 1 && {
-        let v = a | b | c;
-        v & (v - 1) == 0
-    }
-}
-/// At least two bits set across the bands — popcount-free (the `< 2` guard the
-/// locked-candidate scans want, phrased without a count).
-#[inline(always)]
-fn at_least_two(x: B) -> bool {
-    nonzero(x) && !exactly_one(x)
-}
-/// Cell of the lowest set bit in a row-major value.
-#[inline(always)]
-fn first_rm(x: B) -> usize {
-    if x[0] != 0 {
-        rm_cell(0, x[0].trailing_zeros())
-    } else if x[1] != 0 {
-        rm_cell(1, x[1].trailing_zeros())
-    } else {
-        rm_cell(2, x[2].trailing_zeros())
-    }
-}
-/// 9-bit triplet occupancy of one band's 27-bit candidate set: bit `3*r + k` set
-/// iff triplet (band-row `r`, box-column `k`) holds any candidate. Three `OCC3`
-/// loads off the band's three 9-bit row chunks, gathered into the 9-bit result.
-#[inline(always)]
-fn triplet_occ(m: u32) -> usize {
-    OCC3[(m & 0x1FF) as usize] as usize
-        | (OCC3[((m >> 9) & 0x1FF) as usize] as usize) << 3
-        | (OCC3[((m >> 18) & 0x1FF) as usize] as usize) << 6
-}
-
 /// The nine digit boards in both bandings, plus the empty-cell mask in both.
 /// `r`/`unsolved_r` are row-major (rows & boxes in-lane); `c`/`unsolved_c` are
 /// column-major (columns & boxes in-lane). The two are kept consistent at every
@@ -509,6 +149,24 @@ pub struct BitBoard {
 struct Sieve {
     ones: B,
     twos: B,
+}
+
+/// Naked-single sieve over nine row-major digit boards: `ones` = cells with at
+/// least one candidate, `twos` = cells with at least two, accumulated across the
+/// digit boards. `ones & !twos` are the naked singles, `!ones` the dead cells.
+/// Shared verbatim by [`BitBoard`] (dual view) and [`ProberBoard`] (single view)
+/// — both sieve only the row-major bands.
+#[inline(always)]
+fn sieve(r: &[B; 9]) -> Sieve {
+    let mut ones = ZERO;
+    let mut twos = ZERO;
+    for d in 0..9 {
+        // SAFETY: d in 0..9.
+        let b = unsafe { *r.get_unchecked(d) };
+        twos |= ones & b;
+        ones |= b;
+    }
+    Sieve { ones, twos }
 }
 
 /// Per-digit *clue* positions in the row-major banding: bit for cell `i` of
@@ -544,252 +202,6 @@ enum Prop {
     Contradiction,
     /// A fixpoint with empty cells remaining — the caller must branch.
     Stuck,
-}
-
-/// Lean **single-layout** existence prober — the uniqueness gate's own board,
-/// deliberately NOT a [`BitBoard`].
-///
-/// The prober is a pure existence oracle: it only answers *does a completion
-/// exist*, never reports a deduction trace, so any technique that merely *prunes*
-/// the search (never flips the yes/no) is optional — completeness comes from the
-/// branch. That frees it from everything the baseline needs the dual view for:
-///
-/// - **Row-major bands only** (`r`/`unsolved_r`, no `c`/`unsolved_c`). Rows and
-///   boxes are in-lane; columns straddle bands and are simply never swept as
-///   units — branching still reaches every completion. This halves both the
-///   per-branch clone and the per-placement peer-mask work (no column mirror).
-/// - **No locked candidates.** LC barely prunes the existence search (~1.06x
-///   more DFS nodes without it) yet costs a `triplet_occ` + `DROP_TRIP` lookup on
-///   every (band,digit) scan, so dropping it is a net win.
-///
-/// Both effects are verdict-preserving, so the generator fingerprint is exactly
-/// invariant (the strip trajectory reads only the prober's yes/no). Validated as
-/// the fastest banded variant — `banded-sl-nolc` — in solver-lab's decoupled
-/// prober bench, oracle-pinned against the dual engine.
-#[derive(Clone)]
-struct ProberBoard {
-    r: [B; 9],
-    unsolved_r: B,
-}
-
-impl ProberBoard {
-    /// Snapshot a [`BitBoard`]'s row-major half — the only view the prober needs.
-    /// The column bands and `unsolved_c` are dropped on the floor (a strided copy
-    /// of 10 `u32x4` instead of the dual board's 20).
-    #[inline(always)]
-    fn from_bitboard(bb: &BitBoard) -> Self {
-        ProberBoard { r: bb.r, unsolved_r: bb.unsolved_r }
-    }
-
-    /// Place digit `d` (1..=9) at cell `c`: decide the cell, forbid `d` on its
-    /// peers — one `unsolved` clear and one peer-mask AND-NOT, no column mirror.
-    #[inline(always)]
-    fn place(&mut self, cell: usize, d: u8) {
-        self.unsolved_r &= !bit_r(cell);
-        // SAFETY: d in 1..=9 so d-1 in 0..9.
-        unsafe {
-            *self.r.get_unchecked_mut((d - 1) as usize) &= !peer_mask_r(cell);
-        }
-    }
-
-    /// Naked-single sieve over the row-major boards (see [`BitBoard::sieve`]).
-    #[cfg_attr(not(prof_solver), inline(always))]
-    #[cfg_attr(prof_solver, inline(never))]
-    fn sieve(&self) -> Sieve {
-        let mut ones = ZERO;
-        let mut twos = ZERO;
-        for d in 0..9 {
-            // SAFETY: d in 0..9.
-            let b = unsafe { *self.r.get_unchecked(d) };
-            twos |= ones & b;
-            ones |= b;
-        }
-        Sieve { ones, twos }
-    }
-
-    /// Place a wave of naked singles into the row-major view. Returns false if two
-    /// singles of the same digit are peers (a contradiction).
-    #[cfg_attr(not(prof_solver), inline)]
-    #[cfg_attr(prof_solver, inline(never))]
-    fn place_singles(&mut self, singles: B) -> bool {
-        for d in 0..9 {
-            // SAFETY: d in 0..9.
-            let group = singles & unsafe { *self.r.get_unchecked(d) };
-            if !nonzero(group) {
-                continue;
-            }
-            let mut peers_r = ZERO;
-            for lane in 0..3 {
-                let mut g = group[lane];
-                while g != 0 {
-                    let cell = rm_cell(lane, g.trailing_zeros());
-                    g &= g - 1;
-                    peers_r |= peer_mask_r(cell);
-                }
-            }
-            // peer_mask excludes the cell itself, so a group cell lands in the
-            // accumulated peers iff another group cell peers it.
-            if nonzero(peers_r & group) {
-                return false;
-            }
-            self.unsolved_r &= !group;
-            self.r[d] &= !peers_r;
-        }
-        true
-    }
-
-    /// Row-major band update: hidden singles in the three rows and three boxes of
-    /// each band off the `SINGLE9` table — the in-lane units of this view. No
-    /// locked candidates, no column sweep. The transpose of [`BitBoard::band_update_rm`]'s
-    /// hidden-single half; the LC and column-major work is gone.
-    #[cfg_attr(prof_solver, inline(never))]
-    fn band_update_rm(&mut self) -> bool {
-        let mut changed = false;
-        for b in 0..3 {
-            for d in 0..9 {
-                #[cfg(feature = "count")]
-                let mut prod = false;
-                #[cfg(feature = "count")]
-                unsafe {
-                    BAND_CTR[2] += 1;
-                }
-                let mut live = (self.r[d] & self.unsolved_r)[b];
-                // Hidden singles in the three rows (each a contiguous 9-bit chunk).
-                for rr in 0..3 {
-                    let s = SINGLE9[((live >> (9 * rr)) & 0x1FF) as usize];
-                    if s != 0xFF {
-                        self.place(rm_cell(b, 9 * rr + s as u32), d as u8 + 1);
-                        changed = true;
-                        #[cfg(feature = "count")]
-                        {
-                            prod = true;
-                        }
-                        live = (self.r[d] & self.unsolved_r)[b];
-                    }
-                }
-                // Hidden singles in the three boxes (gather each box's 9 bits).
-                for k in 0..3 {
-                    let bk = ((live >> (3 * k)) & 7)
-                        | (((live >> (9 + 3 * k)) & 7) << 3)
-                        | (((live >> (18 + 3 * k)) & 7) << 6);
-                    let s = SINGLE9[bk as usize] as usize;
-                    if s != 0xFF {
-                        let bit = (s / 3) * 9 + 3 * k as usize + s % 3;
-                        self.place(rm_cell(b, bit as u32), d as u8 + 1);
-                        changed = true;
-                        #[cfg(feature = "count")]
-                        {
-                            prod = true;
-                        }
-                        live = (self.r[d] & self.unsolved_r)[b];
-                    }
-                }
-                #[cfg(feature = "count")]
-                if prod {
-                    unsafe {
-                        BAND_CTR[3] += 1;
-                    }
-                }
-            }
-        }
-        changed
-    }
-
-    /// Propagate to a fixpoint: naked singles (cross-digit sieve) drained first,
-    /// then the row-major hidden-single band update, looping until nothing
-    /// changes. The single-layout no-LC counterpart of [`BitBoard::propagate`].
-    #[cfg_attr(prof_solver, inline(never))]
-    fn propagate(&mut self) -> Prop {
-        #[cfg(feature = "count")]
-        unsafe {
-            BAND_CTR[0] += 1;
-        }
-        loop {
-            loop {
-                pbump(3);
-                let Sieve { ones, twos } = self.sieve();
-                if nonzero(self.unsolved_r & !ones) {
-                    return Prop::Contradiction;
-                }
-                if !nonzero(self.unsolved_r) {
-                    return Prop::Solved;
-                }
-                let singles = self.unsolved_r & ones & !twos;
-                if !nonzero(singles) {
-                    break;
-                }
-                pbump(4);
-                if !self.place_singles(singles) {
-                    return Prop::Contradiction;
-                }
-            }
-            #[cfg(feature = "count")]
-            unsafe {
-                BAND_CTR[1] += 1;
-            }
-            if !self.band_update_rm() {
-                return Prop::Stuck;
-            }
-        }
-    }
-
-    #[cfg_attr(not(prof_solver), inline)]
-    #[cfg_attr(prof_solver, inline(never))]
-    fn branch_cell(&self) -> (usize, u16) {
-        let mut ones = ZERO;
-        let mut twos = ZERO;
-        let mut threes = ZERO;
-        for d in 0..9 {
-            // SAFETY: d in 0..9.
-            let b = unsafe { *self.r.get_unchecked(d) };
-            threes |= twos & b;
-            twos |= ones & b;
-            ones |= b;
-        }
-        let bivalue = self.unsolved_r & twos & !threes;
-        let pick = if nonzero(bivalue) { bivalue } else { self.unsolved_r };
-        let cell = first_rm(pick);
-        let cb = bit_r(cell);
-        let mut mask: u16 = 0;
-        for d in 0..9 {
-            if nonzero(self.r[d] & cb) {
-                mask |= 1 << d;
-            }
-        }
-        (cell, mask)
-    }
-
-    /// True iff the grid has at least one completion. Single-layout: naked singles
-    /// + row/box hidden singles to a fixpoint, then branch — columns are reached
-    /// only through branching, which is complete.
-    fn solve_first(&mut self) -> bool {
-        pbump(2);
-        loop {
-            match self.propagate() {
-                Prop::Solved => return true,
-                Prop::Contradiction => return false,
-                Prop::Stuck => {}
-            }
-            pbump(5);
-            let (cell, mask) = self.branch_cell();
-            let mut m = mask;
-            loop {
-                let d = m.trailing_zeros() as u8 + 1;
-                m &= m - 1;
-                pbump(7);
-                if m == 0 {
-                    self.place(cell, d);
-                    break;
-                }
-                pbump(6);
-                let mut child = self.clone();
-                child.place(cell, d);
-                if child.solve_first() {
-                    return true;
-                }
-            }
-        }
-    }
 }
 
 impl BitBoard {
@@ -943,55 +355,20 @@ impl BitBoard {
         (core::array::from_fn(|d| self.r[d].to_array()), self.unsolved_r.to_array())
     }
 
-    /// THROWAWAY instrumentation: the exact first-closure a probe pays — build the
-    /// lean prober board, restrict cell `i` to `alts`, propagate ONCE to fixpoint
-    /// (no branching). Timing this isolates the closure cost from the branch cost
-    /// in `any_alt_solves` (which is closure + branch), so it runs the same
-    /// single-layout no-LC closure the real prober does.
-    pub fn probe_closure_only(&self, i: usize, alts: u16) -> bool {
-        let mut s = ProberBoard::from_bitboard(self);
-        let kr = bit_r(i);
-        for d in 0..9 {
-            if alts & (1 << d) == 0 {
-                s.r[d] &= !kr;
-            }
-        }
-        matches!(s.propagate(), Prop::Solved)
-    }
-
-    /// THROWAWAY instrumentation: how many cells the prober's unrestricted
-    /// propagation closure (naked + row/box hidden singles, no LC, NO branch)
-    /// determines.
-    pub fn closure_solved(&self) -> u32 {
-        let before = popcnt(self.unsolved_r);
-        let mut s = ProberBoard::from_bitboard(self);
-        match s.propagate() {
-            Prop::Contradiction => before, // dead line — treat as fully resolved
-            _ => before - popcnt(s.unsolved_r),
-        }
-    }
-
     // --- dual-view band closure (baseline fast path) ----------------------
     //
-    // The fused naked + hidden singles + both-LC fixpoint, shared by the
-    // baseline's fast path (`baseline_fast` via `propagate_g`) and the throwaway
-    // closure diagnostics. The uniqueness prober no longer rides this — it has its
-    // own single-layout no-LC closure on [`ProberBoard`].
+    // The fused naked + hidden singles + both-LC fixpoint that drives the
+    // baseline's fast path (`baseline_fast` via `propagate_g`). The uniqueness
+    // prober does not ride this — it has its own single-layout no-LC closure on
+    // `ProberBoard` (see the `prober` submodule).
 
-    /// Naked-single sieve over the row-major boards: which cells admit exactly one
-    /// digit (`ones & !twos`) and which admit none (`!ones`).
+    /// Naked-single sieve over the row-major boards — the shared [`sieve`] over
+    /// this board's `r` (which cells admit exactly one digit, `ones & !twos`, and
+    /// which admit none, `!ones`).
     #[cfg_attr(not(prof_solver), inline(always))]
     #[cfg_attr(prof_solver, inline(never))]
     fn sieve(&self) -> Sieve {
-        let mut ones = ZERO;
-        let mut twos = ZERO;
-        for d in 0..9 {
-            // SAFETY: d in 0..9.
-            let b = unsafe { *self.r.get_unchecked(d) };
-            twos |= ones & b;
-            ones |= b;
-        }
-        Sieve { ones, twos }
+        sieve(&self.r)
     }
 
     /// Place a wave of naked singles (cells `singles`) into both views. Returns
@@ -1046,10 +423,7 @@ impl BitBoard {
             for d in 0..9 {
                 #[cfg(feature = "count")]
                 let mut prod = false;
-                #[cfg(feature = "count")]
-                unsafe {
-                    BAND_CTR[2] += 1;
-                }
+                band_ctr_inc(2);
                 let mut live = (self.r[d] & self.unsolved_r)[b];
                 // Locked candidates: drop the triplets the within-band fixpoint
                 // kills. Gated by the const `LC`: a spec whose baseline excludes
@@ -1114,9 +488,7 @@ impl BitBoard {
                 }
                 #[cfg(feature = "count")]
                 if prod {
-                    unsafe {
-                        BAND_CTR[3] += 1;
-                    }
+                    band_ctr_inc(3);
                 }
             }
         }
@@ -1134,10 +506,7 @@ impl BitBoard {
             for d in 0..9 {
                 #[cfg(feature = "count")]
                 let mut prod = false;
-                #[cfg(feature = "count")]
-                unsafe {
-                    BAND_CTR[2] += 1;
-                }
+                band_ctr_inc(2);
                 let mut live = (self.c[d] & self.unsolved_c)[b];
                 if LC {
                     let occ = triplet_occ(live);
@@ -1179,9 +548,7 @@ impl BitBoard {
                 }
                 #[cfg(feature = "count")]
                 if prod {
-                    unsafe {
-                        BAND_CTR[3] += 1;
-                    }
+                    band_ctr_inc(3);
                 }
             }
         }
@@ -1195,10 +562,7 @@ impl BitBoard {
     /// — it runs its own leaner single-layout no-LC closure on [`ProberBoard`].
     #[cfg_attr(prof_solver, inline(never))]
     fn propagate_g<const LC: bool, const TRACK: bool>(&mut self, fired: &mut u32) -> Prop {
-        #[cfg(feature = "count")]
-        unsafe {
-            BAND_CTR[0] += 1;
-        }
+        band_ctr_inc(0);
         loop {
             loop {
                 pbump(3);
@@ -1221,50 +585,13 @@ impl BitBoard {
                     return Prop::Contradiction;
                 }
             }
-            #[cfg(feature = "count")]
-            unsafe {
-                BAND_CTR[1] += 1;
-            }
+            band_ctr_inc(1);
             let mut changed = self.band_update_rm::<LC, TRACK>(fired);
             changed |= self.band_update_cm::<LC, TRACK>(fired);
             if !changed {
                 return Prop::Stuck;
             }
         }
-    }
-
-    /// Uniqueness gate: restrict cell `i` to the alternate digits `alts` and ask
-    /// whether any completion exists — i.e. stripping `i` made the puzzle
-    /// non-unique. Runs on a lean single-layout [`ProberBoard`] built from this
-    /// board's row-major half (the dual `BitBoard` is the baseline's; the prober
-    /// needs neither the column view nor locked candidates — see [`ProberBoard`]),
-    /// so the base is untouched for the baseline.
-    #[cfg_attr(feature = "profiling", inline(never))]
-    pub fn any_alt_solves(&self, i: usize, alts: u16) -> bool {
-        pbump(0);
-        let mut s = ProberBoard::from_bitboard(self);
-        let kr = bit_r(i);
-        for d in 0..9 {
-            if alts & (1 << d) == 0 {
-                s.r[d] &= !kr;
-            }
-        }
-        #[cfg(feature = "count")]
-        let (n0, g0, empties) = unsafe { (PCTR[2], PCTR[5], popcnt(self.unsolved_r) as u16) };
-        let r = s.solve_first();
-        if r {
-            pbump(1);
-        }
-        #[cfg(feature = "count")]
-        unsafe {
-            (*core::ptr::addr_of_mut!(ALT_STATS)).push(AltStat {
-                empties,
-                nodes: (PCTR[2] - n0) as u32,
-                guesses: (PCTR[5] - g0) as u32,
-                nonunique: r,
-            });
-        }
-        r
     }
 
     // --- baseline technique engine ----------------------------------------
@@ -1301,17 +628,17 @@ impl BitBoard {
     /// HiddenSingle) has nothing that degenerates and is fine — so a one-single
     /// baseline is supported, but LC/subsets without both singles are not.
     #[cfg_attr(feature = "profiling", inline(never))]
-    pub fn baseline(&self, allowed: Mask, forced: Mask) -> Outcome {
-        const NS_BIT: Mask = 1 << NAKED_SINGLE;
-        const HS_BIT: Mask = 1 << HIDDEN_SINGLE;
-        const LCP_BIT: Mask = 1 << LC_POINTING;
-        const LCC_BIT: Mask = 1 << LC_CLAIMING;
-        const CHEAP: Mask = NS_BIT | HS_BIT | LCP_BIT | LCC_BIT;
+    pub fn baseline(&self, allowed: KindMask, forced: KindMask) -> SolveTrace {
+        const NS_BIT: KindMask = 1 << NAKED_SINGLE;
+        const HS_BIT: KindMask = 1 << HIDDEN_SINGLE;
+        const LCP_BIT: KindMask = 1 << LC_POINTING;
+        const LCC_BIT: KindMask = 1 << LC_CLAIMING;
+        const CHEAP: KindMask = NS_BIT | HS_BIT | LCP_BIT | LCC_BIT;
         // Anything above a hidden single can degenerate into either single, so if
         // any such kind is in the baseline, BOTH singles must be too, else the
         // toolbox is non-confluent (see PRECONDITION). Debug-only: release ignores
         // it, and the generator runs in release.
-        const HARDER: Mask = !(NS_BIT | HS_BIT) & ((1 << NUM) - 1);
+        const HARDER: KindMask = !(NS_BIT | HS_BIT) & ((1 << NUM) - 1);
         debug_assert!(
             allowed & HARDER == 0 || allowed & (NS_BIT | HS_BIT) == (NS_BIT | HS_BIT),
             "non-confluent baseline (mask {allowed:#b}): a technique above hidden \
@@ -1350,7 +677,7 @@ impl BitBoard {
     /// confluent), so each subset firing — and the Forced target's exact count —
     /// matches the reference. Cheap kinds are recorded fired-or-not only (they are
     /// never Forced on this path, so the generator never reads their counts).
-    fn baseline_fast<const LC: bool>(&self, allowed: Mask) -> Outcome {
+    fn baseline_fast<const LC: bool>(&self, allowed: KindMask) -> SolveTrace {
         bump(0);
         let mut bb = self.clone();
         let mut counts = [0u16; NUM];
@@ -1373,14 +700,14 @@ impl BitBoard {
                 counts[k] = 1;
             }
         }
-        Outcome { solved: result, counts }
+        SolveTrace { solved: result, counts }
     }
 
     /// Discrete reference baseline: naked singles drain in bit-parallel waves; the
     /// rarer harder techniques (hidden single, both LC orientations, subsets)
     /// apply one easiest-first step at a time, each counted exactly. The general
     /// engine for any spec the fast path cannot fold faithfully.
-    fn baseline_discrete(&self, allowed: Mask) -> Outcome {
+    fn baseline_discrete(&self, allowed: KindMask) -> SolveTrace {
         bump(0);
         let mut bb = self.clone();
         let mut counts = [0u16; NUM];
@@ -1394,11 +721,11 @@ impl BitBoard {
                 }
             }
             if !nonzero(bb.unsolved_r) {
-                return Outcome { solved: true, counts };
+                return SolveTrace { solved: true, counts };
             }
             match bb.step_harder(allowed) {
                 Some(k) => counts[k] = counts[k].saturating_add(1),
-                None => return Outcome { solved: false, counts },
+                None => return SolveTrace { solved: false, counts },
             }
         }
     }
@@ -1407,7 +734,7 @@ impl BitBoard {
     /// kind index of the first subset technique that fires, or `None` if none do.
     /// Used by the fast path after the fused closure stalls (singles + LC are
     /// already drained by the closure, so only NakedPair..HiddenQuad remain).
-    fn step_subsets(&mut self, allowed: Mask) -> Option<usize> {
+    fn step_subsets(&mut self, allowed: KindMask) -> Option<usize> {
         if allowed & (1 << NAKED_PAIR) != 0 && self.naked_subset(2) {
             return Some(NAKED_PAIR);
         }
@@ -1453,7 +780,7 @@ impl BitBoard {
 
     /// Apply the first applicable harder technique (hidden single up to hidden
     /// quad, in difficulty order, gated by `allowed`); return its kind index.
-    fn step_harder(&mut self, allowed: Mask) -> Option<usize> {
+    fn step_harder(&mut self, allowed: KindMask) -> Option<usize> {
         if allowed & (1 << HIDDEN_SINGLE) != 0 && self.hidden_single() {
             return Some(HIDDEN_SINGLE);
         }

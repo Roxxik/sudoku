@@ -13,6 +13,8 @@ use crate::bb::{BitBoard, Placed};
 use crate::grid::{Board, CELLS, Digit, PEERS, digit_to_bit};
 use crate::rng::Rng;
 use crate::spec::Spec;
+use crate::techniques::KindMask;
+use crate::util::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 use crate::verify::verify;
 
 /// A random complete solution grid. Same MRV+shuffle search as core — identical
@@ -201,7 +203,7 @@ pub struct GeneratedPuzzle {
 }
 
 /// Why a single attempt ended.
-pub enum Outcome {
+pub enum AttemptResult {
     /// A puzzle satisfying the spec (passed verify).
     Success(GeneratedPuzzle),
     /// A requirement-meeting `best` was found but verify rejected it (the target
@@ -224,8 +226,120 @@ pub fn board_from_cells(cells: &[Digit; CELLS]) -> Board {
     b
 }
 
+/// The mutable board state of one strip attempt, and the per-cell gate logic that
+/// drives it. Shared by the sequential [`attempt`] and the resumable per-lane
+/// state machine of the warp (`crate::warp::Lane` embeds one), so the gate
+/// sequence — `alts == 0` fast path, uniqueness gate, baseline gate,
+/// `req_met`/`best` update — lives in ONE place and the two drivers cannot drift.
+///
+/// `bb` is the single source of candidate truth (it already holds every candidate
+/// band). The only scalar shadow kept is the bare puzzle grid `cells` (present
+/// cell = its digit, `0` = stripped) — the one thing `bb` can't derive: which
+/// digit a surviving peer holds. `bb` is maintained incrementally (a clear/place
+/// only touches cell `i` and its peers; `apply_clear` reads the reopened
+/// candidates straight off `placed`), so there is no duplicate per-cell candidate
+/// array and no per-position `from_board` rebuild.
+pub(crate) struct StripState {
+    pub bb: BitBoard,
+    placed: Placed,
+    pub cells: [Digit; CELLS],
+    /// The bare-grid snapshot of the most-stripped requirement-meeting state; the
+    /// candidate board is rebuilt from it only if the attempt succeeds.
+    pub best: Option<[Digit; CELLS]>,
+    /// The running requirement verdict of the current accepted board (see the
+    /// `alts == 0` fast path). The full grid is trivially baseline-solvable but
+    /// fires nothing, so it starts false.
+    pub req_met: bool,
+}
+
+impl StripState {
+    /// Fresh state stripping the full `solution` grid (nothing removed yet).
+    pub fn new(solution: &Board) -> Self {
+        StripState {
+            bb: BitBoard::from_board(solution),
+            placed: Placed::from_board(solution),
+            cells: core::array::from_fn(|i| solution.cell(i)),
+            best: None,
+            req_met: false,
+        }
+    }
+
+    /// Speculatively strip cell `i` (holding `orig`): clear it from the grid and
+    /// the bitboard, returning the alternate digits the cell could still take —
+    /// `0` means it is still a naked single, so the strip is trivially valid.
+    pub fn strip(&mut self, i: usize, orig: Digit) -> u16 {
+        self.cells[i] = 0;
+        let cand = self.bb.apply_clear(i, orig, &mut self.placed);
+        debug_assert!(
+            self.bb == BitBoard::from_board(&board_from_cells(&self.cells)),
+            "bb desync after clear at {i}"
+        );
+        cand & !digit_to_bit(orig)
+    }
+
+    /// `alts == 0` fast path: clearing the cell left only its own digit, so `i` is
+    /// still a naked single. The baseline would re-place it immediately and reach a
+    /// byte-identical closure — so the strip stays unique AND baseline-solvable and
+    /// the requirement verdict is unchanged. Both gates are skippable; just carry
+    /// `req_met` into `best`.
+    pub fn keep_trivial(&mut self, spec: &Spec) {
+        debug_assert!(
+            {
+                let o = self.bb.baseline(spec.baseline_mask(), spec.forced_mask());
+                o.solved && spec.requirement_met(&o.counts) == self.req_met
+            },
+            "alts==0 fast-path invariant broke"
+        );
+        if self.req_met {
+            self.best = Some(self.cells);
+        }
+    }
+
+    /// Revert a rejected strip of `cell` (held `orig`).
+    pub fn revert(&mut self, cell: usize, orig: Digit) {
+        self.cells[cell] = orig;
+        self.bb.apply_place(cell, orig, &mut self.placed);
+        debug_assert!(
+            self.bb == BitBoard::from_board(&board_from_cells(&self.cells)),
+            "bb desync after revert at {cell}"
+        );
+    }
+
+    /// Resolve the gates for the strip of `cell` (held `orig`) given the
+    /// already-decided uniqueness verdict `nonunique`: if non-unique, revert; else
+    /// run the baseline gate (`baseline`/`forced` masks) and either accept —
+    /// keeping `cells`/`bb` in the stripped state and updating `req_met`/`best` —
+    /// or revert. The verdict source is the only thing the two drivers differ on
+    /// (the sequential one computes it inline with [`BitBoard::any_alt_solves`];
+    /// the warp gets it from the packed prober).
+    pub fn resolve_gate(
+        &mut self,
+        cell: usize,
+        orig: Digit,
+        nonunique: bool,
+        spec: &Spec,
+        baseline: KindMask,
+        forced: KindMask,
+    ) {
+        if nonunique {
+            self.revert(cell, orig);
+            return;
+        }
+        // Baseline gate + requirement counts (one tracked solve).
+        let outcome = self.bb.baseline(baseline, forced);
+        if !outcome.solved {
+            self.revert(cell, orig);
+            return;
+        }
+        self.req_met = spec.requirement_met(&outcome.counts);
+        if self.req_met {
+            self.best = Some(self.cells);
+        }
+    }
+}
+
 /// One full strip attempt for `spec`. Mirrors core's per-attempt body.
-pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
+pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     let baseline = spec.baseline_mask();
     let forced = spec.forced_mask();
     let solution = random_full_grid(rng);
@@ -235,109 +349,40 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> Outcome {
     let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
     rng.shuffle(&mut positions);
 
-    // `bb` is the single source of candidate truth (it already holds every
-    // candidate band). The only scalar shadow kept is the bare puzzle grid
-    // `cells` (present cell = its digit, `0` = stripped) — the one thing bb can't
-    // derive: which digit a surviving peer holds. `bb` is maintained
-    // incrementally — a clear/place only touches cell i and its peers — and
-    // `apply_clear` reads the reopened candidates straight off `cells`, so the
-    // duplicate per-cell *candidate* array (and its upkeep) is gone, as is any
-    // per-position `from_board` rebuild.
-    let mut bb = BitBoard::from_board(&solution);
-    let mut placed = Placed::from_board(&solution);
-    let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
-
-    // `best` is the bare-grid snapshot of the most-stripped requirement-meeting
-    // state; the candidate board is rebuilt from it only if the attempt succeeds.
-    // `req_met` carries the running requirement verdict of the current accepted
-    // board (see the `alts == 0` fast path below). The full grid is trivially
-    // baseline-solvable but fires nothing, so it starts false.
-    let mut best: Option<[Digit; CELLS]> = None;
-    let mut req_met = false;
+    let mut st = StripState::new(&solution);
     for i in positions {
-        if cells[i] == 0 {
+        if st.cells[i] == 0 {
             continue;
         }
-        let orig = cells[i];
-        cells[i] = 0;
-        let cand = bb.apply_clear(i, orig, &mut placed);
-        debug_assert!(
-            bb == BitBoard::from_board(&board_from_cells(&cells)),
-            "bb desync after clear at {i}"
-        );
-
-        let v_bit = digit_to_bit(orig);
-        let alts = cand & !v_bit;
-
-        // Fast path: clearing `i` left it with only its own digit, i.e. `i` is
-        // still a naked single. The strip is therefore always valid — the
-        // baseline would re-place `i` immediately and reach a byte-identical
-        // closure — so it stays unique AND baseline-solvable, and the requirement
-        // verdict is unchanged. Both gates are skippable; just carry `req_met`.
+        let orig = st.cells[i];
+        let alts = st.strip(i, orig);
         if alts == 0 {
-            debug_assert!(
-                {
-                    let o = bb.baseline(baseline, forced);
-                    o.solved && spec.requirement_met(&o.counts) == req_met
-                },
-                "alts==0 fast-path invariant broke at {i}"
-            );
-            if req_met {
-                best = Some(cells);
-            }
+            st.keep_trivial(spec);
             continue;
         }
-
-        // Uniqueness gate.
-        if bb.any_alt_solves(i, alts) {
-            cells[i] = orig;
-            bb.apply_place(i, orig, &mut placed);
-            debug_assert!(
-                bb == BitBoard::from_board(&board_from_cells(&cells)),
-                "bb desync after revert at {i}"
-            );
-            continue;
-        }
-
-        // Baseline gate + requirement counts (one tracked solve).
-        let outcome = bb.baseline(baseline, forced);
-        if !outcome.solved {
-            cells[i] = orig;
-            bb.apply_place(i, orig, &mut placed);
-            debug_assert!(
-                bb == BitBoard::from_board(&board_from_cells(&cells)),
-                "bb desync after revert at {i}"
-            );
-            continue;
-        }
-        // Accept the strip: `cells` and `bb` stay in the stripped state.
-        req_met = spec.requirement_met(&outcome.counts);
-        if req_met {
-            best = Some(cells);
-        }
+        // Uniqueness gate (inline scalar prober), then baseline gate + accept.
+        let nonunique = st.bb.any_alt_solves(i, alts);
+        st.resolve_gate(i, orig, nonunique, spec, baseline, forced);
     }
 
-    match best {
+    match st.best {
         Some(snap) => {
             let seed = board_from_cells(&snap);
             if verify(&seed, spec) {
                 let givens = seed.givens();
-                Outcome::Success(GeneratedPuzzle {
-                    puzzle: seed,
-                    solution,
-                    givens,
-                })
+                AttemptResult::Success(GeneratedPuzzle { puzzle: seed, solution, givens })
             } else {
-                Outcome::NotForced
+                AttemptResult::NotForced
             }
         }
-        None => Outcome::NeverFired,
+        None => AttemptResult::NeverFired,
     }
 }
 
-/// Per-run tallies, for throughput/yield reporting.
-#[derive(Default, Clone, Copy)]
-pub struct GenStats {
+/// Per-run / per-lane tallies, for throughput/yield reporting and the warp's
+/// per-lane equivalence cross-check against the sequential generator.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stats {
     pub attempts: usize,
     pub successes: usize,
     pub never_fired: usize,
@@ -345,20 +390,31 @@ pub struct GenStats {
     pub total_givens: usize,
 }
 
+impl Stats {
+    /// Fold another tally into this one (the warp aggregates per-lane `Stats`).
+    pub fn add(&mut self, o: &Stats) {
+        self.attempts += o.attempts;
+        self.successes += o.successes;
+        self.never_fired += o.never_fired;
+        self.not_forced += o.not_forced;
+        self.total_givens += o.total_givens;
+    }
+}
+
 /// Generate until a puzzle satisfying `spec` is found or `max_attempts` is hit.
 /// Returns the puzzle (if any) and the tallies up to that point.
-pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<GeneratedPuzzle>, GenStats) {
-    let mut stats = GenStats::default();
+pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<GeneratedPuzzle>, Stats) {
+    let mut stats = Stats::default();
     for _ in 0..max_attempts {
         stats.attempts += 1;
         match attempt(rng, spec) {
-            Outcome::Success(p) => {
+            AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
                 return (Some(p), stats);
             }
-            Outcome::NotForced => stats.not_forced += 1,
-            Outcome::NeverFired => stats.never_fired += 1,
+            AttemptResult::NotForced => stats.not_forced += 1,
+            AttemptResult::NeverFired => stats.never_fired += 1,
         }
     }
     (None, stats)
@@ -368,27 +424,24 @@ pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<Gene
 /// deterministic benchmark of the per-attempt cost mix. Returns the tallies plus
 /// a fingerprint over produced puzzles (prevents dead-code elimination and lets
 /// native/wasm cross-check they did identical work).
-pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (GenStats, u64) {
-    let mut stats = GenStats::default();
-    let mut fp: u64 = 0xcbf29ce484222325;
+pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
+    let mut stats = Stats::default();
+    let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {
         stats.attempts += 1;
         match attempt(rng, spec) {
-            Outcome::Success(p) => {
+            AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
-                for i in 0..CELLS {
-                    fp ^= p.puzzle.cell(i) as u64;
-                    fp = fp.wrapping_mul(0x100000001b3);
-                }
+                fnv_fold_cells(&mut fp, p.puzzle.cells());
             }
-            Outcome::NotForced => {
+            AttemptResult::NotForced => {
                 stats.not_forced += 1;
-                fp = fp.wrapping_mul(0x100000001b3);
+                fp = fp.wrapping_mul(FNV_PRIME);
             }
-            Outcome::NeverFired => {
+            AttemptResult::NeverFired => {
                 stats.never_fired += 1;
-                fp = fp.wrapping_mul(0x100000001b3);
+                fp = fp.wrapping_mul(FNV_PRIME);
             }
         }
     }
@@ -405,16 +458,16 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (GenStats, u64) {
 /// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so
 /// it is a faithful probe. This is a correctness guard, not a perf metric.
 pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
-    let mut fp: u64 = 0xcbf29ce484222325;
+    let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {
         let solution = random_full_grid(rng);
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
         for i in 0..CELLS {
             fp ^= solution.cell(i) as u64;
-            fp = fp.wrapping_mul(0x100000001b3);
+            fp = fp.wrapping_mul(FNV_PRIME);
             fp ^= positions[i] as u64;
-            fp = fp.wrapping_mul(0x100000001b3);
+            fp = fp.wrapping_mul(FNV_PRIME);
         }
     }
     fp

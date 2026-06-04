@@ -36,6 +36,7 @@
 #![feature(portable_simd)]
 
 pub mod bb;
+pub(crate) mod counters;
 pub mod generator;
 pub mod grid;
 pub mod rng;

@@ -130,57 +130,21 @@ fn conflict_v(group: [V; 3], row_occ: V, col_occ: V, box_occ: V) -> M {
         | box_occ.count_ones().simd_lt(n)
 }
 
+use crate::counters::counter_block;
+
 // --- packed-prober verdict split (feature = "count") --------------------------
 // How probes resolve under the new kernel: settled by propagation alone (no
 // branch ever needed) vs needing the DFS — [solved-no-branch, contra-no-branch,
-// branched]. `packdiag` reads this; the `branched` flag is only tracked under the
-// feature so production pays nothing.
-#[cfg(feature = "count")]
-static mut PSTAT: [u64; 3] = [0; 3];
-#[cfg(feature = "count")]
-#[inline(always)]
-fn pstat_bump(i: usize) {
-    unsafe {
-        PSTAT[i] += 1;
-    }
-}
-#[cfg(feature = "count")]
-pub fn pstat_snapshot() -> [u64; 3] {
-    unsafe { PSTAT }
-}
-#[cfg(feature = "count")]
-pub fn pstat_reset() {
-    unsafe {
-        PSTAT = [0; 3];
-    }
-}
+// branched]. `packdiag` reads this via `pstat_snapshot`; `pstat_bump(i)` tallies.
+// The `branched` flag is only tracked under the feature so production pays nothing.
+counter_block!(PSTAT: 3, inc = pstat_bump, add = pstat_add, snapshot = pstat_snapshot, reset = pstat_reset);
 
 // --- packed-DFS prober metrics (feature = "count") ----------------------------
 // [0] probes, [1] warp passes (ticks), [2] branch nodes, [3] active-lane-sum over
 // ticks. utilization = active_lane_sum / (LANES * ticks); branches/probe and
-// passes/probe size the node inflation vs the scalar prober (`infl`).
-#[cfg(feature = "count")]
-static mut DSTAT: [u64; 4] = [0; 4];
-#[cfg(feature = "count")]
-#[inline(always)]
-fn dstat_add(i: usize, v: u64) {
-    unsafe {
-        DSTAT[i] += v;
-    }
-}
-#[cfg(not(feature = "count"))]
-#[inline(always)]
-fn dstat_add(_i: usize, _v: u64) {}
-#[cfg(feature = "count")]
-pub fn dstat_snapshot() -> [u64; 4] {
-    unsafe { DSTAT }
-}
-#[cfg(feature = "count")]
-pub fn dstat_reset() {
-    unsafe {
-        DSTAT = [0; 4];
-    }
-}
+// passes/probe size the node inflation vs the scalar prober (`infl`). `dstat_add(i, v)`
+// tallies; it is a no-op when the feature is off, so its call sites need no gating.
+counter_block!(DSTAT: 4, inc = dstat_inc, add = dstat_add, snapshot = dstat_snapshot, reset = dstat_reset);
 
 /// One lane's input to the packed prober: its row-major candidate bands and empty
 /// mask (from [`crate::bb::BitBoard::export_r`]), the stripped `cell`, and the

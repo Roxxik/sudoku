@@ -7,7 +7,7 @@
 //! no spec in PoC scope uses it (train/drill(HiddenQuad) only Force a single
 //! kind). Add it when scope grows past HiddenSubset.
 
-use crate::techniques::{DIFFICULTY, HIDDEN_SINGLE, Mask, NUM};
+use crate::techniques::{DIFFICULTY, HIDDEN_SINGLE, KindMask, NUM};
 
 /// How a technique participates in a spec — mirrors core's `Usage`.
 ///
@@ -35,7 +35,7 @@ impl Spec {
     }
 
     /// Start an explicit, empty spec and layer kinds with [`Spec::allow`] /
-    /// [`Spec::force`] / [`Spec::concede_kind`]. The generator must accept every
+    /// [`Spec::force`] / [`Spec::concede`]. The generator must accept every
     /// label combination, not just `train`/`drill`; this is how callers (and the
     /// equivalence tests) build arbitrary specs to exercise the baseline gate.
     pub fn explicit() -> Self {
@@ -56,7 +56,7 @@ impl Spec {
 
     /// Mark kind `idx` `Conceded` (in scope for verify's avoid-walk, but not part
     /// of the baseline solvability toolbox).
-    pub fn concede_kind(mut self, idx: usize) -> Self {
+    pub fn concede(mut self, idx: usize) -> Self {
         self.usage[idx] = Some(Usage::Conceded);
         self
     }
@@ -73,20 +73,10 @@ impl Spec {
         s
     }
 
-    fn require(mut self, target: usize, count: u16) -> Self {
-        self.usage[target] = Some(Usage::Forced(count));
-        self
-    }
-
-    fn concede(mut self, idx: usize) -> Self {
-        self.usage[idx] = Some(Usage::Conceded);
-        self
-    }
-
     /// Broad-mode training: allow everything up to and including `target`, force
     /// `target` to appear at least once. `Spec::train` in core.
     pub fn train(target: usize) -> Self {
-        Self::allow_up_to(target).require(target, 1)
+        Self::allow_up_to(target).force(target, 1)
     }
 
     /// Drill-mode: a small baseline plus the target, with every kind strictly
@@ -101,7 +91,7 @@ impl Spec {
         let ceiling = HIDDEN_SINGLE; // valid for any target with difficulty < 50
         let low = DIFFICULTY[ceiling];
         let high = DIFFICULTY[target];
-        let mut s = Self::allow_up_to(ceiling).require(target, 1);
+        let mut s = Self::allow_up_to(ceiling).force(target, 1);
         for idx in 0..NUM {
             if DIFFICULTY[idx] > low && DIFFICULTY[idx] < high {
                 s = s.concede(idx);
@@ -112,7 +102,7 @@ impl Spec {
 
     /// Baseline toolbox (Allowed | Forced): the strip-loop solvability gate and
     /// verify's positive check.
-    pub fn baseline_mask(&self) -> Mask {
+    pub fn baseline_mask(&self) -> KindMask {
         let mut m = 0;
         for idx in 0..NUM {
             if matches!(self.usage[idx], Some(Usage::Allowed) | Some(Usage::Forced(_))) {
@@ -124,7 +114,7 @@ impl Spec {
 
     /// Everything in scope (Allowed | Forced | Conceded): verify's avoid-target
     /// walk toolbox.
-    pub fn in_scope_mask(&self) -> Mask {
+    pub fn in_scope_mask(&self) -> KindMask {
         let mut m = 0;
         for idx in 0..NUM {
             if self.usage[idx].is_some() {
@@ -138,7 +128,7 @@ impl Spec {
     /// is `Forced`. The baseline engine reads this to choose a strategy: it must
     /// count every Forced kind exactly (the requirement check reads those counts),
     /// so a Forced kind can never be folded into the batched fast-path closure.
-    pub fn forced_mask(&self) -> Mask {
+    pub fn forced_mask(&self) -> KindMask {
         let mut m = 0;
         for idx in 0..NUM {
             if matches!(self.usage[idx], Some(Usage::Forced(_))) {

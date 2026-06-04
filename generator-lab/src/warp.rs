@@ -31,41 +31,19 @@
 //! Logical lanes are independent, so the 8-slot interleave can't change any lane's
 //! outcome (`tests/equiv.rs` pins each lane byte-identical to its sequential run).
 
-use crate::bb::{BitBoard, Placed};
-use crate::generator::{GeneratedPuzzle, board_from_cells, random_full_grid};
-use crate::grid::{Board, CELLS, Digit, digit_to_bit};
+use crate::generator::{GeneratedPuzzle, Stats, StripState, board_from_cells, random_full_grid};
+use crate::grid::{Board, CELLS, Digit};
 use crate::packed::{LANES, PackedProber, Probe};
 use crate::rng::Rng;
 use crate::spec::Spec;
+use crate::util::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 use crate::verify::verify;
 
-const FNV_PRIME: u64 = 0x100000001b3;
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-
-/// Per-lane / aggregate tallies. Mirrors generator-lab's `GenStats` field-for-
-/// field so a lane's totals can be compared against the sequential run.
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stats {
-    pub attempts: usize,
-    pub successes: usize,
-    pub never_fired: usize,
-    pub not_forced: usize,
-    pub total_givens: usize,
-}
-
-impl Stats {
-    fn add(&mut self, o: &Stats) {
-        self.attempts += o.attempts;
-        self.successes += o.successes;
-        self.never_fired += o.never_fired;
-        self.not_forced += o.not_forced;
-        self.total_givens += o.total_givens;
-    }
-}
-
 /// One lane = one in-flight attempt plus the running tallies/fingerprint of every
-/// attempt this lane has retired. State mirrors generator-lab's `attempt` locals,
-/// kept across slot refills so the attempt can be paused at its uniqueness gate.
+/// attempt this lane has retired. The board state and per-cell gate logic are the
+/// shared [`StripState`]; the lane adds the resumable walk (strip order + cursor)
+/// and the retired-attempt accounting, kept across slot refills so the attempt can
+/// be paused at its uniqueness gate.
 struct Lane {
     rng: Rng,
     /// Attempts still owed by this lane (its share of the fixed work budget).
@@ -77,16 +55,14 @@ struct Lane {
     pending: Option<(usize, Digit, u16)>,
 
     // --- in-flight attempt state (valid iff `active`) ---
-    bb: BitBoard,
-    placed: Placed,
-    cells: [Digit; CELLS],
+    /// The board being stripped + the shared gate logic (the same `StripState` the
+    /// sequential `attempt` drives).
+    strip: StripState,
     /// The full solution grid this attempt is stripping (cells before any strip),
     /// kept so a success can report its solution like the scalar `generate`.
     solution: [Digit; CELLS],
     positions: [usize; CELLS],
     pos_idx: usize,
-    best: Option<[Digit; CELLS]>,
-    req_met: bool,
 
     // --- retired-attempt accounting ---
     stats: Stats,
@@ -95,21 +71,16 @@ struct Lane {
 
 impl Lane {
     fn new(rng: Rng, quota: usize) -> Self {
-        // Placeholder bitboard; replaced by `start_attempt` before any use.
-        let empty = Board::empty();
         Lane {
             rng,
             remaining: quota,
             active: false,
             pending: None,
-            bb: BitBoard::from_board(&empty),
-            placed: Placed::from_board(&empty),
-            cells: [0; CELLS],
+            // Placeholder state; replaced by `start_attempt` before any use.
+            strip: StripState::new(&Board::empty()),
             solution: [0; CELLS],
             positions: core::array::from_fn(|i| i),
             pos_idx: 0,
-            best: None,
-            req_met: false,
             stats: Stats::default(),
             fp: FNV_OFFSET,
         }
@@ -120,15 +91,11 @@ impl Lane {
     /// fill, then the strip-order shuffle) so the stream stays faithful.
     fn start_attempt(&mut self) {
         let solution = random_full_grid(&mut self.rng);
-        self.cells = core::array::from_fn(|i| solution.cell(i));
-        self.solution = self.cells;
-        self.bb = BitBoard::from_board(&solution);
-        self.placed = Placed::from_board(&solution);
+        self.solution = core::array::from_fn(|i| solution.cell(i));
+        self.strip = StripState::new(&solution);
         self.positions = core::array::from_fn(|i| i);
         self.rng.shuffle(&mut self.positions);
         self.pos_idx = 0;
-        self.best = None;
-        self.req_met = false;
         self.active = true;
         self.pending = None;
         self.remaining -= 1;
@@ -154,19 +121,13 @@ impl Lane {
             }
             let i = self.positions[self.pos_idx];
             self.pos_idx += 1;
-            if self.cells[i] == 0 {
+            if self.strip.cells[i] == 0 {
                 continue; // already stripped
             }
-            let orig = self.cells[i];
-            self.cells[i] = 0;
-            let cand = self.bb.apply_clear(i, orig, &mut self.placed);
-            let alts = cand & !digit_to_bit(orig);
+            let orig = self.strip.cells[i];
+            let alts = self.strip.strip(i, orig);
             if alts == 0 {
-                // Still a naked single: strip is trivially valid, verdict
-                // unchanged — both gates skippable, just carry `req_met`.
-                if self.req_met {
-                    self.best = Some(self.cells);
-                }
+                self.strip.keep_trivial(spec);
                 continue;
             }
             // Reached the batch point.
@@ -175,27 +136,18 @@ impl Lane {
         }
     }
 
-    /// Revert the speculative clear of `cell` (held `orig`): the strip is rejected.
-    fn revert(&mut self, cell: usize, orig: Digit) {
-        self.cells[cell] = orig;
-        self.bb.apply_place(cell, orig, &mut self.placed);
-    }
-
     /// Finalize the current attempt: verify `best`, tally the outcome, fold the
     /// fingerprint — byte-identical to generator-lab's `run_attempts` per-outcome
     /// bookkeeping.
     fn finalize(&mut self, spec: &Spec) -> Option<GeneratedPuzzle> {
-        match self.best {
+        match self.strip.best {
             Some(snap) => {
                 let seed = board_from_cells(&snap);
                 if verify(&seed, spec) {
                     self.stats.successes += 1;
                     let givens = seed.givens();
                     self.stats.total_givens += givens;
-                    for i in 0..CELLS {
-                        self.fp ^= snap[i] as u64;
-                        self.fp = self.fp.wrapping_mul(FNV_PRIME);
-                    }
+                    fnv_fold_cells(&mut self.fp, &snap);
                     Some(GeneratedPuzzle { puzzle: seed, solution: board_from_cells(&self.solution), givens })
                 } else {
                     self.stats.not_forced += 1;
@@ -218,29 +170,14 @@ impl Lane {
 /// requirement counts; accept or revert.
 fn resolve_gate_with(lane: &mut Lane, spec: &Spec, baseline: u32, forced: u32, nonunique: bool) {
     let (i, orig, _alts) = lane.pending.take().expect("resolve_gate on a lane with no pending gate");
-
-    if nonunique {
-        lane.revert(i, orig);
-        return;
-    }
-    // Baseline gate + requirement counts.
-    let outcome = lane.bb.baseline(baseline, forced);
-    if !outcome.solved {
-        lane.revert(i, orig);
-        return;
-    }
-    // Accept the strip.
-    lane.req_met = spec.requirement_met(&outcome.counts);
-    if lane.req_met {
-        lane.best = Some(lane.cells);
-    }
+    lane.strip.resolve_gate(i, orig, nonunique, spec, baseline, forced);
 }
 
 /// Snapshot a lane's pending gate as a [`Probe`] for the packed prober: the
 /// board's row-major bands + empty mask, the stripped cell, and its alternates.
 fn probe_of(lane: &Lane) -> Probe {
     let (cell, _orig, alts) = lane.pending.expect("probe_of on a lane with no gate");
-    let (r, unsolved) = lane.bb.export_r();
+    let (r, unsolved) = lane.strip.bb.export_r();
     Probe { r, unsolved, cell, alts }
 }
 
