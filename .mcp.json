@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "lsp": {
+      "type": "stdio",
+      "command": "mcp-language-server",
+      "args": [
+        "--workspace",
+        "/home/roxxik/repos/sudoku",
+        "--lsp",
+        "rust-analyzer"
+      ],
+      "env": {}
+    }
+  }
+}

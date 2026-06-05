@@ -23,6 +23,10 @@
 //!
 //! Usage: cargo run --release -p generator-lab --example gridbench -- [--iters N=200000] [--seed S=1]
 
+#![feature(portable_simd)]
+
+use std::simd::Simd;
+use std::simd::cmp::SimdPartialEq;
 use std::time::Instant;
 
 use generator_lab::bb::{BitBoard, Placed};
@@ -105,6 +109,7 @@ fn main() {
     bench_bbfill(iters, seed);
     bench_bbfill2(iters, seed);
     bench_bbfill3(iters, seed);
+    bench_simdfill(iters, seed);
     hist_mintier(iters, seed);
 }
 
@@ -660,4 +665,134 @@ fn bench_bbfill3(iters: usize, seed: u64) {
     }
     let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
     println!("  bbfill3 last-nobkp (G3) {:>8.1} ns/grid   (fp {:#018x})", ns, fp);
+}
+
+// === Experiment H: digit-transposed Simd<u32,4> banded fill ===================
+// Same capped-sieve MRV as G2, but the cell-set is the prober's row-major banding
+// (B = Simd<u32,4>: three 27-bit bands in lanes 0/1/2, lane 3 unused) instead of a
+// u128. The banding is contiguous in cell order -- cell = 27*lane + bit -- so the
+// lowest-set-bit pick selects the same cell as the u128 fill, giving byte-identical
+// grids (fp must match). The question it answers: does the popcount-free sieve in
+// one 128-bit SSE register beat the u128's GPR pair on native, and -- unlike the
+// dead dense reduce-min scan -- stay ARM-friendly (no vector popcount), so fill
+// could share the prober's representation.
+type B = Simd<u32, 4>;
+const BAND27: u32 = (1u32 << 27) - 1;
+const BZERO: B = Simd::from_array([0, 0, 0, 0]);
+const BALL: B = Simd::from_array([BAND27, BAND27, BAND27, 0]);
+
+const fn build_peer_mask_b() -> [[u32; 4]; CELLS] {
+    let mut m = [[0u32; 4]; CELLS];
+    let mut i = 0;
+    while i < CELLS {
+        let mut k = 0;
+        while k < 20 { let p = PEERS[i][k]; m[i][p / 27] |= 1u32 << (p % 27); k += 1; }
+        i += 1;
+    }
+    m
+}
+const PEER_MASK_B: [[u32; 4]; CELLS] = build_peer_mask_b();
+
+const fn build_bit_b() -> [[u32; 4]; CELLS] {
+    let mut b = [[0u32; 4]; CELLS];
+    let mut c = 0;
+    while c < CELLS { b[c][c / 27] = 1u32 << (c % 27); c += 1; }
+    b
+}
+const BIT_B: [[u32; 4]; CELLS] = build_bit_b();
+
+#[inline]
+fn bnz(x: B) -> bool { x.simd_ne(BZERO).any() }
+
+#[derive(Clone)]
+struct SimdFill {
+    board: [B; 9],
+    unsolved: B,
+    cells: [u8; 81],
+}
+
+impl SimdFill {
+    #[inline]
+    fn pick(&self, tier: B, k: u32) -> (usize, u32, u16) {
+        // cell = 27*lane + bit: lowest non-empty lane, then its lowest set bit.
+        let cell = if tier[0] != 0 {
+            tier[0].trailing_zeros() as usize
+        } else if tier[1] != 0 {
+            27 + tier[1].trailing_zeros() as usize
+        } else {
+            54 + tier[2].trailing_zeros() as usize
+        };
+        let cb = B::from_array(BIT_B[cell]);
+        let mut mask = 0u16;
+        for d in 0..9 { if bnz(self.board[d] & cb) { mask |= 1 << d; } }
+        (cell, k, mask)
+    }
+    #[inline]
+    fn scan(&self) -> (usize, u32, u16) {
+        let u = self.unsolved;
+        let (mut ones, mut twos, mut threes, mut fours) = (BZERO, BZERO, BZERO, BZERO);
+        for d in 0..9 {
+            let b = self.board[d] & u;
+            fours |= threes & b;
+            threes |= twos & b;
+            twos |= ones & b;
+            ones |= b;
+        }
+        if bnz(u & !ones) { return (usize::MAX, 0, 0); } // dead unsolved cell
+        if !bnz(u) { return (usize::MAX, 10, 0); }        // solved
+        let t1 = ones & !twos;
+        if bnz(t1) { return self.pick(t1, 1); }
+        let t2 = twos & !threes;
+        if bnz(t2) { return self.pick(t2, 2); }
+        let t3 = threes & !fours;
+        if bnz(t3) { return self.pick(t3, 3); }
+        // Rare (~16%): every unsolved cell has >=4 candidates. Full sieve for 4..9.
+        let mut a = [BZERO; 11];
+        for d in 0..9 {
+            let b = self.board[d] & u;
+            let mut k = 9; while k >= 2 { a[k] |= a[k - 1] & b; k -= 1; } a[1] |= b;
+        }
+        for k in 4..=9usize {
+            let tier = a[k] & !a[k + 1];
+            if bnz(tier) { return self.pick(tier, k as u32); }
+        }
+        unreachable!()
+    }
+    #[inline]
+    fn place(&mut self, cell: usize, d: u8) {
+        self.unsolved &= !B::from_array(BIT_B[cell]);
+        self.board[(d - 1) as usize] &= !B::from_array(PEER_MASK_B[cell]);
+        self.cells[cell] = d;
+    }
+    fn fill(&mut self, rng: &mut Rng) -> bool {
+        let (cell, count, mask) = self.scan();
+        if count == 0 { return false; }
+        if cell == usize::MAX { return true; }
+        let mut digits = [0u8; 9];
+        let mut n = 0; let mut m = mask;
+        while m != 0 { digits[n] = m.trailing_zeros() as u8 + 1; m &= m - 1; n += 1; }
+        rng.shuffle(&mut digits[..n]);
+        for &d in &digits[..n] {
+            let bu_board = self.board; let bu_un = self.unsolved;
+            self.place(cell, d);
+            if self.fill(rng) { return true; }
+            self.board = bu_board; self.unsolved = bu_un; self.cells[cell] = 0;
+        }
+        false
+    }
+}
+
+#[allow(dead_code)]
+fn bench_simdfill(iters: usize, seed: u64) {
+    let mut rng = Rng::from_seed(seed);
+    let mut fp: u64 = 0xcbf29ce484222325;
+    let t = Instant::now();
+    for _ in 0..iters {
+        let mut f = SimdFill { board: [BALL; 9], unsolved: BALL, cells: [0; 81] };
+        f.fill(&mut rng);
+        fp ^= f.cells[0] as u64 ^ ((f.cells[40] as u64) << 8) ^ ((f.cells[80] as u64) << 16);
+        fp = fp.wrapping_mul(0x100000001b3);
+    }
+    let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+    println!("  simdfill capped (exp H) {:>8.1} ns/grid   (fp {:#018x})", ns, fp);
 }

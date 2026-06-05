@@ -37,14 +37,21 @@
 //!   on wasm simd128 the packing ceiling is too small to pay).
 
 #![feature(portable_simd)]
+#![feature(const_trait_impl)]
 
 pub mod bb;
+pub mod repr;
 pub(crate) mod counters;
 pub mod fill;
+pub mod generate;
 pub mod generator;
 pub mod grid;
+pub mod probe;
 pub mod rng;
+pub mod scan;
+pub mod sieve;
 pub mod spec;
+pub mod technique;
 pub mod technique_kinds;
 pub mod techniques;
 pub mod util;
