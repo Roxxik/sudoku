@@ -24,7 +24,7 @@ use super::{Branchable, CELLS, CellIdx, Digit, DigitGrid, GridMask, Mark, Marks,
 /// Per-digit candidate cells in packing `M`, plus the empty-cell mask gating them.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SearchState<M: GridMask> {
-    board: PerDigit<M>,
+    candidates: PerDigit<M>,
     unsolved: M,
 }
 
@@ -32,7 +32,7 @@ impl<M: GridMask> SearchState<M> {
     /// The per-digit candidate cell-sets — what a [`scan`](crate::scan) reads.
     #[inline]
     pub fn candidates(&self) -> &PerDigit<M> {
-        &self.board
+        &self.candidates
     }
 
     /// The still-empty cells — the gate over [`candidates`](SearchState::candidates).
@@ -49,7 +49,7 @@ impl<M: GridMask> SearchState<M> {
     /// without re-deriving the known `d`-completion (bb's `any_alt_solves`).
     #[inline]
     pub fn forbid(&mut self, cell: CellIdx, d: Digit) {
-        self.board[d] &= !M::cell(cell);
+        self.candidates[d] &= !M::cell(cell);
     }
 }
 
@@ -83,7 +83,7 @@ impl<M: Branchable> SearchState<M> {
             peers |= M::peers(c);
         }
         self.unsolved &= !(group & !peers); // decide the non-conflicting singles
-        self.board[d] &= !peers; // forbid d on every peer (clears any conflicting single)
+        self.candidates[d] &= !peers; // forbid d on every peer (clears any conflicting single)
     }
 
     /// The per-digit clue cells of `digits` — the seed `clue` map for an incremental
@@ -118,9 +118,9 @@ impl<M: Branchable> SearchState<M> {
         for e in 0..9 {
             let dig = Digit::from_index(e);
             if (clue[dig] & pm).any() {
-                self.board[dig] &= !cb;
+                self.candidates[dig] &= !cb;
             } else {
-                self.board[dig] |= cb;
+                self.candidates[dig] |= cb;
                 cand.insert(dig);
             }
         }
@@ -134,7 +134,7 @@ impl<M: Branchable> SearchState<M> {
             rest &= !M::cell(q);
             blocked |= M::peers(q);
         }
-        self.board[d] |= pm & self.unsolved & !blocked;
+        self.candidates[d] |= pm & self.unsolved & !blocked;
         cand
     }
 
@@ -147,9 +147,9 @@ impl<M: Branchable> SearchState<M> {
         clue[d] |= cb;
         self.unsolved &= !cb;
         for e in 0..9 {
-            self.board[Digit::from_index(e)] &= !cb;
+            self.candidates[Digit::from_index(e)] &= !cb;
         }
-        self.board[d] &= !M::peers(cell);
+        self.candidates[d] &= !M::peers(cell);
     }
 }
 
@@ -169,13 +169,13 @@ impl<M: GridMask> Marks for SearchState<M> {
                 board[d] &= !M::peers(cell);
             }
         }
-        SearchState { board, unsolved }
+        SearchState { candidates: board, unsolved }
     }
 
     #[inline]
     fn place(&mut self, cell: CellIdx, d: Digit) {
         self.unsolved &= !M::cell(cell);
-        self.board[d] &= !M::peers(cell);
+        self.candidates[d] &= !M::peers(cell);
     }
 
     fn get(&self, cell: CellIdx) -> Mark {
@@ -184,7 +184,7 @@ impl<M: GridMask> Marks for SearchState<M> {
             return Mark::EMPTY;
         }
         let mut m = Mark::EMPTY;
-        for (i, &cand) in self.board.each().iter().enumerate() {
+        for (i, &cand) in self.candidates.each().iter().enumerate() {
             if (cand & cb).any() {
                 m.insert(Digit::from_index(i));
             }
