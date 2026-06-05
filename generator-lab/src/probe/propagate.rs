@@ -64,15 +64,23 @@ fn drain_naked_singles<M: Branchable>(state: &mut SearchState<M>) -> Fixpoint {
         // would pay is redundant here (bb's prober sieve).
         let sieve = Sieve::<M, 2>::compute_raw(state.candidates());
         let unsolved = state.unsolved();
+        // Classify dead/solved FIRST, every pass (bb's order). The obvious structure —
+        // compute `singles`, and only classify dead/solved once it empties — makes the
+        // compiler lay out the hot fixpoint loop with ~7% more *taken* branches (816M ->
+        // 871M over a 15k-seed run). On Zen each taken branch closes an op-cache fetch
+        // window, so that throttles micro-op delivery and makes the prober frontend-bound
+        // (~12% slower than bb). Hoisting the dead/solved checks above the single placement
+        // restores bb's branch layout — gap closed (in fact ~3% faster than bb), verdict
+        // and fingerprint unchanged.
+        if (unsolved & sieve.dead()).any() {
+            return Fixpoint::Dead;
+        }
+        if !unsolved.any() {
+            return Fixpoint::Solved;
+        }
         let singles = unsolved & sieve.exactly(1);
         if !singles.any() {
-            return if !unsolved.any() {
-                Fixpoint::Solved
-            } else if (unsolved & sieve.dead()).any() {
-                Fixpoint::Dead
-            } else {
-                Fixpoint::Stuck
-            };
+            return Fixpoint::Stuck;
         }
         // Group this pass's singles by their lone digit — `singles & board[d]` is the
         // singles whose candidate is `d` (a single sits in exactly one digit's board) —
