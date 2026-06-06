@@ -43,6 +43,14 @@ impl Mark {
         self.0.count_ones()
     }
 
+    /// The raw 9-bit mask (bit `d-1` = digit `d`) — the packed prober's per-cell
+    /// `alts` is exactly this set's bits, so the warp host hands the restriction
+    /// to its SoA lanes as a `u16` rather than re-deriving it per digit.
+    #[inline]
+    pub fn bits(self) -> u16 {
+        self.0
+    }
+
     /// Whether the set is empty.
     #[inline]
     pub fn is_empty(self) -> bool {

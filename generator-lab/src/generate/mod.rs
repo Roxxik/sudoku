@@ -17,6 +17,13 @@
 
 mod random;
 
+// The packed W=8 SIMT warp host — the new-`repr` twin of `crate::simt::host`, driving
+// the `crate::probe::simt` packed prober over resumable per-lane strips. An AVX native
+// play, so it (and the `std::simd` warp it batches onto) stays out of the wasm cdylib,
+// which ships the scalar `run_attempts` path.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod random_simt;
+
 pub use random::{
     AttemptResult, GeneratedPuzzle, Stats, attempt, determinism_fp, generate, run_attempts, verify,
 };

@@ -35,6 +35,16 @@ impl<B: Banding> Bands<B> {
         self.0 &= !Simd::from_array(B::CELL_MASKS[cell]);
     }
 
+    /// The three bands as raw 27-bit words in the low three lanes (lane 3 unused) —
+    /// the SoA input the packed prober loads into one warp lane. Read-only escape
+    /// hatch, paralleling [`band`](Bands::band): a [`SearchState`](crate::repr::SearchState)
+    /// row view exports its per-digit candidate bands this way so the native warp can
+    /// pack eight probes across SIMD lanes without re-deriving them cell by cell.
+    #[inline]
+    pub(crate) fn to_lanes(self) -> [u32; 4] {
+        self.0.to_array()
+    }
+
     /// Extract band `i` (0..3) as a scalar [`Band`] for a per-band unit sweep. The
     /// escape hatch the fused hidden-single prober needs: a band's 27 bits read off
     /// one lane drive a whole band's row/box scan, work the cell-at-a-time

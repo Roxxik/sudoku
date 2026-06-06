@@ -25,7 +25,7 @@
 use crate::fill::random_solution;
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, DualBandedMarkGrid, RowMajor};
-use crate::repr::{Board, CELLS, DigitGrid, Marks, PerDigit, Puzzle, Solution};
+use crate::repr::{Board, CELLS, Digit, DigitGrid, Mark, Marks, PerDigit, Puzzle, Solution};
 use crate::rng::Rng;
 use crate::scan::Bivalue;
 use crate::solve::{FusedLogicSolver, LogicSolver, Solver};
@@ -61,7 +61,7 @@ pub enum AttemptResult {
 
 /// The cells of `digits` as a bare `[u8; 81]` (`0` = empty) — for fingerprint folding
 /// against the `grid::Board`-based [`crate::generator`] path, which folds the same.
-fn cells_u8(digits: &DigitGrid) -> [u8; CELLS] {
+pub(in crate::generate) fn cells_u8(digits: &DigitGrid) -> [u8; CELLS] {
     core::array::from_fn(|i| digits.get(i).map_or(0, |d| d.get()))
 }
 
@@ -74,7 +74,7 @@ fn cells_u8(digits: &DigitGrid) -> [u8; CELLS] {
 /// check would read). The production train/drill(HiddenQuad) specs satisfy this; a spec
 /// that forces a cheap kind (e.g. train(LcPointing)) must use the exact [`LogicSolver`],
 /// exactly as bb routes a forced cheap kind off its fused closure.
-fn baseline_fast_applicable(spec: &Spec) -> bool {
+pub(in crate::generate) fn baseline_fast_applicable(spec: &Spec) -> bool {
     const NS: KindMask = 1 << NAKED_SINGLE;
     const HS: KindMask = 1 << HIDDEN_SINGLE;
     const LCP: KindMask = 1 << LC_POINTING;
@@ -116,13 +116,13 @@ pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
 /// prober reads its row view and the baseline gate reads both views with **no per-gate
 /// rebuild**, exactly as bb reuses one dual `BitBoard`. `digits` is the placements shadow
 /// the produced puzzle reads (and the strip's `alts==0`/`get` source `clue` can't give).
-struct StripState {
+pub(in crate::generate) struct StripState {
     digits: DigitGrid,
     dual: DualBandedMarkGrid,
     clue: PerDigit<RM>,
     /// The most-stripped requirement-meeting grid; the candidate state is rebuilt from
     /// it (by `verify`) only if the attempt succeeds.
-    best: Option<DigitGrid>,
+    pub(in crate::generate) best: Option<DigitGrid>,
     /// The running requirement verdict of the current accepted board (carried across
     /// the `alts == 0` fast path). The full grid fires nothing, so it starts false.
     req_met: bool,
@@ -131,7 +131,7 @@ struct StripState {
 impl StripState {
     /// Fresh state stripping the full `solution` grid (nothing removed yet). The one
     /// `from_digits` of the whole attempt — the strip mutates `dual` in place thereafter.
-    fn new(solution: &Solution) -> Self {
+    pub(in crate::generate) fn new(solution: &Solution) -> Self {
         let digits = solution.0.clone();
         let dual = DualBandedMarkGrid::from_digits(&digits);
         let clue = DualBandedMarkGrid::clue_map(&digits);
@@ -140,9 +140,52 @@ impl StripState {
 
     /// Revert a rejected strip of `cell` (held `orig`): restore the clue in both the
     /// placements shadow and the incremental candidate board (both views).
-    fn revert(&mut self, cell: usize, orig: crate::repr::Digit) {
+    fn revert(&mut self, cell: usize, orig: Digit) {
         self.digits.set(cell, orig);
         self.dual.place_clue(&mut self.clue, cell, orig);
+    }
+
+    /// Speculatively strip `cell` (holding `orig`): clear it from the placements shadow
+    /// and the incremental dual board, returning the ALTERNATE digits the cell could
+    /// still take as a 9-bit mask (`0` = still a naked single, so the strip is trivially
+    /// valid). The warp host's per-lane resumable twin of [`attempt`]'s inline strip step
+    /// — the gate logic stays in this one place so the sequential and SIMT drivers can't
+    /// drift. `cand.without(orig)` is the prober's restriction (forbid `orig`); `0` of it
+    /// is the `alts == 0` fast path.
+    pub(in crate::generate) fn strip(&mut self, cell: usize, orig: Digit) -> u16 {
+        self.digits.clear(cell);
+        let cand = self.dual.clear_clue(&mut self.clue, cell, orig);
+        debug_assert!(
+            self.dual == DualBandedMarkGrid::from_digits(&self.digits),
+            "incremental dual drift after clear at {cell}"
+        );
+        cand.without(Mark::single(orig)).bits()
+    }
+
+    /// `alts == 0` fast path (see [`attempt`]): the cleared cell is still a naked single,
+    /// so both gates are skippable — just carry the running requirement verdict into
+    /// `best`. The warp host's twin of the inline fast path.
+    pub(in crate::generate) fn keep_trivial(&mut self) {
+        if self.req_met {
+            self.best = Some(self.digits.clone());
+        }
+    }
+
+    /// The row-view candidate bands + empty mask as the packed prober's SoA input
+    /// ([`crate::probe::simt::Probe`]'s `r`/`unsolved`) — bb's `export_r` twin: per digit
+    /// its three 27-bit row-major bands ([`Bands::to_lanes`]), plus the still-empty mask.
+    /// The carried `dual` is read directly — no per-gate rebuild.
+    /// The digit currently at `cell` in the placements shadow, or `None` if it has been
+    /// stripped — the warp host's strip-walk reads it to skip already-removed cells (the
+    /// `digits.get` of [`attempt`]'s loop).
+    pub(in crate::generate) fn digit_at(&self, cell: usize) -> Option<Digit> {
+        self.digits.get(cell)
+    }
+
+    pub(in crate::generate) fn export_r(&self) -> ([[u32; 4]; 9], [u32; 4]) {
+        let row = self.dual.row();
+        let cand = row.candidates();
+        (core::array::from_fn(|e| cand.each()[e].to_lanes()), row.unsolved().to_lanes())
     }
 
     /// Resolve the gates for the strip of `cell` (held `orig`) given the already-decided
@@ -152,10 +195,10 @@ impl StripState {
     /// [`baseline_fast_applicable`]). The baseline reads the incrementally-maintained
     /// `dual` directly — no per-gate rebuild — and the solver clones it internally, so
     /// the carried strip state is untouched.
-    fn resolve_gate(
+    pub(in crate::generate) fn resolve_gate(
         &mut self,
         cell: usize,
-        orig: crate::repr::Digit,
+        orig: Digit,
         nonunique: bool,
         spec: &Spec,
         baseline: KindMask,
@@ -245,6 +288,17 @@ pub struct Stats {
     pub never_fired: usize,
     pub not_forced: usize,
     pub total_givens: usize,
+}
+
+impl Stats {
+    /// Fold another tally into this one — the warp aggregates per-lane `Stats`.
+    pub fn add(&mut self, o: &Stats) {
+        self.attempts += o.attempts;
+        self.successes += o.successes;
+        self.never_fired += o.never_fired;
+        self.not_forced += o.not_forced;
+        self.total_givens += o.total_givens;
+    }
 }
 
 /// Generate until a puzzle satisfying `spec` is found or `max_attempts` is hit.

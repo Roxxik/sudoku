@@ -19,6 +19,12 @@ pub mod propagate;
 pub mod search;
 pub mod singles;
 
+// The packed W=8 SoA prober — the new-`repr` twin of `crate::simt::prober`. An AVX
+// native play; the wasm cdylib ships the scalar `Search` path, so keep it (and the
+// `std::simd` warp it builds) out of the wasm binary, exactly as the old SIMT stack.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod simt;
+
 pub use propagate::Propagate;
 
 use crate::repr::{SearchState, SolveView};
