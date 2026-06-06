@@ -1,12 +1,22 @@
-//! Generate N puzzles for train/drill(HiddenQuad) by racing W=8 seed streams in
-//! parallel through the packed SIMT prober (`warp::find_puzzles`), stopping as soon
-//! as N are found. Prints each puzzle's 81-char line plus its solution, so they can
-//! be fed straight to core's CLI/verifier.
+//! Generate one puzzle per seed for train/drill(HiddenQuad) by racing the seeds through
+//! the packed SIMT prober (`random_simt::find_puzzles`), W=8 in flight. Prints each
+//! seed's 81-char puzzle line plus its solution, so they can be fed straight to core's
+//! CLI/verifier.
 //!
-//! This is the realistic way to USE the SIMT prober — batch generation, where there
-//! are always >= 8 independent attempts to keep the warp full. A single puzzle from
-//! a single seed is inherently sequential (attempts share one RNG stream, queries
-//! within an attempt are sequential), so for that use the scalar `find` example.
+//! The seed -> puzzle relation is a pure function of the seed (each seed is run to its
+//! first success, identical to scalar `find` from that seed), so this is the batch way
+//! to fill a persisted seed -> puzzle map: pass the seeds that don't have a puzzle yet.
+//! Here we use the contiguous range `base..base+count`; `find_puzzles` takes any seed
+//! iterator, so a non-contiguous set of missing seeds plugs in the same way.
+//!
+//! Puzzles are streamed to stdout as they finish (warp-completion order, NOT seed order)
+//! so an interrupt loses nothing already printed; the stats line lands on stderr at the
+//! end. Pipe to `sort` if you want them ordered.
+//!
+//! Batch generation is the realistic way to USE the SIMT prober — there are always >= 8
+//! independent seeds to keep the warp full. A single puzzle from a single seed is
+//! inherently sequential (attempts share one RNG stream, queries within an attempt are
+//! sequential), so for that use the scalar `find` example.
 //!
 //! Usage: cargo run --release -p generator-lab --example findpar -- [--mode train|drill] [--count N=1] [--seed BASE=1]
 
@@ -16,7 +26,7 @@ use generator_lab::spec_for_mode;
 fn main() {
     let mut mode = 0u32;
     let mut base = 1u64;
-    let mut count = 1usize;
+    let mut count = 1u64;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -30,19 +40,21 @@ fn main() {
     let label = if mode == 0 { "train" } else { "drill" };
     let spec = spec_for_mode(mode);
     let t0 = std::time::Instant::now();
-    let (puzzles, stats) = find_puzzles(base, &spec, count);
+    // Print each puzzle the instant it is produced (out of seed order) so a Ctrl-C loses
+    // nothing already emitted. stdout stays clean puzzle data (pipeable to the verifier).
+    let stats = find_puzzles(base..base + count, &spec, |seed, p| {
+        println!("seed {seed}: {} ({} givens)", p.puzzle.to_line(), p.givens);
+        println!("solution: {}", p.solution.to_line());
+    });
     let elapsed = t0.elapsed();
 
-    // Summary on stderr so stdout is clean puzzle data (pipeable to the verifier).
+    // Summary on stderr, at the end.
     let us_per_attempt = elapsed.as_secs_f64() * 1e6 / stats.attempts.max(1) as f64;
     eprintln!(
-        "{label}(HiddenQuad): {} puzzle(s) in {:.3}s over {} attempts ({us_per_attempt:.2} us/attempt, W=8 parallel)",
-        puzzles.len(),
+        "{label}(HiddenQuad): {} puzzle(s) for {} seed(s) in {:.3}s over {} attempts ({us_per_attempt:.2} us/attempt, W=8 parallel)",
+        stats.successes,
+        count,
         elapsed.as_secs_f64(),
         stats.attempts
     );
-    for p in &puzzles {
-        println!("{} ({} givens)", p.puzzle.to_line(), p.givens);
-        println!("solution: {}", p.solution.to_line());
-    }
 }

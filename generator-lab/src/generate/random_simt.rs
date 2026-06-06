@@ -44,6 +44,15 @@ use crate::spec::Spec;
 use crate::spec::kinds::KindMask;
 use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 
+/// The result of walking one attempt to its next decision point ([`Lane::step_to_gate`]):
+/// either it paused at a uniqueness gate, or the attempt finished with an outcome.
+enum Step {
+    /// Paused at a uniqueness gate; the lane's `pending` holds `(cell, orig, alts)`.
+    Gate,
+    /// The attempt finished; `Some` is a verified puzzle, `None` a non-yielding attempt.
+    Done(Option<GeneratedPuzzle>),
+}
+
 /// One lane = one in-flight attempt plus the running tallies/fingerprint of every
 /// attempt this lane has retired. The board state and per-cell gate logic are the
 /// shared [`StripState`]; the lane adds the resumable walk (strip order + cursor) and
@@ -51,7 +60,13 @@ use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 /// paused at its uniqueness gate.
 struct Lane {
     rng: Rng,
-    /// Attempts still owed by this lane (its share of the fixed work budget).
+    /// The seed this lane's RNG was created from — the key the produced puzzle is
+    /// tagged with so [`find_puzzles`] can return a seed -> puzzle map. (`run_warp`
+    /// derives seeds positionally and ignores this.)
+    seed: u64,
+    /// Attempts still owed by this lane (its share of the fixed work budget). Only the
+    /// fixed-work [`run_warp`] consults it; the seed-driven [`find_puzzles`] sets it to
+    /// `usize::MAX` (a seed retries until it yields, no per-seed cap).
     remaining: usize,
     /// True while an attempt is in flight (between start and finalize).
     active: bool,
@@ -78,6 +93,7 @@ impl Lane {
     fn new(rng: Rng, quota: usize) -> Self {
         Lane {
             rng,
+            seed: 0,
             remaining: quota,
             active: false,
             pending: None,
@@ -107,22 +123,26 @@ impl Lane {
         self.stats.attempts += 1;
     }
 
-    /// Walk the cheap part of the strip until the lane either reaches a uniqueness-gate
-    /// decision (sets `pending`) or exhausts the attempt — in which case it finalizes
-    /// and refills (looping) until either a gate is reached or its quota runs out (then
-    /// it goes idle).
-    fn advance_to_gate<F: FnMut(GeneratedPuzzle)>(&mut self, spec: &Spec, on_found: &mut F) {
+    /// Bind this lane to a fresh `seed` and begin its first attempt — the entry point
+    /// for the seed-driven [`find_puzzles`] host, which hands a slot a new seed each
+    /// time its current one yields its puzzle.
+    fn assign_seed(&mut self, seed: u64) {
+        self.rng = Rng::from_seed(seed);
+        self.seed = seed;
+        self.start_attempt();
+    }
+
+    /// Walk the cheap part of the **current** attempt until the lane either reaches a
+    /// uniqueness-gate decision (sets `pending`, returns [`Step::Gate`]) or runs the
+    /// attempt out (finalizes it, returns [`Step::Done`] with the outcome). It does NOT
+    /// start the next attempt — the caller's refill policy decides that, which is what
+    /// lets the fixed-work and seed-driven hosts share this one walk.
+    fn step_to_gate(&mut self, spec: &Spec) -> Step {
         loop {
             if self.pos_idx >= CELLS {
-                if let Some(p) = self.finalize(spec) {
-                    on_found(p);
-                }
+                let outcome = self.finalize(spec);
                 self.active = false;
-                if self.remaining > 0 {
-                    self.start_attempt();
-                    continue;
-                }
-                return;
+                return Step::Done(outcome);
             }
             let i = self.positions[self.pos_idx];
             self.pos_idx += 1;
@@ -136,7 +156,46 @@ impl Lane {
             }
             // Reached the batch point.
             self.pending = Some((i, orig, alts));
-            return;
+            return Step::Gate;
+        }
+    }
+
+    /// Fixed-work refill (the [`run_warp`] policy): walk to the next gate, and whenever
+    /// an attempt finishes start the next one while the quota holds, looping until a
+    /// gate is reached or the quota runs out (then the lane goes idle). Produced puzzles
+    /// are reported via `on_found`.
+    fn advance_to_gate<F: FnMut(GeneratedPuzzle)>(&mut self, spec: &Spec, on_found: &mut F) {
+        loop {
+            match self.step_to_gate(spec) {
+                Step::Gate => return,
+                Step::Done(outcome) => {
+                    if let Some(p) = outcome {
+                        on_found(p);
+                    }
+                    if self.remaining > 0 {
+                        self.start_attempt();
+                        continue;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Seed-driven refill (the [`find_puzzles`] policy): walk the current seed's
+    /// attempts until **one succeeds**, returning that puzzle (the seed's single
+    /// output), or park at a uniqueness gate (returns `None`, with `pending` set, so the
+    /// host can hand the probe to the packed prober). A failed attempt starts the next
+    /// one on the SAME seed's stream — the seed retries until it yields — so the result
+    /// is a pure function of the seed, byte-identical to scalar
+    /// [`generate`](crate::generate::generate) from that seed.
+    fn advance_until_success(&mut self, spec: &Spec) -> Option<GeneratedPuzzle> {
+        loop {
+            match self.step_to_gate(spec) {
+                Step::Gate => return None,
+                Step::Done(Some(p)) => return Some(p), // the seed's puzzle
+                Step::Done(None) => self.start_attempt(), // retry the same seed
+            }
         }
     }
 
@@ -264,53 +323,75 @@ pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: us
     WarpResult { stats, per_lane }
 }
 
-/// Generate puzzles by racing the W=8 packed prober across independent seed streams until
-/// `target` puzzles have been produced, then stop. SIMD slot `s` owns one unbounded seed
-/// stream (`base_seed + s`) and the packed prober keeps all 8 slots in flight, so this
-/// harvests the warp's full per-core throughput — the realistic way to *use* the SIMT
-/// prober (batch generation of many puzzles). A single puzzle from a single seed is
-/// inherently sequential; for that use [`crate::generate::generate`].
+/// Generate **exactly one puzzle per seed** in `seeds`, racing the W=8 packed prober
+/// across the seeds and **streaming** each result to `on_found(seed, puzzle)` the moment
+/// it is produced. Each seed is run to its *first* success — the same single puzzle
+/// scalar [`generate`](crate::generate::generate) yields from `Rng::from_seed(seed)` —
+/// so the relation is a pure `seed -> puzzle` map, independent of how the 8 slots
+/// interleave or how many slots there are. Returns the aggregate attempt stats;
+/// `stats.successes` == the number of `on_found` calls.
 ///
-/// Deterministic for a given `base_seed`. Returns the puzzles (each spec-verified, so safe
-/// to feed straight to core's verifier) and the aggregate attempt stats. In-flight slots
-/// are drained once `target` is reached, so a few attempts past the last find may run; the
-/// returned Vec is exactly `target` long (a single warp pass can surface more than one
-/// success).
-pub fn find_puzzles(base_seed: u64, spec: &Spec, target: usize) -> (Vec<GeneratedPuzzle>, Stats) {
+/// **Streaming, not collected.** Puzzles are handed to `on_found` as soon as they finish
+/// (in warp-completion order, *not* seed order), so a caller can persist/print each one
+/// immediately and lose nothing already emitted if the run is interrupted (Ctrl-C). A
+/// caller that wants them ordered sorts what it collected.
+///
+/// `seeds` is an [`IntoIterator`] so a **non-contiguous** seed set plugs straight in —
+/// e.g. only the seeds a persisted map does not have a puzzle for yet (pass
+/// `base..base+n` for a contiguous batch). The iterator is the work list: each SIMD slot
+/// works one seed at a time and, the moment that seed yields its puzzle, pulls the next
+/// available seed, keeping all 8 slots full while seeds remain. This is the realistic
+/// way to *use* the SIMT prober — batch generation, where there are always >= 8
+/// independent seeds in flight.
+///
+/// Note: a seed retries until it yields (no per-seed attempt cap), matching the
+/// "one puzzle per seed" contract. Every emitted puzzle is spec-verified, so safe to
+/// feed straight to core's verifier.
+pub fn find_puzzles<I, F>(seeds: I, spec: &Spec, mut on_found: F) -> Stats
+where
+    I: IntoIterator<Item = u64>,
+    F: FnMut(u64, GeneratedPuzzle),
+{
     let baseline = spec.baseline_mask();
     let fast = baseline_fast_applicable(spec);
-    let mut found: Vec<GeneratedPuzzle> = Vec::with_capacity(target);
-    if target == 0 {
-        return (found, Stats::default());
-    }
+    let mut seeds = seeds.into_iter();
 
-    // One unbounded seed stream per SIMD slot (1:1, no lane pool to refill from).
+    // One slot-bound lane per SIMD slot; each is (re)assigned seeds pulled from `seeds`
+    // as it finishes. `usize::MAX` quota = "retry the current seed until it yields".
     let mut ls: Vec<Lane> =
-        (0..LANES).map(|s| Lane::new(Rng::from_seed(base_seed + s as u64), usize::MAX)).collect();
+        (0..LANES).map(|_| Lane::new(Rng::from_seed(0), usize::MAX)).collect();
     let mut prober = PackedProber::new();
 
     prober.run_stream(|slot, verdict| {
-        if found.len() >= target {
-            return None; // enough found: let the in-flight slots drain
-        }
         let lane = &mut ls[slot];
         match verdict {
+            // Apply the verdict for the gate this slot just probed, then continue below.
             Some(v) => resolve_gate_with(lane, spec, baseline, fast, v),
-            None if !lane.active => lane.start_attempt(), // initial fill
-            None => {}
+            // Initial fill for this slot: take its first seed (or idle if none left).
+            None => match seeds.next() {
+                Some(s) => lane.assign_seed(s),
+                None => return None,
+            },
         }
-        lane.advance_to_gate(spec, &mut |p| found.push(p));
-        if found.len() >= target {
-            return None;
+        // Drive the current seed to its single puzzle, then roll onto the next seed,
+        // until the lane parks at a gate (hand back the probe) or the seeds run out.
+        loop {
+            match lane.advance_until_success(spec) {
+                None => return Some(probe_of(lane)), // parked at a uniqueness gate
+                Some(p) => {
+                    on_found(lane.seed, p); // stream it out immediately
+                    match seeds.next() {
+                        Some(s) => lane.assign_seed(s),
+                        None => return None, // seed supply drained: free this slot
+                    }
+                }
+            }
         }
-        // Unbounded quota => advance always parks the lane at a fresh gate.
-        if lane.pending.is_some() { Some(probe_of(lane)) } else { None }
     });
 
-    found.truncate(target);
     let mut stats = Stats::default();
     for lane in &ls {
         stats.add(&lane.stats);
     }
-    (found, stats)
+    stats
 }
