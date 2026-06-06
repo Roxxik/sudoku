@@ -323,6 +323,62 @@ pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: us
     WarpResult { stats, per_lane }
 }
 
+/// Harvest the **faithful corpus of uniqueness probes** a fixed-work [`run_warp`] would
+/// hand the packed prober, for the isolated prober benchmark (`proberbench`). Runs the
+/// real generator — strip walk + prober verdicts drive the trajectory exactly as
+/// production — but records every [`Probe`] the moment it is handed out. The returned Vec
+/// is then replayed through [`PackedProber::resolve`] with no strip/baseline/fill in the
+/// loop, isolating the prober's raw throughput.
+///
+/// Each probe is a self-contained existence query (board + stripped cell + alternates), so
+/// replaying the corpus reproduces exactly the prober's work — only the interleaved
+/// host-side gate resolution is removed.
+pub fn collect_probes(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> Vec<Probe> {
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut slot_lane = [usize::MAX; LANES];
+    let mut next_lane = 0usize;
+    let mut probes: Vec<Probe> = Vec::new();
+
+    prober.run_stream(|slot, verdict| {
+        if let Some(v) = verdict {
+            let ll = slot_lane[slot];
+            resolve_gate_with(&mut ls[ll], spec, baseline, fast, v);
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                let p = probe_of(&ls[ll]);
+                probes.push(p);
+                return Some(p);
+            }
+        }
+        loop {
+            if next_lane >= ls.len() {
+                return None;
+            }
+            let ll = next_lane;
+            next_lane += 1;
+            if ls[ll].remaining == 0 {
+                continue;
+            }
+            ls[ll].start_attempt();
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                slot_lane[slot] = ll;
+                let p = probe_of(&ls[ll]);
+                probes.push(p);
+                return Some(p);
+            }
+        }
+    });
+
+    probes
+}
+
 /// Generate **exactly one puzzle per seed** in `seeds`, racing the W=8 packed prober
 /// across the seeds and **streaming** each result to `on_found(seed, puzzle)` the moment
 /// it is produced. Each seed is run to its *first* success — the same single puzzle

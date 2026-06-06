@@ -30,10 +30,10 @@
 //!   branching still reaches every completion, so the verdict is unchanged.
 //! - **Placement via the smear formula** ([`smear_v`]). The peer union of a placed
 //!   wave is computed as uniform band ops (row-smear | box-expand |
-//!   column-occupancy broadcast `occ * 0x40201`), with **no per-cell peer gather**.
-//! - **Conflict via occupancy popcount** ([`conflict_v`]) — a placed group whose
-//!   cells collide in a unit (distinct touched units < group size) is dead — again
-//!   gather-free, replacing the old peer-mask accumulation.
+//!   column-occupancy broadcast `occ | occ<<9 | occ<<18`), with **no per-cell peer gather**.
+//! - **Conflict via peer popcount** (inside [`smear_v`]) — a placed group whose
+//!   cells collide in a unit (distinct touched units < group size) is dead, read
+//!   straight off the peer masks (`popcount(row_peer) < 9*n`), gather-free.
 //! - **Branch via [`assign`]** — restrict the branch cell to one digit and let the
 //!   next sweep place it (smear). No per-branch peer gather.
 //!
@@ -98,17 +98,24 @@ fn one_bit(x: V) -> M {
     x.simd_ne(ZERO) & (x & (x - ONE)).simd_eq(ZERO)
 }
 
-/// The peer union of a placed group (the cells to clear digit `d` from), as
-/// uniform band ALU — no per-cell `PEER_MASK` gather. Returns the per-band peer
-/// masks plus the row/column/box occupancy fields the conflict check reuses.
+/// The peer union of a placed group (the cells to clear digit `d` from) plus the
+/// per-lane contradiction mask, as uniform band ALU — no per-cell `PEER_MASK` gather.
 ///
 /// For each placed cell: its whole row is a peer (row-smear), its whole box is a
 /// peer (box-expand), and its column across all three bands is a peer (fold each
 /// band to a 9-bit column-occupancy, OR across bands, broadcast back to all rows
 /// via `occ | occ<<9 | occ<<18`). The column term is shared by all three bands;
 /// the row/box terms are per band.
+///
+/// A group is contradictory when its cells collide in a unit (two singles for the
+/// same digit in one unit) — distinct touched units < cell count. That is read
+/// straight off the peer masks instead of separate occupancy fields: distinct rows
+/// partition into disjoint 9-bit `ROW_MASK`s, so `popcount(rp) == 9 * rows_touched`
+/// and the row collision is `popcount(rp) < 9*n`; likewise boxes; columns use the
+/// 9-bit `col_occ` directly (`popcount(col_occ) < n`). This drops the 18 per-pass
+/// occupancy selects the old `row_occ`/`box_occ` accumulation paid.
 #[inline]
-fn smear_v(group: [V; 3]) -> ([V; 3], V, V, V) {
+fn smear_v(group: [V; 3]) -> ([V; 3], M) {
     let m9 = Simd::splat(0x1FF);
     let mut col_occ = ZERO;
     for b in 0..3 {
@@ -118,39 +125,29 @@ fn smear_v(group: [V; 3]) -> ([V; 3], V, V, V) {
     }
     let colpeer = col_occ | (col_occ << Simd::splat(9)) | (col_occ << Simd::splat(18));
     let mut out = [ZERO; 3];
-    let mut row_occ = ZERO;
-    let mut box_occ = ZERO;
+    let mut rp_pop = ZERO;
+    let mut bp_pop = ZERO;
     for b in 0..3 {
         let g = group[b];
         let mut rp = ZERO;
         for i in 0..3 {
             let rm = Simd::splat(ROW_MASK[i]);
-            let on = (g & rm).simd_ne(ZERO);
-            rp |= on.select(rm, ZERO);
-            row_occ |= on.select(Simd::splat(1 << (3 * b + i)), ZERO);
+            rp |= (g & rm).simd_ne(ZERO).select(rm, ZERO);
         }
         let mut bp = ZERO;
         for k in 0..3 {
             let bm = Simd::splat(BOX_CELLS[k]);
-            let on = (g & bm).simd_ne(ZERO);
-            bp |= on.select(bm, ZERO);
-            box_occ |= on.select(Simd::splat(1 << (3 * b + k)), ZERO);
+            bp |= (g & bm).simd_ne(ZERO).select(bm, ZERO);
         }
+        rp_pop += rp.count_ones();
+        bp_pop += bp.count_ones();
         out[b] = rp | bp | colpeer;
     }
-    (out, row_occ, col_occ, box_occ)
-}
-
-/// A placed group is contradictory when its cells collide in some unit: the
-/// number of *distinct* touched rows / columns / boxes is fewer than the number
-/// of placed cells (two singles for the same digit in one unit). Gather-free —
-/// popcount over the occupancy fields [`smear_v`] already built.
-#[inline(always)]
-fn conflict_v(group: [V; 3], row_occ: V, col_occ: V, box_occ: V) -> M {
+    // distinct rows/boxes touched = popcount(peer)/9; collide iff < n  <=>  popcount < 9n.
     let n = group[0].count_ones() + group[1].count_ones() + group[2].count_ones();
-    row_occ.count_ones().simd_lt(n)
-        | col_occ.count_ones().simd_lt(n)
-        | box_occ.count_ones().simd_lt(n)
+    let n9 = n * Simd::splat(9);
+    let conflict = rp_pop.simd_lt(n9) | bp_pop.simd_lt(n9) | col_occ.count_ones().simd_lt(n);
+    (out, conflict)
 }
 
 use crate::counters::counter_block;
@@ -246,13 +243,13 @@ fn assign(r: &mut [[V; 3]; 9], l: usize, cell: usize, dd: usize) {
     }
 }
 
-/// ONE propagation pass — one naked-single sweep + one hidden-single sweep — across
-/// the warp, applied only to `active` lanes, fully vectorized (smear placement, ALU
-/// hidden detection, popcount conflict). Returns per-lane `(changed, dead, solved)`.
-/// The scheduler calls this repeatedly; a lane is at fixpoint when a full pass
-/// leaves it unchanged. Same operations as the scalar closure, so the per-lane
-/// fixpoint is identical (the closure is confluent) — only the pass granularity
-/// differs.
+/// ONE propagation pass — a single per-digit placement sweep that fuses naked and
+/// hidden singles — across the warp, applied only to `active` lanes, fully vectorized
+/// (smear placement, ALU hidden detection, popcount conflict). Returns per-lane
+/// `(changed, dead, solved)`. The scheduler calls this repeatedly; a lane is at
+/// fixpoint when a full pass leaves it unchanged. Same forced-cell set as the scalar
+/// closure, so the per-lane fixpoint is identical (the closure is confluent) — only the
+/// pass granularity differs.
 #[cfg_attr(feature = "profiling", inline(never))]
 fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
     let mut changed = M::splat(false);
@@ -274,21 +271,16 @@ fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M)
         dead |= (unsolved[b] & !ones[b]).simd_ne(ZERO); // a cell with no candidate
         singles[b] = unsolved[b] & ones[b] & !twos[b];
     }
+    // One placement sweep per digit, fusing naked and hidden singles into a single
+    // `smear_v` (the dominant primitive) — halving the smear count from 18 to 9 vs a
+    // separate naked-then-hidden pass. For each digit the forced group is its naked
+    // singles (`singles & r[d]`) unioned with its row/box hidden singles, detected on
+    // the *current* board. Each digit places immediately, so a later digit's hidden
+    // detection reads the already-updated `unsolved` and can't re-place a solved cell —
+    // every placed cell is genuinely forced, the closure stays confluent, and the
+    // per-lane verdict is unchanged.
     for d in 0..9 {
-        let group = [singles[0] & r[d][0], singles[1] & r[d][1], singles[2] & r[d][2]];
-        let (peers, ro, co, bo) = smear_v(group);
-        dead |= conflict_v(group, ro, co, bo);
-        for b in 0..3 {
-            let gm = active.select(group[b], ZERO);
-            unsolved[b] &= !gm;
-            r[d][b] &= !active.select(peers[b], ZERO);
-            changed |= gm.simd_ne(ZERO);
-        }
-    }
-
-    // Hidden singles (rows + boxes, in-lane), one sweep.
-    for d in 0..9 {
-        let mut group = [ZERO; 3];
+        let mut group = [singles[0] & r[d][0], singles[1] & r[d][1], singles[2] & r[d][2]];
         for b in 0..3 {
             let live = r[d][b] & unsolved[b];
             for rr in 0..3 {
@@ -300,8 +292,8 @@ fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M)
                 group[b] |= one_bit(bc).select(bc, ZERO);
             }
         }
-        let (peers, ro, co, bo) = smear_v(group);
-        dead |= conflict_v(group, ro, co, bo);
+        let (peers, conflict) = smear_v(group);
+        dead |= conflict;
         for b in 0..3 {
             let gm = active.select(group[b], ZERO);
             unsolved[b] &= !gm;
@@ -395,24 +387,33 @@ impl PackedProber {
             dstat_add(3, active_mask.to_bitmask().count_ones() as u64);
             let (changed, dead, solved) = warp_pass(&mut r, &mut unsolved, active_mask);
 
-            for l in 0..LANES {
-                if !active[l] {
-                    continue;
-                }
+            // Service only the lanes that reached a decision this pass, found by bitmask
+            // rather than a per-lane `Mask::test` extract: a lane needs servicing iff it is
+            // solved, dead, or stuck (active but unchanged). The common case — a lane still
+            // propagating — is skipped entirely, and the three verdict masks are reduced to
+            // integers once (three `movemask`s) instead of per-lane lane-extracts.
+            let active_b = active_mask.to_bitmask();
+            let solved_b = solved.to_bitmask();
+            let dead_b = dead.to_bitmask();
+            let changed_b = changed.to_bitmask();
+            let mut service = active_b & (solved_b | dead_b | !changed_b);
+            while service != 0 {
+                let l = service.trailing_zeros() as usize;
+                service &= service - 1;
+                let bit = 1u64 << l;
                 let mut verdict: Option<bool> = None;
-                if solved.test(l) {
+                if solved_b & bit != 0 {
                     verdict = Some(true);
-                } else if dead.test(l) {
+                } else if dead_b & bit != 0 {
                     // Backtrack to the nearest frame with an untried digit.
                     if !self.backtrack(&mut r, &mut unsolved, l) {
                         verdict = Some(false); // tree exhausted: no alternate completion
                     }
-                } else if !changed.test(l) {
-                    // Stuck at a fixpoint with cells remaining: branch.
+                } else {
+                    // Stuck at a fixpoint with cells remaining (active & !changed): branch.
                     self.branch(&mut r, &mut unsolved, l);
                     branched[l] = true;
                 }
-                // else: still changing — keep propagating in place next pass.
 
                 if let Some(v) = verdict {
                     #[cfg(feature = "count")]
