@@ -69,4 +69,30 @@ impl Mark {
     pub fn remove(&mut self, d: Digit) {
         self.0 &= !(1u16 << d.index());
     }
+
+    /// The digits in `self` but not in `other` (set difference) — the subset
+    /// techniques' "remove the kept digits, eliminate the rest" step.
+    #[inline]
+    pub fn without(self, other: Mark) -> Mark {
+        Mark(self.0 & !other.0)
+    }
+}
+
+/// Union of two digit sets — the subset techniques build a combo's candidate union
+/// this way (`a | b`), the digit-set analogue of cell-set [`super::GridMask`] `|`.
+impl std::ops::BitOr for Mark {
+    type Output = Mark;
+    #[inline]
+    fn bitor(self, rhs: Mark) -> Mark {
+        Mark(self.0 | rhs.0)
+    }
+}
+
+/// Intersection of two digit sets — a naked subset eliminates exactly `cell & union`.
+impl std::ops::BitAnd for Mark {
+    type Output = Mark;
+    #[inline]
+    fn bitand(self, rhs: Mark) -> Mark {
+        Mark(self.0 & rhs.0)
+    }
 }

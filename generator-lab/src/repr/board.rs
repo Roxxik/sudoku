@@ -67,6 +67,14 @@ impl Board {
         self.digits.set(i, d);
         self.marks.place(i, d);
     }
+
+    /// Remove candidate `d` from empty cell `i` without placing — the technique layer's
+    /// pruning primitive ([`Eliminate`](crate::solve::Eliminate)). The placements are
+    /// untouched; only the marks shrink.
+    #[inline]
+    pub fn eliminate(&mut self, i: CellIdx, d: Digit) {
+        self.marks.eliminate(i, d);
+    }
 }
 
 /// `Board` is a candidate store too — the scalar reference a technique can run on

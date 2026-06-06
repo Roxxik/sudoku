@@ -24,6 +24,11 @@
 //!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` both baseline engines return.
 //! - [`techniques`]: scalar reference engine — `solve_tracked` and
 //!   `min_target_uses` (verify's avoid-target walk, the cold path).
+//! - [`solve`]: the new-representation **logic solver** — `LogicSolver`, the
+//!   technique-driven, no-backtracking spec gate (the old `baseline` engine,
+//!   renamed) written once over the `repr` layer, parallel to [`probe`].
+//! - [`probe`]: the new-representation existence/uniqueness probers (`Search`,
+//!   `Singles`) over the `repr` layer.
 //! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.
 //! - [`verify`]: spec verification reduced to a bool (scalar, cold path).
 //! - [`fill`]: the random full-grid filler (u128-bitboard MRV search), the first
@@ -50,6 +55,7 @@ pub mod probe;
 pub mod rng;
 pub mod scan;
 pub mod sieve;
+pub mod solve;
 pub mod spec;
 pub mod technique;
 pub mod technique_kinds;

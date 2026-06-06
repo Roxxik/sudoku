@@ -15,6 +15,12 @@
 //! incrementally reopening candidates (bb's `apply_clear`). That rebuild is cheap
 //! next to the prober DFS; the incremental strip is the next step.
 
+mod random;
+
+pub use random::{
+    AttemptResult, GeneratedPuzzle, Stats, attempt, generate, run_attempts, verify,
+};
+
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{Branchable, CELLS, DigitGrid, Marks, Puzzle, SearchState, Solution};

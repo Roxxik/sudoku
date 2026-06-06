@@ -51,6 +51,63 @@ impl<M: GridMask> SearchState<M> {
     pub fn forbid(&mut self, cell: CellIdx, d: Digit) {
         self.candidates[d] &= !M::cell(cell);
     }
+
+    /// Place a wave of naked singles whose lone candidate is `d` (`group`) given the
+    /// already-accumulated `peers` mask (the union of the group cells' peer masks):
+    /// decide the non-conflicting singles and forbid `d` across every peer, in two
+    /// masked ops — bb's `place_singles` tail. Split from
+    /// [`place_single_group`](SearchState::place_single_group) so a caller that
+    /// enumerates the cells itself (e.g. the dual grid, whose column view is not
+    /// [`Branchable`] and so cannot walk the set) can still batch the placement.
+    ///
+    /// Two singles of `d` that are peers is a contradiction: such a cell lands in
+    /// `peers` (a peer excludes only itself), so it is left out of the decided set and
+    /// `&= !peers` strips its lone candidate, leaving it unsolved with zero candidates
+    /// for the next [`Sieve`](crate::sieve) to read as dead.
+    #[inline]
+    pub fn place_group_with(&mut self, d: Digit, group: M, peers: M) {
+        self.unsolved &= !(group & !peers);
+        self.candidates[d] &= !peers;
+    }
+
+    /// Reopen `cell` (now empty) with naked candidate set `cand`: mark it unsolved, then
+    /// per digit set its candidate bit at `cell` iff it survives, else clear it. The
+    /// per-view body of a clue clear — the survival set `cand` is banding-independent (a
+    /// property of the clue map), so the dual grid computes it once and applies it to
+    /// each view with that view's `cellmask`.
+    #[inline]
+    pub(crate) fn open_cell(&mut self, cellmask: M, cand: Mark) {
+        self.unsolved |= cellmask;
+        for e in 0..9 {
+            let dig = Digit::from_index(e);
+            if cand.contains(dig) {
+                self.candidates[dig] |= cellmask;
+            } else {
+                self.candidates[dig] &= !cellmask;
+            }
+        }
+    }
+
+    /// Reopen digit `d` on a just-cleared cell's empty peers — `peers` that are still
+    /// empty and not `blocked` (the cells some other present `d`-clue still forbids `d`
+    /// on). The per-view body of the clue clear's digit reopen; the dual grid supplies
+    /// each view's `peers`/`blocked`.
+    #[inline]
+    pub(crate) fn open_digit_on_peers(&mut self, d: Digit, peers: M, blocked: M) {
+        self.candidates[d] |= peers & self.unsolved & !blocked;
+    }
+
+    /// Decide `cell` as digit `d` (restore a clue): out of `unsolved`, every candidate
+    /// bit at `cell` cleared, `d` removed from `peers`. The per-view body of a clue
+    /// restore.
+    #[inline]
+    pub(crate) fn close_cell(&mut self, cellmask: M, d: Digit, peers: M) {
+        self.unsolved &= !cellmask;
+        for e in 0..9 {
+            self.candidates[Digit::from_index(e)] &= !cellmask;
+        }
+        self.candidates[d] &= !peers;
+    }
 }
 
 /// The incremental clue board — the strip's persistent state, mutated in place across
@@ -82,8 +139,7 @@ impl<M: Branchable> SearchState<M> {
             rest &= !M::cell(c);
             peers |= M::peers(c);
         }
-        self.unsolved &= !(group & !peers); // decide the non-conflicting singles
-        self.candidates[d] &= !peers; // forbid d on every peer (clears any conflicting single)
+        self.place_group_with(d, group, peers);
     }
 
     /// The per-digit clue cells of `digits` — the seed `clue` map for an incremental
@@ -113,17 +169,14 @@ impl<M: Branchable> SearchState<M> {
         clue[d] &= !cb; // cell stops being a clue before peer occupancy is read
 
         // (1) cell -> empty; candidate digit `e` survives iff no present peer holds it.
-        self.unsolved |= cb;
         let mut cand = Mark::EMPTY;
         for e in 0..9 {
             let dig = Digit::from_index(e);
-            if (clue[dig] & pm).any() {
-                self.candidates[dig] &= !cb;
-            } else {
-                self.candidates[dig] |= cb;
+            if !(clue[dig] & pm).any() {
                 cand.insert(dig);
             }
         }
+        self.open_cell(cb, cand);
 
         // (2) reopen `d` on cell's empty peers outside the union of the other present
         // `d`-clues' peer masks (the cells those clues still forbid `d` on).
@@ -134,7 +187,7 @@ impl<M: Branchable> SearchState<M> {
             rest &= !M::cell(q);
             blocked |= M::peers(q);
         }
-        self.candidates[d] |= pm & self.unsolved & !blocked;
+        self.open_digit_on_peers(d, pm, blocked);
         cand
     }
 
@@ -143,13 +196,8 @@ impl<M: Branchable> SearchState<M> {
     /// `unsolved`, all its candidate bits cleared), `d` leaves every peer, and `cell`
     /// is a `d`-clue again.
     pub fn place_clue(&mut self, clue: &mut PerDigit<M>, cell: CellIdx, d: Digit) {
-        let cb = M::cell(cell);
-        clue[d] |= cb;
-        self.unsolved &= !cb;
-        for e in 0..9 {
-            self.candidates[Digit::from_index(e)] &= !cb;
-        }
-        self.candidates[d] &= !M::peers(cell);
+        clue[d] |= M::cell(cell);
+        self.close_cell(M::cell(cell), d, M::peers(cell));
     }
 }
 
