@@ -191,14 +191,19 @@ impl Probe {
 fn load_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, p: &Probe) {
     let cl = rm_lane(p.cell);
     let cbit = 1u32 << rm_bit(p.cell);
+    // The cell's band gets a per-digit AND-mask that clears `cbit` for every non-alternate
+    // digit; the other two bands are untouched. Done branchlessly: the per-digit `if keep`
+    // is a data-dependent test on `alts` (9 unpredictable branches/probe) and was a refill
+    // mispredict source. `keep.wrapping_neg()` is all-ones when the digit is an alternate
+    // (so the mask is `!0`, no clear) and zero otherwise (mask `!cbit`); `bmask[cl]` is an
+    // indexed store, so no `b == cl` branch either. The stores carry no dependency.
     for d in 0..9 {
-        let keep = (p.alts >> d) & 1 != 0;
+        let keep = ((p.alts >> d) & 1) as u32;
+        let cl_mask = !cbit | keep.wrapping_neg();
+        let mut bmask = [u32::MAX; 3];
+        bmask[cl] = cl_mask;
         for b in 0..3 {
-            let mut band = p.r[d][b];
-            if b == cl && !keep {
-                band &= !cbit;
-            }
-            r[d][b].as_mut_array()[l] = band;
+            r[d][b].as_mut_array()[l] = p.r[d][b] & bmask[b];
         }
     }
     for b in 0..3 {
@@ -237,9 +242,11 @@ fn assign(r: &mut [[V; 3]; 9], l: usize, cell: usize, dd: usize) {
     let cl = rm_lane(cell);
     let cbit = 1u32 << rm_bit(cell);
     for d in 0..9 {
-        if d != dd {
-            r[d][cl].as_mut_array()[l] &= !cbit;
-        }
+        // Branchless: clear `cbit` for every digit but `dd`. The `if d != dd` is a
+        // data-dependent branch (dd varies per branch node); `keep.wrapping_neg()` is
+        // all-ones at `d == dd` (mask `!0`, no-op) and zero elsewhere (mask `!cbit`).
+        let keep = (d == dd) as u32;
+        r[d][cl].as_mut_array()[l] &= !cbit | keep.wrapping_neg();
     }
 }
 
@@ -278,7 +285,9 @@ fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M)
     // the *current* board. Each digit places immediately, so a later digit's hidden
     // detection reads the already-updated `unsolved` and can't re-place a solved cell —
     // every placed cell is genuinely forced, the closure stays confluent, and the
-    // per-lane verdict is unchanged.
+    // per-lane verdict is unchanged. The loop is left rolled deliberately: unrolling the
+    // nine large (inlined-`smear_v`) bodies blew up code size and thrashed the I-cache
+    // for a net loss, far outweighing the one loop-exit mispredict per pass it would save.
     for d in 0..9 {
         let mut group = [singles[0] & r[d][0], singles[1] & r[d][1], singles[2] & r[d][2]];
         for b in 0..3 {
