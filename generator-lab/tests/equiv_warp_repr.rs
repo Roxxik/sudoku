@@ -8,7 +8,9 @@
 //! pins faithfulness — and that the new packed prober's verdicts match the scalar
 //! `Search` prober the sequential path uses.)
 
-use generator_lab::generate::random_simt::{find_puzzles, run_warp};
+use generator_lab::generate::random_simt::{
+    find_puzzles, run_warp, run_warp_pingpong, run_warp_pipelined,
+};
 use generator_lab::generate::{generate, run_attempts};
 use generator_lab::rng::Rng;
 use generator_lab::spec::Spec;
@@ -39,6 +41,35 @@ fn check_mode(mode: u32, base_seed: u64, lanes: usize, attempts_per_lane: usize)
 #[test]
 fn train_warp_matches_sequential() {
     check_mode(0, 1, 8, 40);
+}
+
+/// The baseline-vectorizing two-warp hosts ([`run_warp_pipelined`] / [`run_warp_pingpong`])
+/// defer + batch the baseline gate onto the packed solver instead of running it scalar
+/// per lane. Since the packed solver is pinned byte-identical to the scalar one, every
+/// logical lane's `(stats, fp)` must still match plain [`run_warp`] exactly — at a lane
+/// count > 8 so the oversubscription/refill paths are exercised.
+fn check_baseline_hosts(mode: u32, base_seed: u64, lanes: usize, attempts_per_lane: usize) {
+    let spec = spec_for_mode(mode);
+    let bar = run_warp(base_seed, &spec, lanes, attempts_per_lane);
+    for (name, res) in [
+        ("pipelined", run_warp_pipelined(base_seed, &spec, lanes, attempts_per_lane)),
+        ("pingpong", run_warp_pingpong(base_seed, &spec, lanes, attempts_per_lane)),
+    ] {
+        assert_eq!(res.per_lane.len(), bar.per_lane.len(), "{name} mode {mode}: lane count");
+        for (l, (a, b)) in res.per_lane.iter().zip(bar.per_lane.iter()).enumerate() {
+            assert_eq!(a.0, b.0, "{name} mode {mode} lane {l}: stats diverged");
+            assert_eq!(a.1, b.1, "{name} mode {mode} lane {l}: fingerprint diverged");
+        }
+    }
+}
+
+#[test]
+fn baseline_hosts_match_run_warp() {
+    check_baseline_hosts(0, 1, 24, 60);
+    check_baseline_hosts(1, 1, 24, 60);
+    // Offset seeds + a lane count not a multiple of the 8-wide warp.
+    check_baseline_hosts(0, 500, 19, 40);
+    check_baseline_hosts(1, 500, 19, 40);
 }
 
 #[test]

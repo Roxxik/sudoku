@@ -40,8 +40,9 @@ use crate::fill::random_solution;
 use crate::probe::simt::{LANES, PackedProber, Probe};
 use crate::repr::{CELLS, Digit, DigitGrid, Solution};
 use crate::rng::Rng;
+use crate::solve::simt::{PackedSolver, SolveQuery};
 use crate::spec::Spec;
-use crate::spec::kinds::KindMask;
+use crate::spec::kinds::{KindMask, SolveTrace};
 use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 
 /// The result of walking one attempt to its next decision point ([`Lane::step_to_gate`]):
@@ -379,6 +380,69 @@ pub fn collect_probes(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_la
     probes
 }
 
+/// Harvest the **faithful corpus of baseline-gate boards** a fixed-work [`run_warp`]
+/// would hand the scalar baseline solver, for the isolated SIMT-baseline-solver
+/// benchmark/parity (`baselinebench`, `tests/equiv_baseline_simt`). Runs the real
+/// generator — strip walk + prober verdicts drive the trajectory exactly as production
+/// — and records the stripped placements grid the moment the *baseline* gate would run
+/// on it (i.e. every gate the prober found unique, the only ones the baseline sees).
+///
+/// Each board is a self-contained partial grid; reconstructing its candidate state
+/// (`from_digits`) reproduces exactly the board the per-lane scalar
+/// [`FusedLogicSolver`](crate::solve::FusedLogicSolver) solves, so the corpus is the
+/// SIMT solver's input distribution with the interleaved host-side strip walk removed.
+pub fn collect_baseline_boards(
+    base_seed: u64,
+    spec: &Spec,
+    lanes: usize,
+    attempts_per_lane: usize,
+) -> Vec<DigitGrid> {
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut slot_lane = [usize::MAX; LANES];
+    let mut next_lane = 0usize;
+    let mut boards: Vec<DigitGrid> = Vec::new();
+
+    prober.run_stream(|slot, verdict| {
+        if let Some(v) = verdict {
+            let ll = slot_lane[slot];
+            // A unique gate (`!v`) is one the baseline gate runs on — capture the board
+            // it sees (the strip's current placements) before resolution mutates it.
+            if !v {
+                boards.push(ls[ll].strip.board_digits());
+            }
+            resolve_gate_with(&mut ls[ll], spec, baseline, fast, v);
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                return Some(probe_of(&ls[ll]));
+            }
+        }
+        loop {
+            if next_lane >= ls.len() {
+                return None;
+            }
+            let ll = next_lane;
+            next_lane += 1;
+            if ls[ll].remaining == 0 {
+                continue;
+            }
+            ls[ll].start_attempt();
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                slot_lane[slot] = ll;
+                return Some(probe_of(&ls[ll]));
+            }
+        }
+    });
+
+    boards
+}
+
 /// Generate **exactly one puzzle per seed** in `seeds`, racing the W=8 packed prober
 /// across the seeds and **streaming** each result to `on_found(seed, puzzle)` the moment
 /// it is produced. Each seed is run to its *first* success — the same single puzzle
@@ -450,4 +514,241 @@ where
         stats.add(&lane.stats);
     }
     stats
+}
+
+// ===========================================================================
+// SIMT-baseline integration prototypes
+// ===========================================================================
+//
+// `run_warp` above vectorizes only the *uniqueness* gate (the packed prober) and runs
+// the *baseline* gate scalar per lane inside the refill callback (`resolve_gate_with`).
+// A warp-only profile puts that scalar baseline at ~46% of warp time, and the packed
+// baseline solver ([`crate::solve::simt::PackedSolver`]) is 1.87x (train) / 2.97x (drill)
+// faster than it in isolation — so vectorizing the baseline too should give ~1.3x e2e.
+//
+// The baseline gate is *downstream* of the prober verdict, per lane, and the strip is
+// sequential, so a lane parked at a baseline gate can't produce its next uniqueness probe
+// until the baseline resolves. Vectorizing the baseline therefore needs a producer/
+// consumer between two warps plus enough logical lanes in flight (oversubscription) to
+// keep both warps fed. On a single core, interleaving the two warps buys nothing over
+// running them in decoupled phases (same instruction stream) — the only cost is warp-drain
+// bubbles at the phase edges, which large batches amortize. These two prototypes are the
+// two natural decoupled schedulers; both reuse the equiv-tested `PackedSolver`, so per-lane
+// verdicts (and thus the produced puzzles / `Stats`) stay byte-identical to `run_warp`.
+
+/// Apply the prober's uniqueness verdict to a lane parked at a gate. Non-unique: revert
+/// and clear the gate (the lane is now ready to advance). Unique: capture the post-strip
+/// placements as a [`SolveQuery`] for the deferred batched baseline solve and leave the
+/// gate parked (`pending` kept) — returns `Some(query)` iff unique.
+fn on_uniqueness(lane: &mut Lane, nonunique: bool) -> Option<SolveQuery> {
+    let (cell, orig, _alts) = lane.pending.expect("on_uniqueness on a lane with no gate");
+    if nonunique {
+        lane.strip.revert_gate(cell, orig);
+        lane.pending = None;
+        None
+    } else {
+        // The strip already has `cell` cleared (advance_to_gate stripped it), so its row
+        // view is exactly the board the baseline gate runs on — no rebuild, like `probe_of`.
+        let (r, unsolved) = lane.strip.export_r();
+        Some(SolveQuery { r, unsolved })
+    }
+}
+
+/// Apply a deferred baseline [`SolveTrace`] to a lane that was parked at a unique gate,
+/// then clear the gate (the lane is ready to advance).
+fn on_baseline(lane: &mut Lane, spec: &Spec, trace: &SolveTrace) {
+    let (cell, orig, _alts) = lane.pending.take().expect("on_baseline on a lane with no gate");
+    lane.strip.apply_baseline(cell, orig, trace, spec);
+}
+
+/// **Prototype A1 — nested flush.** Same fixed-work contract as [`run_warp`] but with the
+/// baseline gate vectorized too. The packed prober owns the outer loop and runs
+/// *continuously* (never drained mid-run); a unique gate's board is captured and pushed to
+/// a deferred-baseline batch instead of solved inline, and the slot is refilled from a
+/// queue of lanes whose baseline already resolved. When that queue empties, the whole
+/// deferred batch is flushed through the packed baseline solver in one shot (a big batch =
+/// high solver-warp utilization), refilling the queue. `lanes` logical lanes are kept in
+/// flight (oversubscription headroom — pick `lanes` >> 8), each an independent seed, so the
+/// per-lane outcome is identical to the sequential run regardless of interleave.
+pub fn run_warp_pipelined(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
+    let baseline = spec.baseline_mask();
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut solver = PackedSolver::new();
+    let mut slot_lane = [usize::MAX; LANES];
+    let mut next_lane = 0usize;
+
+    // Lanes whose baseline resolved and which now hold a fresh uniqueness probe.
+    let mut probe_ready: Vec<usize> = Vec::with_capacity(lanes);
+    // Deferred baseline batch: parallel lane-index / board-query Vecs + a reusable verdict
+    // buffer, flushed together through the packed solver.
+    let mut bp_lane: Vec<usize> = Vec::with_capacity(lanes);
+    let mut bp_query: Vec<SolveQuery> = Vec::with_capacity(lanes);
+    let mut bp_out: Vec<SolveTrace> = Vec::with_capacity(lanes);
+
+    prober.run_stream(|slot, verdict| {
+        // 1. Resolve the slot's current gate (skipped on the initial fill).
+        if let Some(v) = verdict {
+            let ll = slot_lane[slot];
+            match on_uniqueness(&mut ls[ll], v) {
+                Some(q) => {
+                    // Unique: defer the baseline; the lane is blocked until the flush.
+                    bp_lane.push(ll);
+                    bp_query.push(q);
+                }
+                None => {
+                    // Non-unique: reverted; keep the slot on this lane through its next gate.
+                    ls[ll].advance_to_gate(spec, &mut |_| {});
+                    if ls[ll].pending.is_some() {
+                        return Some(probe_of(&ls[ll]));
+                    }
+                    // else the lane exhausted its quota — acquire a new one below.
+                }
+            }
+        }
+        // 2. Acquire a probe for this slot. Priority: a lane whose baseline already
+        //    resolved (probe_ready), then a fresh logical lane (which lets the deferred
+        //    baseline batch keep growing), and only flush the batch when there is no other
+        //    way to make progress. Flushing eagerly (before exhausting fresh lanes) would
+        //    drain the batch one board at a time, running the W=8 solver at scalar speed —
+        //    the whole point is to flush a big batch so the solver warp runs full.
+        loop {
+            if let Some(ll) = probe_ready.pop() {
+                slot_lane[slot] = ll;
+                return Some(probe_of(&ls[ll]));
+            }
+            if next_lane < ls.len() {
+                let ll = next_lane;
+                next_lane += 1;
+                if ls[ll].remaining == 0 {
+                    continue;
+                }
+                ls[ll].start_attempt();
+                ls[ll].advance_to_gate(spec, &mut |_| {});
+                if ls[ll].pending.is_some() {
+                    slot_lane[slot] = ll;
+                    return Some(probe_of(&ls[ll]));
+                }
+                continue;
+            }
+            if !bp_lane.is_empty() {
+                // No ready probes and no fresh lanes left: flush the whole deferred
+                // baseline batch at once (a big batch => the solver warp runs full).
+                bp_out.clear();
+                bp_out.resize(bp_lane.len(), SolveTrace::default());
+                solver.solve(baseline, &bp_query, &mut bp_out);
+                for (i, &ll) in bp_lane.iter().enumerate() {
+                    on_baseline(&mut ls[ll], spec, &bp_out[i]);
+                    ls[ll].advance_to_gate(spec, &mut |_| {});
+                    if ls[ll].pending.is_some() {
+                        probe_ready.push(ll);
+                    }
+                }
+                bp_lane.clear();
+                bp_query.clear();
+                continue;
+            }
+            return None;
+        }
+    });
+
+    let mut stats = Stats::default();
+    let mut per_lane = Vec::with_capacity(lanes);
+    for lane in &ls {
+        stats.add(&lane.stats);
+        per_lane.push((lane.stats, lane.fp));
+    }
+    WarpResult { stats, per_lane }
+}
+
+/// **Prototype A2 — ping-pong.** Same fixed-work contract as [`run_warp`], baseline
+/// vectorized. Alternates two full warp passes: a *prober phase* drains a worklist of
+/// lanes-needing-a-uniqueness-probe (routing unique gates into the deferred-baseline batch
+/// and re-queuing non-unique lanes' next gates), then a *solver phase* runs the whole
+/// deferred batch through the packed baseline solver and re-queues each lane's next gate.
+/// Simpler than [`run_warp_pipelined`] (two plain `run_stream` calls, no nested flush) but
+/// it drains *both* warps once per cycle, so it pays two warp-drain bubbles per cycle vs
+/// the pipelined host's one-per-flush — the A/B that measures whether that matters.
+pub fn run_warp_pingpong(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
+    let baseline = spec.baseline_mask();
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut solver = PackedSolver::new();
+
+    // Worklist of lanes that need a uniqueness probe (fresh-started or post-baseline).
+    let mut probe_ready: Vec<usize> = (0..lanes).collect();
+    // Each fresh lane is started + walked to its first gate up front.
+    for &ll in &probe_ready {
+        ls[ll].start_attempt();
+        ls[ll].advance_to_gate(spec, &mut |_| {});
+    }
+    probe_ready.retain(|&ll| ls[ll].pending.is_some());
+
+    let mut bp_lane: Vec<usize> = Vec::with_capacity(lanes);
+    let mut bp_query: Vec<SolveQuery> = Vec::with_capacity(lanes);
+    let mut bp_out: Vec<SolveTrace> = Vec::with_capacity(lanes);
+
+    while !probe_ready.is_empty() {
+        // --- prober phase: every queued lane through the uniqueness gate ---
+        bp_lane.clear();
+        bp_query.clear();
+        let mut pr_idx = 0usize; // cursor into probe_ready (a lane may re-enter on revert)
+        let mut slot_lane = [usize::MAX; LANES];
+        prober.run_stream(|slot, verdict| {
+            if let Some(v) = verdict {
+                let ll = slot_lane[slot];
+                match on_uniqueness(&mut ls[ll], v) {
+                    Some(q) => {
+                        bp_lane.push(ll);
+                        bp_query.push(q);
+                    }
+                    None => {
+                        // Non-unique: advance; its next gate re-enters this same phase.
+                        ls[ll].advance_to_gate(spec, &mut |_| {});
+                        if ls[ll].pending.is_some() {
+                            return Some(probe_of(&ls[ll]));
+                        }
+                    }
+                }
+            }
+            // Hand out the next queued lane's probe.
+            while pr_idx < probe_ready.len() {
+                let ll = probe_ready[pr_idx];
+                pr_idx += 1;
+                slot_lane[slot] = ll;
+                return Some(probe_of(&ls[ll]));
+            }
+            None
+        });
+        probe_ready.clear();
+
+        // --- solver phase: the whole deferred baseline batch at once ---
+        if bp_lane.is_empty() {
+            break;
+        }
+        bp_out.clear();
+        bp_out.resize(bp_lane.len(), SolveTrace::default());
+        solver.solve(baseline, &bp_query, &mut bp_out);
+        for (i, &ll) in bp_lane.iter().enumerate() {
+            on_baseline(&mut ls[ll], spec, &bp_out[i]);
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                probe_ready.push(ll);
+            }
+        }
+    }
+
+    let mut stats = Stats::default();
+    let mut per_lane = Vec::with_capacity(lanes);
+    for lane in &ls {
+        stats.add(&lane.stats);
+        per_lane.push((lane.stats, lane.fp));
+    }
+    WarpResult { stats, per_lane }
 }

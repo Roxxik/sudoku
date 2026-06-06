@@ -37,6 +37,7 @@
 //! cheap-fixpoint before any subset fires), which is the contract the generator reads.
 
 use super::{LogicSolver, Solver, techniques};
+use crate::counters::counter_block;
 use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMajor};
 use crate::repr::{Digit, GridMask, Marks};
 use crate::scan::sieve::Sieve;
@@ -44,6 +45,20 @@ use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
 };
+
+// --- baseline-gate workload metrics (feature = "count") -----------------------
+// Data for the SIMT-baseline-solver design: how the scalar FusedLogicSolver's work
+// splits between the vectorizable cheap closure and the hard subset ladder.
+//   [0] solve calls
+//   [1] total propagate() invocations (outer-loop iterations = cheap-closure depth)
+//   [2] total subset steps that fired (step_subsets -> Some)
+//   [3] calls that fired >= 1 subset step (i.e. reached past the cheap closure)
+//   [4] calls that solved (solved == true)
+//   [5] calls with counts[HIDDEN_QUAD] >= 1 (the Forced kind actually fired)
+//   [6] total step_subsets invocations (incl. the None that ends an unsolvable stall)
+//   [10+k] per-kind k firing totals (cheap kinds 0..4 are fired-or-not, <=1/call;
+//          subset kinds 4..10 are exact)
+counter_block!(FSTAT: 20, inc = fstat_inc, add = fstat_add, snapshot = fstat_snapshot, reset = fstat_reset);
 
 /// The fused fast-path logic solver over the dual-banded grid. Stateless marker, like
 /// [`LogicSolver`](super::LogicSolver); see the module docs for its precondition.
@@ -90,10 +105,12 @@ enum Prop {
 /// Solve via the gated fused closure + the discrete subset ladder, easiest-first.
 /// `LC` monomorphizes the locked-candidates step away when the baseline excludes it.
 fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> SolveTrace {
+    fstat_add(0, 1);
     let mut b = board.clone();
     let mut counts = [0u16; NUM];
     let mut fired = 0u32;
     let solved = loop {
+        fstat_add(1, 1);
         match propagate::<LC>(&mut b, &mut fired) {
             // A board with a known solution never contradicts under sound techniques;
             // fold Contradiction into baseline-unsolvable anyway.
@@ -101,6 +118,7 @@ fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> So
             Prop::Contradiction => break false,
             Prop::Stuck => {}
         }
+        fstat_add(6, 1);
         match step_subsets(&mut b, allowed) {
             Some(k) => counts[k] = counts[k].saturating_add(1),
             None => break false,
@@ -112,6 +130,25 @@ fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> So
     for k in 0..NUM {
         if fired & (1 << k) != 0 && counts[k] == 0 {
             counts[k] = 1;
+        }
+    }
+    #[cfg(feature = "count")]
+    {
+        let subset_steps: u64 = (NAKED_PAIR..NUM).map(|k| counts[k] as u64).sum();
+        fstat_add(2, subset_steps);
+        if subset_steps > 0 {
+            fstat_add(3, 1);
+        }
+        if solved {
+            fstat_add(4, 1);
+        }
+        if counts[HIDDEN_QUAD] >= 1 {
+            fstat_add(5, 1);
+        }
+        for k in 0..NUM {
+            if counts[k] > 0 {
+                fstat_add(10 + k, counts[k] as u64);
+            }
         }
     }
     SolveTrace { solved, counts }
@@ -339,7 +376,7 @@ const OCC3: [u8; 512] = {
 /// keyed on its 9-bit triplet occupancy: `occ & !keep`, precomputed. Nonzero only
 /// for the rare occupancies that actually have an LC elimination. The same table
 /// serves both views (box↔row in row-major bands, box↔column in column-major).
-const DROP_TRIP: [u32; 512] = {
+pub(crate) const DROP_TRIP: [u32; 512] = {
     let mut t = [0u32; 512];
     let mut occ = 0usize;
     while occ < 512 {

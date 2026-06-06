@@ -56,15 +56,15 @@ use std::simd::{Mask, Select, Simd};
 // geometry (`band_idx`/`band_pos`/`cell_at`), byte-identical to the old bb
 // `rm_lane`/`rm_bit`/`rm_cell` it replaces. Thin wrappers keep the kernel body unchanged.
 #[inline]
-fn rm_lane(cell: usize) -> usize {
+pub(crate) fn rm_lane(cell: usize) -> usize {
     RowMajor::band_idx(cell)
 }
 #[inline]
-fn rm_bit(cell: usize) -> usize {
+pub(crate) fn rm_bit(cell: usize) -> usize {
     RowMajor::band_pos(cell)
 }
 #[inline]
-fn rm_cell(lane: usize, bit: u32) -> usize {
+pub(crate) fn rm_cell(lane: usize, bit: u32) -> usize {
     RowMajor::cell_at(lane, bit as usize)
 }
 
@@ -72,15 +72,15 @@ fn rm_cell(lane: usize, bit: u32) -> usize {
 /// was a wash: Zen 4 double-pumps it, so no raw-throughput gain.)
 pub const LANES: usize = 8;
 
-type V = Simd<u32, LANES>;
-type M = Mask<i32, LANES>;
-const ZERO: V = Simd::from_array([0; LANES]);
-const ONE: V = Simd::from_array([1; LANES]);
+pub(crate) type V = Simd<u32, LANES>;
+pub(crate) type M = Mask<i32, LANES>;
+pub(crate) const ZERO: V = Simd::from_array([0; LANES]);
+pub(crate) const ONE: V = Simd::from_array([1; LANES]);
 
 /// The three rows of a band as 9-bit masks (row r occupies bits `9*r..9*r+9`).
-const ROW_MASK: [u32; 3] = [0x1FF, 0x1FF << 9, 0x1FF << 18];
+pub(crate) const ROW_MASK: [u32; 3] = [0x1FF, 0x1FF << 9, 0x1FF << 18];
 /// The three boxes of a band: box k is columns `3*k..3*k+3` across all three rows.
-const BOX_CELLS: [u32; 3] = {
+pub(crate) const BOX_CELLS: [u32; 3] = {
     let mut t = [0u32; 3];
     let mut k = 0;
     while k < 3 {
@@ -94,7 +94,7 @@ const BOX_CELLS: [u32; 3] = {
 /// Lane-parallel "exactly one bit set" over a per-lane field: `f != 0 && f &
 /// (f-1) == 0`. The lanes whose field holds a lone bit (a hidden single).
 #[inline(always)]
-fn one_bit(x: V) -> M {
+pub(crate) fn one_bit(x: V) -> M {
     x.simd_ne(ZERO) & (x & (x - ONE)).simd_eq(ZERO)
 }
 
@@ -115,7 +115,7 @@ fn one_bit(x: V) -> M {
 /// 9-bit `col_occ` directly (`popcount(col_occ) < n`). This drops the 18 per-pass
 /// occupancy selects the old `row_occ`/`box_occ` accumulation paid.
 #[inline]
-fn smear_v(group: [V; 3]) -> ([V; 3], M) {
+pub(crate) fn smear_v(group: [V; 3]) -> ([V; 3], M) {
     let m9 = Simd::splat(0x1FF);
     let mut col_occ = ZERO;
     for b in 0..3 {
@@ -214,7 +214,7 @@ fn load_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, p: &Probe) {
 /// Snapshot lane `l`'s board out of the SoA warp into scalar bands (the per-branch
 /// clone the design pays). Strided reads of 30 `u32`, no scatter.
 #[inline]
-fn snapshot_lane(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> ([[u32; 3]; 9], [u32; 3]) {
+pub(crate) fn snapshot_lane(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> ([[u32; 3]; 9], [u32; 3]) {
     (
         core::array::from_fn(|d| core::array::from_fn(|b| r[d][b].as_array()[l])),
         core::array::from_fn(|b| unsolved[b].as_array()[l]),
@@ -223,7 +223,7 @@ fn snapshot_lane(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> ([[u32; 3]; 9]
 
 /// Restore a snapshot into lane `l` of the SoA warp (backtrack).
 #[inline]
-fn restore_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, sr: &[[u32; 3]; 9], su: &[u32; 3]) {
+pub(crate) fn restore_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, sr: &[[u32; 3]; 9], su: &[u32; 3]) {
     for d in 0..9 {
         for b in 0..3 {
             r[d][b].as_mut_array()[l] = sr[d][b];

@@ -52,6 +52,7 @@ pub type KindMask = u32;
 /// board, and how many times each kind fired (for the requirement check). Returned
 /// by the [`solve`](crate::solve) engines ([`LogicSolver`](crate::solve::LogicSolver)
 /// and [`FusedLogicSolver`](crate::solve::FusedLogicSolver)).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct SolveTrace {
     pub solved: bool,
     pub counts: [u16; NUM],

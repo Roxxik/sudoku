@@ -30,7 +30,7 @@ use crate::scan::Bivalue;
 use crate::solve::{FusedLogicSolver, LogicSolver, Solver};
 use crate::spec::Spec;
 use crate::spec::kinds::{
-    HIDDEN_SINGLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_SINGLE,
+    HIDDEN_SINGLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_SINGLE, SolveTrace,
 };
 use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 
@@ -181,6 +181,14 @@ impl StripState {
         self.digits.get(cell)
     }
 
+    /// The current (mid-strip) placements grid — the board the baseline gate runs on
+    /// (`self.dual == from_digits(self.digits)` by the strip invariant). The SIMT
+    /// baseline-solver corpus harvester clones it at each gate to replay the exact
+    /// boards the baseline solves.
+    pub(in crate::generate) fn board_digits(&self) -> DigitGrid {
+        self.digits.clone()
+    }
+
     pub(in crate::generate) fn export_r(&self) -> ([[u32; 4]; 9], [u32; 4]) {
         let row = self.dual.row();
         let cand = row.candidates();
@@ -213,6 +221,39 @@ impl StripState {
         } else {
             LogicSolver::solve_tracked(&self.dual, baseline)
         };
+        if !trace.solved {
+            self.revert(cell, orig);
+            return;
+        }
+        self.req_met = spec.requirement_met(&trace.counts);
+        if self.req_met {
+            self.best = Some(self.digits.clone());
+        }
+    }
+
+    /// Revert a rejected gate (the prober found the strip non-unique) — the public twin
+    /// of [`revert`](Self::revert) for the SIMT host, which decides the uniqueness verdict
+    /// out-of-line (in the packed prober) and applies it here. Splits the uniqueness half
+    /// of [`resolve_gate`](Self::resolve_gate) out so the baseline half can be deferred and
+    /// batched onto the packed baseline solver.
+    pub(in crate::generate) fn revert_gate(&mut self, cell: usize, orig: Digit) {
+        self.revert(cell, orig);
+    }
+
+    /// Apply an already-computed baseline [`SolveTrace`] for a kept (unique) gate — the
+    /// baseline half of [`resolve_gate`](Self::resolve_gate), split out so the SIMT host
+    /// can run the baseline solve on the packed W=8 solver and feed the verdict back here.
+    /// If the toolbox can't solve the strip, revert; else record the requirement verdict
+    /// and snapshot `best`. The `trace` MUST be the verdict the scalar
+    /// [`FusedLogicSolver`]/[`LogicSolver`] would return on this board (the packed solver
+    /// is pinned byte-identical to it), so the outcome is unchanged by the deferral.
+    pub(in crate::generate) fn apply_baseline(
+        &mut self,
+        cell: usize,
+        orig: Digit,
+        trace: &SolveTrace,
+        spec: &Spec,
+    ) {
         if !trace.solved {
             self.revert(cell, orig);
             return;
