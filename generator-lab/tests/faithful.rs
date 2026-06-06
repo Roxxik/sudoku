@@ -13,11 +13,11 @@
 //! too slow for the default run).
 
 use generator_lab::generate::generate as glab_generate;
-use generator_lab::grid::Board as GBoard;
+use generator_lab::generate::verify as glab_verify;
+use generator_lab::repr::DigitGrid;
 use generator_lab::rng::Rng as GRng;
 use generator_lab::spec::Spec as GSpec;
 use generator_lab::technique_kinds as gt;
-use generator_lab::verify::verify as glab_verify;
 
 use sudoku_core::{
     Board as CBoard, Rng as CRng, Spec as CSpec, TechniqueKind as CK, make_puzzle_for_spec, verify as core_verify,
@@ -74,7 +74,7 @@ fn glab_generated_pass_core(mode: Mode, target: usize, want: usize, per_cap: usi
         let line = p.puzzle.to_line();
 
         // glab self-consistency.
-        let gb = GBoard::parse(&line).expect("glab parse");
+        let gb = DigitGrid::parse(&line).expect("glab parse");
         assert!(glab_verify(&gb, &gspec), "glab rejected its own puzzle: {line}");
 
         // The real check: core's verifier accepts it for the equivalent spec.
@@ -99,7 +99,7 @@ fn core_generated_pass_glab(mode: Mode, target: usize, want: usize, per_cap: usi
     for _ in 0..want {
         let Some(res) = make_puzzle_for_spec(&mut rng, &cspec, per_cap) else { continue };
         let line = res.puzzle.puzzle.to_line();
-        let gb = GBoard::parse(&line).expect("glab parse");
+        let gb = DigitGrid::parse(&line).expect("glab parse");
         assert!(
             glab_verify(&gb, &gspec),
             "glab REJECTED a core puzzle (target {}, line {line})",

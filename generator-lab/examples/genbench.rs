@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use generator_lab::fill::random_solution;
 use generator_lab::generate::strip_to_minimal;
-use generator_lab::grid::CELLS;
 use generator_lab::probe::{Prober, Search, Singles};
+use generator_lab::repr::CELLS;
 use generator_lab::repr::SearchState;
 use generator_lab::repr::banded::{Bands, RowMajor};
 use generator_lab::rng::Rng;

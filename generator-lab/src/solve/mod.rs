@@ -5,10 +5,8 @@
 //! the allowed toolbox forces and stops when nothing more is forced). It is the spec
 //! oracle — the strip loop's difficulty gate — not a completion oracle.
 //!
-//! This is the new-representation home of the old `baseline` engine (the dual-view
-//! `bb::BitBoard::baseline` and its scalar twin [`crate::techniques::solve_tracked`]),
-//! renamed because "baseline" said nothing about *what* it is. It exposes the same
-//! two spec primitives those engines did:
+//! It was once called the `baseline` engine, renamed because "baseline" said nothing
+//! about *what* it is. It exposes two spec primitives:
 //!
 //! - [`Solver::solve_tracked`]: solve with the `allowed` toolbox, easiest-first,
 //!   reporting whether it [`solved`](SolveTrace::solved) and how many times each kind

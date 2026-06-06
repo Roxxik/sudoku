@@ -1,10 +1,9 @@
 //! The attempt **warp** on the `repr` layer: K independent strip attempts driven in
-//! lockstep, with per-lane refill. The new-`repr` twin of the old bb-based
-//! [`crate::simt::host`] — same streaming orchestration, but each lane's per-cell gate
-//! logic is the [`crate::generate::random`] [`StripState`] (the incremental
+//! lockstep, with per-lane refill. Each lane's per-cell gate logic is the
+//! [`random`](crate::generate::random) `StripState` (the incremental
 //! [`DualBandedMarkGrid`](crate::repr::banded::DualBandedMarkGrid) strip), and the
 //! uniqueness gate it batches is resolved by the packed-DFS prober
-//! ([`crate::probe::simt`], the gather-free W=8 smear+ALU kernel) instead of the bb one.
+//! ([`crate::probe::simt`], the gather-free W=8 smear+ALU kernel).
 //!
 //! ## The cheap/expensive split and on-demand refill
 //!

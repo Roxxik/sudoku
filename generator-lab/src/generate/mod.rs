@@ -1,26 +1,20 @@
-//! Puzzle generation built on the new `repr` foundations.
+//! Puzzle generation built on the new `repr` foundations — the production
+//! strip-generate pipeline.
 //!
-//! For now this holds a **simplified, uniqueness-only** strip loop: it produces a
-//! minimal uniquely-solvable puzzle, with NO spec/difficulty gate (no baseline
-//! technique requirement) yet — just the uniqueness prober. It is the skeleton the
-//! full spec-driven strip loop will grow into; the existing `crate::generator`
-//! strip loop (with its baseline gate, used by the scalar-simd and simt
-//! generators) is untouched.
+//! Each attempt fills a random solution ([`crate::fill`]) then strips clues in random
+//! order, holding the puzzle uniquely solvable (the [`probe`](crate::probe) prober)
+//! and meeting the spec's difficulty requirement (the [`solve`](crate::solve) gate).
 //!
-//! Generic over the [`Branchable`] packing the prober runs on (parallel to
-//! [`Fill`](crate::fill)): the flat `u128` reference and the banded rep both work.
-//!
-//! Simplification vs the eventual hot path: the strip rebuilds the candidate state
-//! from the placements each step ([`SearchState::from_digits`]) instead of
-//! incrementally reopening candidates (bb's `apply_clear`). That rebuild is cheap
-//! next to the prober DFS; the incremental strip is the next step.
+//! - [`random`]: the shipped scalar/wasm path — one attempt at a time over an
+//!   incrementally-maintained dual-banded strip state.
+//! - [`random_simt`] (native only): the W=8 SIMT warp host, running K attempts in
+//!   lockstep over [`crate::probe::simt`] with per-lane refill.
 
 mod random;
 
-// The packed W=8 SIMT warp host — the new-`repr` twin of `crate::simt::host`, driving
-// the `crate::probe::simt` packed prober over resumable per-lane strips. An AVX native
-// play, so it (and the `std::simd` warp it batches onto) stays out of the wasm cdylib,
-// which ships the scalar `run_attempts` path.
+// The packed W=8 SIMT warp host, driving the `crate::probe::simt` packed prober over
+// resumable per-lane strips. An AVX native play, so it (and the `std::simd` warp it
+// batches onto) stays out of the wasm cdylib, which ships the scalar `run_attempts` path.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod random_simt;
 

@@ -15,50 +15,38 @@
 //! session — it's a benchable PoC.
 //!
 //! ## Modules
-//! - [`grid`] / [`rng`] / [`util`]: primitives copied from core (kept faithful;
-//!   the strip stream reproduces core's for a given seed).
-//! - [`bb`]: the shared bitboard core — ONE transposed digit-board
-//!   representation for both the uniqueness prober (existence DFS) and the
-//!   baseline technique engine, so candidate propagation isn't duplicated.
+//! - [`repr`]: the representation layer — the [`Digit`](repr::Digit)/[`Mark`](repr::Mark)
+//!   value types, the [`DigitGrid`](repr::DigitGrid)/[`Board`](repr::Board) grids, and
+//!   the banded SIMD packings ([`repr::banded`]) every solver/prober/generator is built
+//!   on. The whole crate lives on this layer.
+//! - [`rng`] / [`util`]: primitives kept faithful to core (the strip stream
+//!   reproduces core's for a given seed) plus the shared FNV fingerprint.
 //! - [`technique_kinds`]: the shared taxonomy — kind indices, `KindMask`,
-//!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` both baseline engines return.
-//! - [`techniques`]: scalar reference engine — `solve_tracked` and
-//!   `min_target_uses` (verify's avoid-target walk, the cold path).
-//! - [`solve`]: the new-representation **logic solver** — `LogicSolver`, the
-//!   technique-driven, no-backtracking spec gate (the old `baseline` engine,
-//!   renamed) written once over the `repr` layer, parallel to [`probe`].
-//! - [`probe`]: the new-representation existence/uniqueness probers (`Search`,
-//!   `Singles`) over the `repr` layer.
+//!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` a logic solve returns.
+//! - [`technique`] / [`scan`] / [`sieve`]: the composable technique steps, the
+//!   MRV/Bivalue branch strategies, and the popcount-free naked-single sieve.
+//! - [`solve`]: the **logic solver** — `LogicSolver` and its fused fast path
+//!   `FusedLogicSolver`, the technique-driven, no-backtracking spec gate over the
+//!   `repr` layer, parallel to [`probe`].
+//! - [`probe`]: the existence/uniqueness probers (`Search`, `Singles`) over the
+//!   `repr` layer, plus the native packed W=8 SIMT prober ([`probe::simt`]).
 //! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.
-//! - [`verify`]: spec verification reduced to a bool (scalar, cold path).
-//! - [`fill`]: the random full-grid filler (u128-bitboard MRV search), the first
+//! - [`fill`]: the random full-grid filler (banded-bitboard MRV search), the first
 //!   half of every attempt.
-//! - [`generate`]: the shipped scalar/wasm strip-generate pipeline on the `repr`
-//!   layer (the [`probe`] prober + [`solve`] gate) — this is the production path.
-//! - [`generator`] (native only): the old bb-based strip scaffolding the SIMT warp
-//!   still rides on (the dual `BitBoard` strip state + shared gate logic). Trimmed
-//!   to exactly what `simt` needs; it survives only until the warp is ported to
-//!   the `repr` layer, then it goes too.
-//! - [`simt`] (native only): the SIMT stack — `simt::prober`, a warp of W=8
-//!   per-lane DFS searches (gather-free smear+ALU kernel) with streaming refill,
-//!   and `simt::host`, the driver that batches the strip loop's uniqueness gates
-//!   onto it. SIMT is a native AVX play; on wasm simd128 the packing ceiling is too
-//!   small to pay, so the wasm cdylib ships the scalar [`generate`]/[`probe`] path
-//!   instead.
+//! - [`generate`]: the strip-generate pipeline on the `repr` layer (the [`probe`]
+//!   prober + [`solve`] gate). [`generate::random`] is the shipped scalar/wasm
+//!   path; [`generate::random_simt`] (native only) is the W=8 SIMT warp host that
+//!   batches the strip loop's uniqueness gates onto [`probe::simt`]. SIMT is a
+//!   native AVX play; on wasm simd128 the packing ceiling is too small to pay, so
+//!   the wasm cdylib ships the scalar path.
 
 #![feature(portable_simd)]
 #![feature(const_trait_impl)]
 
-pub mod bb;
 pub mod repr;
 pub(crate) mod counters;
 pub mod fill;
 pub mod generate;
-// The trimmed `generator` is now pure SIMT-support scaffolding (the warp's strip
-// state + gate logic); SIMT is native-only, so keep it out of the wasm binary too.
-#[cfg(not(target_arch = "wasm32"))]
-pub mod generator;
-pub mod grid;
 pub mod probe;
 pub mod rng;
 pub mod scan;
@@ -67,14 +55,7 @@ pub mod solve;
 pub mod spec;
 pub mod technique;
 pub mod technique_kinds;
-pub mod techniques;
 pub mod util;
-pub mod verify;
-
-// The packed prober is an AVX (W=8) native play; the wasm cdylib build uses the
-// scalar prober via `wasm_exports`, so keep the SIMT stack out of the wasm binary.
-#[cfg(not(target_arch = "wasm32"))]
-pub mod simt;
 
 use spec::Spec;
 use technique_kinds::HIDDEN_QUAD;

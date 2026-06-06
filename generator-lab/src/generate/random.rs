@@ -1,6 +1,5 @@
 //! The spec-driven `random`-method generator on the new `repr` foundations — the
-//! port of [`crate::generator`] off the `bb` bitboard onto the layered prober/solver
-//! stack ([`probe`](crate::probe) for uniqueness, [`solve`](crate::solve) for the
+//! layered prober/solver stack ([`probe`](crate::probe) for uniqueness, [`solve`](crate::solve) for the
 //! difficulty gate).
 //!
 //! Per attempt: a random full grid ([`random_solution`]), then strip cells in random
@@ -59,8 +58,8 @@ pub enum AttemptResult {
     NeverFired,
 }
 
-/// The cells of `digits` as a bare `[u8; 81]` (`0` = empty) — for fingerprint folding
-/// against the `grid::Board`-based [`crate::generator`] path, which folds the same.
+/// The cells of `digits` as a bare `[u8; 81]` (`0` = empty) — the form the
+/// cross-backend determinism fingerprint folds (see [`fnv_fold_cells`](crate::util::fnv_fold_cells)).
 pub(in crate::generate) fn cells_u8(digits: &DigitGrid) -> [u8; CELLS] {
     core::array::from_fn(|i| digits.get(i).map_or(0, |d| d.get()))
 }
@@ -88,8 +87,8 @@ pub(in crate::generate) fn baseline_fast_applicable(spec: &Spec) -> bool {
 }
 
 /// True iff `digits` satisfies `spec`: baseline-solvable AND every Forced technique is
-/// irreplaceable. The new-repr twin of [`crate::verify::verify`] — the cold accept
-/// check, so it runs the composable [`LogicSolver`] (exact, no fast-path precondition).
+/// irreplaceable. The cold accept check, so it runs the composable [`LogicSolver`]
+/// (exact, no fast-path precondition).
 /// It runs on the **cell-major** [`Board`], not the strip's digit-major board: verify's
 /// technique scans read candidates per cell, O(1) on `Board` vs a 9-board scan per `get`
 /// on `SearchState`, which matters because the avoid-target walk re-solves repeatedly.
@@ -109,8 +108,8 @@ pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
     true
 }
 
-/// The mutable state of one strip attempt and its per-cell gate logic — the new-repr
-/// [`crate::generator::StripState`]. The single candidate source is one incrementally
+/// The mutable state of one strip attempt and its per-cell gate logic. The single
+/// candidate source is one incrementally
 /// maintained dual-banded board (`dual`) + its row-major `clue` map, mutated in place
 /// across the 81 removal attempts (bb's `apply_clear`/`apply_place`) — so the uniqueness
 /// prober reads its row view and the baseline gate reads both views with **no per-gate
@@ -279,8 +278,8 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     }
 }
 
-/// Per-run tallies, for throughput/yield reporting and the equivalence cross-check
-/// against [`crate::generator::Stats`].
+/// Per-run tallies, for throughput/yield reporting and the warp-vs-sequential
+/// equivalence cross-check.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stats {
     pub attempts: usize,
@@ -355,8 +354,8 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
 /// the guard that the Lemire `range`/shuffle and the fill are target-independent. It walks
 /// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so it is a
 /// faithful probe. This is a correctness guard, not a perf metric. The digit fold via
-/// [`cells_u8`] matches the old `grid::Board`-based path bit-for-bit (the pinned values in
-/// `tests/faithful`).
+/// [`cells_u8`] is pinned per seed in `tests/faithful` (and cross-checked by the wasm
+/// `det_fp` export).
 pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
     let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {

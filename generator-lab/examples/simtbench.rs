@@ -1,24 +1,15 @@
-//! End-to-end throughput: the warp (packed W=8 SIMT prober) vs generator-lab's
-//! sequential scalar generator (lean `ProberBoard`), on the SAME total work and
-//! producing the SAME puzzles (one seed per logical lane => the warp's union is
-//! exactly the sequential run's; the yield assert pins it).
+//! End-to-end throughput of the `repr`-layer warp ([`generate::random_simt`], the packed
+//! W=8 SIMT prober on the new representation) vs generator-lab's sequential scalar
+//! generator ([`generate::run_attempts`]), on the SAME total work and producing the SAME
+//! puzzles (one seed per logical lane => the warp's union is exactly the sequential run's;
+//! the yield assert pins it).
 //!
-//! `lanes` is the number of independent logical seed-streams, NOT a concurrency
-//! knob: the streaming driver keeps exactly W=8 attempts in flight regardless, so
-//! throughput is flat for `lanes >= 8` (the old macro-warp / FIFO-depth knob is
-//! gone). The warp's parallelism comes from running 8 INDEPENDENT seed streams at
-//! once, so this measures BATCH generation throughput (many puzzles), NOT
-//! single-puzzle `find` latency — a single seed stream is inherently sequential
-//! (attempts share one RNG stream; the uniqueness queries within an attempt are
-//! sequential). For the faithful single-stream scalar number, use the `bench`
-//! example.
-//!
-//! Usage: cargo run --release -p generator-lab --example packbench -- [lanes=8] [per_lane=4000]
+//! Usage: cargo run --release -p generator-lab --example simtbench -- [lanes=8] [per_lane=4000]
 
+use generator_lab::generate::random_simt::run_warp;
 use generator_lab::generate::run_attempts;
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
-use generator_lab::simt::host::run_warp;
 use std::time::Instant;
 
 fn main() {
@@ -28,13 +19,13 @@ fn main() {
     let total = lanes * per_lane;
     let base_seed = 1u64;
 
-    println!("packbench: {lanes} lanes x {per_lane} attempts = {total} total attempts/mode\n");
+    println!("simtbench: {lanes} lanes x {per_lane} attempts = {total} total attempts/mode\n");
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
         let spec = spec_for_mode(mode);
 
-        // --- sequential baseline (generator-lab): the same total work, one seed
-        // per lane so the produced puzzles are exactly the warp's union. ---
+        // --- sequential baseline (generator-lab): the same total work, one seed per lane
+        // so the produced puzzles are exactly the warp's union. ---
         let t0 = Instant::now();
         let mut seq = SeqStats { attempts: 0, successes: 0, total_givens: 0 };
         for l in 0..lanes {
@@ -75,7 +66,7 @@ fn main() {
     }
 }
 
-/// Tiny local tally (avoids leaking generator-lab's GenStats type here).
+/// Tiny local tally (avoids leaking generator-lab's Stats type here).
 struct SeqStats {
     attempts: usize,
     successes: usize,

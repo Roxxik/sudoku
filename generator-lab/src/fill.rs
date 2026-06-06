@@ -14,27 +14,17 @@
 
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{Branchable, Digit, DigitGrid, PerDigit, Solution};
-use crate::grid::Board;
 use crate::rng::Rng;
 use crate::scan::{BranchStrategy, Mrv, Scan};
 use std::marker::PhantomData;
-
-/// DEPRECATED
-/// Boundary shim: hand the solution back as a `grid::Board` for callers that have
-/// not yet migrated off it (the strip machinery in [`crate::generator`]). Drop
-/// once they take a [`Solution`] / the new [`crate::repr::Board`].
-pub fn random_full_grid(rng: &mut Rng) -> Board {
-    let sol = random_solution(rng);
-    Board::from_solved_cells(core::array::from_fn(|i| sol.cells()[i].map_or(0, |d| d.get())))
-}
 
 /// A random complete [`Solution`]. Same MRV+shuffle search as core — identical
 /// grid and RNG stream for a given seed. The fill is scan-bound (~83 nodes/grid,
 /// one MRV scan each, ~1.7 backtracks), so the cheap popcount-free scan over the
 /// digit-transposed cell-sets is the win. Runs on the banded
 /// [`Bands<RowMajor>`](crate::repr::banded) packing — the sieve fits one SIMD
-/// register, so it avoids the flat `u128` sieve's GPR spill storm (~1.13x native,
-/// `gridbench` exp H). Swap the type parameter to [`FlatGridMask`] to fall back.
+/// register, so it avoids the flat `u128` sieve's GPR spill storm (~1.13x native).
+/// Swap the type parameter to [`FlatGridMask`] to fall back.
 pub fn random_solution(rng: &mut Rng) -> Solution {
     random_solution_with::<Mrv>(rng)
 }

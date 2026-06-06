@@ -1,8 +1,8 @@
 //! Off-by-default instrumentation counters (`feature = "count"`).
 //!
-//! Every diagnostic in the crate — baseline anatomy ([`crate::bb`] `CTR`), prober
-//! anatomy (`PCTR`), band-scan metrics (`BAND_CTR`), and the packed-DFS metrics
-//! ([`crate::simt::prober`] `PSTAT`/`DSTAT`) — is the same shape: a fixed `[u64; N]` of
+//! Every diagnostic in the crate — prober anatomy ([`crate::probe`] `PCTR`),
+//! band-scan metrics (`BAND_CTR`), and the packed-DFS metrics
+//! ([`crate::probe::simt`] `PSTAT`/`DSTAT`) — is the same shape: a fixed `[u64; N]` of
 //! tallies that an example snapshots and resets around a measured run. The
 //! [`counter_block`] macro generates one such block (the backing static, the
 //! `snapshot`/`reset` readout, and the `inc`/`add` mutators), so each is one line
@@ -12,8 +12,8 @@
 //! With the feature off the mutators are no-ops and the static/readouts are
 //! absent (callers gate their `snapshot`/`reset` calls behind the feature too),
 //! so a production build pays nothing. The macro expands *inside the invoking
-//! module*, so the generated `snapshot`/`reset` keep their `crate::bb::…` /
-//! `crate::simt::prober::…` paths that the example diagnostics import.
+//! module*, so the generated `snapshot`/`reset` keep their `crate::probe::…` /
+//! `crate::probe::simt::…` paths that the example diagnostics import.
 
 /// Declare a counter block named `$static` of `$len` `u64` tallies. Generates, in
 /// the invoking module: `pub(crate)` `inc(i)` / `add(i, v)` mutators (no-ops when

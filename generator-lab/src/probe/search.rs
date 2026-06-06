@@ -35,7 +35,7 @@ where
     M: Propagate,
     S: BranchStrategy,
 {
-    crate::bb::pbump(2); // node tally (no-op without feature "count")
+    super::pbump(2); // node tally (no-op without feature "count")
     loop {
         // Drain forced cells in place before branching — bb's rule, and the difference
         // between Bivalue working and degenerating (after propagation the board is

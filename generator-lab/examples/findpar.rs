@@ -10,8 +10,8 @@
 //!
 //! Usage: cargo run --release -p generator-lab --example findpar -- [--mode train|drill] [--count N=1] [--seed BASE=1]
 
+use generator_lab::generate::random_simt::find_puzzles;
 use generator_lab::spec_for_mode;
-use generator_lab::simt::host::find_puzzles;
 
 fn main() {
     let mut mode = 0u32;

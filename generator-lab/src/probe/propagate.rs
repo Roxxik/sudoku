@@ -111,7 +111,7 @@ impl Propagate for Bands<RowMajor> {
     /// Naked singles drained, then the fused row/box hidden-single sweep, looping
     /// until neither fires — bb's `propagate` structure on the new representation.
     fn propagate(state: &mut SearchState<Self>) -> Fixpoint {
-        crate::bb::band_ctr_inc(0); // propagate-calls (no-op without feature "count")
+        super::band_ctr_inc(0); // propagate-calls (no-op without feature "count")
         loop {
             // Solved/dead boards can't yield a hidden single — skip the sweep, as bb's
             // naked loop returns Solved/Contradiction before its band update.
@@ -119,7 +119,7 @@ impl Propagate for Bands<RowMajor> {
                 Fixpoint::Stuck => {}
                 terminal => return terminal,
             }
-            crate::bb::band_ctr_inc(1); // band-pass
+            super::band_ctr_inc(1); // band-pass
             if !band_hidden_singles(state) {
                 return Fixpoint::Stuck;
             }

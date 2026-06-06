@@ -6,10 +6,9 @@
 //!
 //! Each is the *first-applicable* form the easiest-first engine needs: it applies
 //! exactly its kind's first firing step and returns whether it changed anything (so
-//! the ladder honours the difficulty order — never two kinds in one "step"). This is
-//! the discrete twin of the bb fused band closure; the faithful up-to-HiddenQuad
-//! bodies are ported from [`crate::techniques`] (same shape), retargeted from the
-//! scalar `grid::Board` onto the generic view.
+//! the ladder honours the difficulty order — never two kinds in one "step"). The
+//! faithful up-to-HiddenQuad bodies follow core's technique definitions, written over
+//! the generic view.
 //!
 //! Reads work off *candidates only* — a digit already placed in a unit has left
 //! every empty peer's candidates (the [`Marks`] invariant), so it never shows up in

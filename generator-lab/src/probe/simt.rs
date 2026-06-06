@@ -2,16 +2,14 @@
 //! point. Instead of K scalar uniqueness queries, it lays them out across SIMD lanes
 //! and propagates them in lockstep — W=8 independent existence DFS searches, one per
 //! lane, fed by a work-stealing refill queue so a lane that reaches a verdict
-//! immediately pulls the next probe (the perfect-refill regime `packsim`/`warpsim`
-//! predicted, `killswitch` realized at ~2.6x per core).
+//! immediately pulls the next probe (the perfect-refill regime, ~2.6x per core).
 //!
-//! This is the new-`repr` twin of the old bb-based [`crate::simt::prober`] — the
-//! identical gather-free smear+ALU kernel, but its [`Probe`] SoA is loaded from a
+//! Its [`Probe`] SoA is loaded from a
 //! [`SearchState<Bands<RowMajor>>`](crate::repr::SearchState) row view (via
-//! [`crate::repr::banded::Bands::to_lanes`]) instead of `bb::BitBoard::export_r`. The
-//! row-major banding is byte-identical between the two (`cell = 27*band + pos`,
-//! [`RowMajor`]), so the kernel and its bit twiddling carry over unchanged; only the
-//! cell <-> (lane, bit) helpers are re-sourced from the [`Banding`] geometry.
+//! [`crate::repr::banded::Bands::to_lanes`]). The row-major banding lays cells out
+//! as `cell = 27*band + pos` ([`RowMajor`]), so the gather-free smear+ALU kernel and
+//! its bit twiddling read straight off the bands; the cell <-> (lane, bit) helpers
+//! come from the [`Banding`] geometry.
 //!
 //! ## The gather-free kernel (the lever that makes it pay)
 //!

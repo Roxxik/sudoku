@@ -1,14 +1,12 @@
 //! The shared technique **taxonomy** for spec-driven generation, PoC scope = the
 //! ladder up to HiddenQuad: the kind enumeration (as difficulty-ordered indices),
 //! their metadata ([`DIFFICULTY`]/[`NAMES`]), the [`KindMask`] set type over them,
-//! and the [`SolveTrace`] a baseline solve produces.
+//! and the [`SolveTrace`] a logic solve produces.
 //!
 //! This is the vocabulary the rest of the crate speaks — [`crate::spec`],
-//! [`crate::bb`], and [`crate::generator`] all reference it without needing the
-//! scalar reference engine in [`crate::techniques`]. `SolveTrace` is the shared
-//! contract returned by *both* [`crate::techniques::solve_tracked`] (scalar) and
-//! [`crate::bb::BitBoard::baseline`] (bitboard), so it lives here, not with either
-//! engine.
+//! [`crate::solve`], [`crate::probe`], and [`crate::generate`] all reference it.
+//! `SolveTrace` is the contract the [`solve`](crate::solve) engines return, so it
+//! lives here, not with any one engine.
 //!
 //! Kinds are indexed in difficulty order; the index IS the kind and the bit
 //! `1 << index` is its membership bit in a [`KindMask`].
@@ -46,14 +44,14 @@ pub const NAMES: [&str; NUM] = [
     "hidden-quad",
 ];
 
-/// A set of technique *kinds* as a bitmask (`1 << kind_index`). Distinct from
-/// [`crate::grid::DigitMask`], the 9-bit set of digits.
+/// A set of technique *kinds* as a bitmask (`1 << kind_index`). Distinct from a
+/// [`Mark`](crate::repr::Mark), the 9-bit set of digits.
 pub type KindMask = u32;
 
-/// The result of a tracked baseline solve: whether the `allowed` toolbox solved
-/// the board, and how many times each kind fired (for the requirement check).
-/// Returned by both the scalar [`crate::techniques::solve_tracked`] and the
-/// bitboard [`crate::bb::BitBoard::baseline`].
+/// The result of a tracked logic solve: whether the `allowed` toolbox solved the
+/// board, and how many times each kind fired (for the requirement check). Returned
+/// by the [`solve`](crate::solve) engines ([`LogicSolver`](crate::solve::LogicSolver)
+/// and [`FusedLogicSolver`](crate::solve::FusedLogicSolver)).
 pub struct SolveTrace {
     pub solved: bool,
     pub counts: [u16; NUM],

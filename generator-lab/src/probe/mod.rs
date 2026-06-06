@@ -19,17 +19,30 @@ pub mod propagate;
 pub mod search;
 pub mod singles;
 
-// The packed W=8 SoA prober — the new-`repr` twin of `crate::simt::prober`. An AVX
-// native play; the wasm cdylib ships the scalar `Search` path, so keep it (and the
-// `std::simd` warp it builds) out of the wasm binary, exactly as the old SIMT stack.
+// The packed W=8 SoA prober. An AVX native play; the wasm cdylib ships the scalar
+// `Search` path, so keep it (and the `std::simd` warp it builds) out of the wasm binary.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod simt;
 
 pub use propagate::Propagate;
 
+use crate::counters::counter_block;
 use crate::repr::{SearchState, SolveView};
 use crate::scan::BranchStrategy;
 use core::marker::PhantomData;
+
+// --- prober anatomy counters (feature = "count") ------------------------------
+// Where does the existence-DFS cost go: propagation (singles waves) vs branching
+// (recursion / clones)? `pbump(i)` tallies. Read by `search`.
+counter_block!(PCTR: 8, inc = pbump, add = pctr_add, snapshot = pctr_snapshot, reset = pctr_reset);
+
+// --- band_update scan metrics (feature = "count") -----------------------------
+// Sizes the dirty-band-tracking opportunity: 0 propagate-calls, 1 band-passes
+// (one rm+cm fixpoint iteration), 2 bd-scans (per-(band,digit) iterations across
+// rm+cm), 3 bd-productive (scans that actually dropped a triplet or placed a
+// single). waste = 1 - productive/scans = the rescans dirty-tracking could skip.
+// `band_ctr_inc(i)` tallies. Read by `propagate`.
+counter_block!(BAND_CTR: 4, inc = band_ctr_inc, add = band_ctr_add, snapshot = band_ctr_snapshot, reset = band_ctr_reset);
 
 /// A completion prober over board type `B` — the swap point between engines
 /// ([`Search`], [`Singles`]) so the strip loop and the bench read `P: Prober<…>`
