@@ -2,8 +2,9 @@
 //! every precomputed lookup table the closures read (`SINGLE9`, `DROP_TRIP`,
 //! `RM_LC_TRIP`/`CM_LC_TRIP`, …), and the small `Simd<u32, 4>` (`B`) helpers
 //! (`nonzero`, `exactly_one`, `first_rm`, `triplet_occ`, …). Pure data and
-//! arithmetic, shared by the baseline engine ([`super`]) and the prober
-//! ([`super::prober`]). See the [`super`] module docs for *why* two views exist.
+//! arithmetic, shared by the baseline engine ([`super`]) and the SIMT prober
+//! (which imports the cell-map fns). See the [`super`] module docs for *why* two
+//! views exist.
 
 use crate::grid::{BOX_UNITS, CELLS, COL_UNITS, PEERS, ROW_UNITS};
 use std::simd::Simd;

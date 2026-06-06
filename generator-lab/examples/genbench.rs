@@ -1,30 +1,26 @@
 //! Uniqueness-only generation bench: strip random solutions to minimal uniquely-
-//! solvable puzzles, NO baseline/spec gate, comparing prober engines against the
-//! old `bb` path as the bar.
+//! solvable puzzles, NO baseline/spec gate, comparing the new prober engines against
+//! each other.
 //!
 //! Every variant strips the same solutions in the same order (same seed -> same
 //! fill RNG -> same grid + same shuffle), so they must all produce byte-identical
-//! puzzles — the run asserts every variant's fingerprint matches `bb`'s, which is a
+//! puzzles — the run asserts every variant's fingerprint matches the bar's, which is a
 //! correctness cross-check of the whole new stack as much as a perf measurement.
 //!
-//! Variants: `bb` (incremental `apply_clear` + fused `any_alt_solves` + alts==0 fast
-//! path); the new scan/sieve `Search` with three over-cap policies for the rare
+//! Variants: the new scan/sieve `Search` with three over-cap policies for the rare
 //! all-`≥D` node — `Mrv` (recompute a full-depth sieve) at depths 2/3/4/5/9,
 //! `LooseMrv` (give up, branch on whatever) at 2/3/4/5, `MrvRecount` (recount just
 //! the stuck cells, no full recompute) at 2/3/4/5 — plus `Bivalue` at depth 3 (its
 //! natural cap) and the composable `Singles`. `Mrv`/`MrvRecount` pick the identical
-//! branch cell, so that pair is a clean recompute-vs-recount A/B. The new variants
-//! rebuild the candidate state per strip and have no fast path yet, so the gap to
-//! `bb` is expected — this quantifies it and the relative prober costs.
+//! branch cell, so that pair is a clean recompute-vs-recount A/B.
 //!
 //! Run: `cargo run --release --example genbench -- [seeds]` (default 200).
 
 use std::time::{Duration, Instant};
 
-use generator_lab::bb::{BitBoard, Placed};
-use generator_lab::fill::{random_full_grid, random_solution};
+use generator_lab::fill::random_solution;
 use generator_lab::generate::strip_to_minimal;
-use generator_lab::grid::{Board, CELLS, Digit, digit_to_bit};
+use generator_lab::grid::CELLS;
 use generator_lab::probe::{Prober, Search, Singles};
 use generator_lab::repr::SearchState;
 use generator_lab::repr::banded::{Bands, RowMajor};
@@ -51,48 +47,7 @@ fn run_new<P: Prober<SearchState<M>>>(n: u64) -> Run {
         let mut rng = Rng::from_seed(seed);
         let solution = random_solution(&mut rng);
         let puzzle = strip_to_minimal::<M, P>(&mut rng, &solution);
-        let cells: [Digit; CELLS] = core::array::from_fn(|i| puzzle.get(i).map_or(0, |d| d.get()));
-        fnv_fold_cells(&mut fp, &cells);
-        givens += cells.iter().filter(|&&d| d != 0).count();
-    }
-    Run { elapsed: t.elapsed(), fp, givens }
-}
-
-/// The `bb` uniqueness-only strip: the `crate::generator` strip loop with the
-/// baseline gate removed — incremental `apply_clear`/`apply_place`, the alts==0 fast
-/// path, and the fused `any_alt_solves` prober.
-fn strip_bb(rng: &mut Rng, solution: &Board) -> [Digit; CELLS] {
-    let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
-    let mut bb = BitBoard::from_board(solution);
-    let mut placed = Placed::from_board(solution);
-    let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
-    rng.shuffle(&mut positions);
-    for cell in positions {
-        let orig = cells[cell];
-        if orig == 0 {
-            continue;
-        }
-        cells[cell] = 0;
-        let cand = bb.apply_clear(cell, orig, &mut placed);
-        let alts = cand & !digit_to_bit(orig);
-        // alts == 0: still a naked single, uniqueness trivially preserved -> keep.
-        if alts != 0 && bb.any_alt_solves(cell, alts) {
-            // A different digit completes -> non-unique -> revert the strip.
-            cells[cell] = orig;
-            bb.apply_place(cell, orig, &mut placed);
-        }
-    }
-    cells
-}
-
-fn run_bb(n: u64) -> Run {
-    let mut fp = FNV_OFFSET;
-    let mut givens = 0usize;
-    let t = Instant::now();
-    for seed in 0..n {
-        let mut rng = Rng::from_seed(seed);
-        let solution = random_full_grid(&mut rng);
-        let cells = strip_bb(&mut rng, &solution);
+        let cells: [u8; CELLS] = core::array::from_fn(|i| puzzle.get(i).map_or(0, |d| d.get()));
         fnv_fold_cells(&mut fp, &cells);
         givens += cells.iter().filter(|&&d| d != 0).count();
     }
@@ -106,7 +61,6 @@ fn main() {
         .unwrap_or(200);
 
     let variants: Vec<(&str, Run)> = vec![
-        ("bb", run_bb(n)),
         ("Search<Mrv<2>>", run_new::<Search<Mrv<2>>>(n)),
         ("Search<Mrv<3>>", run_new::<Search<Mrv<3>>>(n)),
         ("Search<Mrv<4>>", run_new::<Search<Mrv<4>>>(n)),
@@ -130,7 +84,7 @@ fn main() {
     // Correctness: every variant must produce identical puzzles.
     let bar = &variants[0];
     for (name, run) in &variants {
-        assert_eq!(run.fp, bar.1.fp, "{name} produced different puzzles than bb");
+        assert_eq!(run.fp, bar.1.fp, "{name} produced different puzzles than {}", bar.0);
     }
 
     let bar_us = bar.1.elapsed.as_secs_f64() * 1e6 / n as f64;
@@ -139,7 +93,7 @@ fn main() {
         bar.1.fp,
         bar.1.givens as f64 / n as f64,
     );
-    println!("{:<24} {:>12} {:>12} {:>10}", "variant", "us/puzzle", "puzzles/s", "vs bb");
+    println!("{:<24} {:>12} {:>12} {:>10}", "variant", "us/puzzle", "puzzles/s", "vs bar");
     for (name, run) in &variants {
         let us = run.elapsed.as_secs_f64() * 1e6 / n as f64;
         let per_s = n as f64 / run.elapsed.as_secs_f64();

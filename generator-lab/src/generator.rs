@@ -1,25 +1,20 @@
-//! The spec-driven `random`-method generator — core's
-//! `make_puzzle_for_spec_with_search` with the `random` path ONLY (no local
-//! search, no construction) and none of the play-time bookkeeping.
+//! The bb-based strip scaffolding the native SIMT warp still rides on.
 //!
-//! Per attempt: a random full grid, then strip cells in random order keeping a
-//! strip iff the puzzle stays unique (prober) AND baseline-solvable (spec
-//! toolbox). The most-stripped state whose baseline trace meets the requirement
-//! counts is remembered as `best`; after the strip, if a `best` exists and it
-//! passes [`verify`], the attempt succeeds. This is the exact gate sequence and
-//! `best`/requirement/verify logic from core, just stripped to bools + counts.
+//! This module has been trimmed to exactly what `crate::simt` needs: the per-attempt
+//! mutable [`StripState`] (the shared gate logic the warp's per-lane state machine
+//! embeds), [`GeneratedPuzzle`]/[`Stats`], and the `board_from_cells`/`random_full_grid`
+//! primitives. The scalar sequential generator (`attempt`/`generate`/`run_attempts`/
+//! `determinism_fp`) has moved to [`crate::generate`] on the new `repr` foundations —
+//! that is the shipped scalar/wasm path now. Only the warp, which is not yet ported off
+//! the `bb` bitboard, keeps this scaffolding alive.
 
 use crate::bb::{BitBoard, Placed};
 use crate::grid::{Board, CELLS, Digit, digit_to_bit};
-use crate::rng::Rng;
 use crate::spec::Spec;
 use crate::technique_kinds::KindMask;
-use crate::util::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
-use crate::verify::verify;
 
 // The grid filler moved to [`crate::fill`]; re-export it here so callers that reach
-// for the generation primitive via `generator::` (the benches and the warp host)
-// keep working, and so this module's own attempt/determinism paths see it in scope.
+// for the generation primitive via `generator::` (the warp host + gridbench) keep working.
 pub use crate::fill::random_full_grid;
 
 /// A generated puzzle and the full solution it was stripped from.
@@ -27,17 +22,6 @@ pub struct GeneratedPuzzle {
     pub puzzle: Board,
     pub solution: Board,
     pub givens: usize,
-}
-
-/// Why a single attempt ended.
-pub enum AttemptResult {
-    /// A puzzle satisfying the spec (passed verify).
-    Success(GeneratedPuzzle),
-    /// A requirement-meeting `best` was found but verify rejected it (the target
-    /// was substitutable). Core's `requirement_not_forced`.
-    NotForced,
-    /// No strip ever met the requirement counts. Core's `requirement_never_fired`.
-    NeverFired,
 }
 
 /// Reconstruct a `Board` (cells + naked candidates) from a bare puzzle grid
@@ -136,9 +120,9 @@ impl StripState {
     /// already-decided uniqueness verdict `nonunique`: if non-unique, revert; else
     /// run the baseline gate (`baseline`/`forced` masks) and either accept —
     /// keeping `cells`/`bb` in the stripped state and updating `req_met`/`best` —
-    /// or revert. The verdict source is the only thing the two drivers differ on
-    /// (the sequential one computes it inline with [`BitBoard::any_alt_solves`];
-    /// the warp gets it from the packed prober).
+    /// or revert. The warp supplies `nonunique` from the packed prober (`simt`); the
+    /// gate logic lives here so the prober verdict and the baseline/`best` update
+    /// stay in one place.
     pub fn resolve_gate(
         &mut self,
         cell: usize,
@@ -165,47 +149,6 @@ impl StripState {
     }
 }
 
-/// One full strip attempt for `spec`. Mirrors core's per-attempt body.
-pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
-    let baseline = spec.baseline_mask();
-    let forced = spec.forced_mask();
-    let solution = random_full_grid(rng);
-    // Strip order — always exactly the 81 cell indices, so a fixed stack array
-    // (no heap alloc per attempt) rather than a `Vec`. The shuffle and iteration
-    // order are unchanged, so the RNG stream and produced puzzle are identical.
-    let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
-    rng.shuffle(&mut positions);
-
-    let mut st = StripState::new(&solution);
-    for i in positions {
-        if st.cells[i] == 0 {
-            continue;
-        }
-        let orig = st.cells[i];
-        let alts = st.strip(i, orig);
-        if alts == 0 {
-            st.keep_trivial(spec);
-            continue;
-        }
-        // Uniqueness gate (inline scalar prober), then baseline gate + accept.
-        let nonunique = st.bb.any_alt_solves(i, alts);
-        st.resolve_gate(i, orig, nonunique, spec, baseline, forced);
-    }
-
-    match st.best {
-        Some(snap) => {
-            let seed = board_from_cells(&snap);
-            if verify(&seed, spec) {
-                let givens = seed.givens();
-                AttemptResult::Success(GeneratedPuzzle { puzzle: seed, solution, givens })
-            } else {
-                AttemptResult::NotForced
-            }
-        }
-        None => AttemptResult::NeverFired,
-    }
-}
-
 /// Per-run / per-lane tallies, for throughput/yield reporting and the warp's
 /// per-lane equivalence cross-check against the sequential generator.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,74 +171,3 @@ impl Stats {
     }
 }
 
-/// Generate until a puzzle satisfying `spec` is found or `max_attempts` is hit.
-/// Returns the puzzle (if any) and the tallies up to that point.
-pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<GeneratedPuzzle>, Stats) {
-    let mut stats = Stats::default();
-    for _ in 0..max_attempts {
-        stats.attempts += 1;
-        match attempt(rng, spec) {
-            AttemptResult::Success(p) => {
-                stats.successes += 1;
-                stats.total_givens += p.givens;
-                return (Some(p), stats);
-            }
-            AttemptResult::NotForced => stats.not_forced += 1,
-            AttemptResult::NeverFired => stats.never_fired += 1,
-        }
-    }
-    (None, stats)
-}
-
-/// Run exactly `n` attempts (NOT "until found") for `spec` — a fixed-work,
-/// deterministic benchmark of the per-attempt cost mix. Returns the tallies plus
-/// a fingerprint over produced puzzles (prevents dead-code elimination and lets
-/// native/wasm cross-check they did identical work).
-pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
-    let mut stats = Stats::default();
-    let mut fp: u64 = FNV_OFFSET;
-    for _ in 0..n {
-        stats.attempts += 1;
-        match attempt(rng, spec) {
-            AttemptResult::Success(p) => {
-                stats.successes += 1;
-                stats.total_givens += p.givens;
-                fnv_fold_cells(&mut fp, p.puzzle.cells());
-            }
-            AttemptResult::NotForced => {
-                stats.not_forced += 1;
-                fp = fp.wrapping_mul(FNV_PRIME);
-            }
-            AttemptResult::NeverFired => {
-                stats.never_fired += 1;
-                fp = fp.wrapping_mul(FNV_PRIME);
-            }
-        }
-    }
-    (stats, fp)
-}
-
-/// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG
-/// stream. Unlike [`run_attempts`]'s fp (which only folds *successful* puzzles,
-/// so it is blind to the grids when nothing succeeds), this folds the full
-/// solution grid AND the shuffled strip order of every iteration — the two and
-/// only two RNG consumers of an attempt (the prober and baseline take no RNG).
-/// Native and wasm32 MUST return the same value; that is the guard that the
-/// Lemire `range`/shuffle and the bitboard fill are target-independent. It walks
-/// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so
-/// it is a faithful probe. This is a correctness guard, not a perf metric.
-pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
-    let mut fp: u64 = FNV_OFFSET;
-    for _ in 0..n {
-        let solution = random_full_grid(rng);
-        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
-        rng.shuffle(&mut positions);
-        for i in 0..CELLS {
-            fp ^= solution.cell(i) as u64;
-            fp = fp.wrapping_mul(FNV_PRIME);
-            fp ^= positions[i] as u64;
-            fp = fp.wrapping_mul(FNV_PRIME);
-        }
-    }
-    fp
-}

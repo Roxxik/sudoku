@@ -1,11 +1,12 @@
 //! **Dual-banded** bitboard for the **baseline technique engine** (the spec
-//! oracle). The uniqueness prober was split out into a separate, leaner
-//! single-layout [`ProberBoard`]: a pure existence oracle needs neither the
-//! column view nor locked candidates (completeness comes from branching), so
-//! giving it its own row-major-only board halves the per-branch clone and drops
-//! the LC scan — a ~12% generator win, verdict-identical. The baseline keeps the
-//! dual view below because it genuinely needs every unit in-lane (it stalls into
-//! the subset ladder without column hidden singles).
+//! oracle) — the last piece of the old `bb` core still in use, kept because the
+//! native SIMT warp ([`crate::simt`]) rides on it (via
+//! [`crate::generator::StripState`]) and has not yet been ported to the new `repr`
+//! layer. The uniqueness prober that used to live here (a lean single-layout
+//! `ProberBoard` existence oracle) is gone — probing moved wholesale to
+//! [`crate::probe`]. What remains is the dual-view `BitBoard` and its baseline
+//! closure, which genuinely needs every unit in-lane (it stalls into the subset
+//! ladder without column hidden singles).
 //!
 //! ## Why two views
 //!
@@ -44,23 +45,19 @@
 //! Both are order-independent (the deductive closure is unique), so these
 //! techniques need only be *sound* and *complete*, NOT step-for-step identical to
 //! the scalar twins. The baseline's dual-view closure (both-view hidden singles,
-//! both orientations of LC) is sound, and the [`ProberBoard`]'s leaner toolbox is
-//! verdict-preserving (it only ever decides yes/no, and dropping a pruning-only
-//! technique never flips that) — so the generator fingerprint is invariant.
-//! `tests/bb_equiv.rs` cross-checks the baseline against the scalar engine;
-//! the generator's `find 118329` anchor pins it end-to-end.
+//! both orientations of LC) is sound, so the generator fingerprint is invariant.
+//! The warp's `tests/equiv_warp.rs` pins this whole bb-based strip (baseline
+//! included) byte-identical to the new-repr generator, lane for lane.
 //!
 //! ## Module layout
 //! - [`layout`]: the banding maps, every precomputed lookup table, and the
-//!   `Simd<u32, 4>` helpers — pure data shared by the engine and the prober.
-//! - [`prober`]: the lean single-layout `ProberBoard` existence oracle and the
-//!   `BitBoard` methods that enter it (`any_alt_solves`, closure diagnostics).
+//!   `Simd<u32, 4>` helpers — pure data shared by the engine and the SIMT prober
+//!   (`rm_bit`/`rm_cell`/`rm_lane`).
 //! - this file (`mod`): the dual-view `BitBoard` itself — its I/O
 //!   (`from_board`/`apply_clear`/`apply_place`/`export_r`), the shared `Placed`
 //!   clue map, and the baseline technique engine.
 
 mod layout;
-mod prober;
 
 use crate::grid::{Board, CELLS, iter_digits};
 use crate::technique_kinds::{
@@ -85,19 +82,11 @@ use crate::counters::counter_block;
 // --- optional baseline anatomy counters (feature = "count") -------------------
 // Count how often each technique is SCANNED per attempt (scan count × scan size
 // ≈ cost), to see what dominates `baseline` before optimizing it. `bump(i)` tallies.
-pub const CTR_NAMES: [&str; 8] = [
-    "baseline-calls", "sieve-waves", "hidden_single", "lc_pointing", "lc_claiming",
-    "naked_subset", "hidden_subset", "cell_candidates",
-];
 counter_block!(CTR: 8, inc = bump, add = ctr_add, snapshot = ctr_snapshot, reset = ctr_reset);
 
 // --- prober anatomy counters (feature = "count") ------------------------------
 // Where does the existence-DFS cost go: propagation (singles waves) vs branching
 // (recursion / clones)? `pbump(i)` tallies.
-pub const PCTR_NAMES: [&str; 8] = [
-    "alt-calls", "alt-nonunique", "solve_first-nodes", "sieve-waves",
-    "place_singles-calls", "branch-points", "child-clones", "branch-digits",
-];
 counter_block!(PCTR: 8, inc = pbump, add = pctr_add, snapshot = pctr_snapshot, reset = pctr_reset);
 
 // --- band_update scan metrics (feature = "count") -----------------------------
@@ -106,33 +95,8 @@ counter_block!(PCTR: 8, inc = pbump, add = pctr_add, snapshot = pctr_snapshot, r
 // rm+cm), 3 bd-productive (scans that actually dropped a triplet or placed a
 // single). waste = 1 - productive/scans = the rescans dirty-tracking could skip.
 // `band_ctr_inc(i)` tallies.
-pub const BAND_CTR_NAMES: [&str; 4] = ["propagate-calls", "band-passes", "bd-scans", "bd-productive"];
 counter_block!(BAND_CTR: 4, inc = band_ctr_inc, add = band_ctr_add, snapshot = band_ctr_snapshot, reset = band_ctr_reset);
 
-/// One existence-DFS query (`any_alt_solves`): the board sparsity it ran on, the
-/// work it cost, and whether it found a 2nd solution. Lets a diagnostic see WHERE
-/// prober time concentrates (sparse vs dense boards; unique-proving vs
-/// alt-finding) instead of just totals.
-#[cfg(feature = "count")]
-#[derive(Clone, Copy)]
-pub struct AltStat {
-    pub empties: u16,
-    pub nodes: u32,
-    pub guesses: u32,
-    pub nonunique: bool,
-}
-#[cfg(feature = "count")]
-static mut ALT_STATS: Vec<AltStat> = Vec::new();
-#[cfg(feature = "count")]
-pub fn alt_stats() -> &'static [AltStat] {
-    unsafe { &*core::ptr::addr_of!(ALT_STATS) }
-}
-#[cfg(feature = "count")]
-pub fn alt_stats_reset() {
-    unsafe {
-        (*core::ptr::addr_of_mut!(ALT_STATS)).clear();
-    }
-}
 
 /// The nine digit boards in both bandings, plus the empty-cell mask in both.
 /// `r`/`unsolved_r` are row-major (rows & boxes in-lane); `c`/`unsolved_c` are
@@ -154,8 +118,8 @@ struct Sieve {
 /// Naked-single sieve over nine row-major digit boards: `ones` = cells with at
 /// least one candidate, `twos` = cells with at least two, accumulated across the
 /// digit boards. `ones & !twos` are the naked singles, `!ones` the dead cells.
-/// Shared verbatim by [`BitBoard`] (dual view) and [`ProberBoard`] (single view)
-/// — both sieve only the row-major bands.
+/// Used by [`BitBoard`]'s baseline closure on the row-major bands (the same sieve
+/// the now-separate [`crate::probe`] prober reproduces in the new layer).
 #[inline(always)]
 fn sieve(r: &[B; 9]) -> Sieve {
     let mut ones = ZERO;
@@ -348,9 +312,8 @@ impl BitBoard {
     /// arrays — the candidate state the packed prober ([`crate::simt::prober`]) needs to
     /// load a lane. The column-major view is redundant for naked-single
     /// propagation (peers and the sieve are all in-lane row-major), so it is not
-    /// exported. This is exactly the [`ProberBoard`] half (the lean scalar prober
-    /// runs on the same single-layout no-LC state), so packed and scalar verdicts
-    /// agree by construction.
+    /// exported. This single-layout no-LC state is exactly what the packed prober
+    /// loads, so packed and scalar verdicts agree by construction.
     pub fn export_r(&self) -> ([[u32; 4]; 9], [u32; 4]) {
         (core::array::from_fn(|d| self.r[d].to_array()), self.unsolved_r.to_array())
     }
@@ -359,8 +322,8 @@ impl BitBoard {
     //
     // The fused naked + hidden singles + both-LC fixpoint that drives the
     // baseline's fast path (`baseline_fast` via `propagate_g`). The uniqueness
-    // prober does not ride this — it has its own single-layout no-LC closure on
-    // `ProberBoard` (see the `prober` submodule).
+    // prober does not ride this — it has its own single-layout no-LC closure in
+    // the new `crate::probe` layer.
 
     /// Naked-single sieve over the row-major boards — the shared [`sieve`] over
     /// this board's `r` (which cells admit exactly one digit, `ones & !twos`, and
@@ -559,7 +522,7 @@ impl BitBoard {
     /// locked-candidates step (a spec whose baseline excludes LC compiles it away);
     /// `TRACK` records which cheap kinds fired into `fired` (bit = kind index), for
     /// the baseline gate's fired-or-not bookkeeping. The prober does not enter here
-    /// — it runs its own leaner single-layout no-LC closure on [`ProberBoard`].
+    /// — it runs its own leaner single-layout no-LC closure in [`crate::probe`].
     #[cfg_attr(prof_solver, inline(never))]
     fn propagate_g<const LC: bool, const TRACK: bool>(&mut self, fired: &mut u32) -> Prop {
         band_ctr_inc(0);
@@ -609,7 +572,7 @@ impl BitBoard {
     /// Dispatches on the spec shape between a batched fast path and the discrete
     /// reference engine. Both yield identical `solved` and identical counts for
     /// every Forced kind, so the strip trajectory is invariant to the choice
-    /// (the `find` anchor and `bb_equiv` pin this). `forced` is the Forced-kind
+    /// (the `find` anchor pins this end-to-end). `forced` is the Forced-kind
     /// membership mask: a Forced kind must be counted exactly and so can never be
     /// folded into the batched closure, hence the fast path requires no cheap kind
     /// (singles / locked candidates) be Forced.

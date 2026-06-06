@@ -27,7 +27,7 @@
 //! scan).
 //!
 //! NOTE vs the depth-2 prober sieve: that one sieves the *raw* candidate boards,
-//! trusting the ProberBoard to hold candidates only on live cells, so it pays no
+//! trusting the prober's board to hold candidates only on live cells, so it pays no
 //! `& unsolved` per digit. This one masks (matching the fill's old `Tiers`); an
 //! unmasked constructor would be the prober-path variant. Folding both without
 //! regressing the prober's hot loop is the open integration question — so the

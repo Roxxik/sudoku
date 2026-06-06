@@ -33,13 +33,18 @@
 //! - [`verify`]: spec verification reduced to a bool (scalar, cold path).
 //! - [`fill`]: the random full-grid filler (u128-bitboard MRV search), the first
 //!   half of every attempt.
-//! - [`generator`]: the random strip-generate pipeline.
+//! - [`generate`]: the shipped scalar/wasm strip-generate pipeline on the `repr`
+//!   layer (the [`probe`] prober + [`solve`] gate) — this is the production path.
+//! - [`generator`] (native only): the old bb-based strip scaffolding the SIMT warp
+//!   still rides on (the dual `BitBoard` strip state + shared gate logic). Trimmed
+//!   to exactly what `simt` needs; it survives only until the warp is ported to
+//!   the `repr` layer, then it goes too.
 //! - [`simt`] (native only): the SIMT stack — `simt::prober`, a warp of W=8
 //!   per-lane DFS searches (gather-free smear+ALU kernel) with streaming refill,
 //!   and `simt::host`, the driver that batches the strip loop's uniqueness gates
-//!   onto it. The scalar [`bb::ProberBoard`] prober is kept as the shipped wasm
-//!   path, the correctness oracle, and the perf bar (SIMT is a native AVX play;
-//!   on wasm simd128 the packing ceiling is too small to pay).
+//!   onto it. SIMT is a native AVX play; on wasm simd128 the packing ceiling is too
+//!   small to pay, so the wasm cdylib ships the scalar [`generate`]/[`probe`] path
+//!   instead.
 
 #![feature(portable_simd)]
 #![feature(const_trait_impl)]
@@ -49,6 +54,9 @@ pub mod repr;
 pub(crate) mod counters;
 pub mod fill;
 pub mod generate;
+// The trimmed `generator` is now pure SIMT-support scaffolding (the warp's strip
+// state + gate logic); SIMT is native-only, so keep it out of the wasm binary too.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod generator;
 pub mod grid;
 pub mod probe;
@@ -86,7 +94,7 @@ pub fn spec_for_mode(mode: u32) -> Spec {
 #[cfg(target_arch = "wasm32")]
 mod wasm_exports {
     use crate::rng::Rng;
-    use crate::{generator, spec_for_mode};
+    use crate::{generate, spec_for_mode};
 
     /// Run exactly `attempts` strip attempts for `mode` (0=train, 1=drill) from
     /// `seed`, returning a u32-truncated fingerprint over the produced puzzles
@@ -96,7 +104,7 @@ mod wasm_exports {
     pub extern "C" fn bench(mode: u32, attempts: u32, seed: u32) -> u32 {
         let spec = spec_for_mode(mode);
         let mut rng = Rng::from_seed(seed as u64);
-        let (_stats, fp) = generator::run_attempts(&mut rng, &spec, attempts as usize);
+        let (_stats, fp) = generate::run_attempts(&mut rng, &spec, attempts as usize);
         fp as u32
     }
 
@@ -106,7 +114,7 @@ mod wasm_exports {
     pub extern "C" fn bench_yield(mode: u32, attempts: u32, seed: u32) -> u32 {
         let spec = spec_for_mode(mode);
         let mut rng = Rng::from_seed(seed as u64);
-        let (stats, _fp) = generator::run_attempts(&mut rng, &spec, attempts as usize);
+        let (stats, _fp) = generate::run_attempts(&mut rng, &spec, attempts as usize);
         stats.successes as u32
     }
 
@@ -117,6 +125,6 @@ mod wasm_exports {
     #[unsafe(no_mangle)]
     pub extern "C" fn det_fp(attempts: u32, seed: u32) -> u32 {
         let mut rng = Rng::from_seed(seed as u64);
-        generator::determinism_fp(&mut rng, attempts as usize) as u32
+        generate::determinism_fp(&mut rng, attempts as usize) as u32
     }
 }

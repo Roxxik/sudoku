@@ -1,25 +1,33 @@
-//! Phase-split profiler: where does generation time actually go? Times the four
-//! phases of the per-attempt trajectory separately, for train and drill, so the
-//! bottleneck is measured (not guessed) before any optimization.
+//! Phase-split profiler: where does generation time actually go? Times the phases
+//! of the per-attempt trajectory separately, for train and drill, so the bottleneck
+//! is measured (not guessed) before any optimization. Runs the new-repr strip:
+//! incremental dual-banded candidate maintenance, the `Search<Bivalue>` uniqueness
+//! prober, and the `FusedLogicSolver` baseline gate.
 //!
 //! Phases:
-//!   - grid     : random full grid + position shuffle + initial bb
-//!   - bb-maint : apply_clear (reopen cell i, derived from solution + present)
-//!   - prober   : uniqueness gate (any_alt_solves)
-//!   - baseline : the strip gate-b tracked solve (solvability + requirement counts)
+//!   - grid     : random solution + position shuffle + initial dual board / clue map
+//!   - maint    : clear_clue (reopen cell i in both views, derived from clue map)
+//!   - prober   : uniqueness gate (Search<Bivalue> existence query)
+//!   - baseline : the strip gate's tracked solve (solvability + requirement counts)
 //!   - verify   : irreplaceability check (only runs when a `best` exists)
-//!   - other    : place reverts / `present` bookkeeping (the remainder)
+//!   - other    : place reverts / bookkeeping (the remainder)
 //!
 //! Usage: cargo run --release -p generator-lab --example profile -- [--attempts N=4000] [--seed S=1]
 
 use std::time::{Duration, Instant};
 
-use generator_lab::bb::{BitBoard, Placed};
-use generator_lab::generator::{board_from_cells, random_full_grid};
-use generator_lab::grid::{CELLS, Digit, digit_to_bit};
+use generator_lab::fill::random_solution;
+use generator_lab::generate::verify;
+use generator_lab::probe::{Prober, Search};
+use generator_lab::repr::banded::DualBandedMarkGrid;
+use generator_lab::repr::{CELLS, DigitGrid, Marks};
 use generator_lab::rng::Rng;
+use generator_lab::scan::Bivalue;
+use generator_lab::solve::{FusedLogicSolver, Solver};
 use generator_lab::spec_for_mode;
-use generator_lab::verify::verify;
+
+/// The uniqueness prober: scan/sieve `Search` with the `Bivalue` branch strategy.
+type P = Search<Bivalue>;
 
 #[derive(Default)]
 struct Phases {
@@ -36,73 +44,69 @@ struct Phases {
 fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
     let spec = spec_for_mode(mode);
     let baseline = spec.baseline_mask();
-    let forced = spec.forced_mask();
     let mut rng = Rng::from_seed(seed);
     let mut p = Phases::default();
     let run = Instant::now();
 
     for _ in 0..attempts {
         let t = Instant::now();
-        let solution = random_full_grid(&mut rng);
+        let solution = random_solution(&mut rng);
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
-        let mut bb = BitBoard::from_board(&solution);
-        let mut placed = Placed::from_board(&solution);
-        let mut cells: [Digit; CELLS] = core::array::from_fn(|i| solution.cell(i));
+        let mut digits: DigitGrid = solution.0.clone();
+        let mut dual = DualBandedMarkGrid::from_digits(&digits);
+        let mut clue = DualBandedMarkGrid::clue_map(&digits);
         p.grid += t.elapsed();
 
-        let mut best: Option<[Digit; CELLS]> = None;
+        let mut best: Option<DigitGrid> = None;
         let mut req_met = false;
         for i in positions {
-            if cells[i] == 0 {
+            let Some(orig) = digits.get(i) else {
                 continue;
-            }
-            let orig = cells[i];
-            cells[i] = 0;
+            };
+            digits.clear(i);
 
             let tbuild = Instant::now();
-            let cand = bb.apply_clear(i, orig, &mut placed);
+            let cand = dual.clear_clue(&mut clue, i, orig);
             p.build += tbuild.elapsed();
-
-            let v_bit = digit_to_bit(orig);
-            let alts = cand & !v_bit;
 
             // Fast path: `i` still a naked single -> strip always valid, both
             // gates skippable, requirement verdict carried (mirrors `attempt`).
-            if alts == 0 {
+            if cand.len() == 1 {
                 if req_met {
-                    best = Some(cells);
+                    best = Some(digits.clone());
                 }
                 continue;
             }
 
             let tp = Instant::now();
-            let non_unique = bb.any_alt_solves(i, alts);
+            let mut probe = dual.row().clone();
+            probe.forbid(i, orig);
+            let non_unique = P::has_completion(probe);
             p.prober += tp.elapsed();
             if non_unique {
-                cells[i] = orig;
-                bb.apply_place(i, orig, &mut placed);
+                digits.set(i, orig);
+                dual.place_clue(&mut clue, i, orig);
                 continue;
             }
 
             let tb = Instant::now();
-            let outcome = bb.baseline(baseline, forced);
+            let outcome = FusedLogicSolver::solve_tracked(&dual, baseline);
             p.baseline += tb.elapsed();
             if !outcome.solved {
-                cells[i] = orig;
-                bb.apply_place(i, orig, &mut placed);
+                digits.set(i, orig);
+                dual.place_clue(&mut clue, i, orig);
                 continue;
             }
             req_met = spec.requirement_met(&outcome.counts);
             if req_met {
-                best = Some(cells);
+                best = Some(digits.clone());
             }
         }
 
         if let Some(snap) = best {
-            let seed_board = board_from_cells(&snap);
             let tv = Instant::now();
-            let ok = verify(&seed_board, &spec);
+            let ok = verify(&snap, &spec);
             p.verify += tv.elapsed();
             p.verifies += 1;
             if ok {
@@ -134,7 +138,7 @@ fn main() {
         let other = p.total.saturating_sub(p.grid + p.build + p.prober + p.baseline + p.verify);
         println!("== {label} ==  ({} verifies, {} puzzles)", p.verifies, p.successes);
         println!("  grid     {:>8.1} us/att  {:>5.1}%", us(p.grid), pct(p.grid));
-        println!("  bb-maint {:>8.1} us/att  {:>5.1}%", us(p.build), pct(p.build));
+        println!("  maint    {:>8.1} us/att  {:>5.1}%", us(p.build), pct(p.build));
         println!("  prober   {:>8.1} us/att  {:>5.1}%", us(p.prober), pct(p.prober));
         println!("  baseline {:>8.1} us/att  {:>5.1}%", us(p.baseline), pct(p.baseline));
         println!("  verify   {:>8.1} us/att  {:>5.1}%", us(p.verify), pct(p.verify));

@@ -33,14 +33,31 @@ use std::simd::{Mask, Select, Simd};
 use std::time::Instant;
 
 use generator_lab::bb::{BitBoard, Placed};
-use generator_lab::generator::random_full_grid;
+use generator_lab::fill::random_full_grid;
 use generator_lab::grid::{CELLS, Digit, PEERS, digit_to_bit};
+use generator_lab::probe::{Prober, Search};
+use generator_lab::repr::banded::{Bands, RowMajor};
+use generator_lab::repr::{DigitGrid, Marks, SearchState};
 use generator_lab::rng::Rng;
+use generator_lab::scan::Bivalue;
 use generator_lab::spec_for_mode;
 
 const W: usize = 8;
 type V = Simd<u32, W>;
 type M = Mask<i32, W>;
+
+/// The scalar oracle on the new prober stack: build a `DigitGrid` from the strip's
+/// `cells` (the cleared puzzle), forbid `orig` at `i` to restrict the cell to its
+/// alternates, and ask whether some other digit still completes — the new-repr twin
+/// of bb's old alt-completion existence probe, the soundness reference for the packed prober.
+fn oracle_alt_solves(cells: &[Digit; CELLS], i: usize, orig: Digit) -> bool {
+    let grid = DigitGrid::from_array(core::array::from_fn(|c| {
+        generator_lab::repr::Digit::new(cells[c])
+    }));
+    let mut probe = SearchState::<Bands<RowMajor>>::from_digits(&grid);
+    probe.forbid(i, generator_lab::repr::Digit::new(orig).expect("nonzero clue digit"));
+    Search::<Bivalue>::has_completion(probe)
+}
 
 const fn rm_lane(c: usize) -> usize {
     (c / 9) / 3
@@ -611,7 +628,7 @@ fn main() {
                 continue;
             }
             queries.push(from_cells_restricted(&cells, i, alts));
-            let real = bb.any_alt_solves(i, alts);
+            let real = oracle_alt_solves(&cells, i, orig);
             reals.push(real);
             if real {
                 cells[i] = orig;

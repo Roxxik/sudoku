@@ -9,8 +9,9 @@
 //! state whose baseline trace meets the requirement counts is remembered as `best`;
 //! after the strip, if a `best` exists and it passes [`verify`], the attempt succeeds.
 //! This is the exact gate sequence — `alts == 0` fast path, uniqueness gate, baseline
-//! gate, `req_met`/`best`/verify — of [`crate::generator::attempt`], so for a given
-//! seed it produces byte-identical puzzles (the `tests/generate_equiv` cross-check).
+//! gate, `req_met`/`best`/verify — of the old bb-based `generator` strip attempt it
+//! replaced, so for a given seed it produces byte-identical puzzles (the warp still
+//! runs that bb strip; `tests/equiv_warp` pins the two lane-for-lane).
 //!
 //! The candidate state is carried incrementally across the 81 strip steps exactly as
 //! bb does: a single [`DualBandedMarkGrid`] plus a `clue` map, reopened/reclosed in
@@ -47,7 +48,7 @@ pub struct GeneratedPuzzle {
     pub givens: usize,
 }
 
-/// Why a single attempt ended — mirrors [`crate::generator::AttemptResult`].
+/// Why a single attempt ended — the new-repr twin of the old bb `generator`'s `AttemptResult`.
 pub enum AttemptResult {
     /// A puzzle satisfying the spec (passed verify).
     Success(GeneratedPuzzle),
@@ -181,7 +182,7 @@ impl StripState {
     }
 }
 
-/// One full strip attempt for `spec`. Mirrors [`crate::generator::attempt`] gate for
+/// One full strip attempt for `spec`. Mirrors the old bb `generator`'s strip-attempt gate for
 /// gate, on the new prober/solver stack.
 pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     let baseline = spec.baseline_mask();
@@ -266,7 +267,7 @@ pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<Gene
 
 /// Run exactly `n` attempts (NOT "until found") for `spec` — a fixed-work, deterministic
 /// benchmark of the per-attempt cost mix. Returns the tallies plus a fingerprint over
-/// produced puzzles folded identically to [`crate::generator::run_attempts`], so the two
+/// produced puzzles folded identically to the old bb `generator`'s `run_attempts`, so the two
 /// fps are directly comparable.
 pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
     let mut stats = Stats::default();
@@ -290,4 +291,30 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
         }
     }
     (stats, fp)
+}
+
+/// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG stream.
+/// Unlike [`run_attempts`]'s fp (which only folds *successful* puzzles, so it is blind to
+/// the grids when nothing succeeds), this folds the full solution grid AND the shuffled
+/// strip order of every iteration — the two and only two RNG consumers of an attempt (the
+/// prober and baseline take no RNG). Native and wasm32 MUST return the same value; that is
+/// the guard that the Lemire `range`/shuffle and the fill are target-independent. It walks
+/// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so it is a
+/// faithful probe. This is a correctness guard, not a perf metric. The digit fold via
+/// [`cells_u8`] matches the old `grid::Board`-based path bit-for-bit (the pinned values in
+/// `tests/faithful`).
+pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
+    let mut fp: u64 = FNV_OFFSET;
+    for _ in 0..n {
+        let cells = cells_u8(&random_solution(rng).0);
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        for i in 0..CELLS {
+            fp ^= cells[i] as u64;
+            fp = fp.wrapping_mul(FNV_PRIME);
+            fp ^= positions[i] as u64;
+            fp = fp.wrapping_mul(FNV_PRIME);
+        }
+    }
+    fp
 }

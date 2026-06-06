@@ -21,7 +21,7 @@ fn main() {
 #[cfg(feature = "count")]
 fn main() {
     use generator_lab::bb::{pctr_reset, pctr_snapshot};
-    use generator_lab::generator::run_attempts;
+    use generator_lab::generate::run_attempts;
     use generator_lab::simt::prober::{dstat_reset, dstat_snapshot};
     use generator_lab::rng::Rng;
     use generator_lab::spec_for_mode;

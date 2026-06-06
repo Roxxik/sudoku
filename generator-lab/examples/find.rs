@@ -3,7 +3,7 @@
 //!
 //! Usage: cargo run --release -p generator-lab --example find -- [--mode train|drill] [--seed S=1] [--max N=200000]
 
-use generator_lab::generator::generate;
+use generator_lab::generate::generate;
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
 

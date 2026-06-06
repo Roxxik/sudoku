@@ -18,7 +18,7 @@
 mod random;
 
 pub use random::{
-    AttemptResult, GeneratedPuzzle, Stats, attempt, generate, run_attempts, verify,
+    AttemptResult, GeneratedPuzzle, Stats, attempt, determinism_fp, generate, run_attempts, verify,
 };
 
 use crate::probe::{Prober, Search};

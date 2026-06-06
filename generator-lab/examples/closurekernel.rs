@@ -5,7 +5,7 @@
 //! This is NOT the full prober (no DFS stacks, no refill scheduler — those are the
 //! real build). It isolates the foundational claim: the uniform part of the kernel
 //! composes. It collects real restricted boards from the strip loop (exactly the
-//! states `any_alt_solves` starts its DFS from), then times propagate-to-fixpoint
+//! states the existence prober starts its DFS from), then times propagate-to-fixpoint
 //! two ways on identical boards:
 //!
 //!   scalar : single-layout, smear place, smear hidden-single placement, no LC
@@ -27,14 +27,31 @@ use std::simd::{Mask, Select, Simd};
 use std::time::Instant;
 
 use generator_lab::bb::{BitBoard, Placed};
-use generator_lab::generator::random_full_grid;
+use generator_lab::fill::random_full_grid;
 use generator_lab::grid::{CELLS, Digit, PEERS, digit_to_bit};
+use generator_lab::probe::{Prober, Search};
+use generator_lab::repr::banded::{Bands, RowMajor};
+use generator_lab::repr::{DigitGrid, Marks, SearchState};
 use generator_lab::rng::Rng;
+use generator_lab::scan::Bivalue;
 use generator_lab::spec_for_mode;
 
 const W: usize = 8;
 type V = Simd<u32, W>;
 type M = Mask<i32, W>;
+
+/// The scalar existence oracle on the new prober stack: build a `DigitGrid` from the
+/// strip's cleared `cells`, forbid `orig` at `i` to restrict the cell to its
+/// alternates, and ask whether some other digit still completes — the new-repr twin
+/// of bb's old alt-completion existence probe, the soundness reference for the single-layout DFS.
+fn oracle_alt_solves(cells: &[Digit; CELLS], i: usize, orig: Digit) -> bool {
+    let grid = DigitGrid::from_array(core::array::from_fn(|c| {
+        generator_lab::repr::Digit::new(cells[c])
+    }));
+    let mut probe = SearchState::<Bands<RowMajor>>::from_digits(&grid);
+    probe.forbid(i, generator_lab::repr::Digit::new(orig).expect("nonzero clue digit"));
+    Search::<Bivalue>::has_completion(probe)
+}
 
 const fn rm_lane(c: usize) -> usize {
     (c / 9) / 3
@@ -251,7 +268,7 @@ fn assign(mut b: Bd, k: usize, bit: usize, dd: usize) -> Bd {
 }
 
 /// The existence DFS, single-layout no-LC, with early-exit on the first solution
-/// (exactly what `any_alt_solves` does). Pushes every node's PRE-closure board to
+/// (exactly what the alt-completion existence probe does). Pushes every node's PRE-closure board to
 /// `out`, so `out` ends up holding the real per-node board population — roots and
 /// interior alike. Returns whether any solution exists (the prober verdict).
 fn dfs(b: Bd, out: &mut Vec<Bd>, budget: &mut u32) -> bool {
@@ -522,7 +539,7 @@ fn main() {
             // layout/technique/branch-order independent, so it MUST match).
             let mut budget = 5_000_000u32;
             let mine = dfs(root, &mut nodes, &mut budget);
-            let real = bb.any_alt_solves(i, alts);
+            let real = oracle_alt_solves(&cells, i, orig);
             if mine != real {
                 verdict_mism += 1;
             }

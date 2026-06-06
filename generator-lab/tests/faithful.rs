@@ -12,7 +12,7 @@
 //! HiddenQuad itself is checked behind `--ignored` (mean ~74k attempts/puzzle is
 //! too slow for the default run).
 
-use generator_lab::generator::generate as glab_generate;
+use generator_lab::generate::generate as glab_generate;
 use generator_lab::grid::Board as GBoard;
 use generator_lab::rng::Rng as GRng;
 use generator_lab::spec::Spec as GSpec;
@@ -147,7 +147,7 @@ fn train_hidden_quad_both_directions() {
 /// change the RNG or fill on purpose, re-baseline these values.
 #[test]
 fn determinism_fp_pinned() {
-    use generator_lab::generator::determinism_fp;
+    use generator_lab::generate::determinism_fp;
     for (seed, want) in [
         (1u64, 0xeff10e346cad1dc9u64),
         (2, 0xf6ea34a6fbad2d0d),

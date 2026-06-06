@@ -15,7 +15,7 @@
 //!
 //! Usage: cargo run --release -p generator-lab --example packbench -- [lanes=8] [per_lane=4000]
 
-use generator_lab::generator::run_attempts;
+use generator_lab::generate::run_attempts;
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
 use generator_lab::simt::host::run_warp;

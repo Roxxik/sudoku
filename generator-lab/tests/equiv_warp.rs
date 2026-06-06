@@ -6,7 +6,7 @@
 //! the counts. (The spec `verify` inside the warp independently guarantees every
 //! emitted puzzle satisfies the spec; this test additionally pins faithfulness.)
 
-use generator_lab::generator::run_attempts;
+use generator_lab::generate::run_attempts;
 use generator_lab::rng::Rng;
 use generator_lab::spec_for_mode;
 use generator_lab::simt::host::run_warp;

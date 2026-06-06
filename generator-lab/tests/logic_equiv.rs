@@ -1,9 +1,9 @@
-//! Equivalence: the new-representation logic solver (`solve::LogicSolver`) must
-//! agree with BOTH proven baseline engines — the scalar `techniques::solve_tracked`
-//! and the bitboard `bb::BitBoard::baseline` — on every board the strip loop feeds
-//! the difficulty gate, for the two production specs.
+//! Equivalence: the new-representation logic solvers (`solve::LogicSolver` and its
+//! fused fast path `solve::FusedLogicSolver`) must agree with the proven scalar
+//! reference engine `techniques::solve_tracked` — and with each other — on every
+//! board the strip loop feeds the difficulty gate, for the two production specs.
 //!
-//! The contract the generator relies on (identical to `bb_equiv`'s):
+//! The contract the generator relies on:
 //!   - same `solved` verdict,
 //!   - same `requirement_met` verdict (the strip reads only the Forced kinds' counts),
 //!   - identical subset counts (NakedPair..HiddenQuad).
@@ -15,12 +15,13 @@
 //! fixpoint before any subset can fire. Walking REAL strip trajectories makes the
 //! boards exactly the post-uniqueness-gate boards the gate sees in production.
 
-use generator_lab::bb::BitBoard;
 use generator_lab::generator::random_full_grid;
 use generator_lab::grid::{Board, CELLS, digit_to_bit};
+use generator_lab::probe::{Prober, Search};
 use generator_lab::repr::banded::{Bands, DualBandedMarkGrid, RowMajor};
 use generator_lab::repr::{DigitGrid, Marks, SearchState};
 use generator_lab::rng::Rng;
+use generator_lab::scan::Bivalue;
 use generator_lab::solve::{FusedLogicSolver, LogicSolver, Solver};
 use generator_lab::spec::Spec;
 use generator_lab::spec_for_mode;
@@ -44,7 +45,6 @@ fn fused_trace(puzzle: &Board, baseline: u32) -> SolveTrace {
 
 fn check_spec(label: &str, spec: &Spec, attempts: usize, min_compared: usize) {
     let baseline = spec.baseline_mask();
-    let forced = spec.forced_mask();
     let mut rng = Rng::from_seed(1);
     let mut compared = 0usize;
 
@@ -61,24 +61,30 @@ fn check_spec(label: &str, spec: &Spec, attempts: usize, min_compared: usize) {
             let orig = puzzle.cell(i);
             puzzle.clear_naked(i);
 
-            let bb = BitBoard::from_board(&puzzle);
-            let v_bit = digit_to_bit(solution.cell(i));
-            let alts = puzzle.candidates(i) & !v_bit;
-            if alts != 0 && bb.any_alt_solves(i, alts) {
+            // Uniqueness gate on the new prober stack (bb's `any_alt_solves`): forbid
+            // `orig` at `i` to restrict the cell to its alternates and ask a single
+            // existence query. Non-unique => revert and stay on the real trajectory.
+            let alts = puzzle.candidates(i) & !digit_to_bit(orig);
+            let nonunique = alts != 0 && {
+                let grid = DigitGrid::parse(&puzzle.to_line()).expect("valid line");
+                let mut probe = SearchState::<Bands<RowMajor>>::from_digits(&grid);
+                probe.forbid(i, generator_lab::repr::Digit::new(orig).expect("nonzero clue digit"));
+                Search::<Bivalue>::has_completion(probe)
+            };
+            if nonunique {
                 puzzle.place(i, orig);
                 continue;
             }
 
-            // Both new engines, and both reference engines, on the identical board.
+            // Both new engines and the scalar reference, on the identical board.
             let scal = solve_tracked(&puzzle, baseline);
-            let bbo = bb.baseline(baseline, forced);
             let logic = logic_trace(&puzzle, baseline);
             let fused = fused_trace(&puzzle, baseline);
             compared += 1;
 
             let line = puzzle.to_line();
             for (new, nname) in [(&logic, "logic"), (&fused, "fused")] {
-                for (other, oname) in [(&scal, "scalar"), (&bbo, "bb")] {
+                for (other, oname) in [(&scal, "scalar")] {
                     assert_eq!(
                         new.solved, other.solved,
                         "[{label}] {nname} solved mismatch vs {oname} on {line}"

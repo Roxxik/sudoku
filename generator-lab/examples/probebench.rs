@@ -5,21 +5,44 @@
 //! (where the still-scalar baseline gate and grid fill cap the win).
 //!
 //! It mirrors generator-lab's `killswitch` example, but measures pack's *actual
-//! deployed* probers: `BitBoard::any_alt_solves` (the scalar bar) against
-//! `PackedProber::resolve` (the new smear+ALU gather-free kernel). Both verdicts
-//! are cross-checked against each other and against the live prober (they MUST
-//! all agree — existence is deterministic), so this is a go/no-go on the kernel,
-//! not a guess.
+//! deployed* probers: the scalar `Search<Bivalue>` existence prober (the scalar bar,
+//! one query at a time) against `PackedProber::resolve` (the new smear+ALU
+//! gather-free kernel). Both verdicts are cross-checked against each other and
+//! against the live prober (they MUST all agree — existence is deterministic), so
+//! this is a go/no-go on the kernel, not a guess.
 //!
 //! Usage: cargo run --release -p generator-pack --example probebench -- [--attempts N=2000] [--iters I=30] [--mode train|drill]
 
 use generator_lab::bb::{BitBoard, Placed};
-use generator_lab::generator::random_full_grid;
+use generator_lab::fill::random_full_grid;
 use generator_lab::grid::{CELLS, Digit, digit_to_bit};
-use generator_lab::simt::prober::{PackedProber, Probe};
+use generator_lab::probe::{Prober, Search};
+use generator_lab::repr::banded::{Bands, RowMajor};
+use generator_lab::repr::{DigitGrid, Marks, SearchState};
 use generator_lab::rng::Rng;
+use generator_lab::scan::Bivalue;
+use generator_lab::simt::prober::{PackedProber, Probe};
 use generator_lab::spec_for_mode;
 use std::time::Instant;
+
+/// The banded packing the scalar prober branches on.
+type RM = Bands<RowMajor>;
+/// The scalar prober: scan/sieve `Search` with the `Bivalue` branch strategy — the
+/// shape the sequential generator calls, one existence query at a time.
+type P = Search<Bivalue>;
+
+/// The restricted prober state for the strip of clue `orig` at `i`: a `SearchState`
+/// built from the cleared `cells` with `orig` forbidden at `i`, so an existence probe
+/// asks whether some *alternate* digit still completes (bb's old alt-completion probe).
+/// This is the scalar oracle and the scalar timing bar for the packed prober.
+fn restricted_state(cells: &[Digit; CELLS], i: usize, orig: Digit) -> SearchState<RM> {
+    let grid = DigitGrid::from_array(core::array::from_fn(|c| {
+        generator_lab::repr::Digit::new(cells[c])
+    }));
+    let mut state = SearchState::<RM>::from_digits(&grid);
+    state.forbid(i, generator_lab::repr::Digit::new(orig).expect("nonzero clue digit"));
+    state
+}
 
 fn main() {
     let mut attempts = 2000usize;
@@ -46,7 +69,9 @@ fn main() {
     let forced = spec.forced_mask();
     let mut rng = Rng::from_seed(1);
     let mut probes: Vec<Probe> = Vec::new();
-    let mut boards: Vec<(BitBoard, usize, u16)> = Vec::new();
+    // The restricted scalar prober state per query (orig forbidden at its cell): the
+    // scalar oracle/bar, the new-stack twin of bb's (board, cell, alts) probe.
+    let mut states: Vec<SearchState<RM>> = Vec::new();
     let mut reals: Vec<bool> = Vec::new();
 
     for _ in 0..attempts {
@@ -69,8 +94,9 @@ fn main() {
             }
             let (r, unsolved) = bb.export_r();
             probes.push(Probe { r, unsolved, cell: i, alts });
-            boards.push((bb.clone(), i, alts));
-            let real = bb.any_alt_solves(i, alts);
+            let state = restricted_state(&cells, i, orig);
+            let real = P::has_completion(state.clone());
+            states.push(state);
             reals.push(real);
             if real {
                 cells[i] = orig;
@@ -87,7 +113,7 @@ fn main() {
     let n = probes.len();
 
     // ---- soundness: scalar vs live, packed vs live, packed vs scalar ----
-    let scalar_verdicts: Vec<bool> = boards.iter().map(|(b, c, a)| b.any_alt_solves(*c, *a)).collect();
+    let scalar_verdicts: Vec<bool> = states.iter().map(|s| P::has_completion(s.clone())).collect();
     let mut packed_verdicts = vec![false; n];
     let mut prober = PackedProber::new();
     prober.resolve(&probes, &mut packed_verdicts);
@@ -111,8 +137,8 @@ fn main() {
     let mut acc = 0u64;
     let t = Instant::now();
     for _ in 0..iters {
-        for (b, c, a) in &boards {
-            acc = acc.wrapping_add(b.any_alt_solves(*c, *a) as u64);
+        for s in &states {
+            acc = acc.wrapping_add(P::has_completion(s.clone()) as u64);
         }
     }
     let ns_s = t.elapsed().as_secs_f64() * 1e9 / (n * iters) as f64;
