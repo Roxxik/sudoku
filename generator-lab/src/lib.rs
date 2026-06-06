@@ -19,12 +19,11 @@
 //!   value types, the [`DigitGrid`](repr::DigitGrid)/[`Board`](repr::Board) grids, and
 //!   the banded SIMD packings ([`repr::banded`]) every solver/prober/generator is built
 //!   on. The whole crate lives on this layer.
-//! - [`rng`] / [`util`]: primitives kept faithful to core (the strip stream
-//!   reproduces core's for a given seed) plus the shared FNV fingerprint.
-//! - [`technique_kinds`]: the shared taxonomy — kind indices, `KindMask`,
-//!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` a logic solve returns.
-//! - [`scan`] / [`sieve`]: the MRV/Bivalue branch strategies and the
-//!   popcount-free naked-single sieve the fast prober runs on.
+//! - [`rng`]: a primitive kept faithful to core (the strip stream reproduces core's
+//!   for a given seed). [`fingerprint`]: the shared FNV fingerprint every generator
+//!   path folds puzzles with.
+//! - [`scan`]: the MRV/Bivalue branch strategies, and (in [`scan::sieve`]) the
+//!   popcount-free candidate-count sieve the scan and the fast prober run on.
 //! - [`solve`]: the **logic solver** — `LogicSolver` and its fused fast path
 //!   `FusedLogicSolver`, the technique-driven, no-backtracking spec gate over the
 //!   `repr` layer, parallel to [`probe`].
@@ -32,7 +31,9 @@
 //!   `repr` layer, the composable [`techniques`](probe::techniques) singles the
 //!   `Singles` reference prober drives, plus the native packed W=8 SIMT prober
 //!   ([`probe::simt`]).
-//! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.
+//! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`, over the
+//!   shared technique taxonomy in [`spec::kinds`] (kind indices, `KindMask`,
+//!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` a logic solve returns).
 //! - [`fill`]: the random full-grid filler (banded-bitboard MRV search), the first
 //!   half of every attempt.
 //! - [`generate`]: the strip-generate pipeline on the `repr` layer (the [`probe`]
@@ -48,18 +49,16 @@
 pub mod repr;
 pub(crate) mod counters;
 pub mod fill;
+pub mod fingerprint;
 pub mod generate;
 pub mod probe;
 pub mod rng;
 pub mod scan;
-pub mod sieve;
 pub mod solve;
 pub mod spec;
-pub mod technique_kinds;
-pub mod util;
 
 use spec::Spec;
-use technique_kinds::HIDDEN_QUAD;
+use spec::kinds::HIDDEN_QUAD;
 
 /// Build the PoC spec for a `mode`: 0 = train(HiddenQuad), else drill(HiddenQuad).
 pub fn spec_for_mode(mode: u32) -> Spec {

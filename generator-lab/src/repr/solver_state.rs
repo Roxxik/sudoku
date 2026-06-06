@@ -63,7 +63,7 @@ impl<M: GridMask> SolverState<M> {
     /// Two singles of `d` that are peers is a contradiction: such a cell lands in
     /// `peers` (a peer excludes only itself), so it is left out of the decided set and
     /// `&= !peers` strips its lone candidate, leaving it unsolved with zero candidates
-    /// for the next [`Sieve`](crate::sieve) to read as dead.
+    /// for the next [`Sieve`](crate::scan::sieve) to read as dead.
     #[inline]
     pub fn place_group_with(&mut self, d: Digit, group: M, peers: M) {
         self.unsolved &= !(group & !peers);
@@ -129,7 +129,7 @@ impl<M: Branchable> SolverState<M> {
     /// Two singles of digit `d` that are peers is a contradiction. Such a cell lands in
     /// the accumulated peer mask (a peer excludes only *itself*), so it is left out of
     /// the decided set and `&= !peers` strips `d` — its lone candidate — leaving it
-    /// unsolved with zero candidates for the next [`Sieve`](crate::sieve) to read as
+    /// unsolved with zero candidates for the next [`Sieve`](crate::scan::sieve) to read as
     /// dead. (Propagation reports no verdict; the following scan does.)
     pub fn place_single_group(&mut self, d: Digit, group: M) {
         let mut peers = M::EMPTY;

@@ -9,9 +9,14 @@
 //! free [`scan_with`] helper; each strategy's [`BranchStrategy::scan`] supplies only
 //! its pick ([`Mrv::pick`] / [`Bivalue::pick`]), the choice among the live cells. It
 //! is a usage layer: it reads a [`GridMask`] board to decide, not a representation.
+//!
+//! The candidate-count [`sieve`] the scan and the fast prober run on lives in the
+//! submodule of the same name — the scan's core primitive.
+
+pub mod sieve;
 
 use crate::repr::{Branchable, CellIdx, GridMask, PerDigit};
-use crate::sieve::Sieve;
+use sieve::Sieve;
 
 /// The outcome of a [`BranchStrategy::scan`] over the unsolved cells.
 pub enum Scan {

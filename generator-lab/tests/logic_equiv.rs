@@ -29,7 +29,7 @@ use generator_lab::scan::Bivalue;
 use generator_lab::solve::{FusedLogicSolver, LogicSolver, Solver};
 use generator_lab::spec::Spec;
 use generator_lab::spec_for_mode;
-use generator_lab::technique_kinds::{
+use generator_lab::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
 };

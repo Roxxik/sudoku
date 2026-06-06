@@ -29,10 +29,10 @@ use crate::rng::Rng;
 use crate::scan::Bivalue;
 use crate::solve::{FusedLogicSolver, LogicSolver, Solver};
 use crate::spec::Spec;
-use crate::technique_kinds::{
+use crate::spec::kinds::{
     HIDDEN_SINGLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_SINGLE,
 };
-use crate::util::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
+use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 
 /// The banded packing the prober branches on and the incremental strip is carried in.
 type RM = Bands<RowMajor>;
@@ -59,7 +59,7 @@ pub enum AttemptResult {
 }
 
 /// The cells of `digits` as a bare `[u8; 81]` (`0` = empty) — the form the
-/// cross-backend determinism fingerprint folds (see [`fnv_fold_cells`](crate::util::fnv_fold_cells)).
+/// cross-backend determinism fingerprint folds (see [`fnv_fold_cells`](crate::fingerprint::fnv_fold_cells)).
 pub(in crate::generate) fn cells_u8(digits: &DigitGrid) -> [u8; CELLS] {
     core::array::from_fn(|i| digits.get(i).map_or(0, |d| d.get()))
 }

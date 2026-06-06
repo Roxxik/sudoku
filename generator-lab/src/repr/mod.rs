@@ -27,6 +27,7 @@
 mod board;
 mod digit;
 mod digit_grid;
+mod flat_grid_mask;
 mod grid_mask;
 mod mark;
 mod mark_grid;
@@ -41,15 +42,19 @@ pub mod banded;
 pub use board::Board;
 pub use digit::Digit;
 pub use digit_grid::DigitGrid;
-pub use grid_mask::{Branchable, FlatGridMask, GridMask};
+pub use flat_grid_mask::FlatGridMask;
+pub use grid_mask::{Branchable, GridMask};
 pub use mark::Mark;
 pub use mark_grid::MarkGrid;
 pub use marks::Marks;
 pub use solver_state::SolverState;
 pub use solve_view::{Occupancy, SolveView};
 pub use per_digit::PerDigit;
-pub use types::{CellIdx, Puzzle, Solution};
+pub use types::{Puzzle, Solution};
 pub use unit::{PEERS, UNITS};
 
-// The number of cells in a sudoku grid, and the range of cell indices.
+/// The number of cells in a sudoku grid.
 pub const CELLS: usize = 81;
+
+/// A cell index, `0..81` (row-major).
+pub type CellIdx = usize;

@@ -41,8 +41,8 @@ use crate::probe::simt::{LANES, PackedProber, Probe};
 use crate::repr::{CELLS, Digit, DigitGrid, Solution};
 use crate::rng::Rng;
 use crate::spec::Spec;
-use crate::technique_kinds::KindMask;
-use crate::util::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
+use crate::spec::kinds::KindMask;
+use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
 
 /// One lane = one in-flight attempt plus the running tallies/fingerprint of every
 /// attempt this lane has retired. The board state and per-cell gate logic are the

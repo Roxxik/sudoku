@@ -39,8 +39,8 @@
 use super::{LogicSolver, Solver, techniques};
 use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMajor};
 use crate::repr::{Digit, GridMask, Marks};
-use crate::sieve::Sieve;
-use crate::technique_kinds::{
+use crate::scan::sieve::Sieve;
+use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
 };

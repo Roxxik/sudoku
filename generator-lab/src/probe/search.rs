@@ -6,7 +6,7 @@
 //! rule) plug in and bench — `count_completions::<M, Mrv>` vs `::<M, Bivalue>`.
 //!
 //! Branching copies the `SolverState` (it is `Copy` — no heap clone). Naked-single +
-//! dead/solved verdicts come from the [`Sieve`](crate::sieve) inside `scan`;
+//! dead/solved verdicts come from the [`Sieve`](crate::scan::sieve) inside `scan`;
 //! completeness comes from the branch, so this is correct for any `S` (a strategy
 //! only changes which cell is branched, never the count). Hidden-single propagation
 //! (bb's fused `band_update`) is the optional pruning that slots in later.

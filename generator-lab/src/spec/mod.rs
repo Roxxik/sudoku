@@ -6,8 +6,14 @@
 //! `require_any` (family-level "any fish" constraints) is intentionally omitted:
 //! no spec in PoC scope uses it (train/drill(HiddenQuad) only Force a single
 //! kind). Add it when scope grows past HiddenSubset.
+//!
+//! [`kinds`] holds the shared technique taxonomy this spec is built over — the kind
+//! indices, the [`KindMask`](kinds::KindMask) set type, and the
+//! [`SolveTrace`](kinds::SolveTrace) the solve engines return.
 
-use crate::technique_kinds::{DIFFICULTY, HIDDEN_SINGLE, KindMask, NUM};
+pub mod kinds;
+
+use kinds::{DIFFICULTY, HIDDEN_SINGLE, KindMask, NUM};
 
 /// How a technique participates in a spec — mirrors core's `Usage`.
 ///

@@ -2,7 +2,7 @@
 //! (`cap = 1` = existence, `cap = 2` = uniqueness, `== 1`). Two interchangeable
 //! engines live here so they cross-check each other and bench head to head:
 //!
-//! - [`search`]: the fast one — the fill's [`scan`](crate::scan) + [`sieve`](crate::sieve)
+//! - [`search`]: the fast one — the fill's [`scan`](crate::scan) + [`sieve`](crate::scan::sieve)
 //!   machinery (naked-single sieve + dead/solved verdict + branch), generic over the
 //!   [`BranchStrategy`](crate::scan::BranchStrategy) so `Mrv` vs `Bivalue` plug in
 //!   and bench. Runs on a [`SolverState<M>`](crate::repr::SolverState).

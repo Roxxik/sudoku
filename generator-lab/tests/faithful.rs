@@ -17,7 +17,7 @@ use generator_lab::generate::verify as glab_verify;
 use generator_lab::repr::DigitGrid;
 use generator_lab::rng::Rng as GRng;
 use generator_lab::spec::Spec as GSpec;
-use generator_lab::technique_kinds as gt;
+use generator_lab::spec::kinds as gt;
 
 use sudoku_core::{
     Board as CBoard, Rng as CRng, Spec as CSpec, TechniqueKind as CK, make_puzzle_for_spec, verify as core_verify,

@@ -26,7 +26,7 @@ use generator_lab::repr::SolverState;
 use generator_lab::repr::banded::{Bands, RowMajor};
 use generator_lab::rng::Rng;
 use generator_lab::scan::{Bivalue, LooseMrv, Mrv, MrvRecount};
-use generator_lab::util::{FNV_OFFSET, fnv_fold_cells};
+use generator_lab::fingerprint::{FNV_OFFSET, fnv_fold_cells};
 
 /// The production banded packing for the new probers.
 type M = Bands<RowMajor>;

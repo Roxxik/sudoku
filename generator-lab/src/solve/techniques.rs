@@ -17,7 +17,7 @@
 
 use super::LogicBoard;
 use crate::repr::{CELLS, CellIdx, Digit, Mark, UNITS};
-use crate::util::for_each_combination;
+use super::combinations::for_each_combination;
 
 /// Cell `c`'s box index (0..9) — its band-of-three-rows times three plus its
 /// stack-of-three-columns. The one piece of geometry the locked-candidates scans

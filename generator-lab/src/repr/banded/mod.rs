@@ -4,9 +4,6 @@
 //! the technique engine and the existence search that *use* these boards to solve
 //! live a layer up.
 //!
-//! - [`RowBandedDigitGrid`]: placements (one banded cell-set per digit) in the
-//!   row-major banding — the banded analogue of [`super::DigitGrid`], the reopen
-//!   oracle a banded strip needs.
 //! - [`DualSolverState`]: candidates held in *both* bandings at once, kept
 //!   consistent — the analogue of [`super::MarkGrid`] for the baseline technique
 //!   engine, which needs every unit in-lane in at least one view. It is just a
@@ -22,10 +19,8 @@ mod band;
 mod banding;
 mod bands;
 mod dual_solver_state;
-mod row_banded_digit_grid;
 
 pub use dual_solver_state::DualSolverState;
-pub use row_banded_digit_grid::RowBandedDigitGrid;
 
 // The scalar per-band primitive and the banding geometry trait, for the fused
 // per-band prober sweep (`Bands::band` -> `Band`, `Banding::cell_at`).

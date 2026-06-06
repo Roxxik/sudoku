@@ -1,5 +1,5 @@
-//! Simple board value types with no behaviour of their own: the [`Digit`]
-//! primitive, and the intent-tagged grids [`Puzzle`] / [`Solution`].
+//! The intent-tagged placement grids [`Puzzle`] / [`Solution`] — board value types
+//! with no behaviour of their own.
 //!
 //! `Puzzle` and `Solution` are both just a [`DigitGrid`]; the newtype says which
 //! one we mean so signatures can speak the domain (`fill` yields a `Solution`,
@@ -8,9 +8,6 @@
 
 use std::ops::Deref;
 use super::DigitGrid;
-
-/// A cell index, `0..81` (row-major).
-pub type CellIdx = usize;
 
 /// A fully-filled grid: a sudoku solution.
 #[derive(Clone, PartialEq, Eq)]

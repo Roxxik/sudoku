@@ -22,19 +22,6 @@ use std::simd::cmp::SimdPartialEq;
 pub struct Bands<B: Banding>(Simd<u32, 4>, PhantomData<B>);
 
 impl<B: Banding> Bands<B> {
-    /// The empty set.
-    pub(super) const EMPTY: Bands<B> = Bands(Simd::from_array([0; 4]), PhantomData);
-
-    /// Add cell `cell` to the set.
-    pub(super) fn insert(&mut self, cell: CellIdx) {
-        self.0 |= Simd::from_array(B::CELL_MASKS[cell]);
-    }
-
-    /// Remove cell `cell` from the set (no-op if absent).
-    pub(super) fn remove(&mut self, cell: CellIdx) {
-        self.0 &= !Simd::from_array(B::CELL_MASKS[cell]);
-    }
-
     /// The three bands as raw 27-bit words in the low three lanes (lane 3 unused) —
     /// the SoA input the packed prober loads into one warp lane. Read-only escape
     /// hatch, paralleling [`band`](Bands::band): a [`SolverState`](crate::repr::SolverState)

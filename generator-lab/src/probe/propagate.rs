@@ -21,7 +21,7 @@
 
 use crate::repr::banded::{Band, Banding, Bands, RowMajor};
 use crate::repr::{Branchable, Digit, FlatGridMask, Marks, SolverState};
-use crate::sieve::Sieve;
+use crate::scan::sieve::Sieve;
 
 /// The state of a board once propagation can place no more forced cells.
 #[derive(Clone, Copy, PartialEq, Eq)]
