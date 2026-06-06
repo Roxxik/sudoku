@@ -28,8 +28,8 @@ mod techniques;
 
 pub use fused::FusedLogicSolver;
 
-use crate::repr::banded::DualBandedMarkGrid;
-use crate::repr::{Board, CELLS, CellIdx, Digit, GridMask, SearchState, SolveView};
+use crate::repr::banded::DualSolverState;
+use crate::repr::{Board, CELLS, CellIdx, Digit, GridMask, SolverState, SolveView};
 use crate::technique_kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
@@ -176,10 +176,10 @@ fn is_solved<V: LogicBoard>(b: &V) -> bool {
 }
 
 /// The digit-major search board prunes a candidate by forbidding the digit at the
-/// cell ([`SearchState::forbid`]) — the same op the prober uses as its uniqueness
+/// cell ([`SolverState::forbid`]) — the same op the prober uses as its uniqueness
 /// lever, here as the technique engine's elimination. Generic over the packing, so
 /// the logic solver runs on the flat reference and either banding.
-impl<M: GridMask> Eliminate for SearchState<M> {
+impl<M: GridMask> Eliminate for SolverState<M> {
     #[inline]
     fn eliminate(&mut self, cell: CellIdx, d: Digit) {
         self.forbid(cell, d);
@@ -199,9 +199,9 @@ impl Eliminate for Board {
 }
 
 /// The dual-banded grid prunes by forbidding the digit in both views at once
-/// ([`DualBandedMarkGrid::forbid`]) — so the composable techniques (and the fused
+/// ([`DualSolverState::forbid`]) — so the composable techniques (and the fused
 /// engine's subset ladder) run on it directly, every unit in-lane in one view.
-impl Eliminate for DualBandedMarkGrid {
+impl Eliminate for DualSolverState {
     #[inline]
     fn eliminate(&mut self, cell: CellIdx, d: Digit) {
         self.forbid(cell, d);
@@ -212,10 +212,10 @@ impl Eliminate for DualBandedMarkGrid {
 mod tests {
     use super::{LogicSolver, Solver};
     use crate::repr::banded::{Bands, RowMajor};
-    use crate::repr::{DigitGrid, FlatGridMask, Marks, SearchState};
+    use crate::repr::{DigitGrid, FlatGridMask, Marks, SolverState};
     use crate::spec_for_mode;
 
-    type Banded = SearchState<Bands<RowMajor>>;
+    type Banded = SolverState<Bands<RowMajor>>;
 
     const PUZZLE: &str = "\
         53..7....\
@@ -228,8 +228,8 @@ mod tests {
         ...419..5\
         ....8..79";
 
-    fn state<M: crate::repr::GridMask>(s: &str) -> SearchState<M> {
-        SearchState::from_digits(&DigitGrid::parse(s).unwrap())
+    fn state<M: crate::repr::GridMask>(s: &str) -> SolverState<M> {
+        SolverState::from_digits(&DigitGrid::parse(s).unwrap())
     }
 
     /// The classic singles puzzle solves with just the two singles, and the verdict

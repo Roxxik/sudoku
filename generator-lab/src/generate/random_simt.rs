@@ -1,7 +1,7 @@
 //! The attempt **warp** on the `repr` layer: K independent strip attempts driven in
 //! lockstep, with per-lane refill. Each lane's per-cell gate logic is the
 //! [`random`](crate::generate::random) `StripState` (the incremental
-//! [`DualBandedMarkGrid`](crate::repr::banded::DualBandedMarkGrid) strip), and the
+//! [`DualSolverState`](crate::repr::banded::DualSolverState) strip), and the
 //! uniqueness gate it batches is resolved by the packed-DFS prober
 //! ([`crate::probe::simt`], the gather-free W=8 smear+ALU kernel).
 //!

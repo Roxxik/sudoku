@@ -1,5 +1,5 @@
-//! `DualBandedMarkGrid` — the candidates in *both* bandings at once: a row-major
-//! [`SearchState`] (rows and boxes in-lane) and a column-major one (columns and
+//! `DualSolverState` — the candidates in *both* bandings at once: a row-major
+//! [`SolverState`] (rows and boxes in-lane) and a column-major one (columns and
 //! boxes in-lane), kept consistent at every mutation. The banded analogue of the
 //! scalar [`MarkGrid`](super::super::MarkGrid) for the *baseline technique engine*,
 //! mirroring the old dual-view `BitBoard`.
@@ -12,7 +12,7 @@
 //! unit in-lane in at least one view, so the engine never has to scan a unit that
 //! crosses bands. The lean prober needs only one view (it reaches columns by
 //! branching, not by scanning), so it uses a single
-//! [`SearchState<Bands<RowMajor>>`]; the baseline genuinely needs every unit and
+//! [`SolverState<Bands<RowMajor>>`]; the baseline genuinely needs every unit and
 //! pays for the second copy.
 //!
 //! Placements sync for free — each view clears its own peer mask — so maintaining
@@ -22,32 +22,32 @@
 use super::banding::{ColMajor, RowMajor};
 use super::bands::Bands;
 use crate::repr::{
-    Branchable, CellIdx, Digit, DigitGrid, GridMask, Mark, Marks, Occupancy, PerDigit, SearchState,
+    Branchable, CellIdx, Digit, DigitGrid, GridMask, Mark, Marks, Occupancy, PerDigit, SolverState,
 };
 
 /// Candidates held in both bandings, kept consistent. The two views always encode
 /// the same candidate set (transposed), so reads answer from the row-major copy;
 /// mutations touch both.
 #[derive(Clone, PartialEq, Eq)]
-pub struct DualBandedMarkGrid {
-    row: SearchState<Bands<RowMajor>>,
-    col: SearchState<Bands<ColMajor>>,
+pub struct DualSolverState {
+    row: SolverState<Bands<RowMajor>>,
+    col: SolverState<Bands<ColMajor>>,
 }
 
-impl DualBandedMarkGrid {
+impl DualSolverState {
     /// The row-major view (rows and boxes in-lane) — read access for the fused
     /// technique engine's per-band sweeps, which read one view's candidate bands a
     /// band at a time. Mutation still goes through [`place`](Marks::place) /
-    /// [`forbid`](DualBandedMarkGrid::forbid), which keep both views in sync.
+    /// [`forbid`](DualSolverState::forbid), which keep both views in sync.
     #[inline]
-    pub fn row(&self) -> &SearchState<Bands<RowMajor>> {
+    pub fn row(&self) -> &SolverState<Bands<RowMajor>> {
         &self.row
     }
 
     /// The column-major view (columns and boxes in-lane) — the transpose of
-    /// [`row`](DualBandedMarkGrid::row), so column units are in-lane too.
+    /// [`row`](DualSolverState::row), so column units are in-lane too.
     #[inline]
-    pub fn col(&self) -> &SearchState<Bands<ColMajor>> {
+    pub fn col(&self) -> &SolverState<Bands<ColMajor>> {
         &self.col
     }
 
@@ -66,7 +66,7 @@ impl DualBandedMarkGrid {
     /// set-bit walk accumulates each view's group and peer masks (the column view is
     /// not [`Branchable`], so it can't walk its own set; the row-major group can,
     /// supplying the cells for both), then each view decides its cells in a single
-    /// masked op via [`SearchState::place_group_with`] — no per-cell `place`.
+    /// masked op via [`SolverState::place_group_with`] — no per-cell `place`.
     pub fn place_single_group(&mut self, d: Digit, group: Bands<RowMajor>) {
         let mut row_peers = <Bands<RowMajor> as GridMask>::EMPTY;
         let mut col_group = <Bands<ColMajor> as GridMask>::EMPTY;
@@ -88,11 +88,11 @@ impl DualBandedMarkGrid {
     /// row-major because the clue-survival/blocked logic ([`clear_clue`]) reads it
     /// banding-independently; only the candidate boards are kept in both views.
     pub fn clue_map(digits: &DigitGrid) -> PerDigit<Bands<RowMajor>> {
-        SearchState::<Bands<RowMajor>>::clue_map(digits)
+        SolverState::<Bands<RowMajor>>::clue_map(digits)
     }
 
     /// Remove the clue digit `d` at `cell`, reopening candidates in **both** views — the
-    /// dual analogue of [`SearchState::clear_clue`], so the strip can carry a single
+    /// dual analogue of [`SolverState::clear_clue`], so the strip can carry a single
     /// incrementally-maintained dual board (the baseline gate reads it with no per-gate
     /// rebuild) exactly as bb's `apply_clear` does. Mirrors bb: drop `cell` from the
     /// (row-major) `clue` map, reopen `cell`'s naked candidates, and return `d` to the
@@ -140,7 +140,7 @@ impl DualBandedMarkGrid {
     }
 
     /// Restore the clue digit `d` at `cell` in both views — the strip's revert, the dual
-    /// analogue of [`SearchState::place_clue`] and the inverse of [`clear_clue`].
+    /// analogue of [`SolverState::place_clue`] and the inverse of [`clear_clue`].
     pub fn place_clue(&mut self, clue: &mut PerDigit<Bands<RowMajor>>, cell: CellIdx, d: Digit) {
         clue[d] |= <Bands<RowMajor> as GridMask>::cell(cell);
         self.row.close_cell(
@@ -156,20 +156,20 @@ impl DualBandedMarkGrid {
     }
 }
 
-impl Occupancy for DualBandedMarkGrid {
+impl Occupancy for DualSolverState {
     /// Answered from the row view's `unsolved` mask (both views agree).
     fn is_empty(&self, cell: CellIdx) -> bool {
         self.row.is_empty(cell)
     }
 }
 
-impl Marks for DualBandedMarkGrid {
+impl Marks for DualSolverState {
     /// Derive both views from a digit grid — the same per-view derivation run once
     /// per banding.
     fn from_digits(grid: &DigitGrid) -> Self {
-        DualBandedMarkGrid {
-            row: SearchState::from_digits(grid),
-            col: SearchState::from_digits(grid),
+        DualSolverState {
+            row: SolverState::from_digits(grid),
+            col: SolverState::from_digits(grid),
         }
     }
 
@@ -190,7 +190,7 @@ impl Marks for DualBandedMarkGrid {
 
 #[cfg(test)]
 mod tests {
-    use super::DualBandedMarkGrid;
+    use super::DualSolverState;
     use crate::repr::{CELLS, Digit, DigitGrid, MarkGrid, Marks};
 
     const GRID: &str = "\
@@ -210,7 +210,7 @@ mod tests {
     /// peer masks.
     #[test]
     fn both_views_match_scalar_through_place() {
-        let check = |dual: &DualBandedMarkGrid, scalar: &MarkGrid| {
+        let check = |dual: &DualSolverState, scalar: &MarkGrid| {
             for cell in 0..CELLS {
                 let s = scalar.get(cell);
                 assert_eq!(dual.row.get(cell), s, "row cell {cell}");
@@ -219,7 +219,7 @@ mod tests {
         };
 
         let grid = DigitGrid::parse(GRID).unwrap();
-        let mut dual = DualBandedMarkGrid::from_digits(&grid);
+        let mut dual = DualSolverState::from_digits(&grid);
         let mut scalar = MarkGrid::from_digits(&grid);
         check(&dual, &scalar);
 

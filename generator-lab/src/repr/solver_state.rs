@@ -1,4 +1,4 @@
-//! `SearchState<M>` — the digit-major candidate board: per digit, the cells it may
+//! `SolverState<M>` — the digit-major candidate board: per digit, the cells it may
 //! still occupy ([`PerDigit<M>`]), plus the still-empty cell mask. The state every
 //! search and solver works on — the fill, the existence/uniqueness prober, and (via
 //! its two bandings) the baseline's dual view — generic over the [`GridMask`]
@@ -9,8 +9,8 @@
 //! than a [`Mark`] per cell. At `M = FlatGridMask` it is the flat reference; at
 //! `M = Bands<RowMajor>` the row-major banded board the prober branches on; at
 //! `M = Bands<ColMajor>` the column view (a `GridMask` but not `Branchable` — the
-//! search never branches it). A [`super::banded::DualBandedMarkGrid`] is just the
-//! row and column `SearchState`s held together.
+//! search never branches it). A [`super::banded::DualSolverState`] is just the
+//! row and column `SolverState`s held together.
 //!
 //! A decided cell's stale bits in the per-digit boards are never cleared; `unsolved`
 //! gates them everywhere, so the candidates of *unsolved* cells stay exactly the
@@ -23,19 +23,19 @@ use super::{Branchable, CELLS, CellIdx, Digit, DigitGrid, GridMask, Mark, Marks,
 
 /// Per-digit candidate cells in packing `M`, plus the empty-cell mask gating them.
 #[derive(Clone, PartialEq, Eq)]
-pub struct SearchState<M: GridMask> {
+pub struct SolverState<M: GridMask> {
     candidates: PerDigit<M>,
     unsolved: M,
 }
 
-impl<M: GridMask> SearchState<M> {
+impl<M: GridMask> SolverState<M> {
     /// The per-digit candidate cell-sets — what a [`scan`](crate::scan) reads.
     #[inline]
     pub fn candidates(&self) -> &PerDigit<M> {
         &self.candidates
     }
 
-    /// The still-empty cells — the gate over [`candidates`](SearchState::candidates).
+    /// The still-empty cells — the gate over [`candidates`](SolverState::candidates).
     #[inline]
     pub fn unsolved(&self) -> M {
         self.unsolved
@@ -56,7 +56,7 @@ impl<M: GridMask> SearchState<M> {
     /// already-accumulated `peers` mask (the union of the group cells' peer masks):
     /// decide the non-conflicting singles and forbid `d` across every peer, in two
     /// masked ops — bb's `place_singles` tail. Split from
-    /// [`place_single_group`](SearchState::place_single_group) so a caller that
+    /// [`place_single_group`](SolverState::place_single_group) so a caller that
     /// enumerates the cells itself (e.g. the dual grid, whose column view is not
     /// [`Branchable`] and so cannot walk the set) can still batch the placement.
     ///
@@ -117,10 +117,10 @@ impl<M: GridMask> SearchState<M> {
 /// since a decided cell's candidate bits are stale) rides alongside, and a clue is
 /// removed or restored with band ops over the cell and its peers, not an 81-cell sweep.
 ///
-/// The set-bit walk in [`clear_clue`](SearchState::clear_clue)'s peer-reopen needs the
+/// The set-bit walk in [`clear_clue`](SolverState::clear_clue)'s peer-reopen needs the
 /// lowest set cell, so this rides on [`Branchable`] (the row-major prober packing and
 /// the flat reference, both of which the strip uses).
-impl<M: Branchable> SearchState<M> {
+impl<M: Branchable> SolverState<M> {
     /// Place a wave of naked singles that all take digit `d` — `group` is the cells
     /// whose sole candidate is `d`. Batched after bb's `place_singles`: accumulate the
     /// group's peer mask once, decide the cells, and forbid `d` across all their peers
@@ -155,7 +155,7 @@ impl<M: Branchable> SearchState<M> {
     }
 
     /// Remove the clue digit `d` at `cell`, reopening candidates — the inverse of
-    /// [`place_clue`](SearchState::place_clue). Mirrors bb's `apply_clear`: drop `cell`
+    /// [`place_clue`](SolverState::place_clue). Mirrors bb's `apply_clear`: drop `cell`
     /// from `clue[d]`, then (1) make `cell` empty with its naked candidates — digit `e`
     /// survives iff no still-present peer holds it — and (2) return `d` to every empty
     /// peer no *other* present `d`-clue still blocks (the union of the surviving
@@ -201,7 +201,7 @@ impl<M: Branchable> SearchState<M> {
     }
 }
 
-impl<M: GridMask> Marks for SearchState<M> {
+impl<M: GridMask> Marks for SolverState<M> {
     fn from_digits(digits: &DigitGrid) -> Self {
         let mut unsolved = M::EMPTY;
         for cell in 0..CELLS {
@@ -217,7 +217,7 @@ impl<M: GridMask> Marks for SearchState<M> {
                 board[d] &= !M::peers(cell);
             }
         }
-        SearchState { candidates: board, unsolved }
+        SolverState { candidates: board, unsolved }
     }
 
     #[inline]
@@ -241,7 +241,7 @@ impl<M: GridMask> Marks for SearchState<M> {
     }
 }
 
-impl<M: GridMask> Occupancy for SearchState<M> {
+impl<M: GridMask> Occupancy for SolverState<M> {
     #[inline]
     fn is_empty(&self, cell: CellIdx) -> bool {
         (self.unsolved & M::cell(cell)).any()
@@ -250,7 +250,7 @@ impl<M: GridMask> Occupancy for SearchState<M> {
 
 #[cfg(test)]
 mod tests {
-    use super::SearchState;
+    use super::SolverState;
     use crate::repr::banded::{Bands, ColMajor, RowMajor};
     use crate::repr::{CELLS, Digit, DigitGrid, FlatGridMask, MarkGrid, Marks};
 
@@ -269,7 +269,7 @@ mod tests {
     /// scalar `MarkGrid` cell for cell — flat, both bandings, the lot.
     fn agrees_with_scalar<M: crate::repr::GridMask>() {
         let grid = DigitGrid::parse(GRID).unwrap();
-        let mut subject = SearchState::<M>::from_digits(&grid);
+        let mut subject = SolverState::<M>::from_digits(&grid);
         let mut reference = MarkGrid::from_digits(&grid);
         let cell = 2;
         let d = Digit::new(1).unwrap();

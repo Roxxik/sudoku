@@ -22,7 +22,7 @@ use generator_lab::fill::random_solution;
 use generator_lab::generate::strip_to_minimal;
 use generator_lab::probe::{Prober, Search, Singles};
 use generator_lab::repr::CELLS;
-use generator_lab::repr::SearchState;
+use generator_lab::repr::SolverState;
 use generator_lab::repr::banded::{Bands, RowMajor};
 use generator_lab::rng::Rng;
 use generator_lab::scan::{Bivalue, LooseMrv, Mrv, MrvRecount};
@@ -39,7 +39,7 @@ struct Run {
 }
 
 /// Strip with a new-stack prober `P` on the banded packing.
-fn run_new<P: Prober<SearchState<M>>>(n: u64) -> Run {
+fn run_new<P: Prober<SolverState<M>>>(n: u64) -> Run {
     let mut fp = FNV_OFFSET;
     let mut givens = 0usize;
     let t = Instant::now();

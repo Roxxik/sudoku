@@ -20,7 +20,7 @@
 //! board is genuinely stuck.
 
 use crate::repr::banded::{Band, Banding, Bands, RowMajor};
-use crate::repr::{Branchable, Digit, FlatGridMask, Marks, SearchState};
+use crate::repr::{Branchable, Digit, FlatGridMask, Marks, SolverState};
 use crate::sieve::Sieve;
 
 /// The state of a board once propagation can place no more forced cells.
@@ -34,7 +34,7 @@ pub enum Fixpoint {
     Stuck,
 }
 
-/// Drive a [`SearchState`] to a propagation fixpoint in place before the search
+/// Drive a [`SolverState`] to a propagation fixpoint in place before the search
 /// branches: place every forced cell so the branch only ever fires on a stuck board.
 /// The swap point — the flat reference does naked singles; the banded packing adds the
 /// fused hidden-single sweep.
@@ -43,7 +43,7 @@ pub trait Propagate: Branchable {
     /// caller branches only on [`Fixpoint::Stuck`]; `Solved`/`Dead` are terminal, so it
     /// skips the branch scan on them — the verdict the drain already computed, rather
     /// than a second pass to rediscover it.
-    fn propagate(state: &mut SearchState<Self>) -> Fixpoint;
+    fn propagate(state: &mut SolverState<Self>) -> Fixpoint;
 }
 
 /// Place every naked single (one-candidate cell) in place, looping to a fixpoint —
@@ -57,7 +57,7 @@ pub trait Propagate: Branchable {
 /// naked loop), [`Stuck`](Fixpoint::Stuck) means every unsolved cell has >= 2
 /// candidates so the sweep may still fire.
 #[inline(always)]
-fn drain_naked_singles<M: Branchable>(state: &mut SearchState<M>) -> Fixpoint {
+fn drain_naked_singles<M: Branchable>(state: &mut SolverState<M>) -> Fixpoint {
     loop {
         // The raw (unmasked) sieve: a decided cell's stale bits can inflate its tier,
         // but `& unsolved` below drops it — so the per-digit `& unsolved` `compute`
@@ -102,7 +102,7 @@ impl Propagate for FlatGridMask {
     /// The flat reference has no in-lane units, so it stops at naked singles — still
     /// correct (the branch reaches every completion), just less pruning than banded.
     #[inline]
-    fn propagate(state: &mut SearchState<Self>) -> Fixpoint {
+    fn propagate(state: &mut SolverState<Self>) -> Fixpoint {
         drain_naked_singles(state) // no in-lane units to sweep — naked singles are all
     }
 }
@@ -110,7 +110,7 @@ impl Propagate for FlatGridMask {
 impl Propagate for Bands<RowMajor> {
     /// Naked singles drained, then the fused row/box hidden-single sweep, looping
     /// until neither fires — bb's `propagate` structure on the new representation.
-    fn propagate(state: &mut SearchState<Self>) -> Fixpoint {
+    fn propagate(state: &mut SolverState<Self>) -> Fixpoint {
         super::band_ctr_inc(0); // propagate-calls (no-op without feature "count")
         loop {
             // Solved/dead boards can't yield a hidden single — skip the sweep, as bb's
@@ -157,7 +157,7 @@ fn lone(unit: usize) -> Option<usize> {
 /// by branching, never swept. Returns whether any placement was made, so the caller
 /// loops it against [`drain_naked_singles`] to a joint fixpoint.
 #[inline(always)]
-fn band_hidden_singles(state: &mut SearchState<Bands<RowMajor>>) -> bool {
+fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> bool {
     let mut changed = false;
     for b in 0..3 {
         for di in 0..9 {

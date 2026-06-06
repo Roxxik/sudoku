@@ -1,11 +1,11 @@
 //! The scan/sieve completion search — the fill's machinery read for
-//! existence/uniqueness. Same [`SearchState`] + `scan -> branch -> recurse` shape as
+//! existence/uniqueness. Same [`SolverState`] + `scan -> branch -> recurse` shape as
 //! [`Fill`](crate::fill), but seeded from a puzzle and counting completions instead
 //! of returning the first. Generic over the [`GridMask`](crate::repr::GridMask)
 //! packing **and** the [`BranchStrategy`] `S`, so `Mrv` vs `Bivalue` (the prober's
 //! rule) plug in and bench — `count_completions::<M, Mrv>` vs `::<M, Bivalue>`.
 //!
-//! Branching copies the `SearchState` (it is `Copy` — no heap clone). Naked-single +
+//! Branching copies the `SolverState` (it is `Copy` — no heap clone). Naked-single +
 //! dead/solved verdicts come from the [`Sieve`](crate::sieve) inside `scan`;
 //! completeness comes from the branch, so this is correct for any `S` (a strategy
 //! only changes which cell is branched, never the count). Hidden-single propagation
@@ -13,13 +13,13 @@
 
 use super::propagate::Fixpoint;
 use super::Propagate;
-use crate::repr::{Digit, Marks, SearchState};
+use crate::repr::{Digit, Marks, SolverState};
 use crate::scan::{BranchStrategy, Scan};
 
 /// The number of completions of `state`, counting only up to `cap`, branching by
 /// strategy `S` (which carries its own sieve-depth cap — that only changes which
 /// cell is branched, never the count).
-pub fn count_completions<M, S>(state: SearchState<M>, cap: usize) -> usize
+pub fn count_completions<M, S>(state: SolverState<M>, cap: usize) -> usize
 where
     M: Propagate,
     S: BranchStrategy,
@@ -30,7 +30,7 @@ where
     found
 }
 
-fn count<M, S>(state: &mut SearchState<M>, cap: usize, found: &mut usize)
+fn count<M, S>(state: &mut SolverState<M>, cap: usize, found: &mut usize)
 where
     M: Propagate,
     S: BranchStrategy,
@@ -83,7 +83,7 @@ where
 mod tests {
     use super::count_completions;
     use crate::repr::banded::{Bands, RowMajor};
-    use crate::repr::{DigitGrid, FlatGridMask, Marks, SearchState};
+    use crate::repr::{DigitGrid, FlatGridMask, Marks, SolverState};
     use crate::scan::{Bivalue, Mrv};
 
     const PUZZLE: &str = "\
@@ -107,8 +107,8 @@ mod tests {
         287419635\
         345286179";
 
-    fn state<M: crate::repr::GridMask>(s: &str) -> SearchState<M> {
-        SearchState::from_digits(&DigitGrid::parse(s).unwrap())
+    fn state<M: crate::repr::GridMask>(s: &str) -> SolverState<M> {
+        SolverState::from_digits(&DigitGrid::parse(s).unwrap())
     }
 
     #[test]

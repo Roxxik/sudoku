@@ -29,7 +29,7 @@
 //!   `FusedLogicSolver`, the technique-driven, no-backtracking spec gate over the
 //!   `repr` layer, parallel to [`probe`].
 //! - [`probe`]: the existence/uniqueness probers (`Search`, `Singles`) over the
-//!   `repr` layer, the composable [`technique`](probe::technique) singles the
+//!   `repr` layer, the composable [`techniques`](probe::techniques) singles the
 //!   `Singles` reference prober drives, plus the native packed W=8 SIMT prober
 //!   ([`probe::simt`]).
 //! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.

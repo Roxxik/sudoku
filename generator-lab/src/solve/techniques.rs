@@ -13,7 +13,7 @@
 //! Reads work off *candidates only* — a digit already placed in a unit has left
 //! every empty peer's candidates (the [`Marks`] invariant), so it never shows up in
 //! a unit scan and needs no separate "is it placed here" check (the same trick
-//! [`crate::probe::technique`] uses).
+//! [`crate::probe::techniques`] uses).
 
 use super::LogicBoard;
 use crate::repr::{CELLS, CellIdx, Digit, Mark, UNITS};

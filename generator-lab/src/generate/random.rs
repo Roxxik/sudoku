@@ -13,9 +13,9 @@
 //! runs that bb strip; `tests/equiv_warp` pins the two lane-for-lane).
 //!
 //! The candidate state is carried incrementally across the 81 strip steps exactly as
-//! bb does: a single [`DualBandedMarkGrid`] plus a `clue` map, reopened/reclosed in
-//! place with [`clear_clue`](DualBandedMarkGrid::clear_clue) /
-//! [`place_clue`](DualBandedMarkGrid::place_clue) rather than rebuilt each step. Holding
+//! bb does: a single [`DualSolverState`] plus a `clue` map, reopened/reclosed in
+//! place with [`clear_clue`](DualSolverState::clear_clue) /
+//! [`place_clue`](DualSolverState::place_clue) rather than rebuilt each step. Holding
 //! both bandings live means the uniqueness prober reads the row view and the baseline
 //! gate reads both — with **no per-gate reconstruction**, just as bb reuses one dual
 //! `BitBoard` for both gates. The lone `from_digits` is once per attempt, on the full
@@ -23,7 +23,7 @@
 
 use crate::fill::random_solution;
 use crate::probe::{Prober, Search};
-use crate::repr::banded::{Bands, DualBandedMarkGrid, RowMajor};
+use crate::repr::banded::{Bands, DualSolverState, RowMajor};
 use crate::repr::{Board, CELLS, Digit, DigitGrid, Mark, Marks, PerDigit, Puzzle, Solution};
 use crate::rng::Rng;
 use crate::scan::Bivalue;
@@ -91,7 +91,7 @@ pub(in crate::generate) fn baseline_fast_applicable(spec: &Spec) -> bool {
 /// (exact, no fast-path precondition).
 /// It runs on the **cell-major** [`Board`], not the strip's digit-major board: verify's
 /// technique scans read candidates per cell, O(1) on `Board` vs a 9-board scan per `get`
-/// on `SearchState`, which matters because the avoid-target walk re-solves repeatedly.
+/// on `SolverState`, which matters because the avoid-target walk re-solves repeatedly.
 pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
     let board = Board::from_digits(digits);
     // Positive: the baseline toolbox alone must solve it.
@@ -117,7 +117,7 @@ pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
 /// the produced puzzle reads (and the strip's `alts==0`/`get` source `clue` can't give).
 pub(in crate::generate) struct StripState {
     digits: DigitGrid,
-    dual: DualBandedMarkGrid,
+    dual: DualSolverState,
     clue: PerDigit<RM>,
     /// The most-stripped requirement-meeting grid; the candidate state is rebuilt from
     /// it (by `verify`) only if the attempt succeeds.
@@ -132,8 +132,8 @@ impl StripState {
     /// `from_digits` of the whole attempt — the strip mutates `dual` in place thereafter.
     pub(in crate::generate) fn new(solution: &Solution) -> Self {
         let digits = solution.0.clone();
-        let dual = DualBandedMarkGrid::from_digits(&digits);
-        let clue = DualBandedMarkGrid::clue_map(&digits);
+        let dual = DualSolverState::from_digits(&digits);
+        let clue = DualSolverState::clue_map(&digits);
         StripState { digits, dual, clue, best: None, req_met: false }
     }
 
@@ -155,7 +155,7 @@ impl StripState {
         self.digits.clear(cell);
         let cand = self.dual.clear_clue(&mut self.clue, cell, orig);
         debug_assert!(
-            self.dual == DualBandedMarkGrid::from_digits(&self.digits),
+            self.dual == DualSolverState::from_digits(&self.digits),
             "incremental dual drift after clear at {cell}"
         );
         cand.without(Mark::single(orig)).bits()
@@ -243,7 +243,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
         st.digits.clear(cell);
         let cand = st.dual.clear_clue(&mut st.clue, cell, orig);
         debug_assert!(
-            st.dual == DualBandedMarkGrid::from_digits(&st.digits),
+            st.dual == DualSolverState::from_digits(&st.digits),
             "incremental dual drift after clear at {cell}"
         );
         // `alts == 0` fast path: the cleared cell is still a naked single, so its peers

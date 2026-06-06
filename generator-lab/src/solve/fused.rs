@@ -1,5 +1,5 @@
 //! `FusedLogicSolver` — the **fast path** of the logic solver: bb's dual-view fused
-//! band closure ported onto the [`DualBandedMarkGrid`]. The performance counterpart
+//! band closure ported onto the [`DualSolverState`]. The performance counterpart
 //! of the composable [`LogicSolver`](super::LogicSolver) (the analogue of
 //! [`probe::Search`](crate::probe::Search) to the prober's `Singles`): identical
 //! verdicts, far less work — no per-cell unit scan, no popcount.
@@ -37,7 +37,7 @@
 //! cheap-fixpoint before any subset fires), which is the contract the generator reads.
 
 use super::{LogicSolver, Solver, techniques};
-use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualBandedMarkGrid, RowMajor};
+use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMajor};
 use crate::repr::{Digit, GridMask, Marks};
 use crate::sieve::Sieve;
 use crate::technique_kinds::{
@@ -49,8 +49,8 @@ use crate::technique_kinds::{
 /// [`LogicSolver`](super::LogicSolver); see the module docs for its precondition.
 pub struct FusedLogicSolver;
 
-impl Solver<DualBandedMarkGrid> for FusedLogicSolver {
-    fn solve_tracked(board: &DualBandedMarkGrid, allowed: KindMask) -> SolveTrace {
+impl Solver<DualSolverState> for FusedLogicSolver {
+    fn solve_tracked(board: &DualSolverState, allowed: KindMask) -> SolveTrace {
         const NS: KindMask = 1 << NAKED_SINGLE;
         const HS: KindMask = 1 << HIDDEN_SINGLE;
         const LCP: KindMask = 1 << LC_POINTING;
@@ -72,7 +72,7 @@ impl Solver<DualBandedMarkGrid> for FusedLogicSolver {
 
     /// The avoid-target walk needs per-step technique gating the fused closure can't
     /// express, and it is the cold verify path — delegate to the composable engine.
-    fn min_target_uses(board: &DualBandedMarkGrid, scope: KindMask, target: KindMask) -> usize {
+    fn min_target_uses(board: &DualSolverState, scope: KindMask, target: KindMask) -> usize {
         LogicSolver::min_target_uses(board, scope, target)
     }
 }
@@ -89,7 +89,7 @@ enum Prop {
 
 /// Solve via the gated fused closure + the discrete subset ladder, easiest-first.
 /// `LC` monomorphizes the locked-candidates step away when the baseline excludes it.
-fn fused_solve<const LC: bool>(board: &DualBandedMarkGrid, allowed: KindMask) -> SolveTrace {
+fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> SolveTrace {
     let mut b = board.clone();
     let mut counts = [0u16; NUM];
     let mut fired = 0u32;
@@ -120,7 +120,7 @@ fn fused_solve<const LC: bool>(board: &DualBandedMarkGrid, allowed: KindMask) ->
 /// Drive naked singles + both fused band updates to a joint fixpoint — bb's
 /// `propagate_g`. Naked singles drain first (cheapest), then the row + column band
 /// sweeps; loop until a whole pass changes nothing.
-fn propagate<const LC: bool>(b: &mut DualBandedMarkGrid, fired: &mut u32) -> Prop {
+fn propagate<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> Prop {
     loop {
         match drain_naked_singles(b, fired) {
             Prop::Stuck => {}
@@ -140,7 +140,7 @@ fn propagate<const LC: bool>(b: &mut DualBandedMarkGrid, fired: &mut u32) -> Pro
 /// (`unsolved & exactly(1)`) popcount-free; placement syncs both views. On a
 /// uniquely-solvable board naked singles are forced and never conflict, so a wave
 /// places them all without a contradiction check.
-fn drain_naked_singles(b: &mut DualBandedMarkGrid, fired: &mut u32) -> Prop {
+fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
     loop {
         let sieve = Sieve::<Bands<RowMajor>, 2>::compute_raw(b.row().candidates());
         let unsolved = b.row().unsolved();
@@ -172,7 +172,7 @@ fn drain_naked_singles(b: &mut DualBandedMarkGrid, fired: &mut u32) -> Prop {
 /// candidates once and drive box↔row locked candidates ([`DROP_TRIP`]) and hidden
 /// singles in the three rows and three boxes ([`SINGLE9`]) off it. Returns whether
 /// anything changed. Mirror of bb's `band_update_rm`.
-fn band_update_rm<const LC: bool>(b: &mut DualBandedMarkGrid, fired: &mut u32) -> bool {
+fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
     for band in 0..3 {
         for di in 0..9 {
@@ -214,7 +214,7 @@ fn band_update_rm<const LC: bool>(b: &mut DualBandedMarkGrid, fired: &mut u32) -
 /// view, giving box↔column locked candidates and hidden singles in the three
 /// columns. Boxes are already covered row-major, so only the lines (columns) are
 /// swept. Mirror of bb's `band_update_cm`.
-fn band_update_cm<const LC: bool>(b: &mut DualBandedMarkGrid, fired: &mut u32) -> bool {
+fn band_update_cm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
     for band in 0..3 {
         for di in 0..9 {
@@ -245,10 +245,10 @@ fn band_update_cm<const LC: bool>(b: &mut DualBandedMarkGrid, fired: &mut u32) -
 /// Clear digit `d` from every cell of each dropped triplet, in both views. A
 /// triplet `t = 3*a + g` is band-row (or column-within-stack) `a` × box-column (or
 /// box-row) `g`; its three cells sit at band positions `9*a + 3*g + j`. The
-/// [`Banding`] `B` maps each back to a cell, and [`DualBandedMarkGrid::forbid`]
+/// [`Banding`] `B` maps each back to a cell, and [`DualSolverState::forbid`]
 /// clears it in both bandings — so the row-major and column-major triplet drops
 /// share one routine.
-fn drop_triplets<B: Banding>(b: &mut DualBandedMarkGrid, d: Digit, band: usize, mut dropped: u32) {
+fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut dropped: u32) {
     while dropped != 0 {
         let t = dropped.trailing_zeros() as usize;
         dropped &= dropped - 1;
@@ -263,7 +263,7 @@ fn drop_triplets<B: Banding>(b: &mut DualBandedMarkGrid, d: Digit, band: usize, 
 /// technique that fires, or `None`. Reuses the composable [`super::techniques`]
 /// subsets (they run on any board, the dual grid included); singles and LC are
 /// already drained by the fused closure, so only NakedPair..HiddenQuad remain.
-fn step_subsets(b: &mut DualBandedMarkGrid, allowed: KindMask) -> Option<usize> {
+fn step_subsets(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
     macro_rules! try_subset {
         ($bit:expr, $call:expr) => {
             if allowed & (1 << $bit) != 0 && $call {

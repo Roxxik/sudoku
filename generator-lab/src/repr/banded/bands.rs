@@ -37,7 +37,7 @@ impl<B: Banding> Bands<B> {
 
     /// The three bands as raw 27-bit words in the low three lanes (lane 3 unused) —
     /// the SoA input the packed prober loads into one warp lane. Read-only escape
-    /// hatch, paralleling [`band`](Bands::band): a [`SearchState`](crate::repr::SearchState)
+    /// hatch, paralleling [`band`](Bands::band): a [`SolverState`](crate::repr::SolverState)
     /// row view exports its per-digit candidate bands this way so the native warp can
     /// pack eight probes across SIMD lanes without re-deriving them cell by cell.
     #[inline]

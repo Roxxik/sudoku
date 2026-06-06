@@ -5,9 +5,9 @@
 //! - [`search`]: the fast one — the fill's [`scan`](crate::scan) + [`sieve`](crate::sieve)
 //!   machinery (naked-single sieve + dead/solved verdict + branch), generic over the
 //!   [`BranchStrategy`](crate::scan::BranchStrategy) so `Mrv` vs `Bivalue` plug in
-//!   and bench. Runs on a [`SearchState<M>`](crate::repr::SearchState).
+//!   and bench. Runs on a [`SolverState<M>`](crate::repr::SolverState).
 //! - [`singles`]: the composable reference/fallback — drives the generic
-//!   [`technique`](self::technique) singles (naked + hidden) to a fixpoint, then
+//!   [`techniques`](self::techniques) singles (naked + hidden) to a fixpoint, then
 //!   branches. Slower, but uses the full technique set and runs on any
 //!   [`SolveView`](crate::repr::SolveView). Kept as the correctness oracle and the
 //!   "composable always works" baseline.
@@ -18,7 +18,7 @@
 pub mod propagate;
 pub mod search;
 pub mod singles;
-pub mod technique;
+pub mod techniques;
 
 // The packed W=8 SoA prober. An AVX native play; the wasm cdylib ships the scalar
 // `Search` path, so keep it (and the `std::simd` warp it builds) out of the wasm binary.
@@ -28,7 +28,7 @@ pub mod simt;
 pub use propagate::Propagate;
 
 use crate::counters::counter_block;
-use crate::repr::{SearchState, SolveView};
+use crate::repr::{SolverState, SolveView};
 use crate::scan::BranchStrategy;
 use core::marker::PhantomData;
 
@@ -66,17 +66,17 @@ pub trait Prober<B> {
 }
 
 /// The fast prober: [`search`] (scan/sieve) with branch strategy `S`. Probes a
-/// [`SearchState`] at any [`Branchable`] packing. The sieve depth rides on the
+/// [`SolverState`] at any [`Branchable`] packing. The sieve depth rides on the
 /// strategy (`Mrv<D>`; Bivalue has no knob), so a bench sweeps it as `Search<Mrv<2>>`,
 /// `Search<Mrv<9>>`, … — the same strategy at different candidate-count caps.
 pub struct Search<S>(PhantomData<S>);
 
-impl<M, S> Prober<SearchState<M>> for Search<S>
+impl<M, S> Prober<SolverState<M>> for Search<S>
 where
     M: Propagate,
     S: BranchStrategy,
 {
-    fn count_completions(board: SearchState<M>, cap: usize) -> usize {
+    fn count_completions(board: SolverState<M>, cap: usize) -> usize {
         search::count_completions::<M, S>(board, cap)
     }
 }

@@ -24,7 +24,7 @@ pub use random::{
 
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, RowMajor};
-use crate::repr::{Branchable, CELLS, DigitGrid, Marks, Puzzle, SearchState, Solution};
+use crate::repr::{Branchable, CELLS, DigitGrid, Marks, Puzzle, SolverState, Solution};
 use crate::rng::Rng;
 use crate::scan::Bivalue;
 
@@ -37,7 +37,7 @@ use crate::scan::Bivalue;
 pub fn strip_to_minimal<M, P>(rng: &mut Rng, solution: &Solution) -> Puzzle
 where
     M: Branchable,
-    P: Prober<SearchState<M>>,
+    P: Prober<SolverState<M>>,
 {
     let mut digits: DigitGrid = solution.0.clone();
     let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
@@ -45,15 +45,15 @@ where
     // The candidate board is carried across the 81 attempts and reopened/reclosed in
     // place (bb's `apply_clear`/`apply_place`) rather than rebuilt with `from_digits`
     // each step. `clue` is the per-digit clue map the reopen needs.
-    let mut state = SearchState::<M>::from_digits(&digits);
-    let mut clue = SearchState::<M>::clue_map(&digits);
+    let mut state = SolverState::<M>::from_digits(&digits);
+    let mut clue = SolverState::<M>::clue_map(&digits);
     for cell in positions {
         let Some(orig) = digits.get(cell) else {
             continue;
         };
         digits.clear(cell);
         let cand = state.clear_clue(&mut clue, cell, orig);
-        debug_assert!(state == SearchState::<M>::from_digits(&digits), "incremental drift");
+        debug_assert!(state == SolverState::<M>::from_digits(&digits), "incremental drift");
         // Fast path (bb's `alts == 0`): if the cleared cell still has just one naked
         // candidate, its peers already force `orig` there, so the clue was redundant
         // and uniqueness cannot have changed — keep it removed without probing. ~36%
@@ -91,12 +91,12 @@ mod tests {
     use crate::fill::random_solution;
     use crate::probe::{Propagate, Prober, Search, Singles};
     use crate::repr::banded::{Bands, RowMajor};
-    use crate::repr::{CELLS, DigitGrid, FlatGridMask, Marks, SearchState};
+    use crate::repr::{CELLS, DigitGrid, FlatGridMask, Marks, SolverState};
     use crate::rng::Rng;
     use crate::scan::Bivalue;
 
     fn is_unique<M: Propagate>(digits: &DigitGrid) -> bool {
-        Search::<Bivalue>::is_unique(SearchState::<M>::from_digits(digits))
+        Search::<Bivalue>::is_unique(SolverState::<M>::from_digits(digits))
     }
 
     /// Across several seeds, the stripped puzzle must be (1) a subgrid of the

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use generator_lab::fill::random_solution;
 use generator_lab::generate::verify;
 use generator_lab::probe::{Prober, Search};
-use generator_lab::repr::banded::DualBandedMarkGrid;
+use generator_lab::repr::banded::DualSolverState;
 use generator_lab::repr::{CELLS, DigitGrid, Marks};
 use generator_lab::rng::Rng;
 use generator_lab::scan::Bivalue;
@@ -54,8 +54,8 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
         let mut digits: DigitGrid = solution.0.clone();
-        let mut dual = DualBandedMarkGrid::from_digits(&digits);
-        let mut clue = DualBandedMarkGrid::clue_map(&digits);
+        let mut dual = DualSolverState::from_digits(&digits);
+        let mut clue = DualSolverState::clue_map(&digits);
         p.grid += t.elapsed();
 
         let mut best: Option<DigitGrid> = None;

@@ -54,7 +54,7 @@ impl Marks for MarkGrid {
 impl MarkGrid {
     /// Remove candidate `d` from cell `i` without placing — the technique layer's
     /// pruning primitive (locked candidates / subsets eliminate without deciding a
-    /// cell). The cell-major counterpart of [`SearchState::forbid`](super::SearchState).
+    /// cell). The cell-major counterpart of [`SolverState::forbid`](super::SolverState).
     #[inline]
     pub fn eliminate(&mut self, i: CellIdx, d: Digit) {
         self.0[i].remove(d);

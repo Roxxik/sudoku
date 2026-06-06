@@ -8,8 +8,8 @@
 //!
 //! Implemented by the cell-major scalar [`MarkGrid`](super::MarkGrid) (`[Mark; 81]`,
 //! the reference), the [`Board`](super::Board), the digit-major
-//! [`SearchState<M>`](super::SearchState) (the search/prober board, any packing),
-//! and the dual-view [`DualBandedMarkGrid`](super::banded::DualBandedMarkGrid) (the
+//! [`SolverState<M>`](super::SolverState) (the search/prober board, any packing),
+//! and the dual-view [`DualSolverState`](super::banded::DualSolverState) (the
 //! baseline's — every unit in-lane in one of its two views). A `from_digits`-derived
 //! grid in any packing holds the same candidates cell for cell; the
 //! `marks_agree_across_packings` test pins that.
@@ -50,7 +50,7 @@ pub trait Marks {
 #[cfg(test)]
 mod tests {
     use super::Marks;
-    use crate::repr::banded::DualBandedMarkGrid;
+    use crate::repr::banded::DualSolverState;
     use crate::repr::{CELLS, Digit, DigitGrid, MarkGrid};
 
     /// A mid-solve grid (givens + space across all three bands), the same fixture
@@ -90,6 +90,6 @@ mod tests {
     #[test]
     fn marks_agree_across_packings() {
         agrees_with_reference::<MarkGrid>();
-        agrees_with_reference::<DualBandedMarkGrid>();
+        agrees_with_reference::<DualSolverState>();
     }
 }

@@ -22,8 +22,8 @@
 
 use generator_lab::fill::random_solution;
 use generator_lab::probe::{Prober, Search};
-use generator_lab::repr::banded::{Bands, DualBandedMarkGrid, RowMajor};
-use generator_lab::repr::{CELLS, Digit, DigitGrid, Marks, SearchState};
+use generator_lab::repr::banded::{Bands, DualSolverState, RowMajor};
+use generator_lab::repr::{CELLS, Digit, DigitGrid, Marks, SolverState};
 use generator_lab::rng::Rng;
 use generator_lab::scan::Bivalue;
 use generator_lab::solve::{FusedLogicSolver, LogicSolver, Solver};
@@ -77,14 +77,14 @@ fn core_trace(line: &str, baseline: KindMask) -> SolveTrace {
 /// same puzzle the reference sees.
 fn logic_trace(line: &str, baseline: KindMask) -> SolveTrace {
     let grid = DigitGrid::parse(line).expect("valid line");
-    let state = SearchState::<Bands<RowMajor>>::from_digits(&grid);
+    let state = SolverState::<Bands<RowMajor>>::from_digits(&grid);
     LogicSolver::solve_tracked(&state, baseline)
 }
 
 /// The fused fast-path logic solver on the dual-banded grid, same puzzle.
 fn fused_trace(line: &str, baseline: KindMask) -> SolveTrace {
     let grid = DigitGrid::parse(line).expect("valid line");
-    let dual = DualBandedMarkGrid::from_digits(&grid);
+    let dual = DualSolverState::from_digits(&grid);
     FusedLogicSolver::solve_tracked(&dual, baseline)
 }
 
@@ -115,7 +115,7 @@ fn check_spec(label: &str, spec: &Spec, attempts: usize, min_compared: usize) {
             let alts = cb.candidates(i) & !(1u16 << (orig - 1));
             let nonunique = alts != 0 && {
                 let grid = DigitGrid::parse(&cb.to_line()).expect("valid line");
-                let mut probe = SearchState::<Bands<RowMajor>>::from_digits(&grid);
+                let mut probe = SolverState::<Bands<RowMajor>>::from_digits(&grid);
                 probe.forbid(i, Digit::new(orig).expect("nonzero clue digit"));
                 Search::<Bivalue>::has_completion(probe)
             };

@@ -72,7 +72,7 @@ pub fn hidden_singles<M: Marks>(marks: &mut M) -> bool {
 #[cfg(test)]
 mod tests {
     use super::hidden_singles;
-    use crate::repr::banded::DualBandedMarkGrid;
+    use crate::repr::banded::DualSolverState;
     use crate::repr::{Board, CELLS, DigitGrid, MarkGrid, Marks};
 
     /// A classic puzzle solvable largely by singles, and its unique solution — so
@@ -117,7 +117,7 @@ mod tests {
     fn hidden_singles_agree_across_packings() {
         let grid = DigitGrid::parse(PUZZLE).unwrap();
         let (scalar, fired) = fixpoint::<MarkGrid>(&grid);
-        let (banded, _) = fixpoint::<DualBandedMarkGrid>(&grid);
+        let (banded, _) = fixpoint::<DualSolverState>(&grid);
         assert!(fired, "no hidden single fired — test is vacuous");
         for c in 0..CELLS {
             assert_eq!(scalar.get(c), banded.get(c), "cell {c}");

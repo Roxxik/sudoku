@@ -5,7 +5,7 @@
 //! immediately pulls the next probe (the perfect-refill regime, ~2.6x per core).
 //!
 //! Its [`Probe`] SoA is loaded from a
-//! [`SearchState<Bands<RowMajor>>`](crate::repr::SearchState) row view (via
+//! [`SolverState<Bands<RowMajor>>`](crate::repr::SolverState) row view (via
 //! [`crate::repr::banded::Bands::to_lanes`]). The row-major banding lays cells out
 //! as `cell = 27*band + pos` ([`RowMajor`]), so the gather-free smear+ALU kernel and
 //! its bit twiddling read straight off the bands; the cell <-> (lane, bit) helpers
@@ -170,7 +170,7 @@ counter_block!(PSTAT: 3, inc = pstat_bump, add = pstat_add, snapshot = pstat_sna
 counter_block!(DSTAT: 4, inc = dstat_inc, add = dstat_add, snapshot = dstat_snapshot, reset = dstat_reset);
 
 /// One lane's input to the packed prober: its row-major candidate bands and empty
-/// mask (from a [`SearchState<Bands<RowMajor>>`](crate::repr::SearchState) row view,
+/// mask (from a [`SolverState<Bands<RowMajor>>`](crate::repr::SolverState) row view,
 /// via [`crate::repr::banded::Bands::to_lanes`]), the stripped `cell`, and the
 /// alternate-digit mask the cell is restricted to.
 #[derive(Clone, Copy)]

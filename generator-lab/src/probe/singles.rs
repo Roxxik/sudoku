@@ -1,8 +1,8 @@
 //! The composable completion search — the reference/fallback prober. It drives the
-//! generic [`technique`](super::technique) singles (naked + hidden, over the
+//! generic [`techniques`](super::techniques) singles (naked + hidden, over the
 //! per-cell [`Marks`](crate::repr::Marks) contract) to a fixpoint, then branches.
 //! Generic over any [`SolveView`] (candidates + occupancy + clone), so it runs on
-//! the scalar [`Board`](crate::repr::Board), a [`SearchState`](crate::repr::SearchState),
+//! the scalar [`Board`](crate::repr::Board), a [`SolverState`](crate::repr::SolverState),
 //! or the dual banded grid.
 //!
 //! Slower than [`super::search`] (get-based, all 27 units, hand-rolled MRV branch),
@@ -11,7 +11,7 @@
 //! Completeness comes from the branch, so the techniques are pure pruning.
 
 use crate::repr::{CELLS, CellIdx, SolveView};
-use super::technique::{hidden_singles, naked_singles};
+use super::techniques::{hidden_singles, naked_singles};
 
 enum Status {
     Solved,
@@ -92,7 +92,7 @@ fn count<V: SolveView>(mut view: V, cap: usize, found: &mut usize) {
 mod tests {
     use super::count_completions;
     use crate::repr::banded::{Bands, RowMajor};
-    use crate::repr::{Board, DigitGrid, Marks, SearchState};
+    use crate::repr::{Board, DigitGrid, Marks, SolverState};
 
     const PUZZLE: &str = "\
         53..7....\
@@ -106,18 +106,18 @@ mod tests {
         ....8..79";
 
     /// The composable prober must give the same count as the scan/sieve one on the
-    /// scalar `Board` and a banded `SearchState` — the cross-engine, cross-packing
+    /// scalar `Board` and a banded `SolverState` — the cross-engine, cross-packing
     /// oracle.
     #[test]
     fn agrees_with_search_prober() {
         let grid = DigitGrid::parse(PUZZLE).unwrap();
         let board = Board::from_digits(&grid);
-        let state = SearchState::<Bands<RowMajor>>::from_digits(&grid);
+        let state = SolverState::<Bands<RowMajor>>::from_digits(&grid);
         let via_board = count_completions(board, 2);
         let via_state = count_completions(state, 2);
         let via_search =
             crate::probe::search::count_completions::<Bands<RowMajor>, crate::scan::Bivalue>(
-                SearchState::<Bands<RowMajor>>::from_digits(&grid),
+                SolverState::<Bands<RowMajor>>::from_digits(&grid),
                 2,
             );
         assert_eq!(via_board, 1);
