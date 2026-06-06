@@ -23,13 +23,15 @@
 //!   reproduces core's for a given seed) plus the shared FNV fingerprint.
 //! - [`technique_kinds`]: the shared taxonomy — kind indices, `KindMask`,
 //!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` a logic solve returns.
-//! - [`technique`] / [`scan`] / [`sieve`]: the composable technique steps, the
-//!   MRV/Bivalue branch strategies, and the popcount-free naked-single sieve.
+//! - [`scan`] / [`sieve`]: the MRV/Bivalue branch strategies and the
+//!   popcount-free naked-single sieve the fast prober runs on.
 //! - [`solve`]: the **logic solver** — `LogicSolver` and its fused fast path
 //!   `FusedLogicSolver`, the technique-driven, no-backtracking spec gate over the
 //!   `repr` layer, parallel to [`probe`].
 //! - [`probe`]: the existence/uniqueness probers (`Search`, `Singles`) over the
-//!   `repr` layer, plus the native packed W=8 SIMT prober ([`probe::simt`]).
+//!   `repr` layer, the composable [`technique`](probe::technique) singles the
+//!   `Singles` reference prober drives, plus the native packed W=8 SIMT prober
+//!   ([`probe::simt`]).
 //! - [`spec`]: compact `train`/`drill` spec, faithful to core's `Spec`.
 //! - [`fill`]: the random full-grid filler (banded-bitboard MRV search), the first
 //!   half of every attempt.
@@ -53,7 +55,6 @@ pub mod scan;
 pub mod sieve;
 pub mod solve;
 pub mod spec;
-pub mod technique;
 pub mod technique_kinds;
 pub mod util;
 

@@ -7,7 +7,7 @@
 //!   [`BranchStrategy`](crate::scan::BranchStrategy) so `Mrv` vs `Bivalue` plug in
 //!   and bench. Runs on a [`SearchState<M>`](crate::repr::SearchState).
 //! - [`singles`]: the composable reference/fallback — drives the generic
-//!   [`technique`](crate::technique) singles (naked + hidden) to a fixpoint, then
+//!   [`technique`](self::technique) singles (naked + hidden) to a fixpoint, then
 //!   branches. Slower, but uses the full technique set and runs on any
 //!   [`SolveView`](crate::repr::SolveView). Kept as the correctness oracle and the
 //!   "composable always works" baseline.
@@ -18,6 +18,7 @@
 pub mod propagate;
 pub mod search;
 pub mod singles;
+pub mod technique;
 
 // The packed W=8 SoA prober. An AVX native play; the wasm cdylib ships the scalar
 // `Search` path, so keep it (and the `std::simd` warp it builds) out of the wasm binary.

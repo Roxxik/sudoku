@@ -1,5 +1,5 @@
 //! The composable completion search — the reference/fallback prober. It drives the
-//! generic [`technique`](crate::technique) singles (naked + hidden, over the
+//! generic [`technique`](super::technique) singles (naked + hidden, over the
 //! per-cell [`Marks`](crate::repr::Marks) contract) to a fixpoint, then branches.
 //! Generic over any [`SolveView`] (candidates + occupancy + clone), so it runs on
 //! the scalar [`Board`](crate::repr::Board), a [`SearchState`](crate::repr::SearchState),
@@ -11,7 +11,7 @@
 //! Completeness comes from the branch, so the techniques are pure pruning.
 
 use crate::repr::{CELLS, CellIdx, SolveView};
-use crate::technique::{hidden_singles, naked_singles};
+use super::technique::{hidden_singles, naked_singles};
 
 enum Status {
     Solved,
