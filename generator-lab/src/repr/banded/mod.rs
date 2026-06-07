@@ -22,6 +22,10 @@ mod dual_solver_state;
 
 pub use dual_solver_state::DualSolverState;
 
+// Naked-single group-size histogram (`feature = "count"`) — read by `combobench`.
+#[cfg(feature = "count")]
+pub use dual_solver_state::{psg_reset, psg_snapshot};
+
 // The scalar per-band primitive and the banding geometry trait, for the fused
 // per-band prober sweep (`Bands::band` -> `Band`, `Banding::cell_at`).
 pub(crate) use band::Band;

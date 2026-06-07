@@ -21,9 +21,16 @@
 
 use super::banding::{ColMajor, RowMajor};
 use super::bands::Bands;
+use crate::counters::counter_block;
 use crate::repr::{
     Branchable, CellIdx, Digit, DigitGrid, GridMask, Mark, Marks, Occupancy, PerDigit, SolverState,
 };
+
+// --- naked-single group-size histogram (feature = "count") --------------------
+// Bucket `i` = number of `place_single_group` calls whose group held `i` cells
+// (saturating at 9). Sizes the single-cell fast-path opportunity: bucket 1 is the
+// share that is just a plain `place`. `psg_inc(i)` tallies. Read by `psgstat`.
+counter_block!(PSG: 10, inc = psg_inc, add = psg_add, snapshot = psg_snapshot, reset = psg_reset);
 
 /// Candidates held in both bandings, kept consistent. The two views always encode
 /// the same candidate set (transposed), so reads answer from the row-major copy;
@@ -68,6 +75,16 @@ impl DualSolverState {
     /// supplying the cells for both), then each view decides its cells in a single
     /// masked op via [`SolverState::place_group_with`] — no per-cell `place`.
     pub fn place_single_group(&mut self, d: Digit, group: Bands<RowMajor>) {
+        // PSG histogram (count-only): a single-cell group is the ~74% case, but a
+        // single-cell fast path (`pop == 1` -> `place`) and a per-lane walk both measured
+        // NET SLOWER e2e than this `first()` walk — the `pop` popcounts + the ~26%
+        // unpredictable branch cost more than they save over `place_group_with`'s
+        // unavoidable work — so the walk stays as-is and only the diagnostic remains.
+        #[cfg(feature = "count")]
+        {
+            let l = group.to_lanes();
+            psg_inc(((l[0].count_ones() + l[1].count_ones() + l[2].count_ones()) as usize).min(9));
+        }
         let mut row_peers = <Bands<RowMajor> as GridMask>::EMPTY;
         let mut col_group = <Bands<ColMajor> as GridMask>::EMPTY;
         let mut col_peers = <Bands<ColMajor> as GridMask>::EMPTY;
@@ -126,12 +143,19 @@ impl DualSolverState {
         // `d`-clues' peer masks — accumulated per view from the same row-major clue cells.
         let mut r_blocked = <Bands<RowMajor> as GridMask>::EMPTY;
         let mut c_blocked = <Bands<ColMajor> as GridMask>::EMPTY;
-        let mut rest = clue[d];
-        while rest.any() {
-            let q = rest.first();
-            rest &= !<Bands<RowMajor> as GridMask>::cell(q);
-            r_blocked |= <Bands<RowMajor> as GridMask>::peers(q);
-            c_blocked |= <Bands<ColMajor> as GridMask>::peers(q);
+        // Walk clue[d]'s set cells one row-major band (lane) at a time — `cell = 27*lane
+        // + bit`, so the bit-walk is a scalar `trailing_zeros`/`w & w-1` per band instead
+        // of `first()`'s cross-lane branch plus a `cell(q)` table load to clear each
+        // visited cell. Only the two peer-mask ORs (one per view) are intrinsic.
+        let lanes = clue[d].to_lanes();
+        for (lane, mut w) in lanes[..3].iter().copied().enumerate() {
+            let base = lane * 27;
+            while w != 0 {
+                let q = base + w.trailing_zeros() as usize;
+                w &= w - 1;
+                r_blocked |= <Bands<RowMajor> as GridMask>::peers(q);
+                c_blocked |= <Bands<ColMajor> as GridMask>::peers(q);
+            }
         }
         self.row.open_digit_on_peers(d, r_peers, r_blocked);
         self.col

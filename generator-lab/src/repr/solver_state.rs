@@ -78,13 +78,19 @@ impl<M: GridMask> SolverState<M> {
     #[inline]
     pub(crate) fn open_cell(&mut self, cellmask: M, cand: Mark) {
         self.unsolved |= cellmask;
+        // Clear the cell's bit in every digit board unconditionally (a just-decided cell
+        // carries stale candidate bits), then set it back only on the surviving digits.
+        // Splitting the always-clear from the survivor-set turns the per-digit
+        // data-dependent `contains` branch into a popcount-length walk over `cand`.
+        let notcell = !cellmask;
         for e in 0..9 {
-            let dig = Digit::from_index(e);
-            if cand.contains(dig) {
-                self.candidates[dig] |= cellmask;
-            } else {
-                self.candidates[dig] &= !cellmask;
-            }
+            self.candidates[Digit::from_index(e)] &= notcell;
+        }
+        let mut bits = cand.bits();
+        while bits != 0 {
+            let e = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            self.candidates[Digit::from_index(e)] |= cellmask;
         }
     }
 

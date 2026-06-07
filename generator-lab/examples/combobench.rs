@@ -113,9 +113,20 @@ fn main() {
     let total = lanes * per_lane;
     println!("combobench[{label}] toolbox={toolbox}: {lanes} lanes x {per_lane} = {total} attempts");
 
+    #[cfg(feature = "count")]
+    generator_lab::repr::banded::psg_reset();
     let t0 = std::time::Instant::now();
     let res = run_warp(base_seed, &spec, lanes, per_lane);
     let dt = t0.elapsed();
+    #[cfg(feature = "count")]
+    {
+        let h = generator_lab::repr::banded::psg_snapshot();
+        let total: u64 = h.iter().sum();
+        let pct: Vec<String> =
+            h.iter().map(|&c| format!("{:.1}%", 100.0 * c as f64 / total.max(1) as f64)).collect();
+        println!("  place_single_group group-size histogram (cells): {h:?}");
+        println!("    share: {}", pct.join(" "));
+    }
 
     // Combined fingerprint over every lane's per-puzzle-cells FNV fp (lane order fixed),
     // so two builds match iff they produce the byte-identical set of puzzles.
