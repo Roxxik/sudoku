@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# cq -- compute queue: serialize perf-sensitive benchmark runs across worktrees/sessions.
+#
+# The point: several agent sessions in different worktrees all run benchmarks on the same
+# machine. Low-single-digit-percent measurements can't tolerate a neighbour stealing CPU.
+# cq is a thin, crash-safe wrapper around flock so a session can just say "this part is
+# timing-sensitive" and the kernel does the queueing -- the agent keeps all its bash skills
+# (ad-hoc loops, perf, etc.), it only wraps the compute part.
+#
+# Classes:
+#   sensitive    EXCLUSIVE. Waits for the machine to empty, sleeps a cooldown so the previous
+#                job's cache/freq/thermal residue settles, then runs ALONE. Use whenever you
+#                read a duration / cycles / IPC / cache-miss / mispredict / any ratio.
+#   heavy        SHARED. Heavy jobs run concurrently with each other but are mutually exclusive
+#                with sensitive jobs. Use for load-heavy work that only reads counts contention
+#                can't move (instructions, branches retired) or that just needs to finish.
+#   maybe-heavy  UNLOCKED. Runs immediately, never waits, never blocks anyone -- but its run
+#                window is recorded so a sensitive job can warn if it was overlapped. The escape
+#                hatch for "I think this is harmless"; if a sensitive run reports contamination,
+#                reclassify that work to heavy.
+#
+# Bookkeeping:
+#   cq status            current exclusive holder + live jobs
+#   cq overlaps [N]      last N sensitive runs that were overlapped by maybe-heavy work
+#   cq flag MSG...       record a manual note (a sensitive agent flagging a suspect measurement)
+#
+# Lock state is machine-global (CQ_DIR, default /tmp/cq) so it serializes across ALL worktrees;
+# keeping it in the worktree would defeat the whole purpose. Name your session with CQ_LABEL
+# (default: <repo-basename> pid<N>). Tune CQ_COOLDOWN (seconds, default 2).
+
+set -uo pipefail
+
+CQ_DIR=${CQ_DIR:-/tmp/cq}
+COOLDOWN=${CQ_COOLDOWN:-2}
+EVENTS_MAX=${CQ_EVENTS_MAX:-5000}   # trim events.log once it grows past this many lines
+
+LIVE="$CQ_DIR/live"          # one file per in-flight job (named by pid) -> real-time overlap view
+EVENTS="$CQ_DIR/events.log"  # completed jobs: start<TAB>end<TAB>class<TAB>label
+FLAGS="$CQ_DIR/flags.log"    # manual + auto contamination notes for you to review
+INTENT="$CQ_DIR/intent.lock" # writer-preference gate (held by a waiting/running sensitive job)
+DATA="$CQ_DIR/data.lock"     # the actual shared/exclusive lock
+HOLDER="$CQ_DIR/holder"      # human-readable current exclusive holder
+
+mkdir -p "$LIVE"
+: >> "$EVENTS"; : >> "$FLAGS"
+
+now() { date +%s; }
+label=${CQ_LABEL:-"$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)") pid$$"}
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 2
+}
+
+# Drop live entries whose process died (a crashed agent leaves a stale marker, not a stale lock --
+# flock releases on its own; this just keeps the overlap view honest).
+reap() {
+  local f pid
+  for f in "$LIVE"/*; do
+    [[ -e "$f" ]] || continue
+    pid=${f##*/}
+    kill -0 "$pid" 2>/dev/null || rm -f "$f"
+  done
+}
+
+# Keep events.log bounded; halve it when it gets large. Cheap log rotation, no cron needed.
+rotate() {
+  local n
+  n=$(wc -l < "$EVENTS" 2>/dev/null || echo 0)
+  if (( n > EVENTS_MAX )); then
+    tail -n $(( EVENTS_MAX / 2 )) "$EVENTS" > "$EVENTS.tmp" 2>/dev/null && mv "$EVENTS.tmp" "$EVENTS"
+  fi
+}
+
+sub=${1:-}; [[ $# -ge 1 ]] && shift || usage
+
+case "$sub" in
+  status)
+    reap
+    if [[ -s "$HOLDER" ]]; then echo "exclusive: $(cat "$HOLDER")"; else echo "exclusive: free"; fi
+    local_any=0
+    for f in "$LIVE"/*; do
+      [[ -e "$f" ]] || continue
+      IFS=$'\t' read -r st cls lbl < "$f"
+      printf 'live: %-11s %s (since %s)\n' "$cls" "$lbl" "$(date -d "@$st" +%T)"
+      local_any=1
+    done
+    (( local_any )) || echo "live: none"
+    exit 0;;
+  overlaps)
+    n=${1:-10}
+    awk -F'\t' '$3=="sensitive"' "$EVENTS" | tail -n "$n" | while IFS=$'\t' read -r s e cls lbl; do
+      hits=$(awk -F'\t' -v s="$s" -v e="$e" \
+        '$3=="maybe-heavy" && $1<e && $2>s {printf "    overlapped by: %s (ran %ds)\n", $4, $2-$1}' "$EVENTS")
+      if [[ -n "$hits" ]]; then
+        echo "sensitive: $lbl  [$(date -d "@$s" +%T)..$(date -d "@$e" +%T)]"
+        echo "$hits"
+      fi
+    done
+    exit 0;;
+  flag)
+    [[ $# -ge 1 ]] || usage
+    printf '%s\t%s\tMANUAL: %s\n' "$(now)" "$label" "$*" >> "$FLAGS"
+    echo "[cq] flagged: $*" >&2
+    exit 0;;
+  heavy|sensitive|maybe-heavy) ;;
+  *) usage;;
+esac
+
+[[ "${1:-}" == "--" ]] && shift
+[[ $# -ge 1 ]] || usage
+
+reap; rotate
+start=$(now)
+livefile="$LIVE/$$"
+printf '%s\t%s\t%s\n' "$start" "$sub" "$label" > "$livefile"
+
+finish() {
+  local end; end=$(now)
+  printf '%s\t%s\t%s\t%s\n' "$start" "$end" "$sub" "$label" >> "$EVENTS"
+
+  # A sensitive run that overlapped any maybe-heavy work is suspect -- surface it loudly so the
+  # agent can report back to you, and persist it to flags.log so you can reconcile sessions later.
+  if [[ "$sub" == sensitive ]]; then
+    local hits f st cls lbl2
+    hits=$(awk -F'\t' -v s="$start" -v e="$end" \
+      '$3=="maybe-heavy" && $1<e && $2>s {print $4}' "$EVENTS")
+    for f in "$LIVE"/*; do
+      [[ -e "$f" ]] || continue
+      IFS=$'\t' read -r st cls lbl2 < "$f"
+      [[ "$cls" == maybe-heavy && "$st" -lt "$end" ]] && hits+="${hits:+$'\n'}$lbl2 (still live)"
+    done
+    if [[ -n "$hits" ]]; then
+      echo "[cq] WARNING: this sensitive run overlapped maybe-heavy work -- timing may be contaminated:" >&2
+      echo "$hits" | sed 's/^/[cq]   /' >&2
+      printf '%s\t%s\tAUTO overlap: %s\n' "$end" "$label" "$(echo "$hits" | tr '\n' ';')" >> "$FLAGS"
+    fi
+    : > "$HOLDER" 2>/dev/null || true
+  fi
+
+  rm -f "$livefile"
+}
+trap finish EXIT
+
+exec 8>"$INTENT"
+exec 9>"$DATA"
+
+case "$sub" in
+  heavy)
+    # Reader: tap the intent gate (blocks if a sensitive job is waiting/running), take the shared
+    # lock, then release the gate so other heavy jobs can join concurrently.
+    flock -x 8
+    flock -s 9
+    flock -u 8
+    ;;
+  sensitive)
+    # Writer: HOLD the intent gate for the whole duration so no new heavy job can slip in front of
+    # us -> no writer starvation. Then drain readers, take exclusive, settle, run alone.
+    if ! flock -nx 8; then
+      echo "[cq] waiting for compute lock (holder: $(cat "$HOLDER" 2>/dev/null || echo '?'))..." >&2
+      flock -x 8
+    fi
+    flock -x 9
+    printf '%s  %s  since %s\n' "$sub" "$label" "$(date +%T)" > "$HOLDER"
+    sleep "$COOLDOWN"
+    ;;
+  maybe-heavy)
+    : # no lock -- run free, only the live/events record matters
+    ;;
+esac
+
+"$@"
+rc=$?
+exit "$rc"
