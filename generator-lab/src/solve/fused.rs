@@ -36,10 +36,10 @@
 //! the `solved` verdict are exact on this path (all three engines reach the identical
 //! cheap-fixpoint before any subset fires), which is the contract the generator reads.
 
-use super::{LogicSolver, Solver, techniques};
+use super::{Eliminate, LogicBoard, LogicSolver, Solver, techniques};
 use crate::counters::counter_block;
 use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMajor};
-use crate::repr::{Digit, GridMask, Marks};
+use crate::repr::{Branchable, CellIdx, Digit, GridMask, Mark, Marks, Occupancy};
 use crate::scan::sieve::Sieve;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, JELLYFISH, KindMask, LC_CLAIMING,
@@ -300,13 +300,36 @@ fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut
 
 /// The discrete "harder than the cheap closure" ladder, gated by `allowed`: the
 /// first subset, fish, or bivalue-wing technique that fires, or `None`. Reuses the
-/// composable [`super::techniques`] bodies (they run on any board, the dual grid
-/// included); singles and LC are already drained by the fused closure, so only the
-/// subsets (NakedPair..HiddenQuad), the basic fish (X-Wing..Jellyfish), and the
-/// wings (XY-/XYZ-/W-Wing) remain. The try-order is THIS engine's choice (it follows
+/// composable [`super::techniques`] bodies (they run on any board); singles and LC
+/// are already drained by the fused closure, so only the subsets
+/// (NakedPair..HiddenQuad), the basic fish (X-Wing..Jellyfish), and the wings
+/// (XY-/XYZ-/W-Wing) remain. The try-order is THIS engine's choice (it follows
 /// core's, un-optimized — not benchmarked); branch-scoped specs never put two Expert
 /// branches in scope together, so their relative order is moot in production.
+///
+/// The harder techniques are read-heavy (a fish scans 9x9 cells per digit x2
+/// orientations; the wings scan all 81 cells), and every read is a [`Marks::get`].
+/// On the digit-major [`DualSolverState`] each `get` is a 9-board candidate scan, so
+/// running them on it directly is dominated by that gather (profiled: ~28% of the
+/// w-wing+jellyfish generator in `get` alone). Instead transpose the stalled board
+/// **once** into a cell-major [`CellBoard`] — `get` is then an O(1) [`Mark`] load —
+/// run the ladder there, and replay the handful of eliminations the fired technique
+/// logged back onto `b` (both views). This is the scalar analogue of the SIMT
+/// baseline's `subset_step` / `CellMarks` transpose, identical verdict and elimination
+/// set (the techniques are deterministic over the board contract; `forbid` is
+/// commutative, so the replay order is moot).
 fn step_harder(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
+    let mut cb = CellBoard::from_dual(b);
+    let k = ladder(&mut cb, allowed)?;
+    for &(cell, di) in &cb.elims[..cb.n_elim] {
+        b.forbid(cell as CellIdx, Digit::from_index(di as usize));
+    }
+    Some(k)
+}
+
+/// The easiest-first try-ladder over any [`LogicBoard`], shared by [`step_harder`]'s
+/// cell-major transpose. Returns the first kind whose technique eliminated something.
+fn ladder<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usize> {
     macro_rules! try_kind {
         ($bit:expr, $call:expr) => {
             if allowed & (1 << $bit) != 0 && $call {
@@ -327,6 +350,82 @@ fn step_harder(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
     try_kind!(XYZ_WING, techniques::xyz_wing(b));
     try_kind!(W_WING, techniques::w_wing(b));
     None
+}
+
+/// Candidate-only **cell-major** scratch board for [`step_harder`]'s subset/fish/wing
+/// ladder: each cell's [`Mark`] stored directly, so a technique's per-cell scan reads
+/// it in O(1) rather than [`DualSolverState`]'s digit-major 9-board `get`. Built once
+/// per stall from the stalled board's row view ([`from_dual`](CellBoard::from_dual)),
+/// it logs the eliminations the fired technique makes so [`step_harder`] can replay
+/// just those onto the real (dual) board. The scalar twin of the SIMT baseline's
+/// `CellMarks`.
+#[derive(Clone)]
+struct CellBoard {
+    marks: [Mark; 81],
+    /// Log of `(cell, digit-index)` removed by [`eliminate`](CellBoard::eliminate); one
+    /// firing of any harder technique removes at most a cover's worth of candidates (a
+    /// subset over a nine-cell unit, a fish of `size` cover lines, or a wing's common
+    /// peers — all well under 32), asserted in [`eliminate`](CellBoard::eliminate).
+    elims: [(u8, u8); 32],
+    n_elim: usize,
+}
+
+impl CellBoard {
+    /// Transpose a stalled dual board's live candidates into per-cell marks. Walks each
+    /// digit's row-major live-candidate band (`candidates & unsolved`) by set bit and
+    /// inserts the digit at each cell — cheaper than 81 digit-major `get`s, and the only
+    /// pass that touches the slow representation. A solved cell holds no candidate in any
+    /// band, so it reads as [`Mark::EMPTY`] (matching `DualSolverState::get`); since the
+    /// closure has drained naked singles, every still-empty cell has >= 2 candidates, so
+    /// `is_empty` can be answered straight off the marks (see [`Occupancy`]).
+    fn from_dual(b: &DualSolverState) -> Self {
+        let row = b.row();
+        let unsolved = row.unsolved();
+        let mut marks = [Mark::EMPTY; 81];
+        for di in 0..9 {
+            let d = Digit::from_index(di);
+            let mut rest = row.candidates()[d] & unsolved;
+            while rest.any() {
+                let c = rest.first();
+                rest &= !<Bands<RowMajor> as GridMask>::cell(c);
+                marks[c].insert(d);
+            }
+        }
+        CellBoard { marks, elims: [(0, 0); 32], n_elim: 0 }
+    }
+}
+
+impl Marks for CellBoard {
+    fn from_digits(_: &crate::repr::DigitGrid) -> Self {
+        unreachable!("CellBoard is built from a stalled dual board, not a digit grid")
+    }
+    fn place(&mut self, _: CellIdx, _: Digit) {
+        unreachable!("the harder ladder only eliminates, never places")
+    }
+    #[inline]
+    fn get(&self, cell: CellIdx) -> Mark {
+        self.marks[cell]
+    }
+}
+
+impl Occupancy for CellBoard {
+    /// Empty iff the cell still holds candidates: the closure drained naked singles
+    /// before the stall, so every empty cell has >= 2 marks and every solved cell reads
+    /// [`Mark::EMPTY`] — so non-empty marks exactly identify the unsolved cells.
+    #[inline]
+    fn is_empty(&self, cell: CellIdx) -> bool {
+        !self.marks[cell].is_empty()
+    }
+}
+
+impl Eliminate for CellBoard {
+    #[inline]
+    fn eliminate(&mut self, cell: CellIdx, d: Digit) {
+        debug_assert!(self.n_elim < self.elims.len(), "harder-step eliminations exceeded buffer");
+        self.elims[self.n_elim] = (cell as u8, d.index() as u8);
+        self.n_elim += 1;
+        self.marks[cell].remove(d);
+    }
 }
 
 /// The lone candidate's slot in a 9-bit unit mask, or `None` for zero or more than

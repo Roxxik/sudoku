@@ -16,8 +16,16 @@
 //! [`crate::probe::techniques`] uses).
 
 use super::LogicBoard;
-use crate::repr::{CELLS, CellIdx, Digit, Mark, PEERS, UNITS};
+use crate::repr::{CELLS, CellIdx, Digit, Mark, PEER_MASK, UNITS};
 use super::combinations::for_each_combination;
+
+/// Whether cell `s` sees cell `c` (shares a row, column, or box) — one bit test on
+/// the precomputed peer mask, the wing family's hot "is a peer of" check (replacing a
+/// linear `PEERS[s].contains(&c)` scan over the 20-element peer list).
+#[inline]
+fn sees(s: CellIdx, c: CellIdx) -> bool {
+    (PEER_MASK[s] >> c) & 1 != 0
+}
 
 /// Cell `c`'s box index (0..9) — its band-of-three-rows times three plus its
 /// stack-of-three-columns. The one piece of geometry the locked-candidates scans
@@ -394,12 +402,22 @@ fn eliminate_common_peers<V: LogicBoard>(
     must_see: &[CellIdx],
     d: Digit,
 ) -> bool {
+    // The cells seeing *every* `must_see` endpoint are the intersection of their peer
+    // masks; the excluded wing cells are removed up front. Walking that handful of bits
+    // (lowest cell first, so the elimination order matches the old 0..CELLS scan)
+    // replaces an all-81-cells × all-endpoints `contains` sweep.
+    let mut common = u128::MAX;
+    for &s in must_see {
+        common &= PEER_MASK[s];
+    }
+    for &e in exclude {
+        common &= !(1u128 << e);
+    }
     let mut did = false;
-    for c in 0..CELLS {
-        if exclude.contains(&c) || !v.is_empty(c) || !v.get(c).contains(d) {
-            continue;
-        }
-        if must_see.iter().all(|&s| PEERS[s].contains(&c)) {
+    while common != 0 {
+        let c = common.trailing_zeros() as CellIdx;
+        common &= common - 1;
+        if v.is_empty(c) && v.get(c).contains(d) {
             v.eliminate(c, d);
             did = true;
         }
@@ -415,7 +433,7 @@ pub(super) fn xy_wing<V: LogicBoard>(v: &mut V) -> bool {
     let bivalues = cells_with_n_candidates(v, 2);
     for &(pivot, pcands) in &bivalues {
         for (ai, &(a, acands)) in bivalues.iter().enumerate() {
-            if a == pivot || !PEERS[pivot].contains(&a) {
+            if a == pivot || !sees(pivot, a) {
                 continue;
             }
             // `a` must share exactly one digit (X) with the pivot; its other digit
@@ -431,7 +449,7 @@ pub(super) fn xy_wing<V: LogicBoard>(v: &mut V) -> bool {
             // The second wing must be exactly {Y, Z}: the pivot's other digit + Z.
             let required_b = pcands.without(shared) | z;
             for &(b, bcands) in bivalues.iter().skip(ai + 1) {
-                if b == pivot || b == a || !PEERS[pivot].contains(&b) || bcands != required_b {
+                if b == pivot || b == a || !sees(pivot, b) || bcands != required_b {
                     continue;
                 }
                 let zd = z.iter().next().expect("z is a single digit");
@@ -456,7 +474,7 @@ pub(super) fn xyz_wing<V: LogicBoard>(v: &mut V) -> bool {
         let wings: Vec<(CellIdx, Mark)> = bivalues
             .iter()
             .copied()
-            .filter(|&(c, cands)| PEERS[pivot].contains(&c) && cands.without(pcands).is_empty())
+            .filter(|&(c, cands)| sees(pivot, c) && cands.without(pcands).is_empty())
             .collect();
         if wings.len() < 2 {
             continue;
@@ -493,7 +511,7 @@ pub(super) fn w_wing<V: LogicBoard>(v: &mut V) -> bool {
     let bivalues = cells_with_n_candidates(v, 2);
     for (i, &(x, xcands)) in bivalues.iter().enumerate() {
         for &(y, ycands) in bivalues.iter().skip(i + 1) {
-            if xcands != ycands || PEERS[x].contains(&y) {
+            if xcands != ycands || sees(x, y) {
                 continue;
             }
             // Try each of the two shared digits as the strong-link (conjugate) digit;
@@ -535,9 +553,9 @@ fn w_wing_link<V: LogicBoard>(v: &mut V, x: CellIdx, y: CellIdx, link: Digit, ot
             continue;
         }
         // One endpoint must see `x`, the other `y` (either assignment).
-        let ends = if PEERS[c1].contains(&x) && PEERS[c2].contains(&y) {
+        let ends = if sees(c1, x) && sees(c2, y) {
             Some((c1, c2))
-        } else if PEERS[c1].contains(&y) && PEERS[c2].contains(&x) {
+        } else if sees(c1, y) && sees(c2, x) {
             Some((c2, c1))
         } else {
             None

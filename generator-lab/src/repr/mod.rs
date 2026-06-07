@@ -51,7 +51,7 @@ pub use solver_state::SolverState;
 pub use solve_view::{Occupancy, SolveView};
 pub use per_digit::PerDigit;
 pub use types::{Puzzle, Solution};
-pub use unit::{PEERS, UNITS};
+pub use unit::{PEER_MASK, PEERS, UNITS};
 
 /// The number of cells in a sudoku grid.
 pub const CELLS: usize = 81;

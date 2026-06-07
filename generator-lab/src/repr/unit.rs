@@ -10,6 +10,12 @@ use super::{CELLS, CellIdx};
 /// For each cell, its 20 peers: the other cells sharing its row, column, or box.
 pub const PEERS: [[CellIdx; 20]; CELLS] = build_peers();
 
+/// For each cell, the 81-bit mask of its 20 peers (bit `p` set iff `p` shares the
+/// cell's row, column, or box). The bitset form of [`PEERS`] for the wing family's
+/// "does `s` see `c`" tests and common-peer intersection: a bit test / AND-and-walk
+/// instead of a linear `contains` scan over the 20-element peer list per cell.
+pub const PEER_MASK: [u128; CELLS] = build_peer_mask();
+
 /// The 27 units — the 9 rows, then the 9 columns, then the 9 boxes — each as its
 /// nine cell indices (row-major). The sequences a unit-scan technique iterates;
 /// `UNITS[0..9]` are rows, `[9..18]` columns, `[18..27]` boxes.
@@ -32,6 +38,20 @@ const fn build_units() -> [[CellIdx; 9]; 27] {
         k += 1;
     }
     units
+}
+
+const fn build_peer_mask() -> [u128; CELLS] {
+    let mut masks = [0u128; CELLS];
+    let mut i = 0;
+    while i < CELLS {
+        let mut k = 0;
+        while k < 20 {
+            masks[i] |= 1u128 << PEERS[i][k];
+            k += 1;
+        }
+        i += 1;
+    }
+    masks
 }
 
 const fn build_peers() -> [[CellIdx; 20]; CELLS] {
