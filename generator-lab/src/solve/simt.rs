@@ -45,6 +45,7 @@
 //! contract leaves them undefined, and the fast path's requirement check never reads
 //! one — a Forced cheap kind routes off the fused/SIMT path entirely).
 
+use super::combinations::for_each_combination;
 use super::techniques;
 use crate::counters::counter_block;
 use crate::probe::simt::{
@@ -52,8 +53,8 @@ use crate::probe::simt::{
     load_lane, one_bit, restore_lane, rm_cell, smear_v, snapshot_lane, warp_pass,
 };
 use crate::repr::banded::{Bands, RowMajor};
-use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState};
-use crate::solve::{Eliminate, LogicBoard};
+use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState, UNITS};
+use crate::solve::Eliminate;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_PAIR,
     NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
@@ -340,33 +341,190 @@ fn lc_eliminate(r: &mut [[V; 3]; 9], unsolved: &[V; 3], active: M) -> M {
 /// scalar per-lane fallback the warp drops a stalled lane to. Mirror of
 /// [`FusedLogicSolver`](super::FusedLogicSolver)'s `step_harder`: the cheap closure
 /// has already drained singles + LC, so only the subsets (NakedPair..HiddenQuad), the
-/// basic fish (X-Wing..Jellyfish), and the bivalue wings (XY-/XYZ-/W-Wing) remain, and
-/// it runs on a single row-major board (every unit reachable via `get`, columns
-/// included). Returns the kind index of the first technique that fired, or `None`. The
-/// try-order is this engine's choice (follows core's, un-optimized); branch-scoped
-/// specs never have two Expert branches in scope together, so their relative order is
-/// moot in production.
-fn scalar_step_harder<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usize> {
-    macro_rules! try_kind {
-        ($bit:expr, $call:expr) => {
-            if allowed & (1 << $bit) != 0 && $call {
-                return Some($bit);
-            }
-        };
+/// basic fish (X-Wing..Jellyfish), and the bivalue wings (XY-/XYZ-/W-Wing) remain.
+/// Returns the kind index of the first technique that fired, or `None`. The try-order
+/// is this engine's choice (follows core's, un-optimized); branch-scoped specs never
+/// have two Expert branches in scope together, so their relative order is moot in
+/// production.
+///
+/// The six subsets share a single [`SubsetCache`] built up front (so the per-unit
+/// transpose is paid once, not three times per kind); the rarer fish/wings — guarded
+/// out entirely for the subset-only HiddenQuad toolbox — fall back to the generic
+/// [`super::techniques`] bodies on the cell-major `cm` (every unit reachable via `get`,
+/// columns included).
+fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask) -> Option<usize> {
+    const ANY_SUBSET: KindMask = (1 << NAKED_PAIR)
+        | (1 << HIDDEN_PAIR)
+        | (1 << NAKED_TRIPLE)
+        | (1 << HIDDEN_TRIPLE)
+        | (1 << NAKED_QUAD)
+        | (1 << HIDDEN_QUAD);
+    // The cache only feeds the subset ladder; a subset-free toolbox (e.g. drill, whose
+    // baseline is singles-only) skips the build entirely and falls straight through.
+    if allowed & ANY_SUBSET != 0 {
+        let cache = SubsetCache::build(cm);
+        macro_rules! try_kind {
+            ($bit:expr, $call:expr) => {
+                if allowed & (1 << $bit) != 0 && $call {
+                    return Some($bit);
+                }
+            };
+        }
+        try_kind!(NAKED_PAIR, cached_naked_subset(cm, &cache, 2));
+        try_kind!(HIDDEN_PAIR, cached_hidden_subset(cm, &cache, 2));
+        try_kind!(NAKED_TRIPLE, cached_naked_subset(cm, &cache, 3));
+        try_kind!(HIDDEN_TRIPLE, cached_hidden_subset(cm, &cache, 3));
+        try_kind!(NAKED_QUAD, cached_naked_subset(cm, &cache, 4));
+        try_kind!(HIDDEN_QUAD, cached_hidden_subset(cm, &cache, 4));
     }
-    try_kind!(NAKED_PAIR, techniques::naked_subset(b, 2));
-    try_kind!(HIDDEN_PAIR, techniques::hidden_subset(b, 2));
-    try_kind!(NAKED_TRIPLE, techniques::naked_subset(b, 3));
-    try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
-    try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
-    try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
-    if let Some(k) = techniques::fish_step(b, allowed) {
+    if let Some(k) = techniques::fish_step(cm, allowed) {
         return Some(k);
     }
-    if let Some(k) = techniques::wing_step(b, allowed) {
+    if let Some(k) = techniques::wing_step(cm, allowed) {
         return Some(k);
     }
     None
+}
+
+/// Per-unit candidate cache for the subset ladder, built ONCE per stall and shared by
+/// all six subset techniques. The generic [`techniques::naked_subset`] /
+/// [`techniques::hidden_subset`] each re-derive their per-unit inputs on every call, so
+/// the three sizes rebuild the same per-unit marks (naked) and the same digit-position
+/// transpose (hidden) three times over. Here the difficulty order is unchanged — each
+/// size still scans all 27 units, first-fire-wins — but the inputs are read from this
+/// cache, so the transpose is paid once. Valid because the board is untouched until a
+/// technique fires (and then [`cellmarks_step_harder`] returns), so a cache built before
+/// the first scan stays exact for every later size.
+struct SubsetCache {
+    /// `marks[u][i]` = the candidate set of unit `u`'s `i`-th cell (`UNITS[u][i]`).
+    marks: [[Mark; 9]; 27],
+    /// `positions[u][d]` = the 9-bit mask (over unit slots) of cells in unit `u` where
+    /// digit `d` is a candidate — the hidden-subset transpose of `marks[u]`.
+    positions: [[u16; 9]; 27],
+}
+
+impl SubsetCache {
+    /// Build both views off the cell-major [`CellMarks`] in one pass per unit: read each
+    /// cell's mark (naked's input) and transpose it into the per-digit position masks
+    /// (hidden's input). The transpose is **branchless** — `positions[di]` bit `i` is set
+    /// to bit `di` of slot `i`'s mark — so it adds no data-dependent branch (the closure
+    /// is mispredict-bound; a `trailing_zeros` scatter loop here measurably raised
+    /// branch-misses). Paid once, it replaces the generic hidden body's per-size `contains`
+    /// sweep run three times over.
+    fn build(cm: &CellMarks) -> Self {
+        let mut marks = [[Mark::EMPTY; 9]; 27];
+        let mut positions = [[0u16; 9]; 27];
+        for u in 0..27 {
+            for i in 0..9 {
+                let mk = cm.marks[UNITS[u][i]];
+                marks[u][i] = mk;
+                let row = mk.bits();
+                for di in 0..9 {
+                    positions[u][di] |= ((row >> di) & 1) << i;
+                }
+            }
+        }
+        SubsetCache { marks, positions }
+    }
+}
+
+/// Cache-fed [`techniques::naked_subset`] (see [`SubsetCache`]): identical first-fire
+/// logic and elimination order, reading the precomputed per-unit marks instead of
+/// re-gathering them per size. Eliminations are logged into `cm` (only ever on the
+/// firing step, after which the ladder returns).
+fn cached_naked_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) -> bool {
+    for u in 0..27 {
+        let marks = &cache.marks[u];
+        // Candidate slots: empty cells with 2..=size candidates (a filled cell reads as
+        // the empty mark, so `len` 0 excludes it). `cand` holds slot indices 0..9.
+        let mut cand = [0usize; 9];
+        let mut n = 0;
+        for i in 0..9 {
+            let len = marks[i].len() as usize;
+            if (2..=size).contains(&len) {
+                cand[n] = i;
+                n += 1;
+            }
+        }
+        if n < size {
+            continue;
+        }
+        let mut applied = false;
+        for_each_combination(&cand[..n], size, |combo| {
+            let union = combo.iter().fold(Mark::EMPTY, |acc, &k| acc | marks[k]);
+            if union.len() as usize != size {
+                return true; // not a subset — keep searching
+            }
+            // Eliminate the subset's digits from the unit's OTHER cells.
+            let mut did = false;
+            for i in 0..9 {
+                if combo.contains(&i) {
+                    continue;
+                }
+                for d in (marks[i] & union).iter() {
+                    cm.eliminate(UNITS[u][i], d);
+                    did = true;
+                }
+            }
+            applied = did;
+            !did // stop once we eliminated something
+        });
+        if applied {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cache-fed [`techniques::hidden_subset`] (see [`SubsetCache`]): identical first-fire
+/// logic and elimination order, reading the precomputed per-unit position masks instead
+/// of rebuilding the digit-position transpose per size.
+fn cached_hidden_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) -> bool {
+    for u in 0..27 {
+        let marks = &cache.marks[u];
+        let pos_all = &cache.positions[u];
+        // Digits with 2..=size candidate cells in this unit (a placed digit has none).
+        let mut digits = [0usize; 9];
+        let mut n = 0;
+        for di in 0..9 {
+            let pc = pos_all[di].count_ones() as usize;
+            if (2..=size).contains(&pc) {
+                digits[n] = di;
+                n += 1;
+            }
+        }
+        if n < size {
+            continue;
+        }
+        let mut applied = false;
+        for_each_combination(&digits[..n], size, |combo| {
+            let union: u16 = combo.iter().map(|&di| pos_all[di]).fold(0, |a, x| a | x);
+            if union.count_ones() as usize != size {
+                return true;
+            }
+            // The combo digits stay; every other candidate leaves the union's cells.
+            let keep = combo.iter().fold(Mark::EMPTY, |mut acc, &di| {
+                acc.insert(Digit::from_index(di));
+                acc
+            });
+            let mut did = false;
+            for i in 0..9 {
+                if union & (1 << i) == 0 {
+                    continue;
+                }
+                for d in marks[i].without(keep).iter() {
+                    cm.eliminate(UNITS[u][i], d);
+                    did = true;
+                }
+            }
+            applied = did;
+            !did
+        });
+        if applied {
+            return true;
+        }
+    }
+    false
 }
 
 /// Snapshot stalled lane `l` out of the warp into a scalar [`SolverState`], run one
@@ -392,7 +550,7 @@ fn subset_step(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, allowed: Ki
     // same fast surface `verify` uses (`Board`). Subsets only prune (never place), so the
     // empty mask is unchanged and only the candidate bands are read back.
     let mut cm = CellMarks::from_bands(&sr, &su);
-    let k = scalar_step_harder(&mut cm, allowed)?;
+    let k = cellmarks_step_harder(&mut cm, allowed)?;
     // A fired subset removes only a handful of candidates, so write them straight into the
     // warp lane (one bit clear each) rather than rebuilding + scattering the whole board.
     // `r` is untouched since the snapshot (the LC fixpoint runs on the local copy `sr`), so
