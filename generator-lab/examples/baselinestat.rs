@@ -25,7 +25,7 @@ fn main() {
     use generator_lab::rng::Rng;
     use generator_lab::solve::{fstat_reset, fstat_snapshot};
     use generator_lab::spec::kinds::NAMES;
-    use generator_lab::spec_for_mode;
+    use generator_lab::subset_spec_for_mode;
 
     let mut args = std::env::args().skip(1);
     let attempts: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(20_000);
@@ -39,7 +39,7 @@ fn main() {
     };
 
     for &mode in modes {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
         let name = if mode == 0 { "train(HiddenQuad)" } else { "drill(HiddenQuad)" };
         fstat_reset();
         let mut rng = Rng::from_seed(seed);

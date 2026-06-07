@@ -578,12 +578,13 @@ fn target_applicable_on_avoid_path(board: &Board, spec: &Spec, target: Technique
 /// applicable (i.e. dodged) and, at the first such state, showing the grid and
 /// the target's would-be deductions next to the substitute actually taken. A
 /// probe aid — gated by `Probe::trace`.
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn dump_substitutable(seed: &Board, spec: &Spec, target: TechniqueKind, attempt: usize) {
     println!(
         "=== substitutable no-req example (attempt {}) target={:?} diff={} ===",
         attempt,
         target,
-        target.difficulty(),
+        target.solver_order(),
     );
     println!("puzzle: {}", seed.to_line());
     println!("{}", seed.pretty());
@@ -610,7 +611,7 @@ fn dump_substitutable(seed: &Board, spec: &Spec, target: TechniqueKind, attempt:
             "  {} {:?}({})",
             marker,
             step.technique,
-            step.technique.difficulty(),
+            step.technique.solver_order(),
         );
         if let Some(ts) = target_step {
             if !shown_state {
@@ -618,7 +619,7 @@ fn dump_substitutable(seed: &Board, spec: &Spec, target: TechniqueKind, attempt:
                 println!("      target applicable but dodged:");
                 println!("        focus: {}", fmt_cells(&ts.focus_cells));
                 println!("        would: {}", fmt_deductions(&ts.deductions));
-                println!("        substitute taken: {:?}({})", step.technique, step.technique.difficulty());
+                println!("        substitute taken: {:?}({})", step.technique, step.technique.solver_order());
                 println!("        grid at this state:");
                 println!("{}", b.pretty());
             }

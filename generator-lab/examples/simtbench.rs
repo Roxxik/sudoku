@@ -4,25 +4,52 @@
 //! puzzles (one seed per logical lane => the warp's union is exactly the sequential run's;
 //! the yield assert pins it).
 //!
-//! Usage: cargo run --release -p generator-lab --example simtbench -- [lanes=8] [per_lane=4000]
+//! Usage: cargo run --release -p generator-lab --example simtbench -- \
+//!          [lanes=8] [per_lane=4000] [--target NAME=hidden-quad]
+//!
+//! `lanes`/`per_lane` are positional (back-compat); `--target NAME` is any kind from
+//! `spec::kinds::NAMES` (e.g. `x-wing`, `xy-wing`, `hidden-quad`) — the steady-state
+//! warp us/attempt for that target's train+drill specs. us/attempt is yield-independent,
+//! so rare targets (jellyfish) still measure cleanly even if no puzzle is produced.
 
+use generator_lab::expert_spec;
 use generator_lab::generate::random_simt::run_warp;
 use generator_lab::generate::run_attempts;
 use generator_lab::rng::Rng;
-use generator_lab::spec_for_mode;
+use generator_lab::spec::kinds::NAMES;
 use std::time::Instant;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let lanes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
-    let per_lane: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4000);
+    let mut lanes = 8usize;
+    let mut per_lane = 4000usize;
+    let mut target_name = "hidden-quad".to_string();
+    let mut positional = 0;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--target" => target_name = it.next().unwrap_or(target_name),
+            s if s.starts_with("--") => {}
+            s => {
+                match positional {
+                    0 => lanes = s.parse().unwrap_or(lanes),
+                    1 => per_lane = s.parse().unwrap_or(per_lane),
+                    _ => {}
+                }
+                positional += 1;
+            }
+        }
+    }
+    let target = NAMES.iter().position(|&n| n == target_name).unwrap_or_else(|| {
+        eprintln!("unknown target {target_name:?}; known: {}", NAMES.join(", "));
+        std::process::exit(2);
+    });
     let total = lanes * per_lane;
     let base_seed = 1u64;
 
-    println!("simtbench: {lanes} lanes x {per_lane} attempts = {total} total attempts/mode\n");
+    println!("simtbench[{target_name}]: {lanes} lanes x {per_lane} attempts = {total} total attempts/mode\n");
 
-    for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec = spec_for_mode(mode);
+    for (drill, label) in [(false, "train"), (true, "drill")] {
+        let spec = expert_spec(target, drill);
 
         // --- sequential baseline (generator-lab): the same total work, one seed per lane
         // so the produced puzzles are exactly the warp's union. ---

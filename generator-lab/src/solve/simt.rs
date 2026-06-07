@@ -55,8 +55,9 @@ use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState};
 use crate::solve::{Eliminate, LogicBoard};
 use crate::spec::kinds::{
-    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_PAIR,
-    NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
+    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, JELLYFISH, KindMask, LC_CLAIMING, LC_POINTING,
+    NAKED_PAIR, NAKED_QUAD, NAKED_TRIPLE, NUM, SWORDFISH, SolveTrace, W_WING, X_WING, XYZ_WING,
+    XY_WING,
 };
 use std::simd::cmp::SimdPartialEq;
 use std::simd::num::SimdUint;
@@ -336,34 +337,44 @@ fn lc_eliminate(r: &mut [[V; 3]; 9], unsolved: &[V; 3], active: M) -> M {
     changed
 }
 
-/// The discrete subset ladder, easiest-first, gated by `allowed` — the scalar
-/// per-lane fallback the warp drops a stalled lane to. Mirror of
-/// [`FusedLogicSolver`](super::FusedLogicSolver)'s `step_subsets`: the cheap closure
-/// has already drained singles + LC, so only NakedPair..HiddenQuad remain, and it runs
-/// on a single row-major [`SolverState`] (every unit reachable via `get`, columns
-/// included). Returns the kind index of the first subset that fired, or `None`.
-fn scalar_step_subsets<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usize> {
-    macro_rules! try_subset {
+/// The discrete "harder than the cheap closure" ladder, gated by `allowed` — the
+/// scalar per-lane fallback the warp drops a stalled lane to. Mirror of
+/// [`FusedLogicSolver`](super::FusedLogicSolver)'s `step_harder`: the cheap closure
+/// has already drained singles + LC, so only the subsets (NakedPair..HiddenQuad), the
+/// basic fish (X-Wing..Jellyfish), and the bivalue wings (XY-/XYZ-/W-Wing) remain, and
+/// it runs on a single row-major board (every unit reachable via `get`, columns
+/// included). Returns the kind index of the first technique that fired, or `None`. The
+/// try-order is this engine's choice (follows core's, un-optimized); branch-scoped
+/// specs never have two Expert branches in scope together, so their relative order is
+/// moot in production.
+fn scalar_step_harder<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usize> {
+    macro_rules! try_kind {
         ($bit:expr, $call:expr) => {
             if allowed & (1 << $bit) != 0 && $call {
                 return Some($bit);
             }
         };
     }
-    try_subset!(NAKED_PAIR, techniques::naked_subset(b, 2));
-    try_subset!(HIDDEN_PAIR, techniques::hidden_subset(b, 2));
-    try_subset!(NAKED_TRIPLE, techniques::naked_subset(b, 3));
-    try_subset!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
-    try_subset!(NAKED_QUAD, techniques::naked_subset(b, 4));
-    try_subset!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
+    try_kind!(NAKED_PAIR, techniques::naked_subset(b, 2));
+    try_kind!(HIDDEN_PAIR, techniques::hidden_subset(b, 2));
+    try_kind!(NAKED_TRIPLE, techniques::naked_subset(b, 3));
+    try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
+    try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
+    try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
+    try_kind!(X_WING, techniques::fish(b, 2));
+    try_kind!(SWORDFISH, techniques::fish(b, 3));
+    try_kind!(JELLYFISH, techniques::fish(b, 4));
+    try_kind!(XY_WING, techniques::xy_wing(b));
+    try_kind!(XYZ_WING, techniques::xyz_wing(b));
+    try_kind!(W_WING, techniques::w_wing(b));
     None
 }
 
 /// Snapshot stalled lane `l` out of the warp into a scalar [`SolverState`], run one
-/// [`scalar_step_subsets`] on it, and (if it fired) write the pruned board back into
+/// [`scalar_step_harder`] on it, and (if it fired) write the pruned board back into
 /// the lane so the next [`warp_pass_full`] resumes the cheap closure. Returns the kind
-/// that fired, or `None` when no subset applies (the lane is unsolvable under the
-/// toolbox). Snapshot/restore is the prober's per-branch clone path; the subset search
+/// that fired, or `None` when nothing applies (the lane is unsolvable under the
+/// toolbox). Snapshot/restore is the prober's per-branch clone path; the harder search
 /// is the rare ~2% tail, so paying it per-lane scalar is cheap.
 fn subset_step(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, allowed: KindMask, try_lc: bool) -> Option<usize> {
     let (mut sr, su) = snapshot_lane(r, unsolved, l);
@@ -382,7 +393,7 @@ fn subset_step(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, allowed: Ki
     // same fast surface `verify` uses (`Board`). Subsets only prune (never place), so the
     // empty mask is unchanged and only the candidate bands are read back.
     let mut cm = CellMarks::from_bands(&sr, &su);
-    let k = scalar_step_subsets(&mut cm, allowed)?;
+    let k = scalar_step_harder(&mut cm, allowed)?;
     // A fired subset removes only a handful of candidates, so write them straight into the
     // warp lane (one bit clear each) rather than rebuilding + scattering the whole board.
     // `r` is untouched since the snapshot (the LC fixpoint runs on the local copy `sr`), so
@@ -408,9 +419,10 @@ struct CellMarks {
     unsolved: [u32; 3],
     /// Log of `(cell, digit-index)` candidates removed by [`eliminate`](CellMarks::eliminate),
     /// so [`subset_step`] writes back only what the fired technique pruned (a targeted bit
-    /// clear per entry) instead of rebuilding + scattering the whole lane. One firing of one
-    /// subset on one nine-cell unit removes at most `size * (9 - size) <= 20` candidates, so
-    /// the fixed buffer never overflows (asserted).
+    /// clear per entry) instead of rebuilding + scattering the whole lane. One firing of any
+    /// harder technique — a subset over one nine-cell unit, or a basic fish of `size` cover
+    /// lines — removes at most `size * (9 - size) <= 20` candidates, so the fixed buffer never
+    /// overflows (asserted).
     elims: [(u8, u8); 32],
     n_elim: usize,
 }

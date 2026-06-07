@@ -16,7 +16,7 @@
 //! [`crate::probe::techniques`] uses).
 
 use super::LogicBoard;
-use crate::repr::{CELLS, CellIdx, Digit, Mark, UNITS};
+use crate::repr::{CELLS, CellIdx, Digit, Mark, PEERS, UNITS};
 use super::combinations::for_each_combination;
 
 /// Cell `c`'s box index (0..9) — its band-of-three-rows times three plus its
@@ -222,6 +222,85 @@ pub(super) fn naked_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
     false
 }
 
+/// Cell at base line `b`, cross position `x`, in the given fish orientation: a row
+/// base maps `(row b, col x)`, a column base maps `(col b, row x)`. Row-major
+/// `row * 9 + col` — the one piece of geometry the fish scan needs.
+#[inline]
+fn fish_cell(row_base: bool, b: usize, x: usize) -> CellIdx {
+    if row_base { b * 9 + x } else { x * 9 + b }
+}
+
+/// **Basic fish** of `size` (X-Wing 2, Swordfish 3, Jellyfish 4): for one digit,
+/// `size` base lines (all rows, or all columns) whose candidate cells for that digit
+/// span exactly `size` cross-lines — the digit then leaves those cross-lines in every
+/// *other* base line. The single-digit / Fish branch's first-applicable body, ported
+/// from core's `fish::find_oriented_each` over the generic [`LogicBoard`] view.
+/// Non-finned only (the basic fish the curriculum's Fish branch surfaces).
+///
+/// Reads candidates only: a base line where `digit` is already placed has it in no
+/// candidate cell (the [`Marks`] invariant), so its position mask is empty and it
+/// self-excludes — no separate "is it placed" check, the same trick the subset bodies
+/// use. A placed cross-cell likewise reads empty, so the elimination scan skips it.
+pub(super) fn fish<V: LogicBoard>(v: &mut V, size: usize) -> bool {
+    for di in 0..9 {
+        let d = Digit::from_index(di);
+        // Two orientations: rows as base lines (cross = columns), then columns as base.
+        for row_base in [true, false] {
+            // Per base line, the 9-bit mask of cross-positions where `d` is a candidate.
+            let mut positions = [0u16; 9];
+            let mut bases = [0usize; 9];
+            let mut n = 0;
+            for b in 0..9 {
+                let mut pos = 0u16;
+                for x in 0..9 {
+                    if v.get(fish_cell(row_base, b, x)).contains(d) {
+                        pos |= 1 << x;
+                    }
+                }
+                positions[b] = pos;
+                let pc = pos.count_ones() as usize;
+                if (2..=size).contains(&pc) {
+                    bases[n] = b;
+                    n += 1;
+                }
+            }
+            if n < size {
+                continue;
+            }
+            let mut applied = false;
+            for_each_combination(&bases[..n], size, |combo| {
+                let union: u16 = combo.iter().map(|&b| positions[b]).fold(0, |a, x| a | x);
+                if union.count_ones() as usize != size {
+                    return true; // not a cover of exactly `size` cross-lines — keep searching
+                }
+                // Eliminate `d` from the cover cross-lines in every NON-base line.
+                let mut did = false;
+                for x in 0..9 {
+                    if union & (1 << x) == 0 {
+                        continue;
+                    }
+                    for y in 0..9 {
+                        if combo.contains(&y) {
+                            continue;
+                        }
+                        let cell = fish_cell(row_base, y, x);
+                        if v.get(cell).contains(d) {
+                            v.eliminate(cell, d);
+                            did = true;
+                        }
+                    }
+                }
+                applied = did;
+                !did // stop once we eliminated something
+            });
+            if applied {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// **Hidden subset** of `size`: `size` digits confined to the same `size` cells of
 /// a unit — the other digits leave those cells. Caches the unit's per-cell marks
 /// once (see [`naked_subset`]) and derives the per-digit position masks off them.
@@ -278,6 +357,193 @@ pub(super) fn hidden_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
             !did
         });
         if applied {
+            return true;
+        }
+    }
+    false
+}
+
+// --- Bivalue-chain branch: the wing family ------------------------------------
+//
+// All three wings reason over *bivalue* cells (exactly two candidates) and the peer
+// relation. They share two helpers: the bivalue-cell list, and the common-peer
+// elimination — "digit `d` leaves every empty cell that sees the given wing cells".
+// Ported from core's `xy_wing` / `w_wing` modules over the generic [`LogicBoard`]
+// view; sound (only valid eliminations) and first-applicable (apply the first wing
+// that actually removes a candidate, then return), so the spec gate sees the wing
+// as required exactly when core does.
+
+/// The empty cells holding exactly `n` candidates, paired with their candidate set —
+/// the wing scans' raw material (`n == 2` bivalues, `n == 3` the XYZ pivot). A filled
+/// cell reads as the empty [`Mark`] (see module doc), so the `len` test alone would
+/// exclude it; the `is_empty` guard keeps the intent explicit.
+fn cells_with_n_candidates<V: LogicBoard>(v: &V, n: u32) -> Vec<(CellIdx, Mark)> {
+    (0..CELLS)
+        .filter(|&c| v.is_empty(c) && v.get(c).len() == n)
+        .map(|c| (c, v.get(c)))
+        .collect()
+}
+
+/// Eliminate digit `d` from every empty cell that is a peer of *all* of `must_see`
+/// and is not one of `exclude`; report whether anything was removed. The shared
+/// elimination step of the wing family — the deduced digit leaves every cell that
+/// sees the wing endpoints it must.
+fn eliminate_common_peers<V: LogicBoard>(
+    v: &mut V,
+    exclude: &[CellIdx],
+    must_see: &[CellIdx],
+    d: Digit,
+) -> bool {
+    let mut did = false;
+    for c in 0..CELLS {
+        if exclude.contains(&c) || !v.is_empty(c) || !v.get(c).contains(d) {
+            continue;
+        }
+        if must_see.iter().all(|&s| PEERS[s].contains(&c)) {
+            v.eliminate(c, d);
+            did = true;
+        }
+    }
+    did
+}
+
+/// **XY-Wing**: a bivalue pivot `{X,Y}` with two bivalue wings `{X,Z}` and `{Y,Z}`,
+/// each a peer of the pivot. Whichever digit the pivot takes, one wing is forced to
+/// `Z`, so `Z` leaves every cell that sees *both* wings. The Bivalue branch's
+/// first-applicable body, ported from core's `xy_wing::find_each`.
+pub(super) fn xy_wing<V: LogicBoard>(v: &mut V) -> bool {
+    let bivalues = cells_with_n_candidates(v, 2);
+    for &(pivot, pcands) in &bivalues {
+        for (ai, &(a, acands)) in bivalues.iter().enumerate() {
+            if a == pivot || !PEERS[pivot].contains(&a) {
+                continue;
+            }
+            // `a` must share exactly one digit (X) with the pivot; its other digit
+            // is the candidate Z to eliminate, and Z must not itself be in the pivot.
+            let shared = pcands & acands;
+            if shared.len() != 1 {
+                continue;
+            }
+            let z = acands.without(shared);
+            if !(z & pcands).is_empty() {
+                continue;
+            }
+            // The second wing must be exactly {Y, Z}: the pivot's other digit + Z.
+            let required_b = pcands.without(shared) | z;
+            for &(b, bcands) in bivalues.iter().skip(ai + 1) {
+                if b == pivot || b == a || !PEERS[pivot].contains(&b) || bcands != required_b {
+                    continue;
+                }
+                let zd = z.iter().next().expect("z is a single digit");
+                if eliminate_common_peers(v, &[pivot, a, b], &[a, b], zd) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// **XYZ-Wing**: a *trivalue* pivot `{X,Y,Z}` and two bivalue wings, each a peer of
+/// the pivot with candidates a subset of the pivot's, sharing exactly one digit `Z`
+/// and together covering all three pivot digits. `Z` then leaves every cell that
+/// sees the pivot *and* both wings. Ported from core's `xy_wing::find_xyz_wing_each`.
+pub(super) fn xyz_wing<V: LogicBoard>(v: &mut V) -> bool {
+    let bivalues = cells_with_n_candidates(v, 2);
+    let trivalues = cells_with_n_candidates(v, 3);
+    for &(pivot, pcands) in &trivalues {
+        // Bivalue peers of the pivot whose candidates lie inside the pivot's.
+        let wings: Vec<(CellIdx, Mark)> = bivalues
+            .iter()
+            .copied()
+            .filter(|&(c, cands)| PEERS[pivot].contains(&c) && cands.without(pcands).is_empty())
+            .collect();
+        if wings.len() < 2 {
+            continue;
+        }
+        let mut fired = false;
+        for_each_combination(&wings, 2, |combo| {
+            let (a, acands) = combo[0];
+            let (b, bcands) = combo[1];
+            let shared = acands & bcands;
+            // Exactly one shared digit (Z), and the two wings cover all three pivot
+            // candidates — otherwise keep searching.
+            if shared.len() != 1 || (acands | bcands) != pcands {
+                return true;
+            }
+            let zd = shared.iter().next().expect("one shared digit");
+            if eliminate_common_peers(v, &[pivot, a, b], &[pivot, a, b], zd) {
+                fired = true;
+                return false; // stop once we eliminated something
+            }
+            true
+        });
+        if fired {
+            return true;
+        }
+    }
+    false
+}
+
+/// **W-Wing**: two bivalue cells `X`, `Y` with the *same* candidates `{P,Q}` that are
+/// not peers, joined by a conjugate pair on one digit (say `P`) in some unit — its
+/// two cells seeing `X` and `Y` respectively. Then `Q` leaves every cell that sees
+/// both `X` and `Y`. Ported from core's `w_wing::find_each` + `try_link`.
+pub(super) fn w_wing<V: LogicBoard>(v: &mut V) -> bool {
+    let bivalues = cells_with_n_candidates(v, 2);
+    for (i, &(x, xcands)) in bivalues.iter().enumerate() {
+        for &(y, ycands) in bivalues.iter().skip(i + 1) {
+            if xcands != ycands || PEERS[x].contains(&y) {
+                continue;
+            }
+            // Try each of the two shared digits as the strong-link (conjugate) digit;
+            // the other is the one eliminated.
+            let digits: Vec<Digit> = xcands.iter().collect();
+            for di in 0..2 {
+                if w_wing_link(v, x, y, digits[di], digits[1 - di]) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// One W-Wing strong-link attempt: scan units for a conjugate pair on `link` (a unit
+/// with exactly two cells holding it) whose endpoints see `x` and `y` respectively;
+/// if found, `other` leaves every cell seeing both `x` and `y`. Returns whether it
+/// eliminated anything (first firing unit wins).
+fn w_wing_link<V: LogicBoard>(v: &mut V, x: CellIdx, y: CellIdx, link: Digit, other: Digit) -> bool {
+    for unit in &UNITS {
+        // The unit's cells that still hold `link` — must be exactly two (a conjugate
+        // pair). A filled cell reads empty, so it never counts.
+        let mut pair = [0usize; 2];
+        let mut n = 0;
+        for &c in unit {
+            if v.get(c).contains(link) {
+                if n < 2 {
+                    pair[n] = c;
+                }
+                n += 1;
+            }
+        }
+        if n != 2 {
+            continue;
+        }
+        let (c1, c2) = (pair[0], pair[1]);
+        if c1 == x || c1 == y || c2 == x || c2 == y {
+            continue;
+        }
+        // One endpoint must see `x`, the other `y` (either assignment).
+        let ends = if PEERS[c1].contains(&x) && PEERS[c2].contains(&y) {
+            Some((c1, c2))
+        } else if PEERS[c1].contains(&y) && PEERS[c2].contains(&x) {
+            Some((c2, c1))
+        } else {
+            None
+        };
+        let Some((cx, cy)) = ends else { continue };
+        if eliminate_common_peers(v, &[x, y, cx, cy], &[x, y], other) {
             return true;
         }
     }

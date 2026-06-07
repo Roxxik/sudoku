@@ -15,7 +15,7 @@
 //! Usage: cargo run --release -p generator-lab --example unifiedprof -- [lanes=8] [per_lane=12000] [mode=0]
 
 use generator_lab::generate::random_simt::run_warp_unified;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 use std::time::Instant;
 
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
     let per_lane: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(12_000);
     let mode: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let total = lanes * per_lane;
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
 
     let t = Instant::now();
     let res = run_warp_unified(1, &spec, lanes, per_lane);

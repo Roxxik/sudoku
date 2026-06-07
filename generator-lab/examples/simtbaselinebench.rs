@@ -22,7 +22,7 @@ use generator_lab::generate::random_simt::{
     run_warp_simt, run_warp_unified, run_warp_unified_lean,
 };
 use generator_lab::spec::Spec;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 use std::time::Instant;
 
 fn check_match(name: &str, spec: &Spec, lanes: usize, per_lane: usize) {
@@ -60,7 +60,7 @@ fn main() {
     let reps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(3);
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
 
         // Correctness: prototypes match run_warp at a matched (small) lane count.
         check_match("pipelined", &spec, 16, 2000);

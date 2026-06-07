@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use generator_lab::generate::run_attempts;
 use generator_lab::rng::Rng;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 
 struct Args {
     attempts: usize,
@@ -45,7 +45,7 @@ fn main() {
     );
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
         let mut rng = Rng::from_seed(args.seed);
         let start = Instant::now();
         let (stats, fp) = run_attempts(&mut rng, &spec, args.attempts);

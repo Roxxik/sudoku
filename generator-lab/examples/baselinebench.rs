@@ -21,7 +21,7 @@ use generator_lab::repr::banded::DualSolverState;
 use generator_lab::solve::simt::{PackedSolver, SolveQuery};
 use generator_lab::solve::{FusedLogicSolver, Solver};
 use generator_lab::spec::kinds::SolveTrace;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 use std::time::Instant;
 
 fn main() {
@@ -29,7 +29,7 @@ fn main() {
     let corpus_att: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8000);
     let reps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
     let mode: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
     let baseline = spec.baseline_mask();
 
     let lanes = 8;

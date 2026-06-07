@@ -17,7 +17,7 @@
 
 use generator_lab::generate::random_simt::{collect_probes, run_warp};
 use generator_lab::probe::simt::PackedProber;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 use std::time::Instant;
 
 fn main() {
@@ -25,7 +25,7 @@ fn main() {
     let corpus_att: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8000);
     let reps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
     let mode: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
 
     // Harvest the corpus once (8 lanes share the work). Touch run_warp for the dstat
     // probe count parity check below; the corpus itself comes from collect_probes.

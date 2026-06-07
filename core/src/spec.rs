@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 
+use crate::curriculum::Tier;
 use crate::techniques::{Family, NUM_TECHNIQUE_KINDS, REGISTRY, TechniqueKind};
 
 /// A set of technique kinds packed into a single `u32` bitmask, indexed by
@@ -125,11 +126,12 @@ impl Spec {
         spec
     }
 
+    #[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
     pub fn allow_up_to(t: TechniqueKind) -> Self {
-        let cap = t.difficulty();
+        let cap = t.solver_order();
         let mut spec = Self::default();
         for def in REGISTRY {
-            if def.difficulty <= cap {
+            if def.solver_order <= cap {
                 spec.usages[def.kind.index()] = Some(Usage::Allowed);
             }
         }
@@ -193,48 +195,80 @@ impl Spec {
         self.require_one_of(members, count)
     }
 
-    /// Broad-mode training: allow every technique up to and including `t`,
-    /// and force `t` to appear at least once. Realistic mid-solve deadlock.
-    pub fn train(t: TechniqueKind) -> Self {
-        Self::allow_up_to(t).require(t, 1)
-    }
-
-    /// Drill-mode training: a small baseline plus the target, with every
-    /// technique strictly between the baseline ceiling and `t` (by difficulty)
-    /// conceded — the puzzle must remain unsolvable even when the avoid-target
-    /// solver has the whole in-between toolbox.
-    ///
-    /// The baseline ceiling scales with `t`'s difficulty, on the reasoning that
-    /// a solver learning a hard target already knows the easy propagation
-    /// techniques reflexively:
-    /// - `t` diff < 50: ceiling is HiddenSingle (singles only).
-    /// - `t` diff in 50..75: ceiling is LockedCandidatesClaiming (singles + LC).
-    /// - `t` diff ≥ 75: ceiling is NakedPair (singles + LC + naked pair).
-    ///
-    /// Generation is harder than `train` (and may still fail for some
-    /// techniques) — fall back to `train` if needed.
-    pub fn drill(t: TechniqueKind) -> Self {
-        let ceiling = Self::drill_baseline_ceiling(t);
-        let low = ceiling.difficulty();
-        let high = t.difficulty();
-        let mut spec = Self::allow_up_to(ceiling).require(t, 1);
+    /// Broad-mode training for `target`: force it, and allow what the player may
+    /// lean on to reach it. The whole Trunk (Beginner + Intermediate) is allowed
+    /// unconditionally; within `target`'s own branch, the simpler-or-equal
+    /// Expert/Master techniques are allowed too. Branch-scoped — training a fish
+    /// never enables subsets. See `CURRICULUM.md`.
+    pub fn train(target: TechniqueKind) -> Self {
+        let target_tier = Tier::of(target);
+        let target_branch = target.branch();
+        let target_diff = target.difficulty();
+        let mut spec = Self::default();
         for def in REGISTRY {
-            if def.difficulty > low && def.difficulty < high {
-                spec = spec.concede(def.kind);
+            let tt = Tier::of(def.kind);
+            if tt > target_tier {
+                continue;
+            }
+            let allowed = if tt <= Tier::Intermediate {
+                // Trunk: always available, up to the target's tier.
+                true
+            } else {
+                // Branch technique: same branch as the target, simpler-or-equal.
+                def.kind.branch() == target_branch && def.difficulty <= target_diff
+            };
+            if allowed {
+                spec.usages[def.kind.index()] = Some(Usage::Allowed);
             }
         }
-        spec
+        spec.require(target, 1)
     }
 
-    fn drill_baseline_ceiling(t: TechniqueKind) -> TechniqueKind {
-        let d = t.difficulty();
-        if d >= 75 {
-            TechniqueKind::NakedPair
-        } else if d >= 50 {
-            TechniqueKind::LockedCandidatesClaiming
-        } else {
-            TechniqueKind::HiddenSingle
+    /// Drill-mode training for `target`: force it, allow every *easier tier* in
+    /// full, and *concede* its in-tier peers — the rest of the flat Intermediate
+    /// tier, or the simpler same-branch techniques in Expert/Master. Conceded
+    /// techniques may fire but must not substitute for the target, so the drill
+    /// isolates `target` against its immediate neighbours. Harder-or-other-branch
+    /// peers are out of scope entirely. See `CURRICULUM.md`.
+    ///
+    /// Drill yields fewer puzzles per attempt than `train` (it concedes rather
+    /// than allows the in-tier peers), but generates fine. In particular,
+    /// conceding naked single in the flat Intermediate tier — so a baseline solve
+    /// runs on hidden singles + target alone — is not the obstacle it looks like:
+    /// a naked single is rarely the *only* route to its cell (the same placement
+    /// is usually also a hidden single in one of its units), so hidden singles
+    /// substitute freely and a naked-single-free solve almost always exists.
+    pub fn drill(target: TechniqueKind) -> Self {
+        let target_tier = Tier::of(target);
+        let target_branch = target.branch();
+        let target_diff = target.difficulty();
+        let mut spec = Self::default();
+        for def in REGISTRY {
+            if def.kind == target {
+                continue;
+            }
+            let tt = Tier::of(def.kind);
+            if tt < target_tier {
+                // Easier tiers are allowed in full.
+                spec.usages[def.kind.index()] = Some(Usage::Allowed);
+            } else if tt == target_tier {
+                let concede = match target_tier {
+                    // Beginner is train-only; nothing to concede.
+                    Tier::Beginner => false,
+                    // Flat tier: concede every other Intermediate technique.
+                    Tier::Intermediate => true,
+                    // Branch ladder: concede the simpler same-branch peers.
+                    Tier::Expert | Tier::Master => {
+                        def.kind.branch() == target_branch && def.difficulty < target_diff
+                    }
+                };
+                if concede {
+                    spec.usages[def.kind.index()] = Some(Usage::Conceded);
+                }
+            }
+            // tt > target_tier: out of scope.
         }
+        spec.require(target, 1)
     }
 
     /// True if `t` is in the baseline (Allowed or Forced) — i.e., counts as
@@ -353,15 +387,20 @@ mod tests {
     }
 
     #[test]
-    fn train_is_broad() {
+    fn train_is_branch_scoped() {
         let s = Spec::train(TechniqueKind::Swordfish);
-        // Includes all techniques up to and including Swordfish.
+        // Whole Trunk (Beginner + Intermediate) is allowed unconditionally.
         assert!(s.is_in_scope(TechniqueKind::NakedSingle));
+        assert!(s.is_in_scope(TechniqueKind::HiddenSingle));
+        assert!(s.is_in_scope(TechniqueKind::LockedCandidatesClaiming));
+        // Same branch (single-digit), simpler.
         assert!(s.is_in_scope(TechniqueKind::XWing));
-        assert!(s.is_in_scope(TechniqueKind::Swordfish));
-        // Excludes harder ones.
+        // Other Expert branches are excluded even when simpler than the target.
+        assert!(!s.is_in_scope(TechniqueKind::HiddenPair)); // subset, diff 44 < 56
+        assert!(!s.is_in_scope(TechniqueKind::XYWing)); // bivalue
+        // Harder same-branch excluded.
         assert!(!s.is_in_scope(TechniqueKind::Jellyfish));
-        // And Swordfish is forced.
+        // Target forced.
         assert!(matches!(
             s.usage(TechniqueKind::Swordfish),
             Some(Usage::Forced { .. })
@@ -369,86 +408,97 @@ mod tests {
     }
 
     #[test]
-    fn drill_easy_target_keeps_singles_only_baseline() {
-        // Target diff < 50 → baseline ceiling stays at HiddenSingle.
+    fn drill_expert_concedes_simpler_same_branch() {
+        // NakedTriple: Expert, Subset branch, diff 50.
         let s = Spec::drill(TechniqueKind::NakedTriple);
+        // Easier tiers allowed in full.
         assert!(matches!(
             s.usage(TechniqueKind::HiddenSingle),
-            Some(Usage::Allowed),
+            Some(Usage::Allowed)
         ));
         assert!(matches!(
+            s.usage(TechniqueKind::NakedSingle),
+            Some(Usage::Allowed)
+        ));
+        // Simpler same-branch (subset) peers conceded.
+        assert!(matches!(
             s.usage(TechniqueKind::NakedPair),
-            Some(Usage::Conceded),
+            Some(Usage::Conceded)
+        ));
+        assert!(matches!(
+            s.usage(TechniqueKind::HiddenPair),
+            Some(Usage::Conceded)
         ));
         assert!(matches!(
             s.usage(TechniqueKind::NakedTriple),
-            Some(Usage::Forced { .. }),
+            Some(Usage::Forced { .. })
         ));
+        // Other-branch (X-Wing) and harder same-branch (Naked Quad) out of scope.
+        assert!(!s.is_in_scope(TechniqueKind::XWing));
+        assert!(!s.is_in_scope(TechniqueKind::NakedQuad));
     }
 
     #[test]
-    fn drill_mid_target_lifts_baseline_to_locked_candidates() {
-        // Target diff in 50..75 → baseline includes LC, subsets still Conceded.
-        let s = Spec::drill(TechniqueKind::XYWing);
+    fn drill_intermediate_concedes_other_intermediate() {
+        // Intermediate is flat: drill concedes every other Intermediate technique.
+        let s = Spec::drill(TechniqueKind::LockedCandidatesClaiming);
+        assert!(matches!(
+            s.usage(TechniqueKind::HiddenSingle),
+            Some(Usage::Allowed)
+        )); // Beginner allowed
+        assert!(matches!(
+            s.usage(TechniqueKind::NakedSingle),
+            Some(Usage::Conceded)
+        ));
         assert!(matches!(
             s.usage(TechniqueKind::LockedCandidatesPointing),
-            Some(Usage::Allowed),
+            Some(Usage::Conceded)
         ));
         assert!(matches!(
             s.usage(TechniqueKind::LockedCandidatesClaiming),
-            Some(Usage::Allowed),
+            Some(Usage::Forced { .. })
         ));
-        assert!(matches!(
-            s.usage(TechniqueKind::NakedPair),
-            Some(Usage::Conceded),
-        ));
-        assert!(matches!(
-            s.usage(TechniqueKind::XYWing),
-            Some(Usage::Forced { .. }),
-        ));
+        assert!(!s.is_in_scope(TechniqueKind::NakedPair)); // Expert, out of scope
     }
 
     #[test]
-    fn drill_hard_target_lifts_baseline_through_naked_pair() {
+    fn drill_expert_isolates_other_branches() {
+        // Swordfish: Expert, single-digit branch, diff 56.
         let s = Spec::drill(TechniqueKind::Swordfish);
-        // Baseline now reaches NakedPair for diff-75+ targets.
-        for in_baseline in [
-            TechniqueKind::NakedSingle,
+        // Easier tiers allowed in full.
+        for allowed in [
             TechniqueKind::HiddenSingle,
+            TechniqueKind::NakedSingle,
             TechniqueKind::LockedCandidatesPointing,
             TechniqueKind::LockedCandidatesClaiming,
-            TechniqueKind::NakedPair,
         ] {
             assert!(
-                matches!(s.usage(in_baseline), Some(Usage::Allowed)),
-                "{:?} should be Allowed in drill(Swordfish), got {:?}",
-                in_baseline,
-                s.usage(in_baseline),
+                matches!(s.usage(allowed), Some(Usage::Allowed)),
+                "{:?} should be Allowed, got {:?}",
+                allowed,
+                s.usage(allowed),
             );
         }
+        // Only the simpler same-branch fish is conceded.
+        assert!(matches!(s.usage(TechniqueKind::XWing), Some(Usage::Conceded)));
         assert!(matches!(
             s.usage(TechniqueKind::Swordfish),
-            Some(Usage::Forced { .. }),
+            Some(Usage::Forced { .. })
         ));
-        // Everything strictly between NakedPair and Swordfish stays Conceded.
-        for in_between in [
+        // Other-branch Expert peers and harder same-branch fish are out of scope.
+        for out in [
+            TechniqueKind::NakedPair,
             TechniqueKind::HiddenPair,
             TechniqueKind::NakedTriple,
-            TechniqueKind::HiddenTriple,
-            TechniqueKind::NakedQuad,
-            TechniqueKind::HiddenQuad,
-            TechniqueKind::XWing,
-            TechniqueKind::FinnedXWing,
             TechniqueKind::XYWing,
             TechniqueKind::WWing,
+            TechniqueKind::Jellyfish,
         ] {
             assert!(
-                matches!(s.usage(in_between), Some(Usage::Conceded)),
-                "{:?} should be Conceded under drill(Swordfish), got {:?}",
-                in_between,
-                s.usage(in_between),
+                !s.is_in_scope(out),
+                "{:?} should be out of scope under drill(Swordfish)",
+                out,
             );
         }
-        assert!(!s.is_in_scope(TechniqueKind::Jellyfish));
     }
 }

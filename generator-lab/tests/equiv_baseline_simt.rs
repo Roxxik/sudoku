@@ -18,8 +18,8 @@ use generator_lab::repr::Marks;
 use generator_lab::solve::simt::{PackedSolver, SolveQuery};
 use generator_lab::solve::{FusedLogicSolver, LogicSolver, Solver};
 use generator_lab::spec::Spec;
-use generator_lab::spec::kinds::{NAKED_PAIR, NUM, SolveTrace};
-use generator_lab::spec_for_mode;
+use generator_lab::spec::kinds::{NAKED_PAIR, NUM, SolveTrace, X_WING};
+use generator_lab::subset_spec_for_mode;
 
 /// Compare PackedSolver against FusedLogicSolver (and the composable LogicSolver) on
 /// every harvested board, for the given `spec`, exercising BOTH locked-candidates
@@ -92,22 +92,36 @@ fn check_lc(spec: &Spec, base_seed: u64, lanes: usize, attempts_per_lane: usize,
 
 #[test]
 fn drill_baseline_simt_matches_scalar() {
-    check_against_scalar(&spec_for_mode(1), 1, 8, 150);
+    check_against_scalar(&subset_spec_for_mode(1), 1, 8, 150);
 }
 
 #[test]
 fn train_baseline_simt_matches_scalar() {
-    check_against_scalar(&spec_for_mode(0), 1, 8, 150);
+    check_against_scalar(&subset_spec_for_mode(0), 1, 8, 150);
 }
 
 /// A different seed base + uneven lane lengths, to shake out streaming/refill races in
 /// the per-lane count accumulation.
 #[test]
 fn drill_baseline_simt_offset_seeds() {
-    check_against_scalar(&spec_for_mode(1), 1000, 13, 60);
+    check_against_scalar(&subset_spec_for_mode(1), 1000, 13, 60);
 }
 
 #[test]
 fn train_baseline_simt_offset_seeds() {
-    check_against_scalar(&spec_for_mode(0), 1000, 13, 60);
+    check_against_scalar(&subset_spec_for_mode(0), 1000, 13, 60);
+}
+
+/// Fish branch: the SIMT baseline solver must match the scalar engine on a Fish
+/// corpus too — its scalar fallback now runs the basic fish (X-Wing) after the
+/// subsets. train(X-Wing) exercises LC + the fish step; drill(X-Wing) the no-extra-
+/// subset path. The `NAKED_PAIR..NUM` count loop pins the X-Wing count as well.
+#[test]
+fn train_xwing_baseline_simt_matches_scalar() {
+    check_against_scalar(&Spec::train(X_WING), 7, 8, 150);
+}
+
+#[test]
+fn drill_xwing_baseline_simt_matches_scalar() {
+    check_against_scalar(&Spec::drill(X_WING), 7, 8, 150);
 }

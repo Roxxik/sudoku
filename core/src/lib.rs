@@ -35,6 +35,6 @@ pub use solver::{
 };
 pub use spec::{RequireAny, Spec, TechniqueSet, Usage};
 pub use techniques::{
-    Deduction, Family, HouseRef, REGISTRY, Step, TechniqueDef, TechniqueKind,
+    Branch, Deduction, Family, HouseRef, REGISTRY, Step, TechniqueDef, TechniqueKind,
 };
 pub use verifier::{Violation, verify};

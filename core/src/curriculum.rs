@@ -1,53 +1,79 @@
 use crate::spec::Spec;
-use crate::techniques::TechniqueKind;
+use crate::techniques::{REGISTRY, TechniqueKind};
 
-/// Coarse difficulty buckets that cap the techniques a `Spec` will allow.
-/// Each tier corresponds to a difficulty ceiling on the flat ladder defined
-/// in `techniques::REGISTRY`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Player-facing difficulty tiers, matching `CURRICULUM.md`. A technique's tier
+/// is the band its player-facing `difficulty` score falls into; the cut-points
+/// follow SudokuExplainer's thresholds. `Ord` runs Beginner < Intermediate <
+/// Expert < Master, so "easier tier" is a plain comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tier {
-    /// Singles only.
-    Easy,
-    /// Through hidden quads.
-    Medium,
-    /// Through wings (but no advanced fish: Swordfish/Jellyfish/Finned).
-    Hard,
-    /// Everything implemented, no cap.
+    /// Hidden singles only (SE ~1.0-1.5).
+    Beginner,
+    /// Naked single and locked candidates (SE < 3.0).
+    Intermediate,
+    /// The three trainable branches: single-digit, bivalue, subsets (SE 3.0-~5.4).
+    Expert,
+    /// Advanced set logic and beyond (SE above ~5.4).
     Master,
 }
 
 impl Tier {
-    /// The technique whose difficulty acts as the inclusive ceiling for this
-    /// tier. `None` for [`Tier::Master`], which has no cap.
+    /// Player-difficulty cut-points (upper-exclusive). A score below the next
+    /// tier's floor belongs to the lower tier. See `CURRICULUM.md`.
+    const INTERMEDIATE_FLOOR: u32 = 15; // naked single
+    const EXPERT_FLOOR: u32 = 30; // naked pair (SE 3.0)
+    const MASTER_FLOOR: u32 = 100; // SE ~5.4
+
+    /// The tier a player-facing `difficulty` score falls into.
+    pub fn of_difficulty(d: u32) -> Tier {
+        if d < Self::INTERMEDIATE_FLOOR {
+            Tier::Beginner
+        } else if d < Self::EXPERT_FLOOR {
+            Tier::Intermediate
+        } else if d < Self::MASTER_FLOOR {
+            Tier::Expert
+        } else {
+            Tier::Master
+        }
+    }
+
+    /// The tier a technique belongs to, by its player-facing difficulty.
+    pub fn of(kind: TechniqueKind) -> Tier {
+        Self::of_difficulty(kind.difficulty())
+    }
+
+    /// A representative hardest technique in this tier, for display. `None` for
+    /// [`Tier::Master`], which has no cap.
     pub fn ceiling(self) -> Option<TechniqueKind> {
         match self {
-            Tier::Easy => Some(TechniqueKind::HiddenSingle),
-            Tier::Medium => Some(TechniqueKind::HiddenQuad),
-            Tier::Hard => Some(TechniqueKind::WWing),
+            Tier::Beginner => Some(TechniqueKind::HiddenSingle),
+            Tier::Intermediate => Some(TechniqueKind::LockedCandidatesClaiming),
+            Tier::Expert => Some(TechniqueKind::HiddenQuad),
             Tier::Master => None,
         }
     }
 
     pub fn key(self) -> &'static str {
         match self {
-            Tier::Easy => "easy",
-            Tier::Medium => "medium",
-            Tier::Hard => "hard",
+            Tier::Beginner => "beginner",
+            Tier::Intermediate => "intermediate",
+            Tier::Expert => "expert",
             Tier::Master => "master",
         }
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
         match key {
-            "easy" => Some(Tier::Easy),
-            "medium" => Some(Tier::Medium),
-            "hard" => Some(Tier::Hard),
+            "beginner" => Some(Tier::Beginner),
+            "intermediate" => Some(Tier::Intermediate),
+            "expert" => Some(Tier::Expert),
             "master" => Some(Tier::Master),
             _ => None,
         }
     }
 
-    pub const ALL: &'static [Tier] = &[Tier::Easy, Tier::Medium, Tier::Hard, Tier::Master];
+    pub const ALL: &'static [Tier] =
+        &[Tier::Beginner, Tier::Intermediate, Tier::Expert, Tier::Master];
 }
 
 /// A single training stage in the curriculum. Maps a CLI/UI key to a focus
@@ -70,8 +96,10 @@ impl Stage {
     }
 }
 
-/// Linear training curriculum: one stage per implemented technique, ordered
-/// from easiest to hardest. Used by `--list-stages` and the `--stage` flag.
+/// Linear training curriculum: the player-surfaced techniques, ordered from
+/// easiest to hardest. A curated subset of `REGISTRY` — turbot and finned fish
+/// are implemented but not surfaced here (see `CURRICULUM.md`). Used by
+/// `--list-stages` and the `--stage` flag.
 pub const CURRICULUM: &[Stage] = &[
     Stage {
         key: "singles-naked",
@@ -129,26 +157,6 @@ pub const CURRICULUM: &[Stage] = &[
         focus: TechniqueKind::XWing,
     },
     Stage {
-        key: "skyscraper",
-        label: "Skyscraper",
-        focus: TechniqueKind::Skyscraper,
-    },
-    Stage {
-        key: "two-string-kite",
-        label: "2-String Kite",
-        focus: TechniqueKind::TwoStringKite,
-    },
-    Stage {
-        key: "empty-rectangle",
-        label: "Empty Rectangle",
-        focus: TechniqueKind::EmptyRectangle,
-    },
-    Stage {
-        key: "finned-x-wing",
-        label: "Finned X-Wing",
-        focus: TechniqueKind::FinnedXWing,
-    },
-    Stage {
         key: "xy-wing",
         label: "XY-Wing",
         focus: TechniqueKind::XYWing,
@@ -169,19 +177,9 @@ pub const CURRICULUM: &[Stage] = &[
         focus: TechniqueKind::Swordfish,
     },
     Stage {
-        key: "finned-swordfish",
-        label: "Finned Swordfish",
-        focus: TechniqueKind::FinnedSwordfish,
-    },
-    Stage {
         key: "jellyfish",
         label: "Jellyfish",
         focus: TechniqueKind::Jellyfish,
-    },
-    Stage {
-        key: "finned-jellyfish",
-        label: "Finned Jellyfish",
-        focus: TechniqueKind::FinnedJellyfish,
     },
 ];
 
@@ -190,13 +188,16 @@ pub fn stage_by_key(key: &str) -> Option<&'static Stage> {
 }
 
 impl Spec {
-    /// All techniques whose difficulty is at or below this tier's ceiling.
-    /// `Tier::Master` returns [`Spec::allow_all`].
+    /// Allow every technique in this tier and below, by player-facing
+    /// difficulty. `Tier::Master` allows everything implemented.
     pub fn tier(t: Tier) -> Self {
-        match t.ceiling() {
-            Some(cap) => Spec::allow_up_to(cap),
-            None => Spec::allow_all(),
+        let mut spec = Self::default();
+        for def in REGISTRY {
+            if Tier::of(def.kind) <= t {
+                spec = spec.allow(def.kind);
+            }
         }
+        spec
     }
 
     /// Broad-mode training spec for the named stage.
@@ -219,10 +220,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
     fn curriculum_is_difficulty_sorted() {
         let mut prev: Option<u32> = None;
         for s in CURRICULUM {
-            let d = s.focus.difficulty();
+            let d = s.focus.solver_order();
             if let Some(p) = prev {
                 assert!(p < d, "curriculum must be sorted by difficulty");
             }
@@ -239,11 +241,26 @@ mod tests {
     }
 
     #[test]
-    fn tier_easy_only_singles() {
-        let s = Spec::tier(Tier::Easy);
-        assert!(s.is_in_scope(TechniqueKind::NakedSingle));
+    fn tier_beginner_only_hidden_single() {
+        // Beginner is hidden singles only; naked single is Intermediate.
+        let s = Spec::tier(Tier::Beginner);
         assert!(s.is_in_scope(TechniqueKind::HiddenSingle));
+        assert!(!s.is_in_scope(TechniqueKind::NakedSingle));
         assert!(!s.is_in_scope(TechniqueKind::NakedPair));
+    }
+
+    #[test]
+    fn tier_classification_matches_cut_points() {
+        assert_eq!(Tier::of(TechniqueKind::HiddenSingle), Tier::Beginner); // 5
+        assert_eq!(Tier::of(TechniqueKind::NakedSingle), Tier::Intermediate); // 15
+        assert_eq!(
+            Tier::of(TechniqueKind::LockedCandidatesClaiming),
+            Tier::Intermediate
+        ); // 26
+        assert_eq!(Tier::of(TechniqueKind::NakedPair), Tier::Expert); // 32
+        assert_eq!(Tier::of(TechniqueKind::Jellyfish), Tier::Expert); // 86
+        assert_eq!(Tier::of(TechniqueKind::Skyscraper), Tier::Master); // 100 (SE-scored)
+        assert_eq!(Tier::of(TechniqueKind::PhistomefelRing), Tier::Master); // 110
     }
 
     #[test]

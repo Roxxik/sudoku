@@ -242,7 +242,7 @@ fn main() {
 fn usage_error() -> ! {
     eprintln!(
         "usage: sudoku [--interactive] [--list-stages] \\\n\
-         \t[--stage <key> | --train <technique> | --drill <technique> | --tier <easy|medium|hard|master>] \\\n\
+         \t[--stage <key> | --train <technique> | --drill <technique> | --tier <beginner|intermediate|expert|master>] \\\n\
          \t[--family <name>] [--allow t1,t2,...] [--require t=n,t=n,...] [--concede t1,t2,...] \\\n\
          \t[--construct <name> | --needs <technique> | --forced <technique>] \\\n\
          \t[--max-attempts <n>] \\\n\
@@ -348,7 +348,7 @@ fn build_spec(
         Spec::drill(t)
     } else if let Some(t) = tier_arg {
         let tier = Tier::from_key(t).unwrap_or_else(|| {
-            eprintln!("unknown tier {:?} (easy|medium|hard|master)", t);
+            eprintln!("unknown tier {:?} (beginner|intermediate|expert|master)", t);
             std::process::exit(2);
         });
         Spec::tier(tier)
@@ -414,6 +414,7 @@ fn parse_require_token(tok: &str) -> (&str, usize) {
     }
 }
 
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn print_stages() {
     println!("Training stages (use with --stage <key>):");
     println!("  {:<22} {:<32} {}", "key", "label", "focus");
@@ -423,14 +424,14 @@ fn print_stages() {
             s.key,
             s.label,
             s.focus.cli_name(),
-            s.focus.difficulty(),
+            s.focus.solver_order(),
         );
     }
     println!();
     println!("Tiers (use with --tier):");
     for &t in Tier::ALL {
         let ceiling = match t.ceiling() {
-            Some(c) => format!("through {} (diff {})", c.cli_name(), c.difficulty()),
+            Some(c) => format!("through {} (diff {})", c.cli_name(), c.solver_order()),
             None => "no cap".to_string(),
         };
         println!("  {:<8} {}", t.key(), ceiling);

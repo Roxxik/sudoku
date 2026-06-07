@@ -28,11 +28,12 @@ fn every_registered_prober_matches_oracle() {
 
 /// Convert a lab board to core (via the 81-char line) and back, so we can run
 /// core's technique solver on the same grid.
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn baseline_solvable_core(b: &Board) -> bool {
     use sudoku_core::{Board as CoreBoard, TechniqueKind, solve_filtered};
     let core = CoreBoard::parse(&b.to_line().replace('.', "0")).expect("valid line");
     // allow_up_to(HiddenQuad) = every technique with difficulty <= 45.
-    let allow = |t: TechniqueKind| t.difficulty() <= TechniqueKind::HiddenQuad.difficulty();
+    let allow = |t: TechniqueKind| t.solver_order() <= TechniqueKind::HiddenQuad.solver_order();
     solve_filtered(core, allow).solved
 }
 

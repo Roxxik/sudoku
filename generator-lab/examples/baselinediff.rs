@@ -11,7 +11,7 @@ use generator_lab::solve::simt::{PackedSolver, SolveQuery};
 use generator_lab::solve::{FusedLogicSolver, LogicSolver, Solver};
 use generator_lab::spec::kinds::{NAMES, NUM};
 use generator_lab::spec::kinds::SolveTrace;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -19,7 +19,7 @@ fn main() {
     let mode: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let max_show: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
 
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
     let baseline = spec.baseline_mask();
     let boards = collect_baseline_boards(1, &spec, 8, corpus_att / 8);
     let queries: Vec<SolveQuery> = boards.iter().map(SolveQuery::from_digits).collect();

@@ -18,27 +18,39 @@
 //! inherently sequential (attempts share one RNG stream, queries within an attempt are
 //! sequential), so for that use the scalar `find` example.
 //!
-//! Usage: cargo run --release -p generator-lab --example findpar -- [--mode train|drill] [--count N=1] [--seed BASE=1]
+//! Usage: cargo run --release -p generator-lab --example findpar -- \
+//!          [--target NAME=hidden-quad] [--mode train|drill] [--count N=1] [--seed BASE=1]
+//!
+//! NAME is any kind from `spec::kinds::NAMES` (e.g. `x-wing`, `xy-wing`, `hidden-quad`);
+//! the target determines its branch (train allows simpler same-branch peers, drill
+//! concedes them).
 
+use generator_lab::expert_spec;
 use generator_lab::generate::random_simt::find_puzzles;
-use generator_lab::spec_for_mode;
+use generator_lab::spec::kinds::NAMES;
 
 fn main() {
-    let mut mode = 0u32;
+    let mut target_name = "hidden-quad".to_string();
+    let mut drill = false;
     let mut base = 1u64;
     let mut count = 1u64;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--mode" => mode = if it.next().as_deref() == Some("drill") { 1 } else { 0 },
+            "--target" => target_name = it.next().unwrap_or(target_name),
+            "--mode" => drill = matches!(it.next().as_deref(), Some("drill")),
             "--seed" => base = it.next().and_then(|s| s.parse().ok()).unwrap_or(base),
             "--count" => count = it.next().and_then(|s| s.parse().ok()).unwrap_or(count),
             _ => {}
         }
     }
 
-    let label = if mode == 0 { "train" } else { "drill" };
-    let spec = spec_for_mode(mode);
+    let target = NAMES.iter().position(|&n| n == target_name).unwrap_or_else(|| {
+        eprintln!("unknown target {target_name:?}; known: {}", NAMES.join(", "));
+        std::process::exit(2);
+    });
+    let label = if drill { "drill" } else { "train" };
+    let spec = expert_spec(target, drill);
     let t0 = std::time::Instant::now();
     // Print each puzzle the instant it is produced (out of seed order) so a Ctrl-C loses
     // nothing already emitted. stdout stays clean puzzle data (pipeable to the verifier).
@@ -51,7 +63,7 @@ fn main() {
     // Summary on stderr, at the end.
     let us_per_attempt = elapsed.as_secs_f64() * 1e6 / stats.attempts.max(1) as f64;
     eprintln!(
-        "{label}(HiddenQuad): {} puzzle(s) for {} seed(s) in {:.3}s over {} attempts ({us_per_attempt:.2} us/attempt, W=8 parallel)",
+        "{label}({target_name}): {} puzzle(s) for {} seed(s) in {:.3}s over {} attempts ({us_per_attempt:.2} us/attempt, W=8 parallel)",
         stats.successes,
         count,
         elapsed.as_secs_f64(),

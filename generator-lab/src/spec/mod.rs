@@ -13,7 +13,7 @@
 
 pub mod kinds;
 
-use kinds::{DIFFICULTY, KindMask, LC_CLAIMING, NUM};
+use kinds::{DIFFICULTY, KindMask, NUM, Tier, branch_of, tier_of};
 
 /// How a technique participates in a spec — mirrors core's `Usage`.
 ///
@@ -67,49 +67,77 @@ impl Spec {
         self
     }
 
-    /// Allow every kind with difficulty <= `target`'s difficulty.
-    fn allow_up_to(target: usize) -> Self {
-        let cap = DIFFICULTY[target];
+    /// Broad-mode training for `target`: force it, and allow what the player may
+    /// lean on to reach it. The whole Trunk (Beginner + Intermediate) is allowed
+    /// unconditionally; within `target`'s own branch, the simpler-or-equal Expert
+    /// techniques are allowed too. **Branch-scoped** — training a fish never enables
+    /// subsets, and vice versa. Mirrors core's `Spec::train` (see `CURRICULUM.md`).
+    pub fn train(target: usize) -> Self {
+        let target_tier = tier_of(target);
+        let target_branch = branch_of(target);
+        let target_diff = DIFFICULTY[target];
         let mut s = Self::empty();
         for idx in 0..NUM {
-            if DIFFICULTY[idx] <= cap {
+            let tt = tier_of(idx);
+            if tt > target_tier {
+                continue;
+            }
+            let allowed = if tt <= Tier::Intermediate {
+                // Trunk: always available, up to the target's tier.
+                true
+            } else {
+                // Branch technique: same branch as the target, simpler-or-equal.
+                branch_of(idx) == target_branch && DIFFICULTY[idx] <= target_diff
+            };
+            if allowed {
                 s.usage[idx] = Some(Usage::Allowed);
             }
         }
-        s
+        s.force(target, 1)
     }
 
-    /// Broad-mode training: allow everything up to and including `target`, force
-    /// `target` to appear at least once. `Spec::train` in core.
-    pub fn train(target: usize) -> Self {
-        Self::allow_up_to(target).force(target, 1)
-    }
-
-    /// Drill-mode: allow all of Beginner + Intermediate, force the target, and
-    /// concede every kind strictly between the Intermediate ceiling and `target`
-    /// (by difficulty) — the puzzle must remain unsolvable without `target` even
-    /// when the avoid-target solver has the whole in-between toolbox.
+    /// Drill-mode for `target`: force it, allow every *easier tier* in full, and
+    /// **concede** its in-tier peers — the rest of the flat Intermediate tier, or
+    /// the simpler same-branch techniques in Expert. Conceded techniques may fire
+    /// but must not substitute for the target, so the drill isolates `target`
+    /// against its immediate neighbours. Harder-or-other-branch peers are out of
+    /// scope entirely. Mirrors core's `Spec::drill` (see `CURRICULUM.md`).
     ///
-    /// Per the curriculum, an Expert drill "allows all of Beginner/Intermediate
-    /// and concedes the simpler techniques from the same branch." All implemented
-    /// Expert kinds are subsets (one branch), so conceding everything strictly
-    /// between the Intermediate ceiling and the target is exactly the simpler
-    /// same-branch set. The ceiling is the top of Intermediate
-    /// ([`LC_CLAIMING`]) — Locked Candidates stay Allowed, not Conceded.
-    ///
-    /// PoC scope: only Expert (subset) targets are drilled. An Intermediate-target
-    /// drill (concede the *other* Intermediate techniques) is not handled here.
+    /// Because the concede set is branch-scoped, drilling a fish concedes only the
+    /// simpler fish (not subsets), and drilling a subset concedes only the simpler
+    /// subsets (not fish) — even though X-Wing's difficulty interleaves between
+    /// Naked Pair and Hidden Pair.
     pub fn drill(target: usize) -> Self {
-        let ceiling = LC_CLAIMING; // top of Intermediate: Beginner + Intermediate all Allowed
-        let low = DIFFICULTY[ceiling];
-        let high = DIFFICULTY[target];
-        let mut s = Self::allow_up_to(ceiling).force(target, 1);
+        let target_tier = tier_of(target);
+        let target_branch = branch_of(target);
+        let target_diff = DIFFICULTY[target];
+        let mut s = Self::empty();
         for idx in 0..NUM {
-            if DIFFICULTY[idx] > low && DIFFICULTY[idx] < high {
-                s = s.concede(idx);
+            if idx == target {
+                continue;
             }
+            let tt = tier_of(idx);
+            if tt < target_tier {
+                // Easier tiers are allowed in full.
+                s.usage[idx] = Some(Usage::Allowed);
+            } else if tt == target_tier {
+                let concede = match target_tier {
+                    // Beginner is train-only; nothing to concede.
+                    Tier::Beginner => false,
+                    // Flat tier: concede every other Intermediate technique.
+                    Tier::Intermediate => true,
+                    // Branch ladder: concede the simpler same-branch peers.
+                    Tier::Expert | Tier::Master => {
+                        branch_of(idx) == target_branch && DIFFICULTY[idx] < target_diff
+                    }
+                };
+                if concede {
+                    s.usage[idx] = Some(Usage::Conceded);
+                }
+            }
+            // tt > target_tier: out of scope.
         }
-        s
+        s.force(target, 1)
     }
 
     /// Baseline toolbox (Allowed | Forced): the strip-loop solvability gate and

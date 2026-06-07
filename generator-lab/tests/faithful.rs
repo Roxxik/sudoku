@@ -23,7 +23,7 @@ use sudoku_core::{
     Board as CBoard, Rng as CRng, Spec as CSpec, TechniqueKind as CK, make_puzzle_for_spec, verify as core_verify,
 };
 
-/// glab kind index -> core TechniqueKind (PoC ladder).
+/// glab kind index -> core TechniqueKind (the modelled Trunk + Subset + Fish ladder).
 fn core_kind(idx: usize) -> CK {
     match idx {
         gt::NAKED_SINGLE => CK::NakedSingle,
@@ -36,6 +36,12 @@ fn core_kind(idx: usize) -> CK {
         gt::HIDDEN_TRIPLE => CK::HiddenTriple,
         gt::NAKED_QUAD => CK::NakedQuad,
         gt::HIDDEN_QUAD => CK::HiddenQuad,
+        gt::X_WING => CK::XWing,
+        gt::SWORDFISH => CK::Swordfish,
+        gt::JELLYFISH => CK::Jellyfish,
+        gt::XY_WING => CK::XYWing,
+        gt::XYZ_WING => CK::XYZWing,
+        gt::W_WING => CK::WWing,
         _ => unreachable!(),
     }
 }
@@ -128,13 +134,133 @@ fn train_hidden_pair_both_directions() {
     core_generated_pass_glab(Mode::Train, gt::HIDDEN_PAIR, 4, 40_000);
 }
 
-/// HiddenQuad is the real target but ~74k attempts/puzzle — run on demand:
-/// `cargo test -p generator-lab --release -- --ignored`.
+/// Fish branch (single-digit). X-Wing and Swordfish are cheap to force (tens to a
+/// few hundred attempts), so they run by default; Jellyfish is ~25k attempts/puzzle,
+/// behind `--ignored` like HiddenQuad. Each direction checks the branch-scoped
+/// train/drill spec maps identically between glab and core.
+#[test]
+fn train_x_wing_both_directions() {
+    glab_generated_pass_core(Mode::Train, gt::X_WING, 4, 40_000);
+    core_generated_pass_glab(Mode::Train, gt::X_WING, 4, 40_000);
+}
+
+#[test]
+fn drill_x_wing_both_directions() {
+    glab_generated_pass_core(Mode::Drill, gt::X_WING, 4, 40_000);
+    core_generated_pass_glab(Mode::Drill, gt::X_WING, 4, 40_000);
+}
+
+#[test]
+fn train_swordfish_both_directions() {
+    glab_generated_pass_core(Mode::Train, gt::SWORDFISH, 2, 200_000);
+    core_generated_pass_glab(Mode::Train, gt::SWORDFISH, 2, 200_000);
+}
+
+/// Bivalue-chain branch (wings). All three are cheap to force (a few to ~100
+/// attempts/puzzle), so they run by default. Each direction checks the branch-scoped
+/// train/drill spec maps identically between glab and core — the wing is genuinely
+/// required by the puzzle both engines accept.
+#[test]
+fn train_xy_wing_both_directions() {
+    glab_generated_pass_core(Mode::Train, gt::XY_WING, 4, 40_000);
+    core_generated_pass_glab(Mode::Train, gt::XY_WING, 4, 40_000);
+}
+
+#[test]
+fn drill_xy_wing_both_directions() {
+    glab_generated_pass_core(Mode::Drill, gt::XY_WING, 4, 40_000);
+    core_generated_pass_glab(Mode::Drill, gt::XY_WING, 4, 40_000);
+}
+
+#[test]
+fn train_xyz_wing_both_directions() {
+    glab_generated_pass_core(Mode::Train, gt::XYZ_WING, 4, 80_000);
+    core_generated_pass_glab(Mode::Train, gt::XYZ_WING, 4, 80_000);
+}
+
+#[test]
+fn train_w_wing_both_directions() {
+    glab_generated_pass_core(Mode::Train, gt::W_WING, 4, 40_000);
+    core_generated_pass_glab(Mode::Train, gt::W_WING, 4, 40_000);
+}
+
+/// HiddenQuad (~74k attempts/puzzle) and Jellyfish (~25k) are the real heavy targets —
+/// run on demand: `cargo test -p generator-lab --release -- --ignored`.
 #[test]
 #[ignore]
 fn train_hidden_quad_both_directions() {
     glab_generated_pass_core(Mode::Train, gt::HIDDEN_QUAD, 1, 2_000_000);
     core_generated_pass_glab(Mode::Train, gt::HIDDEN_QUAD, 1, 2_000_000);
+}
+
+#[test]
+#[ignore]
+fn train_jellyfish_both_directions() {
+    glab_generated_pass_core(Mode::Train, gt::JELLYFISH, 1, 2_000_000);
+    core_generated_pass_glab(Mode::Train, gt::JELLYFISH, 1, 2_000_000);
+}
+
+/// Negative cross-check: the positive tests above only sample each generator's
+/// *accept* manifold, so a verifier that disagrees in the *reject* region is
+/// invisible to them. This pins full **verdict agreement**: glab and core must
+/// return the same accept/reject for the SAME (puzzle, spec) — including the many
+/// pairs that reject (e.g. an XY-Wing puzzle checked against the W-Wing spec).
+///
+/// A small corpus of puzzles is generated across cheap targets, then every puzzle
+/// is verified against every target's train+drill spec. Most off-target pairs
+/// reject; the test asserts it saw both accepts and rejects (non-vacuous) and that
+/// the two backends never disagreed on either.
+#[test]
+fn verifiers_agree_on_every_verdict() {
+    // Cheap targets across all three Expert branches + a Subset baseline.
+    let targets = [gt::NAKED_PAIR, gt::X_WING, gt::XY_WING, gt::XYZ_WING, gt::W_WING];
+
+    // Build the corpus: a few glab puzzles per (target, mode), kept as 81-char lines.
+    let mut corpus: Vec<String> = Vec::new();
+    let mut rng = GRng::from_seed(0xC0FFEE);
+    for &t in &targets {
+        for mode in [Mode::Train, Mode::Drill] {
+            let gspec = glab_spec(mode, t);
+            let mut got = 0;
+            while got < 2 {
+                let (puzzle, _stats) = glab_generate(&mut rng, &gspec, 80_000);
+                if let Some(p) = puzzle {
+                    corpus.push(p.puzzle.to_line());
+                    got += 1;
+                }
+            }
+        }
+    }
+
+    // The spec panel: train + drill for every target, paired glab/core.
+    let panel: Vec<(GSpec, CSpec)> = targets
+        .iter()
+        .flat_map(|&t| {
+            [Mode::Train, Mode::Drill]
+                .into_iter()
+                .map(move |m| (glab_spec(m, t), core_spec(m, t)))
+        })
+        .collect();
+
+    let (mut accepts, mut rejects) = (0u32, 0u32);
+    for line in &corpus {
+        let gb = DigitGrid::parse(line).expect("glab parse");
+        let cb = CBoard::parse(line).expect("core parse");
+        for (gspec, cspec) in &panel {
+            let g = glab_verify(&gb, gspec);
+            let c = core_verify(&cb, cspec).is_ok();
+            assert_eq!(g, c, "verdict DISAGREEMENT (glab={g}, core={c}) on {line}");
+            if g {
+                accepts += 1;
+            } else {
+                rejects += 1;
+            }
+        }
+    }
+
+    // Non-vacuity: the panel must exercise both verdicts, or the test proves nothing.
+    assert!(accepts > 0, "no accepting (puzzle, spec) pairs — test vacuous");
+    assert!(rejects > 0, "no rejecting (puzzle, spec) pairs — negatives not exercised");
 }
 
 /// Cross-backend + regression anchor for the RNG/fill stream. glab's bounded RNG

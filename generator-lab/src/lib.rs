@@ -60,13 +60,24 @@ pub mod spec;
 use spec::Spec;
 use spec::kinds::HIDDEN_QUAD;
 
-/// Build the PoC spec for a `mode`: 0 = train(HiddenQuad), else drill(HiddenQuad).
-pub fn spec_for_mode(mode: u32) -> Spec {
+/// Build the **Subset-branch** bench spec for a `mode`: 0 = train(HiddenQuad), else
+/// drill(HiddenQuad). The HiddenQuad ladder is the lab's standard Subset benchmark
+/// target; for any other Expert target use [`expert_spec`].
+pub fn subset_spec_for_mode(mode: u32) -> Spec {
     if mode == 0 {
         Spec::train(HIDDEN_QUAD)
     } else {
         Spec::drill(HIDDEN_QUAD)
     }
+}
+
+/// Build a train/drill spec for any **Expert** `target` kind index (the target
+/// determines its branch — fish or subset — via the taxonomy's `BRANCH`). `drill`
+/// selects drill-mode over train-mode. This is the free-target entry the Fish-branch
+/// benches/tests drive (e.g. `expert_spec(X_WING, false)`); the Trunk/Intermediate
+/// targets are out of scope for the lab (they generate trivially in core).
+pub fn expert_spec(target: usize, drill: bool) -> Spec {
+    if drill { Spec::drill(target) } else { Spec::train(target) }
 }
 
 /// JS-callable bench entry points, exported from the wasm32 cdylib build, timed
@@ -75,7 +86,7 @@ pub fn spec_for_mode(mode: u32) -> Spec {
 #[cfg(target_arch = "wasm32")]
 mod wasm_exports {
     use crate::rng::Rng;
-    use crate::{generate, spec_for_mode};
+    use crate::{generate, subset_spec_for_mode};
 
     /// Run exactly `attempts` strip attempts for `mode` (0=train, 1=drill) from
     /// `seed`, returning a u32-truncated fingerprint over the produced puzzles
@@ -83,7 +94,7 @@ mod wasm_exports {
     /// times this with `performance.now()`.
     #[unsafe(no_mangle)]
     pub extern "C" fn bench(mode: u32, attempts: u32, seed: u32) -> u32 {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
         let mut rng = Rng::from_seed(seed as u64);
         let (_stats, fp) = generate::run_attempts(&mut rng, &spec, attempts as usize);
         fp as u32
@@ -93,7 +104,7 @@ mod wasm_exports {
     /// harness can report puzzles/sec alongside us/attempt.
     #[unsafe(no_mangle)]
     pub extern "C" fn bench_yield(mode: u32, attempts: u32, seed: u32) -> u32 {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
         let mut rng = Rng::from_seed(seed as u64);
         let (stats, _fp) = generate::run_attempts(&mut rng, &spec, attempts as usize);
         stats.successes as u32

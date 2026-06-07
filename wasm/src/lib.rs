@@ -85,17 +85,17 @@ pub fn hint(board: &Board) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(&steps).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// Generate a fresh Tier::Easy (singles-only) puzzle. Returns
+/// Generate a fresh Tier::Beginner (hidden-singles-only) puzzle. Returns
 /// `{ puzzle, solution, givens }`, the two grids as 81-char lines (`.` for an
 /// empty cell) plus the clue count.
 ///
 /// `seed` comes from JS (`Rng::from_entropy` relies on `SystemTime`, which
-/// traps on wasm); pass a fresh random u64 each call. Easy generation is fast;
-/// other tiers can be slow and aren't exposed here yet.
+/// traps on wasm); pass a fresh random u64 each call. Beginner generation is
+/// fast; other tiers can be slow and aren't exposed here yet.
 #[wasm_bindgen]
 pub fn generate(seed: u64) -> Result<JsValue, JsValue> {
     let mut rng = Rng::from_seed(seed);
-    let spec = Spec::tier(Tier::Easy);
+    let spec = Spec::tier(Tier::Beginner);
     let fr = make_puzzle_for_spec(&mut rng, &spec, MAX_ATTEMPTS)
         .ok_or_else(|| JsValue::from_str("could not generate a puzzle within the attempt budget"))?;
     let data = PuzzleData {
@@ -150,12 +150,13 @@ struct DeductionData {
     digit: u8,
 }
 
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn step_data(s: &Step) -> StepData {
     StepData {
         technique: TechniqueData {
             id: s.technique.cli_name(),
             name: s.technique.name(),
-            difficulty: s.technique.difficulty(),
+            difficulty: s.technique.solver_order(),
         },
         focus_cells: s.focus_cells.iter().map(|&c| c as u8).collect(),
         house: s.focus_house.as_ref().map(|h| HouseData {

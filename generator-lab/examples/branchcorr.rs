@@ -17,7 +17,7 @@ fn main() {
 #[cfg(feature = "count")]
 fn main() {
     use generator_lab::generate::random_simt::{CorrGroup, branch_baseline_corr};
-    use generator_lab::spec_for_mode;
+    use generator_lab::subset_spec_for_mode;
 
     let mut args = std::env::args().skip(1);
     let lanes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(32);
@@ -38,7 +38,7 @@ fn main() {
     };
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
         let (nb, br) = branch_baseline_corr(1, &spec, lanes, per_lane);
         let total = nb.gates + br.gates;
         println!("== {label} ==  ({} unique gates / baseline calls)", total);

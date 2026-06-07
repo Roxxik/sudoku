@@ -6,7 +6,7 @@
 //!   perf report --stdio | head -50
 use generator_lab::generate;
 use generator_lab::rng::Rng;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 fn main() {
     let mut attempts = 12000usize;
     let mut mode = 0u32;
@@ -18,7 +18,7 @@ fn main() {
             _ => {}
         }
     }
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
     let (s, fp) = generate::run_attempts(&mut Rng::from_seed(1), &spec, attempts);
     let succ = s.successes;
     println!("new mode={mode} attempts={attempts} succ={succ} fp={fp:#018x}");

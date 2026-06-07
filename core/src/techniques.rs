@@ -74,44 +74,88 @@ pub enum Family {
     //   ForcingChain         (Cell/Unit/Digit forcing chains and nets)
 }
 
+/// Coarse pedagogical strand used to scope training (see `CURRICULUM.md`).
+/// Coarser than [`Family`] — it groups several families into the strands a
+/// player trains down — and a branch may span tiers (single-digit runs X-Wing
+/// in Expert through the finned fish that land in Master). Every technique has
+/// exactly one branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Branch {
+    /// Foundational propagation shared by every solve: singles and locked
+    /// candidates. The Beginner/Intermediate trunk all branches grow from.
+    Trunk,
+    /// Single-digit logic: basic, turbot, and finned fish.
+    SingleDigit,
+    /// Bivalue reasoning: wings and (future) chains.
+    Bivalue,
+    /// Naked/hidden subsets of size 2-4.
+    Subset,
+    /// Advanced set logic and anything not yet placed in a trainable branch
+    /// (the Phistomefel ring; future ALS, uniqueness, chains).
+    Advanced,
+}
+
 pub struct TechniqueDef {
     pub kind: TechniqueKind,
     pub name: &'static str,
     pub cli_name: &'static str,
     pub family: Family,
+    /// Player-facing difficulty score — the curriculum axis (see
+    /// `CURRICULUM.md`). Uncapped integer, SE-informed. It INTERLEAVES branches
+    /// (X-Wing below Hidden Pair, etc.), so it is intentionally NOT monotonic in
+    /// REGISTRY order.
     pub difficulty: u32,
+    /// Internal REGISTRY try-order. NOT a difficulty: a solver should run the
+    /// technique that is cheapest to evaluate, and no meaningful global cost
+    /// order exists, so nothing should consult this. Curriculum and puzzle
+    /// rating use `difficulty`. Retained only until the last readers are
+    /// migrated off it, then removed.
+    #[deprecated(
+        note = "not a difficulty; use `difficulty` for the curriculum axis and let the solver pick by cost"
+    )]
+    pub solver_order: u32,
     pub find_all: fn(&Board) -> Vec<Step>,
     pub find_first: fn(&Board) -> Option<Step>,
 }
 
-// Difficulty ladder, monotonic within each family band:
+// Technique ladder, two independent axes:
 //
-//   10  NakedSingle              Singles
-//   15  HiddenSingle             Singles
-//   20  LockedCandidatesPointing LockedCandidates
-//   25  LockedCandidatesClaiming LockedCandidates
-//   30  NakedPair                NakedSubset
-//   33  HiddenPair               HiddenSubset
-//   36  NakedTriple              NakedSubset
-//   39  HiddenTriple             HiddenSubset
-//   42  NakedQuad                NakedSubset
-//   45  HiddenQuad               HiddenSubset
-//   50  XWing                    Fish
-//   55  Skyscraper               TurbotFish
-//   57  TwoStringKite            TurbotFish
-//   60  EmptyRectangle           TurbotFish
-//   65  FinnedXWing              FinnedFish
-//   70  XYWing                   Wing
-//   72  XYZWing                  Wing
-//   75  WWing                    Wing
-//   80  Swordfish                Fish
-//   85  FinnedSwordfish          FinnedFish
-//   90  Jellyfish                Fish
-//   95  FinnedJellyfish          FinnedFish
-//  135  PhistomefelRing          SetEquality
+//   `difficulty`   — player-facing curriculum score (see CURRICULUM.md).
+//                    Uncapped, SE-informed; INTERLEAVES branches, so the column
+//                    below is intentionally non-monotonic.
+//   `solver_order` — DEPRECATED internal try-order; not a difficulty. Shown
+//                    only because REGISTRY is currently stored in this order.
 //
-// Slots reserved for unimplemented techniques (insert at roughly these
-// difficulties, in the listed family, when adding):
+//   diff  order  Technique                Family
+//     5    15    HiddenSingle             Singles
+//    15    10    NakedSingle              Singles
+//    22    20    LockedCandidatesPointing LockedCandidates
+//    26    25    LockedCandidatesClaiming LockedCandidates
+//    32    30    NakedPair                NakedSubset
+//    38    50    XWing                    Fish
+//    44    33    HiddenPair               HiddenSubset
+//    50    36    NakedTriple              NakedSubset
+//    56    80    Swordfish                Fish
+//    62    39    HiddenTriple             HiddenSubset
+//    68    70    XYWing                   Wing
+//    72    72    XYZWing                  Wing
+//    76    75    WWing                    Wing
+//    82    42    NakedQuad                NakedSubset
+//    86    90    Jellyfish                Fish
+//    92    45    HiddenQuad               HiddenSubset
+//   100    55    Skyscraper               TurbotFish    (SE ~6.6)
+//   102    57    TwoStringKite            TurbotFish    (SE ~6.6)
+//   104    60    EmptyRectangle           TurbotFish    (SE ~6.6)
+//   106    65    FinnedXWing              FinnedFish    (SE ~6.6)
+//   110   135    PhistomefelRing          SetEquality
+//   115    85    FinnedSwordfish          FinnedFish    (SE ~7.0)
+//   125    95    FinnedJellyfish          FinnedFish    (SE ~8.0)
+//
+// NOTE: by SE, turbot/finned fish score 100+ (Master tier) even though they are
+// structurally single-digit (Fish branch). Flagged for the tier/branch step.
+//
+// Reserved `solver_order` slots for unimplemented techniques (insert at roughly
+// these try-order positions, in the listed family, when adding):
 //   ~62  SimpleColoring         SingleDigitColoring
 //   ~64  MultiColoring          SingleDigitColoring
 //   ~73  RemotePair             Chain
@@ -128,13 +172,17 @@ pub struct TechniqueDef {
 //   ~130 DeathBlossom           ALS
 //   ~140 ForcingChain           ForcingChain
 //   ~150 ForcingNet             ForcingChain
+// REGISTRY still stores the deprecated `solver_order`; the allow silences the
+// field initialisers below until the field is removed.
+#[allow(deprecated)]
 pub const REGISTRY: &[TechniqueDef] = &[
     TechniqueDef {
         kind: TechniqueKind::NakedSingle,
         name: "naked single",
         cli_name: "naked-single",
         family: Family::Singles,
-        difficulty: 10,
+        difficulty: 15,
+        solver_order: 10,
         find_all: naked_single::find_all,
         find_first: naked_single::find_first,
     },
@@ -143,7 +191,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "hidden single",
         cli_name: "hidden-single",
         family: Family::Singles,
-        difficulty: 15,
+        difficulty: 5,
+        solver_order: 15,
         find_all: hidden_single::find_all,
         find_first: hidden_single::find_first,
     },
@@ -152,7 +201,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "locked candidates (pointing)",
         cli_name: "pointing",
         family: Family::LockedCandidates,
-        difficulty: 20,
+        difficulty: 22,
+        solver_order: 20,
         find_all: locked_candidates::find_pointing,
         find_first: locked_candidates::find_first_pointing,
     },
@@ -161,7 +211,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "locked candidates (claiming)",
         cli_name: "claiming",
         family: Family::LockedCandidates,
-        difficulty: 25,
+        difficulty: 26,
+        solver_order: 25,
         find_all: locked_candidates::find_claiming,
         find_first: locked_candidates::find_first_claiming,
     },
@@ -170,7 +221,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "naked pair",
         cli_name: "naked-pair",
         family: Family::NakedSubset,
-        difficulty: 30,
+        difficulty: 32,
+        solver_order: 30,
         find_all: naked_subset::find_pairs,
         find_first: naked_subset::find_first_pair,
     },
@@ -179,7 +231,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "hidden pair",
         cli_name: "hidden-pair",
         family: Family::HiddenSubset,
-        difficulty: 33,
+        difficulty: 44,
+        solver_order: 33,
         find_all: hidden_subset::find_pairs,
         find_first: hidden_subset::find_first_pair,
     },
@@ -188,7 +241,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "naked triple",
         cli_name: "naked-triple",
         family: Family::NakedSubset,
-        difficulty: 36,
+        difficulty: 50,
+        solver_order: 36,
         find_all: naked_subset::find_triples,
         find_first: naked_subset::find_first_triple,
     },
@@ -197,7 +251,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "hidden triple",
         cli_name: "hidden-triple",
         family: Family::HiddenSubset,
-        difficulty: 39,
+        difficulty: 62,
+        solver_order: 39,
         find_all: hidden_subset::find_triples,
         find_first: hidden_subset::find_first_triple,
     },
@@ -206,7 +261,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "naked quad",
         cli_name: "naked-quad",
         family: Family::NakedSubset,
-        difficulty: 42,
+        difficulty: 82,
+        solver_order: 42,
         find_all: naked_subset::find_quads,
         find_first: naked_subset::find_first_quad,
     },
@@ -215,7 +271,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "hidden quad",
         cli_name: "hidden-quad",
         family: Family::HiddenSubset,
-        difficulty: 45,
+        difficulty: 92,
+        solver_order: 45,
         find_all: hidden_subset::find_quads,
         find_first: hidden_subset::find_first_quad,
     },
@@ -224,7 +281,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "X-Wing",
         cli_name: "x-wing",
         family: Family::Fish,
-        difficulty: 50,
+        difficulty: 38,
+        solver_order: 50,
         find_all: fish::find_x_wing,
         find_first: fish::find_first_x_wing,
     },
@@ -233,7 +291,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Skyscraper",
         cli_name: "skyscraper",
         family: Family::TurbotFish,
-        difficulty: 55,
+        difficulty: 100,
+        solver_order: 55,
         find_all: turbot::find_skyscraper,
         find_first: turbot::find_first_skyscraper,
     },
@@ -242,7 +301,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "2-String Kite",
         cli_name: "two-string-kite",
         family: Family::TurbotFish,
-        difficulty: 57,
+        difficulty: 102,
+        solver_order: 57,
         find_all: turbot::find_two_string_kite,
         find_first: turbot::find_first_two_string_kite,
     },
@@ -251,7 +311,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Empty Rectangle",
         cli_name: "empty-rectangle",
         family: Family::TurbotFish,
-        difficulty: 60,
+        difficulty: 104,
+        solver_order: 60,
         find_all: turbot::find_empty_rectangle,
         find_first: turbot::find_first_empty_rectangle,
     },
@@ -260,7 +321,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Finned X-Wing",
         cli_name: "finned-x-wing",
         family: Family::FinnedFish,
-        difficulty: 65,
+        difficulty: 106,
+        solver_order: 65,
         find_all: fish::find_finned_x_wing,
         find_first: fish::find_first_finned_x_wing,
     },
@@ -269,7 +331,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "XY-Wing",
         cli_name: "xy-wing",
         family: Family::Wing,
-        difficulty: 70,
+        difficulty: 68,
+        solver_order: 70,
         find_all: xy_wing::find_all,
         find_first: xy_wing::find_first,
     },
@@ -279,6 +342,7 @@ pub const REGISTRY: &[TechniqueDef] = &[
         cli_name: "xyz-wing",
         family: Family::Wing,
         difficulty: 72,
+        solver_order: 72,
         find_all: xy_wing::find_xyz_wing,
         find_first: xy_wing::find_first_xyz_wing,
     },
@@ -287,7 +351,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "W-Wing",
         cli_name: "w-wing",
         family: Family::Wing,
-        difficulty: 75,
+        difficulty: 76,
+        solver_order: 75,
         find_all: w_wing::find_all,
         find_first: w_wing::find_first,
     },
@@ -296,7 +361,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Swordfish",
         cli_name: "swordfish",
         family: Family::Fish,
-        difficulty: 80,
+        difficulty: 56,
+        solver_order: 80,
         find_all: fish::find_swordfish,
         find_first: fish::find_first_swordfish,
     },
@@ -305,7 +371,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Finned Swordfish",
         cli_name: "finned-swordfish",
         family: Family::FinnedFish,
-        difficulty: 85,
+        difficulty: 115,
+        solver_order: 85,
         find_all: fish::find_finned_swordfish,
         find_first: fish::find_first_finned_swordfish,
     },
@@ -314,7 +381,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Jellyfish",
         cli_name: "jellyfish",
         family: Family::Fish,
-        difficulty: 90,
+        difficulty: 86,
+        solver_order: 90,
         find_all: fish::find_jellyfish,
         find_first: fish::find_first_jellyfish,
     },
@@ -323,7 +391,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Finned Jellyfish",
         cli_name: "finned-jellyfish",
         family: Family::FinnedFish,
-        difficulty: 95,
+        difficulty: 125,
+        solver_order: 95,
         find_all: fish::find_finned_jellyfish,
         find_first: fish::find_first_finned_jellyfish,
     },
@@ -332,7 +401,8 @@ pub const REGISTRY: &[TechniqueDef] = &[
         name: "Phistomefel Ring",
         cli_name: "phistomefel-ring",
         family: Family::SetEquality,
-        difficulty: 135,
+        difficulty: 110,
+        solver_order: 135,
         find_all: phistomefel::find_all,
         find_first: phistomefel::find_first,
     },
@@ -367,16 +437,44 @@ impl TechniqueKind {
         self.def().cli_name
     }
 
+    /// Player-facing difficulty score (the curriculum axis). See
+    /// [`TechniqueDef::difficulty`].
     pub fn difficulty(self) -> u32 {
         self.def().difficulty
+    }
+
+    #[deprecated(
+        note = "not a difficulty; use `difficulty` for the curriculum axis and let the solver pick by cost"
+    )]
+    #[allow(deprecated)]
+    pub fn solver_order(self) -> u32 {
+        self.def().solver_order
     }
 
     pub fn family(self) -> Family {
         self.def().family
     }
+
+    /// The pedagogical [`Branch`] this technique trains down.
+    pub fn branch(self) -> Branch {
+        self.family().branch()
+    }
 }
 
 impl Family {
+    /// The [`Branch`] this family belongs to. Singles and locked candidates form
+    /// the [`Branch::Trunk`]; anything not in a trainable branch falls through to
+    /// [`Branch::Advanced`].
+    pub fn branch(self) -> Branch {
+        match self {
+            Family::Singles | Family::LockedCandidates => Branch::Trunk,
+            Family::Fish | Family::TurbotFish | Family::FinnedFish => Branch::SingleDigit,
+            Family::Wing => Branch::Bivalue,
+            Family::NakedSubset | Family::HiddenSubset => Branch::Subset,
+            _ => Branch::Advanced,
+        }
+    }
+
     /// All technique kinds currently implemented under this family, in
     /// difficulty order. Empty for unimplemented families.
     pub fn members(self) -> Vec<TechniqueKind> {
@@ -435,13 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_difficulty_sorted() {
+    #[allow(deprecated)] // solver_order: this test guards the REGISTRY try-order invariant
+    fn registry_is_solver_order_sorted() {
         let mut prev: Option<u32> = None;
         for d in REGISTRY {
             if let Some(p) = prev {
-                assert!(p < d.difficulty, "REGISTRY must be sorted by difficulty");
+                assert!(p < d.solver_order, "REGISTRY must be sorted by solver_order");
             }
-            prev = Some(d.difficulty);
+            prev = Some(d.solver_order);
         }
     }
 

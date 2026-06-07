@@ -24,7 +24,7 @@ use generator_lab::repr::{CELLS, DigitGrid, Marks};
 use generator_lab::rng::Rng;
 use generator_lab::scan::Bivalue;
 use generator_lab::solve::{FusedLogicSolver, Solver};
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 
 /// The uniqueness prober: scan/sieve `Search` with the `Bivalue` branch strategy.
 type P = Search<Bivalue>;
@@ -42,7 +42,7 @@ struct Phases {
 }
 
 fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
     let baseline = spec.baseline_mask();
     let mut rng = Rng::from_seed(seed);
     let mut p = Phases::default();

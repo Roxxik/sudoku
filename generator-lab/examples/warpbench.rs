@@ -7,7 +7,7 @@
 //! Usage: cargo run --release --example warpbench -- [lanes=8] [per_lane=8000] [reps=3]
 
 use generator_lab::generate::random_simt::run_warp;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 use std::time::Instant;
 
 fn main() {
@@ -18,7 +18,7 @@ fn main() {
     let total = lanes * per_lane;
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec = spec_for_mode(mode);
+        let spec = subset_spec_for_mode(mode);
         run_warp(1, &spec, lanes, per_lane); // warmup
         let mut best = f64::MAX;
         for _ in 0..reps {

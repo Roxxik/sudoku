@@ -1,8 +1,9 @@
 use crate::board::Board;
 use crate::techniques::{Deduction, REGISTRY, Step, TechniqueKind};
 
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 pub fn max_technique(trace: &[Step]) -> Option<TechniqueKind> {
-    trace.iter().map(|s| s.technique).max_by_key(|t| t.difficulty())
+    trace.iter().map(|s| s.technique).max_by_key(|t| t.solver_order())
 }
 
 pub fn deduction_counts(board: &Board) -> Vec<usize> {

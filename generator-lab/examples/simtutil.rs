@@ -20,7 +20,7 @@ fn main() {
     use generator_lab::probe::simt::{dstat_reset, dstat_snapshot};
     use generator_lab::solve::{sstat_reset, sstat_snapshot, uwstat_reset, uwstat_snapshot};
     use generator_lab::spec::Spec;
-    use generator_lab::spec_for_mode;
+    use generator_lab::subset_spec_for_mode;
 
     let total: usize = std::env::args()
         .nth(1)
@@ -51,7 +51,7 @@ fn main() {
     };
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec: Spec = spec_for_mode(mode);
+        let spec: Spec = subset_spec_for_mode(mode);
         println!("== {label} ==  ({total} att)   probe-util / baseline-util / base-passes");
         for &lanes in &[8usize, 16, 32] {
             let per_lane = total / lanes;

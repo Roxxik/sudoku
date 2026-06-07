@@ -59,6 +59,7 @@ pub fn diagnose(board: &Board, spec: &Spec, forced_target: Option<TechniqueKind>
     Diag { baseline_solved, baseline_trace, baseline_max_diff, avoid }
 }
 
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn baseline_walk(board: &Board, spec: &Spec) -> (bool, Vec<TechniqueKind>, u32) {
     let mut b = board.clone();
     let mut trace = Vec::new();
@@ -70,7 +71,7 @@ fn baseline_walk(board: &Board, spec: &Spec) -> (bool, Vec<TechniqueKind>, u32) 
         match next_step_filtered(&b, |t| spec.is_baseline(t)) {
             None => return (false, trace, max_diff),
             Some(s) => {
-                let d = s.technique.difficulty();
+                let d = s.technique.solver_order();
                 if d > max_diff {
                     max_diff = d;
                 }
@@ -81,6 +82,7 @@ fn baseline_walk(board: &Board, spec: &Spec) -> (bool, Vec<TechniqueKind>, u32) 
     }
 }
 
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn avoid_walk(board: &Board, spec: &Spec, target: TechniqueKind) -> AvoidWalk {
     let mut b = board.clone();
     let mut length = 0usize;
@@ -102,7 +104,7 @@ fn avoid_walk(board: &Board, spec: &Spec, target: TechniqueKind) -> AvoidWalk {
             if first_substitute.is_none() {
                 first_substitute = Some(s.clone());
             }
-            let d = s.technique.difficulty();
+            let d = s.technique.solver_order();
             if d > max_sub_diff {
                 max_sub_diff = d;
             }
@@ -135,11 +137,12 @@ fn avoid_walk(board: &Board, spec: &Spec, target: TechniqueKind) -> AvoidWalk {
 /// Pick the strongest Forced(T) target from a spec, if any — used as the
 /// avoid-walk subject. A spec can force multiple techniques, but the
 /// avoid walk targets one; conventionally that's the hardest one.
+#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 pub fn primary_target(spec: &Spec) -> Option<TechniqueKind> {
     let mut best: Option<(TechniqueKind, u32)> = None;
     for (k, u) in spec.iter_usages() {
         if matches!(u, Usage::Forced { .. }) {
-            let d = k.difficulty();
+            let d = k.solver_order();
             if best.map_or(true, |(_, bd)| d > bd) {
                 best = Some((k, d));
             }
@@ -265,6 +268,7 @@ impl DefaultHeuristic {
 }
 
 impl TargetHeuristic for DefaultHeuristic {
+    #[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
     fn score(&self, _board: &Board, _spec: &Spec, diag: &Diag) -> i64 {
         if !diag.baseline_solved {
             return i64::MIN / 4;
@@ -286,7 +290,7 @@ impl TargetHeuristic for DefaultHeuristic {
         // Soft: hardest baseline technique close to (or at) the target.
         // Encourages search to bias toward harder solving.
         if let Some(t) = self.target {
-            let target_diff = t.difficulty() as i64;
+            let target_diff = t.solver_order() as i64;
             let max_diff = diag.baseline_max_diff as i64;
             // closer to target_diff = better; equal = best.
             s -= (target_diff - max_diff).abs();

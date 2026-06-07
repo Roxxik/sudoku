@@ -42,8 +42,9 @@ use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMa
 use crate::repr::{Digit, GridMask, Marks};
 use crate::scan::sieve::Sieve;
 use crate::spec::kinds::{
-    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
-    NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
+    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, JELLYFISH, KindMask, LC_CLAIMING,
+    LC_POINTING, NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SWORDFISH, SolveTrace,
+    W_WING, X_WING, XYZ_WING, XY_WING,
 };
 
 // --- baseline-gate workload metrics (feature = "count") -----------------------
@@ -51,14 +52,15 @@ use crate::spec::kinds::{
 // splits between the vectorizable cheap closure and the hard subset ladder.
 //   [0] solve calls
 //   [1] total propagate() invocations (outer-loop iterations = cheap-closure depth)
-//   [2] total subset steps that fired (step_subsets -> Some)
-//   [3] calls that fired >= 1 subset step (i.e. reached past the cheap closure)
+//   [2] total harder steps that fired (step_harder -> Some: subsets + fish + wings)
+//   [3] calls that fired >= 1 harder step (i.e. reached past the cheap closure)
 //   [4] calls that solved (solved == true)
 //   [5] calls with counts[HIDDEN_QUAD] >= 1 (the Forced kind actually fired)
-//   [6] total step_subsets invocations (incl. the None that ends an unsolvable stall)
+//   [6] total step_harder invocations (incl. the None that ends an unsolvable stall)
 //   [10+k] per-kind k firing totals (cheap kinds 0..4 are fired-or-not, <=1/call;
-//          subset kinds 4..10 are exact)
-counter_block!(FSTAT: 20, inc = fstat_inc, add = fstat_add, snapshot = fstat_snapshot, reset = fstat_reset);
+//          the harder kinds 4..NUM — subsets, fish, and wings — are exact)
+// Sized `10 + NUM` so the per-kind slots `[10+k]` for k in 0..NUM always fit.
+counter_block!(FSTAT: 10 + NUM, inc = fstat_inc, add = fstat_add, snapshot = fstat_snapshot, reset = fstat_reset);
 
 /// The fused fast-path logic solver over the dual-banded grid. Stateless marker, like
 /// [`LogicSolver`](super::LogicSolver); see the module docs for its precondition.
@@ -119,7 +121,7 @@ fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> So
             Prop::Stuck => {}
         }
         fstat_add(6, 1);
-        match step_subsets(&mut b, allowed) {
+        match step_harder(&mut b, allowed) {
             Some(k) => counts[k] = counts[k].saturating_add(1),
             None => break false,
         }
@@ -296,24 +298,34 @@ fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut
     }
 }
 
-/// The discrete subset ladder, easiest-first, gated by `allowed`: the first subset
-/// technique that fires, or `None`. Reuses the composable [`super::techniques`]
-/// subsets (they run on any board, the dual grid included); singles and LC are
-/// already drained by the fused closure, so only NakedPair..HiddenQuad remain.
-fn step_subsets(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
-    macro_rules! try_subset {
+/// The discrete "harder than the cheap closure" ladder, gated by `allowed`: the
+/// first subset, fish, or bivalue-wing technique that fires, or `None`. Reuses the
+/// composable [`super::techniques`] bodies (they run on any board, the dual grid
+/// included); singles and LC are already drained by the fused closure, so only the
+/// subsets (NakedPair..HiddenQuad), the basic fish (X-Wing..Jellyfish), and the
+/// wings (XY-/XYZ-/W-Wing) remain. The try-order is THIS engine's choice (it follows
+/// core's, un-optimized — not benchmarked); branch-scoped specs never put two Expert
+/// branches in scope together, so their relative order is moot in production.
+fn step_harder(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
+    macro_rules! try_kind {
         ($bit:expr, $call:expr) => {
             if allowed & (1 << $bit) != 0 && $call {
                 return Some($bit);
             }
         };
     }
-    try_subset!(NAKED_PAIR, techniques::naked_subset(b, 2));
-    try_subset!(HIDDEN_PAIR, techniques::hidden_subset(b, 2));
-    try_subset!(NAKED_TRIPLE, techniques::naked_subset(b, 3));
-    try_subset!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
-    try_subset!(NAKED_QUAD, techniques::naked_subset(b, 4));
-    try_subset!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
+    try_kind!(NAKED_PAIR, techniques::naked_subset(b, 2));
+    try_kind!(HIDDEN_PAIR, techniques::hidden_subset(b, 2));
+    try_kind!(NAKED_TRIPLE, techniques::naked_subset(b, 3));
+    try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
+    try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
+    try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
+    try_kind!(X_WING, techniques::fish(b, 2));
+    try_kind!(SWORDFISH, techniques::fish(b, 3));
+    try_kind!(JELLYFISH, techniques::fish(b, 4));
+    try_kind!(XY_WING, techniques::xy_wing(b));
+    try_kind!(XYZ_WING, techniques::xyz_wing(b));
+    try_kind!(W_WING, techniques::w_wing(b));
     None
 }
 

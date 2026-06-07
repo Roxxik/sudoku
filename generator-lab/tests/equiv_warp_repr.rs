@@ -16,12 +16,12 @@ use generator_lab::generate::{generate, run_attempts};
 use generator_lab::rng::Rng;
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::NAKED_PAIR;
-use generator_lab::spec_for_mode;
+use generator_lab::subset_spec_for_mode;
 
 /// For each `mode`, run a warp of several lanes and check every lane reproduces the
 /// sequential generator's `(stats, fp)` for its seed.
 fn check_mode(mode: u32, base_seed: u64, lanes: usize, attempts_per_lane: usize) {
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
     let res = run_warp(base_seed, &spec, lanes, attempts_per_lane);
     assert_eq!(res.per_lane.len(), lanes);
 
@@ -50,7 +50,7 @@ fn train_warp_matches_sequential() {
 /// logical lane's `(stats, fp)` must still match plain [`run_warp`] exactly — at a lane
 /// count > 8 so the oversubscription/refill paths are exercised.
 fn check_baseline_hosts(mode: u32, base_seed: u64, lanes: usize, attempts_per_lane: usize) {
-    let spec = spec_for_mode(mode);
+    let spec = subset_spec_for_mode(mode);
     let bar = run_warp(base_seed, &spec, lanes, attempts_per_lane);
     for (name, res) in [
         ("pipelined", run_warp_pipelined(base_seed, &spec, lanes, attempts_per_lane)),
