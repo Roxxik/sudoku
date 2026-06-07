@@ -245,7 +245,7 @@ fn fish_cell(row_base: bool, b: usize, x: usize) -> CellIdx {
 /// distinguishes X-Wing / Swordfish / Jellyfish is *how many* base lines combine into a
 /// cover — the per-line masks themselves are size-independent, so [`fish_step`] scans
 /// the board once and the three sizes share it instead of each rebuilding it. The scan
-/// is the fish's read-heavy half (81 cells x 9 digits x 2 orientations of [`get`]).
+/// is the fish's read-heavy half (one [`get`] per cell — see [`FishPositions::scan`]).
 struct FishPositions {
     pos: [[[u16; 9]; 9]; 2],
 }
@@ -253,21 +253,23 @@ struct FishPositions {
 impl FishPositions {
     /// Read every cell's candidates once into the per-line masks. The only board-reading
     /// pass the fish ladder makes per stall.
+    ///
+    /// One [`get`] per cell: a cell `(row, col)` holding `d` is candidate position `col`
+    /// of base row `row` AND candidate position `row` of base col `col`, so a single read
+    /// distributes into both orientations at once. (Reading per `(digit, orientation, b,
+    /// x)` instead would fetch each cell's mask 18 times — once per digit per orientation —
+    /// to extract one bit each.) A placed cell reads as the empty [`Mark`] (the [`Marks`]
+    /// invariant), so it contributes nothing and the digit loop skips it for free.
     fn scan<V: LogicBoard>(v: &V) -> Self {
         let mut pos = [[[0u16; 9]; 9]; 2];
-        for di in 0..9 {
-            let d = Digit::from_index(di);
-            // Two orientations: rows as base lines (cross = columns), then columns as base.
-            for (o, row_base) in [true, false].into_iter().enumerate() {
-                for b in 0..9 {
-                    let mut m = 0u16;
-                    for x in 0..9 {
-                        if v.get(fish_cell(row_base, b, x)).contains(d) {
-                            m |= 1 << x;
-                        }
-                    }
-                    pos[o][di][b] = m;
-                }
+        for cell in 0..CELLS {
+            let m = v.get(cell);
+            let row = cell / 9;
+            let col = cell % 9;
+            for d in m.iter() {
+                let di = d.index();
+                pos[0][di][row] |= 1 << col; // rows as base lines: cross position = col
+                pos[1][di][col] |= 1 << row; // columns as base lines: cross position = row
             }
         }
         Self { pos }
