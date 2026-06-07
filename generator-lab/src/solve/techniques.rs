@@ -552,22 +552,108 @@ fn eliminate_common_peers<V: LogicBoard>(
     did
 }
 
+/// Dense slot for a two-digit candidate mask (a bivalue cell's [`Mark`] bits): the
+/// 36 possible 2-bit values of a 9-bit mask packed into `0..36`, ascending, so a
+/// bivalue's candidate pair indexes a bucket directly. Non-2-bit masks map to slot 0
+/// (never looked up — the wings only key on genuine bivalue pairs). Compile-time, so
+/// the per-stall bucket build pays no wide-array cost.
+const MASK_TO_SLOT: [u8; 512] = {
+    let mut t = [0u8; 512];
+    let (mut next, mut m) = (0u8, 0usize);
+    while m < 512 {
+        if (m as u16).count_ones() == 2 {
+            t[m] = next;
+            next += 1;
+        }
+        m += 1;
+    }
+    t
+};
+
+/// The inverse of [`MASK_TO_SLOT`]: each slot's two-digit mask, so the W-Wing can
+/// recover its bucket's shared pair `{P,Q}` from the slot it is walking.
+const SLOT_TO_MASK: [u16; 36] = {
+    let mut t = [0u16; 36];
+    let (mut next, mut m) = (0usize, 0usize);
+    while m < 512 {
+        if (m as u16).count_ones() == 2 {
+            t[next] = m as u16;
+            next += 1;
+        }
+        m += 1;
+    }
+    t
+};
+
+/// Bivalue cells grouped by their candidate pair: a CSR layout where each of the 36
+/// two-digit masks owns a contiguous run of cells (in ascending cell order). This turns
+/// the wings' "find the partner cells sharing this pair" from an O(n) rescan of every
+/// bivalue into an O(1) bucket lookup, collapsing their O(n²) pair scans to O(Σ kᵢ²)
+/// over the (tiny) per-pair buckets. Built once per [`wing_step`] stall from the shared
+/// bivalue list; only the firing step mutates the board, so the buckets stay valid for
+/// every non-firing wing attempt.
+struct BivalueBuckets {
+    /// Cells packed by slot, ascending within each slot (cell order preserved).
+    cells: Vec<CellIdx>,
+    /// `bounds[s]..bounds[s + 1]` is slot `s`'s run in `cells`.
+    bounds: [u16; 37],
+}
+
+impl BivalueBuckets {
+    /// One counting-sort pass over the bivalue list: tally each slot, prefix-sum into
+    /// run bounds, then scatter cells into their slot (stable, so each run stays in
+    /// cell order). The 37-wide bookkeeping is the only per-stall fixed cost.
+    fn build(bivalues: &[(CellIdx, Mark)]) -> Self {
+        let mut bounds = [0u16; 37];
+        for &(_, m) in bivalues {
+            bounds[MASK_TO_SLOT[m.bits() as usize] as usize + 1] += 1;
+        }
+        for i in 1..37 {
+            bounds[i] += bounds[i - 1];
+        }
+        let mut cells = vec![0usize; bivalues.len()];
+        let mut cur = bounds;
+        for &(c, m) in bivalues {
+            let s = MASK_TO_SLOT[m.bits() as usize] as usize;
+            cells[cur[s] as usize] = c;
+            cur[s] += 1;
+        }
+        Self { cells, bounds }
+    }
+
+    /// The bivalue cells whose candidate pair is exactly `mask` (a 2-bit value), in
+    /// cell order.
+    #[inline]
+    fn with_mask(&self, mask: u16) -> &[CellIdx] {
+        self.run(MASK_TO_SLOT[mask as usize] as usize)
+    }
+
+    /// Slot `s`'s cell run.
+    #[inline]
+    fn run(&self, s: usize) -> &[CellIdx] {
+        &self.cells[self.bounds[s] as usize..self.bounds[s + 1] as usize]
+    }
+}
+
 /// Try the three bivalue-chain wings in difficulty order (XY-Wing, then XYZ-Wing, then
-/// W-Wing), sharing a single bivalue-cell scan across all three. The bivalue list (and
-/// the trivalue list the XYZ pivot needs) is the wings' read-heavy raw material; each
-/// wing body rebuilt it independently, so the all-81-cells scan ran up to three times
-/// per stall. Honours `allowed` and preserves the exact first-applicable order of the
-/// three separate ladder entries it replaces, so the verdict and elimination set are
-/// byte-identical. A wing that fires returns immediately (the ladder restarts), so a
-/// non-firing wing leaves the board — and thus the cached lists — unchanged for the
-/// next. Returns the fired kind index, or `None`.
+/// W-Wing), sharing a single bivalue-cell scan — and the [`BivalueBuckets`] grouping
+/// built from it — across all three. The bivalue list is the wings' read-heavy raw
+/// material; each wing body rebuilt it independently, so the all-81-cells scan ran up
+/// to three times per stall. XY-Wing and W-Wing additionally find their partner cells
+/// by candidate-pair bucket rather than rescanning the whole list. Honours `allowed`.
+/// The reorder of the within-technique pair search is verdict-safe (the solve fixpoint
+/// is confluent under elimination order — see `tests/confluence.rs`), and produces a
+/// byte-identical generator fingerprint. A wing that fires returns immediately (the
+/// ladder restarts). Returns the fired kind index, or `None`.
 pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<usize> {
     const ANY_WING: KindMask = (1 << XY_WING) | (1 << XYZ_WING) | (1 << W_WING);
+    const BUCKETED: KindMask = (1 << XY_WING) | (1 << W_WING);
     if allowed & ANY_WING == 0 {
         return None;
     }
     let bivalues = cells_with_n_candidates(v, 2);
-    if allowed & (1 << XY_WING) != 0 && xy_wing(v, &bivalues) {
+    let buckets = (allowed & BUCKETED != 0).then(|| BivalueBuckets::build(&bivalues));
+    if allowed & (1 << XY_WING) != 0 && xy_wing(v, &bivalues, buckets.as_ref().expect("built")) {
         return Some(XY_WING);
     }
     if allowed & (1 << XYZ_WING) != 0 {
@@ -576,7 +662,7 @@ pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
             return Some(XYZ_WING);
         }
     }
-    if allowed & (1 << W_WING) != 0 && w_wing(v, &bivalues) {
+    if allowed & (1 << W_WING) != 0 && w_wing(v, buckets.as_ref().expect("built")) {
         return Some(W_WING);
     }
     None
@@ -585,42 +671,41 @@ pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
 /// **XY-Wing**: a bivalue pivot `{X,Y}` with two bivalue wings `{X,Z}` and `{Y,Z}`,
 /// each a peer of the pivot. Whichever digit the pivot takes, one wing is forced to
 /// `Z`, so `Z` leaves every cell that sees *both* wings. The Bivalue branch's
-/// first-applicable body, ported from core's `xy_wing::find_each`. `bivalues` is the
-/// shared bivalue-cell list (see [`wing_step`]).
-fn xy_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)]) -> bool {
+/// first-applicable body. `bivalues` drives the pivot loop in cell order;
+/// [`BivalueBuckets`] supplies the two wings by candidate pair, so a pivot's wings are
+/// found by direct bucket lookup instead of two nested rescans of the bivalue list.
+fn xy_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)], buckets: &BivalueBuckets) -> bool {
     for &(pivot, pcands) in bivalues {
-        for (ai, &(a, acands)) in bivalues.iter().enumerate() {
-            if a == pivot {
+        // The pivot's two digits X (low) and Y (high) as singleton masks.
+        let bits = pcands.bits();
+        let x_bit = bits & bits.wrapping_neg();
+        let y_bit = bits & (bits - 1);
+        // Z ranges over the seven digits outside the pivot; the wings are then exactly
+        // {X,Z} and {Y,Z}. Direct bucket lookup replaces the old shared-digit / required-b
+        // rescan of every bivalue.
+        let mut zbits = !bits & Mark::ALL.bits();
+        while zbits != 0 {
+            let z_bit = zbits & zbits.wrapping_neg();
+            zbits &= zbits - 1;
+            let zd = Digit::from_index(z_bit.trailing_zeros() as usize);
+            // {X,Z}-wings and {Y,Z}-wings both seeing the pivot; whichever pair fires
+            // eliminates Z from the cells seeing both wings (the pivot need not be seen).
+            // The {Y,Z} bucket is independent of the {X,Z} wing, so look it up once.
+            let bz = buckets.with_mask(y_bit | z_bit);
+            if bz.is_empty() {
                 continue;
             }
-            // `a` must share exactly one digit (X) with the pivot; its other digit is the
-            // candidate Z to eliminate, and Z must not itself be in the pivot. These are
-            // cheap candidate-set ops, so they reject before the costly peer test — most
-            // bivalues share zero or two digits with the pivot and never reach `sees`.
-            let shared = pcands & acands;
-            if shared.len() != 1 {
-                continue;
-            }
-            let z = acands.without(shared);
-            if !(z & pcands).is_empty() {
-                continue;
-            }
-            if !sees(pivot, a) {
-                continue;
-            }
-            // The second wing must be exactly {Y, Z}: the pivot's other digit + Z.
-            let required_b = pcands.without(shared) | z;
-            for &(b, bcands) in bivalues.iter().skip(ai + 1) {
-                // Candidate-set match first, peer test only on the (rare) exact match.
-                if b == pivot || b == a || bcands != required_b {
+            for &a in buckets.with_mask(x_bit | z_bit) {
+                if !sees(pivot, a) {
                     continue;
                 }
-                if !sees(pivot, b) {
-                    continue;
-                }
-                let zd = z.iter().next().expect("z is a single digit");
-                if eliminate_common_peers(v, &[pivot, a, b], &[a, b], zd) {
-                    return true;
+                for &b in bz {
+                    if !sees(pivot, b) {
+                        continue;
+                    }
+                    if eliminate_common_peers(v, &[pivot, a, b], &[a, b], zd) {
+                        return true;
+                    }
                 }
             }
         }
@@ -728,31 +813,35 @@ impl ConjugatePairs {
 /// **W-Wing**: two bivalue cells `X`, `Y` with the *same* candidates `{P,Q}` that are
 /// not peers, joined by a conjugate pair on one digit (say `P`) in some unit — its
 /// two cells seeing `X` and `Y` respectively. Then `Q` leaves every cell that sees
-/// both `X` and `Y`. Ported from core's `w_wing::find_each` + `try_link`. `bivalues`
-/// is the shared bivalue-cell list (see [`wing_step`]).
+/// both `X` and `Y`. Ported from core's `w_wing::find_each` + `try_link`.
 ///
-/// The strong-link search needs the board's conjugate pairs ([`ConjugatePairs`]); they
-/// are built lazily on the first matching `{P,Q}` pair, so a board with no such pair
-/// pays nothing (matching the old per-attempt scan, which never ran without one).
-fn w_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)]) -> bool {
+/// The same-pair cells are exactly one [`BivalueBuckets`] bucket, so the pair search
+/// walks each non-trivial bucket instead of testing `xcands == ycands` over all O(n²)
+/// bivalue pairs. The strong-link search needs the board's conjugate pairs
+/// ([`ConjugatePairs`]); they are built lazily on the first non-peer same-pair pair, so
+/// a board with no such pair pays nothing.
+fn w_wing<V: LogicBoard>(v: &mut V, buckets: &BivalueBuckets) -> bool {
     let mut conj: Option<ConjugatePairs> = None;
-    for (i, &(x, xcands)) in bivalues.iter().enumerate() {
-        for &(y, ycands) in bivalues.iter().skip(i + 1) {
-            if xcands != ycands || sees(x, y) {
-                continue;
-            }
-            if conj.is_none() {
-                conj = Some(ConjugatePairs::scan(v));
-            }
-            let conj = conj.as_ref().expect("just built");
-            // Try each of the two shared digits as the strong-link (conjugate) digit;
-            // the other is the one eliminated (ascending digit order, as before).
-            let mut bits = xcands.bits();
-            let d0 = Digit::from_index(bits.trailing_zeros() as usize);
-            bits &= bits - 1;
-            let d1 = Digit::from_index(bits.trailing_zeros() as usize);
-            if w_wing_link(v, conj, x, y, d0, d1) || w_wing_link(v, conj, x, y, d1, d0) {
-                return true;
+    for slot in 0..36 {
+        let bucket = buckets.run(slot);
+        if bucket.len() < 2 {
+            continue;
+        }
+        // The bucket's shared pair {P,Q} (ascending), the two strong-link candidates.
+        let mask = SLOT_TO_MASK[slot];
+        let d0 = Digit::from_index(mask.trailing_zeros() as usize);
+        let d1 = Digit::from_index((mask & (mask - 1)).trailing_zeros() as usize);
+        for (i, &x) in bucket.iter().enumerate() {
+            for &y in &bucket[i + 1..] {
+                if sees(x, y) {
+                    continue;
+                }
+                let conj = conj.get_or_insert_with(|| ConjugatePairs::scan(v));
+                // Try each shared digit as the strong-link digit; the other is eliminated
+                // (ascending digit order, as before).
+                if w_wing_link(v, conj, x, y, d0, d1) || w_wing_link(v, conj, x, y, d1, d0) {
+                    return true;
+                }
             }
         }
     }
