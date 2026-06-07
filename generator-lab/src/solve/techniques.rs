@@ -508,15 +508,22 @@ pub(super) fn hidden_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
 // that actually removes a candidate, then return), so the spec gate sees the wing
 // as required exactly when core does.
 
-/// The empty cells holding exactly `n` candidates, paired with their candidate set —
-/// the wing scans' raw material (`n == 2` bivalues, `n == 3` the XYZ pivot). A filled
-/// cell reads as the empty [`Mark`] (see module doc), so the `len` test alone would
-/// exclude it; the `is_empty` guard keeps the intent explicit.
-fn cells_with_n_candidates<V: LogicBoard>(v: &V, n: u32) -> Vec<(CellIdx, Mark)> {
-    (0..CELLS)
-        .filter(|&c| v.is_empty(c) && v.get(c).len() == n)
-        .map(|c| (c, v.get(c)))
-        .collect()
+/// Collect into `buf` the empty cells holding exactly `n` candidates, paired with their
+/// candidate set, in ascending cell order; return how many. The wing scans' raw material
+/// (`n == 2` bivalues, `n == 3` the XYZ pivot). A filled cell reads as the empty [`Mark`]
+/// (see module doc), so the `len` test alone would exclude it; the `is_empty` guard keeps
+/// the intent explicit. Writing into a caller stack buffer (the board has at most [`CELLS`]
+/// such cells) avoids a per-stall heap allocation in the wing ladder.
+fn cells_with_n_candidates<V: LogicBoard>(v: &V, n: u32, buf: &mut [(CellIdx, Mark); CELLS]) -> usize {
+    let mut k = 0;
+    for c in 0..CELLS {
+        let m = v.get(c);
+        if v.is_empty(c) && m.len() == n {
+            buf[k] = (c, m);
+            k += 1;
+        }
+    }
+    k
 }
 
 /// Eliminate digit `d` from every empty cell that is a peer of *all* of `must_see`
@@ -593,8 +600,10 @@ const SLOT_TO_MASK: [u16; 36] = {
 /// bivalue list; only the firing step mutates the board, so the buckets stay valid for
 /// every non-firing wing attempt.
 struct BivalueBuckets {
-    /// Cells packed by slot, ascending within each slot (cell order preserved).
-    cells: Vec<CellIdx>,
+    /// Cells packed by slot, ascending within each slot (cell order preserved); only
+    /// `[..bounds[36]]` is populated. A fixed array (the board has at most [`CELLS`]
+    /// bivalue cells) keeps the whole per-stall build allocation-free.
+    cells: [CellIdx; CELLS],
     /// `bounds[s]..bounds[s + 1]` is slot `s`'s run in `cells`.
     bounds: [u16; 37],
 }
@@ -611,7 +620,7 @@ impl BivalueBuckets {
         for i in 1..37 {
             bounds[i] += bounds[i - 1];
         }
-        let mut cells = vec![0usize; bivalues.len()];
+        let mut cells = [0usize; CELLS];
         let mut cur = bounds;
         for &(c, m) in bivalues {
             let s = MASK_TO_SLOT[m.bits() as usize] as usize;
@@ -651,14 +660,18 @@ pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
     if allowed & ANY_WING == 0 {
         return None;
     }
-    let bivalues = cells_with_n_candidates(v, 2);
-    let buckets = (allowed & BUCKETED != 0).then(|| BivalueBuckets::build(&bivalues));
-    if allowed & (1 << XY_WING) != 0 && xy_wing(v, &bivalues, buckets.as_ref().expect("built")) {
+    let mut bivbuf = [(0usize, Mark::EMPTY); CELLS];
+    let nb = cells_with_n_candidates(v, 2, &mut bivbuf);
+    let bivalues = &bivbuf[..nb];
+    let buckets = (allowed & BUCKETED != 0).then(|| BivalueBuckets::build(bivalues));
+    if allowed & (1 << XY_WING) != 0 && xy_wing(v, bivalues, buckets.as_ref().expect("built")) {
         return Some(XY_WING);
     }
     if allowed & (1 << XYZ_WING) != 0 {
-        let trivalues = cells_with_n_candidates(v, 3);
-        if xyz_wing(v, &bivalues, &trivalues) {
+        let mut tribuf = [(0usize, Mark::EMPTY); CELLS];
+        let nt = cells_with_n_candidates(v, 3, &mut tribuf);
+        let trivalues = &tribuf[..nt];
+        if xyz_wing(v, bivalues, trivalues) {
             return Some(XYZ_WING);
         }
     }
@@ -723,18 +736,24 @@ fn xyz_wing<V: LogicBoard>(
     bivalues: &[(CellIdx, Mark)],
     trivalues: &[(CellIdx, Mark)],
 ) -> bool {
+    // Reused per-pivot scratch for the pivot's candidate wings (a stack buffer, refilled
+    // each pivot, so the trivalue loop allocates nothing).
+    let mut wingbuf = [(0usize, Mark::EMPTY); CELLS];
     for &(pivot, pcands) in trivalues {
         // Bivalue peers of the pivot whose candidates lie inside the pivot's.
-        let wings: Vec<(CellIdx, Mark)> = bivalues
-            .iter()
-            .copied()
-            .filter(|&(c, cands)| sees(pivot, c) && cands.without(pcands).is_empty())
-            .collect();
-        if wings.len() < 2 {
+        let mut nw = 0;
+        for &(c, cands) in bivalues {
+            if sees(pivot, c) && cands.without(pcands).is_empty() {
+                wingbuf[nw] = (c, cands);
+                nw += 1;
+            }
+        }
+        if nw < 2 {
             continue;
         }
+        let wings = &wingbuf[..nw];
         let mut fired = false;
-        for_each_combination(&wings, 2, |combo| {
+        for_each_combination(wings, 2, |combo| {
             let (a, acands) = combo[0];
             let (b, bcands) = combo[1];
             let shared = acands & bcands;
