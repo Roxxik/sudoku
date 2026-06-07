@@ -1,4 +1,4 @@
-//! Sweep COMBINED-requirement specs through the packed W=8 SIMT warp to find a
+//! Sweep COMBINED-requirement specs through the unified W=8 SIMT warp to find a
 //! generator codepath worth optimizing: one that is both slow per attempt AND
 //! rare (many attempts per puzzle), so the warp's average time to produce one
 //! puzzle is large (> 1s is the threshold of interest).
@@ -11,8 +11,8 @@
 //! kind) while making the puzzle much rarer, which is exactly the slow+rare
 //! codepath we want to surface.
 //!
-//! Work is FIXED (`run_warp`, lanes x per_lane attempts) so a truly-rare combo is
-//! capped instead of running forever; us/att is yield-independent so it measures
+//! Work is FIXED (`run_warp_unified`, lanes x per_lane attempts) so a truly-rare combo
+//! is capped instead of running forever; us/att is yield-independent so it measures
 //! cleanly even at zero yield, and the yield (successes/attempts) gives the
 //! attempts/puzzle needed to project the average s/puzzle.
 //!
@@ -27,7 +27,7 @@
 //! that target's branch); `--toolbox full` allows the entire 16-kind ladder
 //! (more substitutes => rarer).
 
-use generator_lab::generate::random_simt::run_warp;
+use generator_lab::generate::random_simt::run_warp_unified;
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::{DIFFICULTY, NAMES, NUM, Tier, branch_of, tier_of};
 
@@ -116,7 +116,7 @@ fn main() {
     #[cfg(feature = "count")]
     generator_lab::repr::banded::psg_reset();
     let t0 = std::time::Instant::now();
-    let res = run_warp(base_seed, &spec, lanes, per_lane);
+    let res = run_warp_unified(base_seed, &spec, lanes, per_lane);
     let dt = t0.elapsed();
     #[cfg(feature = "count")]
     {
