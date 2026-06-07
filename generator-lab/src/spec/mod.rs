@@ -13,7 +13,7 @@
 
 pub mod kinds;
 
-use kinds::{DIFFICULTY, HIDDEN_SINGLE, KindMask, NUM};
+use kinds::{DIFFICULTY, KindMask, LC_CLAIMING, NUM};
 
 /// How a technique participates in a spec — mirrors core's `Usage`.
 ///
@@ -85,16 +85,22 @@ impl Spec {
         Self::allow_up_to(target).force(target, 1)
     }
 
-    /// Drill-mode: a small baseline plus the target, with every kind strictly
-    /// between the baseline ceiling and `target` (by difficulty) conceded — the
-    /// puzzle must remain unsolvable without `target` even when the avoid-target
-    /// solver has the whole in-between toolbox. `Spec::drill` in core.
+    /// Drill-mode: allow all of Beginner + Intermediate, force the target, and
+    /// concede every kind strictly between the Intermediate ceiling and `target`
+    /// (by difficulty) — the puzzle must remain unsolvable without `target` even
+    /// when the avoid-target solver has the whole in-between toolbox.
     ///
-    /// PoC ceiling: HiddenQuad's difficulty (45) is < 50, so the baseline
-    /// ceiling is HiddenSingle (singles only). (Core scales the ceiling up for
-    /// harder targets; out of PoC scope.)
+    /// Per the curriculum, an Expert drill "allows all of Beginner/Intermediate
+    /// and concedes the simpler techniques from the same branch." All implemented
+    /// Expert kinds are subsets (one branch), so conceding everything strictly
+    /// between the Intermediate ceiling and the target is exactly the simpler
+    /// same-branch set. The ceiling is the top of Intermediate
+    /// ([`LC_CLAIMING`]) — Locked Candidates stay Allowed, not Conceded.
+    ///
+    /// PoC scope: only Expert (subset) targets are drilled. An Intermediate-target
+    /// drill (concede the *other* Intermediate techniques) is not handled here.
     pub fn drill(target: usize) -> Self {
-        let ceiling = HIDDEN_SINGLE; // valid for any target with difficulty < 50
+        let ceiling = LC_CLAIMING; // top of Intermediate: Beginner + Intermediate all Allowed
         let low = DIFFICULTY[ceiling];
         let high = DIFFICULTY[target];
         let mut s = Self::allow_up_to(ceiling).force(target, 1);
