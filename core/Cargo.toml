@@ -8,3 +8,11 @@ edition = "2024"
 # len==1 ~99.7% of the time). `union` gives the tightest layout (same size as
 # Vec), spilling to the heap only for the rare large eliminations.
 smallvec = { version = "1.15", features = ["union"] }
+
+# The standalone, spec-driven generator. Core keeps its OWN solver/play machinery
+# and does not reimplement generation; it depends on generator-lab purely to make
+# its tuned scalar `random`-method generate path callable through core (and thus
+# from the wasm bridge). Re-exported, not ported — see `crate::lab`. The dependency
+# is one-directional: generator-lab keeps `sudoku-core` only as a dev-dependency
+# (its faithfulness cross-check), so the normal dependency graph stays acyclic.
+generator-lab = { path = "../generator-lab" }

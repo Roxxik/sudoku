@@ -417,6 +417,7 @@ dependencies = [
 name = "sudoku-core"
 version = "0.1.0"
 dependencies = [
+ "generator-lab",
  "smallvec",
 ]
 

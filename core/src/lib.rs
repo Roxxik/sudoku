@@ -4,6 +4,7 @@ pub mod board;
 pub mod composer;
 pub mod curriculum;
 pub mod generator;
+pub mod lab;
 pub mod rng;
 pub mod search;
 pub mod solver;

@@ -15,6 +15,7 @@
 use serde::Serialize;
 use sudoku_core::board::UnitKind;
 use sudoku_core::{Deduction, Rng, Spec, Step, Tier, all_techniques, make_puzzle_for_spec};
+use sudoku_core::lab;
 use wasm_bindgen::prelude::*;
 
 /// Rejection-sampling budget for generation. Easy puzzles essentially never
@@ -102,6 +103,47 @@ pub fn generate(seed: u64) -> Result<JsValue, JsValue> {
         puzzle: fr.puzzle.puzzle.to_line(),
         solution: fr.puzzle.solution.to_line(),
         givens: fr.puzzle.givens as u32,
+    };
+    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Generate a fresh puzzle with the new `generator-lab` scalar generator (the
+/// tuned `random`-method path core re-exports via [`lab`]), instead of core's own
+/// [`make_puzzle_for_spec`]. Returns the same `{ puzzle, solution, givens }` shape
+/// as [`generate`], so the UI loads it identically.
+///
+/// `target` is a `generator-lab` technique-kind index (`lab::kinds`, e.g.
+/// `HIDDEN_SINGLE`, `NAKED_PAIR`, `HIDDEN_QUAD`, `X_WING`); `drill` selects
+/// drill-mode (target is the *hardest* technique needed) over train-mode (target
+/// may be reached, easier techniques allowed alongside). `seed` comes from JS for
+/// the same reason as [`generate`] (no entropy on wasm).
+///
+/// The native-only SIMT path is not wired here — this is the scalar generator,
+/// which is all wasm has. Harder targets can exhaust the attempt budget; that
+/// surfaces as an error the same way [`generate`] reports an empty budget.
+#[wasm_bindgen(js_name = generateLab)]
+pub fn generate_lab(seed: u64, target: u32, drill: bool) -> Result<JsValue, JsValue> {
+    let target = target as usize;
+    if target >= lab::kinds::NUM {
+        return Err(JsValue::from_str(&format!(
+            "target kind {} out of range (0..{})",
+            target,
+            lab::kinds::NUM
+        )));
+    }
+    let spec = if drill {
+        lab::Spec::drill(target)
+    } else {
+        lab::Spec::train(target)
+    };
+    let mut rng = lab::Rng::from_seed(seed);
+    let (generated, _stats) = lab::generate(&mut rng, &spec, MAX_ATTEMPTS);
+    let generated = generated
+        .ok_or_else(|| JsValue::from_str("could not generate a puzzle within the attempt budget"))?;
+    let data = PuzzleData {
+        puzzle: generated.puzzle.0.to_line(),
+        solution: generated.solution.0.to_line(),
+        givens: generated.givens as u32,
     };
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
 }
