@@ -350,9 +350,9 @@ pub(crate) struct Frame {
 pub struct PackedProber {
     stacks: [Vec<Frame>; LANES],
     // Resident warp state (was local to `run_stream`) so the warp can be **stepped** one
-    // pass at a time — the interleaved host
-    // ([`crate::generate::random_simt::run_warp_interleaved`]) drives this alongside a
-    // baseline warp; `run_stream` is just `step` in a loop with immediate refill.
+    // pass at a time — scaffolding for a two-warp host driving this alongside a baseline warp
+    // (the interleaved prototype that used it was retired for the unified warp); `run_stream`
+    // is just `step` in a loop with immediate refill.
     r: [[V; 3]; 9],
     unsolved: [V; 3],
     active: [bool; LANES],
@@ -383,7 +383,7 @@ impl PackedProber {
         self.active.iter().any(|&a| a)
     }
 
-    /// Whether probe slot `l` is currently occupied (the interleaved host fills idle slots).
+    /// Whether probe slot `l` is currently occupied (a stepping host fills idle slots).
     #[inline]
     pub fn slot_active(&self, l: usize) -> bool {
         self.active[l]
@@ -403,7 +403,7 @@ impl PackedProber {
     /// terminal verdict this pass is **deactivated** and reported via `on_verdict(slot,
     /// nonunique)` (the caller refills via [`load`](Self::load) or leaves the slot idle);
     /// a stuck lane branches and a dead lane backtracks **in place**, with no callback.
-    /// The stepping primitive the interleaved host drives; [`run_stream`](Self::run_stream)
+    /// The stepping primitive a two-warp host drives; [`run_stream`](Self::run_stream)
     /// is this in a loop with immediate refill.
     pub fn step<F: FnMut(usize, bool)>(&mut self, mut on_verdict: F) {
         let active_mask = M::from_array(self.active);

@@ -614,10 +614,10 @@ fn scalar_col_assign(r: &mut [[V; 3]; 9], unsolved: &[V; 3], l: usize) -> bool {
 /// The packed baseline logic solver: 8 SIMD lanes, each running one query's cheap
 /// closure in the SoA rep, refilled as it finishes via [`Self::run_stream`] (on demand
 /// from the host) or [`Self::solve`] (from a slice). Holds resident warp state so the
-/// warp can be **stepped** one pass at a time ([`Self::step_default`]) — the interleaved
-/// host ([`crate::generate::random_simt::run_warp_interleaved`]) drives it alongside the
-/// probe warp; the type mirrors [`PackedProber`](crate::probe::simt::PackedProber) so the
-/// host owns one of each.
+/// warp can be **stepped** one pass at a time ([`Self::step_default`]) — scaffolding for a
+/// two-warp host that drives it alongside a probe warp (the interleaved prototype that used
+/// it was retired in favour of the unified warp); the type mirrors
+/// [`PackedProber`](crate::probe::simt::PackedProber) so such a host owns one of each.
 pub struct PackedSolver {
     r: [[V; 3]; 9],
     unsolved: [V; 3],
@@ -647,7 +647,7 @@ impl PackedSolver {
         self.active.iter().any(|&a| a)
     }
 
-    /// Whether baseline slot `l` is currently occupied (the interleaved host fills idle ones).
+    /// Whether baseline slot `l` is currently occupied (a stepping host fills idle ones).
     #[inline]
     pub fn slot_active(&self, l: usize) -> bool {
         self.active[l]
@@ -666,7 +666,7 @@ impl PackedSolver {
     /// a terminal verdict is **deactivated** and reported via `on_verdict(slot, trace)`
     /// (the caller refills via [`load`](Self::load) or leaves the slot idle); a stuck lane
     /// takes one scalar [`subset_step`] in place (rejoining the warp if a subset fired).
-    /// The stepping primitive the interleaved host drives; the streaming [`drive`] is this
+    /// The stepping primitive a two-warp host drives; the streaming [`drive`] is this
     /// in a loop with immediate refill. `VEC_LC`/`try_lc` mirror [`drive`]'s LC placement.
     fn step<const VEC_LC: bool, F: FnMut(usize, SolveTrace)>(
         &mut self,
@@ -712,7 +712,7 @@ impl PackedSolver {
     }
 
     /// LC-off-warp stepping (the production default — see [`run_stream`](Self::run_stream))
-    /// for the interleaved host: ONE pass + service, terminations reported via `on_verdict`.
+    /// for a two-warp host: ONE pass + service, terminations reported via `on_verdict`.
     pub fn step_default<F: FnMut(usize, SolveTrace)>(&mut self, allowed: KindMask, on_verdict: F) {
         let try_lc = allowed & (1 << LC_POINTING) != 0;
         self.step::<false, F>(allowed, try_lc, on_verdict);

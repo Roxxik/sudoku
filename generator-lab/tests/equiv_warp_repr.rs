@@ -9,8 +9,7 @@
 //! `Search` prober the sequential path uses.)
 
 use generator_lab::generate::random_simt::{
-    find_puzzles, run_warp, run_warp_interleaved, run_warp_pingpong, run_warp_pipelined,
-    run_warp_simt, run_warp_unified, run_warp_unified_lean,
+    find_puzzles, run_warp, run_warp_simt, run_warp_unified, run_warp_unified_lean,
 };
 use generator_lab::generate::{generate, run_attempts};
 use generator_lab::rng::Rng;
@@ -44,19 +43,16 @@ fn train_warp_matches_sequential() {
     check_mode(0, 1, 8, 40);
 }
 
-/// The baseline-vectorizing two-warp hosts ([`run_warp_pipelined`] / [`run_warp_pingpong`])
-/// defer + batch the baseline gate onto the packed solver instead of running it scalar
-/// per lane. Since the packed solver is pinned byte-identical to the scalar one, every
-/// logical lane's `(stats, fp)` must still match plain [`run_warp`] exactly — at a lane
-/// count > 8 so the oversubscription/refill paths are exercised.
+/// The baseline-vectorizing hosts ([`run_warp_simt`] fire-at-8 batch / [`run_warp_unified`]
+/// single warp) defer or fuse the baseline gate onto the packed solver / closure instead of
+/// running it scalar per lane. Since the packed solver is pinned byte-identical to the scalar
+/// one, every logical lane's `(stats, fp)` must still match plain [`run_warp`] exactly — at a
+/// lane count > 8 so the oversubscription/refill paths are exercised.
 fn check_baseline_hosts(mode: u32, base_seed: u64, lanes: usize, attempts_per_lane: usize) {
     let spec = subset_spec_for_mode(mode);
     let bar = run_warp(base_seed, &spec, lanes, attempts_per_lane);
     for (name, res) in [
-        ("pipelined", run_warp_pipelined(base_seed, &spec, lanes, attempts_per_lane)),
-        ("pingpong", run_warp_pingpong(base_seed, &spec, lanes, attempts_per_lane)),
         ("simt", run_warp_simt(base_seed, &spec, lanes, attempts_per_lane)),
-        ("interleaved", run_warp_interleaved(base_seed, &spec, lanes, attempts_per_lane)),
         ("unified", run_warp_unified(base_seed, &spec, lanes, attempts_per_lane)),
         ("unified_lean", run_warp_unified_lean(base_seed, &spec, lanes, attempts_per_lane)),
     ] {
