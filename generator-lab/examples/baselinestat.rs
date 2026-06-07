@@ -78,6 +78,10 @@ fn main() {
             "  calls firing HiddenQuad      {:>12}   {:>6.4}%",
             f[5], 100.0 * f[5] as f64 / calls
         );
+        println!(
+            "  drain entries {}  sieve recomputes {}  ({:.2} sieves/drain-entry, incl terminal pass)",
+            f[8], f[7], f[7] as f64 / f[8].max(1) as f64
+        );
         println!("  per-kind firing totals (cheap kinds 0..4 are fired-or-not, <=1/call):");
         for k in 0..10 {
             if f[10 + k] > 0 {

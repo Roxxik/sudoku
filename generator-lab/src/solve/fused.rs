@@ -158,6 +158,7 @@ fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> So
 /// Drive naked singles + both fused band updates to a joint fixpoint — bb's
 /// `propagate_g`. Naked singles drain first (cheapest), then the row + column band
 /// sweeps; loop until a whole pass changes nothing.
+#[cfg_attr(prof_solver, inline(never))]
 fn propagate<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> Prop {
     loop {
         match drain_naked_singles(b, fired) {
@@ -178,8 +179,13 @@ fn propagate<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> Prop {
 /// (`unsolved & exactly(1)`) popcount-free; placement syncs both views. On a
 /// uniquely-solvable board naked singles are forced and never conflict, so a wave
 /// places them all without a contradiction check.
+#[cfg_attr(prof_solver, inline(never))]
 fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
+    #[cfg(feature = "count")]
+    fstat_add(8, 1); // drain entries
     loop {
+        #[cfg(feature = "count")]
+        fstat_add(7, 1); // sieve recomputes (waves + the terminal pass)
         let sieve = Sieve::<Bands<RowMajor>, 2>::compute_raw(b.row().candidates());
         let unsolved = b.row().unsolved();
         if (unsolved & sieve.dead()).any() {
@@ -210,6 +216,7 @@ fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
 /// candidates once and drive box↔row locked candidates ([`DROP_TRIP`]) and hidden
 /// singles in the three rows and three boxes ([`SINGLE9`]) off it. Returns whether
 /// anything changed. Mirror of bb's `band_update_rm`.
+#[cfg_attr(prof_solver, inline(never))]
 fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
     // Digit-outer: the live candidate set `cand[d] & unsolved` is one SIMD AND across
@@ -261,6 +268,7 @@ fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> b
 /// view, giving box↔column locked candidates and hidden singles in the three
 /// columns. Boxes are already covered row-major, so only the lines (columns) are
 /// swept. Mirror of bb's `band_update_cm`.
+#[cfg_attr(prof_solver, inline(never))]
 fn band_update_cm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
     for di in 0..9 {
@@ -329,6 +337,7 @@ fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut
 /// baseline's `subset_step` / `CellMarks` transpose, identical verdict and elimination
 /// set (the techniques are deterministic over the board contract; `forbid` is
 /// commutative, so the replay order is moot).
+#[cfg_attr(prof_solver, inline(never))]
 fn step_harder(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
     let mut cb = CellBoard::from_dual(b);
     let k = ladder(&mut cb, allowed)?;
