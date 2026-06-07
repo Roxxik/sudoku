@@ -20,7 +20,8 @@
 #                reclassify that work to heavy.
 #
 # Bookkeeping:
-#   cq status            current exclusive holder + live jobs
+#   cq status [--full]   current exclusive holder + live jobs; --full (alias --cmdline) also
+#                        prints the command each live job is running/waiting to run
 #   cq overlaps [N]      last N sensitive runs that were overlapped by maybe-heavy work
 #   cq flag MSG...       record a manual note (a sensitive agent flagging a suspect measurement)
 #
@@ -76,13 +77,22 @@ sub=${1:-}; [[ $# -ge 1 ]] && shift || usage
 
 case "$sub" in
   status)
+    full=0
+    case "${1:-}" in
+      --full|--cmdline) full=1;;
+      "") ;;
+      *) usage;;
+    esac
     reap
     if [[ -s "$HOLDER" ]]; then echo "exclusive: $(cat "$HOLDER")"; else echo "exclusive: free"; fi
     local_any=0
     for f in "$LIVE"/*; do
       [[ -e "$f" ]] || continue
-      IFS=$'\t' read -r st cls lbl < "$f"
+      # Line 1 is the legacy format (start<TAB>class<TAB>label) read by every version; the
+      # command is an optional line 2 that old readers never reach, so this stays compatible.
+      { IFS=$'\t' read -r st cls lbl; read -r cmdline; } < "$f"
       printf 'live: %-11s %s (since %s)\n' "$cls" "$lbl" "$(date -d "@$st" +%T)"
+      if (( full )); then printf '        cmd: %s\n' "${cmdline:-?}"; fi
       local_any=1
     done
     (( local_any )) || echo "live: none"
@@ -113,7 +123,9 @@ esac
 reap; rotate
 start=$(now)
 livefile="$LIVE/$$"
-printf '%s\t%s\t%s\n' "$start" "$sub" "$label" > "$livefile"
+# Readable, single-line rendering of the command (newlines collapsed so it stays one line 2).
+cmdline=$(printf '%s ' "$@"); cmdline=${cmdline% }; cmdline=${cmdline//$'\n'/ }
+printf '%s\t%s\t%s\n%s\n' "$start" "$sub" "$label" "$cmdline" > "$livefile"
 
 finish() {
   local end; end=$(now)
