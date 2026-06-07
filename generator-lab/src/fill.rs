@@ -63,15 +63,6 @@ impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
         }
     }
 
-    /// Decide cell `cell` as digit `d`: drop it from `unsolved` and forbid `d` on
-    /// every peer — two cell-set AND-NOTs, regardless of peer count.
-    #[inline]
-    fn place(&mut self, cell: usize, d: Digit) {
-        self.unsolved &= !M::cell(cell);
-        self.board[d] &= !M::peers(cell);
-        self.digits.set(cell, d);
-    }
-
     fn fill(&mut self, rng: &mut Rng) -> bool {
         let (cell, mask) = match S::scan(&self.board, self.unsolved) {
             Scan::Dead => return false,
@@ -90,19 +81,27 @@ impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
             n += 1;
         }
         rng.shuffle(&mut idxs[..n]);
+        // Deciding `cell` drops it from `unsolved` whichever digit wins, so do that
+        // once for the whole digit loop (not per digit) and re-open it only if every
+        // digit fails. Likewise forbidding `d` on `cell`'s peers touches exactly the
+        // one board `board[d]`, so back up just that 16-byte mask per try instead of
+        // copying all nine boards + `unsolved` (the 160-byte snapshot the loop used
+        // to take every node — ~14% of fill went to those `vmovups` copies).
+        let cell_mask = M::cell(cell);
+        let not_peers = !M::peers(cell);
+        self.unsolved &= !cell_mask;
         for &ix in &idxs[..n] {
-            // Back up only the cell-sets (9+1 masks); `digits[cell]` is reset
-            // explicitly. The strip's ~1.7 backtracks/grid make even that rare.
-            let bu_board = self.board;
-            let bu_unsolved = self.unsolved;
-            self.place(cell, Digit::from_index(ix as usize));
+            let d = Digit::from_index(ix as usize);
+            let bu = self.board[d];
+            self.board[d] &= not_peers;
+            self.digits.set(cell, d);
             if self.fill(rng) {
                 return true;
             }
-            self.board = bu_board;
-            self.unsolved = bu_unsolved;
-            self.digits.clear(cell);
+            self.board[d] = bu;
         }
+        self.unsolved |= cell_mask;
+        self.digits.clear(cell);
         false
     }
 }
