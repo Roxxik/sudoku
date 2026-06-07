@@ -512,11 +512,13 @@ pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
 fn xy_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)]) -> bool {
     for &(pivot, pcands) in bivalues {
         for (ai, &(a, acands)) in bivalues.iter().enumerate() {
-            if a == pivot || !sees(pivot, a) {
+            if a == pivot {
                 continue;
             }
-            // `a` must share exactly one digit (X) with the pivot; its other digit
-            // is the candidate Z to eliminate, and Z must not itself be in the pivot.
+            // `a` must share exactly one digit (X) with the pivot; its other digit is the
+            // candidate Z to eliminate, and Z must not itself be in the pivot. These are
+            // cheap candidate-set ops, so they reject before the costly peer test — most
+            // bivalues share zero or two digits with the pivot and never reach `sees`.
             let shared = pcands & acands;
             if shared.len() != 1 {
                 continue;
@@ -525,10 +527,17 @@ fn xy_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)]) -> bool {
             if !(z & pcands).is_empty() {
                 continue;
             }
+            if !sees(pivot, a) {
+                continue;
+            }
             // The second wing must be exactly {Y, Z}: the pivot's other digit + Z.
             let required_b = pcands.without(shared) | z;
             for &(b, bcands) in bivalues.iter().skip(ai + 1) {
-                if b == pivot || b == a || !sees(pivot, b) || bcands != required_b {
+                // Candidate-set match first, peer test only on the (rare) exact match.
+                if b == pivot || b == a || bcands != required_b {
+                    continue;
+                }
+                if !sees(pivot, b) {
                     continue;
                 }
                 let zd = z.iter().next().expect("z is a single digit");
