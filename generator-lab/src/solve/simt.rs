@@ -46,12 +46,14 @@
 //! one — a Forced cheap kind routes off the fused/SIMT path entirely).
 
 use super::techniques;
+use crate::counters::counter_block;
 use crate::probe::simt::{
-    BOX_CELLS, LANES, M, ONE, ROW_MASK, V, ZERO, one_bit, restore_lane, smear_v, snapshot_lane,
+    BOX_CELLS, Frame, LANES, M, ONE, Probe, ROW_MASK, V, ZERO, assign, backtrack_lane, branch_lane,
+    load_lane, one_bit, restore_lane, rm_cell, smear_v, snapshot_lane, warp_pass,
 };
 use crate::repr::banded::{Bands, RowMajor};
-use crate::repr::{DigitGrid, Marks, PerDigit, SolverState};
-use crate::solve::LogicBoard;
+use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState};
+use crate::solve::{Eliminate, LogicBoard};
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_PAIR,
     NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
@@ -59,6 +61,20 @@ use crate::spec::kinds::{
 use std::simd::cmp::SimdPartialEq;
 use std::simd::num::SimdUint;
 use std::simd::{Select, Simd};
+
+// --- packed baseline-solver utilization (feature = "count") -------------------
+// [0] warp passes (ticks), [1] active-lane-sum over ticks. utilization =
+// active_lane_sum / (LANES * ticks) — the baseline warp's analogue of the prober's
+// DSTAT[3]/(LANES*DSTAT[1]). Read by the `simtutil` example to size the buffer.
+counter_block!(SSTAT: 2, inc = sstat_inc, add = sstat_add, snapshot = sstat_snapshot, reset = sstat_reset);
+
+// --- unified-warp utilization (feature = "count") -----------------------------
+// The single warp that runs probe AND baseline lanes together ([`UnifiedWarp`]):
+// [0] warp passes, [1] active-lane-sum over passes. util = [1]/(LANES*[0]). Unlike
+// the two-warp hosts (separate probe DSTAT / baseline SSTAT), this is ONE number —
+// the whole point of unifying is that the combined warp is full whenever either kind
+// of work exists, so no oversubscription is needed to fill it. Read by `simtutil`.
+counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_snapshot, reset = uwstat_reset);
 
 /// One lane's input to the packed baseline solver: its row-major per-digit candidate
 /// bands and empty mask — the same row view ([`SolverState<Bands<RowMajor>>`] via
@@ -359,18 +375,103 @@ fn subset_step(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, allowed: Ki
         restore_lane(r, unsolved, l, &sr, &su);
         return Some(LC_POINTING); // a cheap kind: counted-but-never-read, signals "progress"
     }
-    let cand = PerDigit::new(core::array::from_fn(|d| {
-        Bands::<RowMajor>::from_lanes([sr[d][0], sr[d][1], sr[d][2], 0])
-    }));
-    let mut ss = SolverState::from_parts(cand, Bands::<RowMajor>::from_lanes([su[0], su[1], su[2], 0]));
-    let k = scalar_step_subsets(&mut ss, allowed)?;
-    let nr: [[u32; 3]; 9] = core::array::from_fn(|d| {
-        let t = ss.candidates().each()[d].to_lanes();
-        [t[0], t[1], t[2]]
-    });
-    let t = ss.unsolved().to_lanes();
-    restore_lane(r, unsolved, l, &nr, &[t[0], t[1], t[2]]);
+    // The subset ladder runs all six (naked/hidden x pair/triple/quad) techniques in
+    // difficulty order, each re-scanning every unit's cells through `get`. On the
+    // digit-major `SolverState<Bands>` `get` is a 9-board scan; transposing the snapshot
+    // once into the cell-major [`CellMarks`] makes every `get` an O(1) `Mark` load — the
+    // same fast surface `verify` uses (`Board`). Subsets only prune (never place), so the
+    // empty mask is unchanged and only the candidate bands are read back.
+    let mut cm = CellMarks::from_bands(&sr, &su);
+    let k = scalar_step_subsets(&mut cm, allowed)?;
+    // A fired subset removes only a handful of candidates, so write them straight into the
+    // warp lane (one bit clear each) rather than rebuilding + scattering the whole board.
+    // `r` is untouched since the snapshot (the LC fixpoint runs on the local copy `sr`), so
+    // clearing the logged bits leaves the lane exactly as a full restore would — and the
+    // empty mask is unchanged (subsets only prune), so `unsolved` needs no write at all.
+    for &(cell, d) in &cm.elims[..cm.n_elim] {
+        let (b, bit) = cell_band_bit(cell as usize);
+        r[d as usize][b].as_mut_array()[l] &= !(1u32 << bit);
+    }
     Some(k)
+}
+
+/// Candidate-only **cell-major** board for the scalar subset step (see [`subset_step`]):
+/// each cell's [`Mark`] stored directly, so a technique's per-unit scan reads it in O(1)
+/// rather than the digit-major snapshot's 9-board scan per `get`. The cell<->(band, bit)
+/// map is [`RowMajor`]'s (`band = cell / 27`, `bit = (cell / 9 % 3) * 9 + cell % 9`).
+/// Candidates only: the subset ladder never places, so `unsolved` is carried solely for
+/// [`Occupancy`] and the unused `Marks::from_digits`/`place` are not meaningful.
+#[derive(Clone)]
+struct CellMarks {
+    marks: [Mark; 81],
+    /// Row-major empty mask (the snapshot's `su`), the one fact candidates can't carry.
+    unsolved: [u32; 3],
+    /// Log of `(cell, digit-index)` candidates removed by [`eliminate`](CellMarks::eliminate),
+    /// so [`subset_step`] writes back only what the fired technique pruned (a targeted bit
+    /// clear per entry) instead of rebuilding + scattering the whole lane. One firing of one
+    /// subset on one nine-cell unit removes at most `size * (9 - size) <= 20` candidates, so
+    /// the fixed buffer never overflows (asserted).
+    elims: [(u8, u8); 32],
+    n_elim: usize,
+}
+
+/// Cell `c`'s `(band, bit)` in the [`RowMajor`] packing.
+#[inline]
+fn cell_band_bit(c: usize) -> (usize, u32) {
+    (c / 27, (((c / 9) % 3) * 9 + c % 9) as u32)
+}
+
+impl CellMarks {
+    /// Transpose a stalled lane's snapshot bands into per-cell marks (empty cells only;
+    /// a solved cell reads as [`Mark::EMPTY`], matching `SolverState::get`).
+    fn from_bands(sr: &[[u32; 3]; 9], su: &[u32; 3]) -> Self {
+        let mut marks = [Mark::EMPTY; 81];
+        for (c, slot) in marks.iter_mut().enumerate() {
+            let (b, bit) = cell_band_bit(c);
+            if (su[b] >> bit) & 1 == 0 {
+                continue; // solved -> EMPTY
+            }
+            let mut m = Mark::EMPTY;
+            for (d, srd) in sr.iter().enumerate() {
+                if (srd[b] >> bit) & 1 != 0 {
+                    m.insert(Digit::from_index(d));
+                }
+            }
+            *slot = m;
+        }
+        CellMarks { marks, unsolved: *su, elims: [(0, 0); 32], n_elim: 0 }
+    }
+}
+
+impl Marks for CellMarks {
+    fn from_digits(_: &DigitGrid) -> Self {
+        unreachable!("CellMarks is built from snapshot bands, not a digit grid")
+    }
+    fn place(&mut self, _: CellIdx, _: Digit) {
+        unreachable!("the subset ladder never places, only eliminates")
+    }
+    #[inline]
+    fn get(&self, cell: CellIdx) -> Mark {
+        self.marks[cell]
+    }
+}
+
+impl Occupancy for CellMarks {
+    #[inline]
+    fn is_empty(&self, cell: CellIdx) -> bool {
+        let (b, bit) = cell_band_bit(cell);
+        (self.unsolved[b] >> bit) & 1 != 0
+    }
+}
+
+impl Eliminate for CellMarks {
+    #[inline]
+    fn eliminate(&mut self, cell: CellIdx, d: Digit) {
+        debug_assert!(self.n_elim < self.elims.len(), "subset eliminations exceeded buffer");
+        self.elims[self.n_elim] = (cell as u8, d.index() as u8);
+        self.n_elim += 1;
+        self.marks[cell].remove(d);
+    }
 }
 
 /// The fast scalar locked-candidates fixpoint over a snapshot's row bands — the
@@ -450,12 +551,68 @@ fn scalar_lc_fast(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
     any
 }
 
+/// Scalar column-hidden-single recovery for one stalled baseline lane under the LEAN
+/// kernel (the cheap [`warp_pass`] omits columns). Detects lane `l`'s column hidden
+/// singles off its extracted row bands — column `c` holds digit `d`'s candidates at bits
+/// `c, c+9, c+18` of each band; fold the nine row-slices into per-column seen-once /
+/// seen-twice and `c` is forced iff exactly one — and [`assign`]s each (restricts the
+/// cell to that one digit). The next [`warp_pass`] then places it as a naked single via
+/// the smear, so NO scalar peer-clear is needed. Every assign is sound (the column leaves
+/// the digit exactly one home), so the closure stays confluent and the verdict is
+/// unchanged; `assign` clearing the cell's other digits also removes it from later digits'
+/// folds in the same scan, so the per-digit sequence matches `warp_pass_full`'s column
+/// block. Returns whether anything was assigned (then the lane rejoins the warp). This is
+/// the gather-free, full-pass-free way to keep columns off the probe lanes (the masked
+/// SIMD recovery it replaces paid the column ALU warp-wide regardless of the mask).
+fn scalar_col_assign(r: &mut [[V; 3]; 9], unsolved: &[V; 3], l: usize) -> bool {
+    let u = [unsolved[0].as_array()[l], unsolved[1].as_array()[l], unsolved[2].as_array()[l]];
+    let mut assigned = false;
+    for d in 0..9 {
+        let mut cones = 0u32;
+        let mut ctwos = 0u32;
+        for b in 0..3 {
+            let live = r[d][b].as_array()[l] & u[b];
+            for rr in 0..3u32 {
+                let slice = (live >> (9 * rr)) & 0x1FF;
+                ctwos |= cones & slice;
+                cones |= slice;
+            }
+        }
+        let mut col_single = cones & !ctwos;
+        while col_single != 0 {
+            let c = col_single.trailing_zeros();
+            col_single &= col_single - 1;
+            // Locate the forced cell: the (band, row) whose digit-`d` live candidate sits
+            // in column `c` (bit `9*rr + c`), then assign `d` there.
+            'find: for b in 0..3 {
+                let live = r[d][b].as_array()[l] & u[b];
+                for rr in 0..3u32 {
+                    let bitpos = 9 * rr + c;
+                    if live & (1 << bitpos) != 0 {
+                        assign(r, l, rm_cell(b, bitpos), d);
+                        assigned = true;
+                        break 'find;
+                    }
+                }
+            }
+        }
+    }
+    assigned
+}
+
 /// The packed baseline logic solver: 8 SIMD lanes, each running one query's cheap
 /// closure in the SoA rep, refilled as it finishes via [`Self::run_stream`] (on demand
-/// from the host) or [`Self::solve`] (from a slice). Stateless today (the subset
-/// fallback snapshots on demand); the type mirrors [`PackedProber`](crate::probe::simt::PackedProber)
-/// so the warp host can own one of each.
-pub struct PackedSolver;
+/// from the host) or [`Self::solve`] (from a slice). Holds resident warp state so the
+/// warp can be **stepped** one pass at a time ([`Self::step_default`]) — the interleaved
+/// host ([`crate::generate::random_simt::run_warp_interleaved`]) drives it alongside the
+/// probe warp; the type mirrors [`PackedProber`](crate::probe::simt::PackedProber) so the
+/// host owns one of each.
+pub struct PackedSolver {
+    r: [[V; 3]; 9],
+    unsolved: [V; 3],
+    active: [bool; LANES],
+    counts: [[u16; NUM]; LANES],
+}
 
 impl Default for PackedSolver {
     fn default() -> Self {
@@ -465,7 +622,89 @@ impl Default for PackedSolver {
 
 impl PackedSolver {
     pub fn new() -> Self {
-        PackedSolver
+        PackedSolver {
+            r: [[ZERO; 3]; 9],
+            unsolved: [ZERO; 3],
+            active: [false; LANES],
+            counts: [[0u16; NUM]; LANES],
+        }
+    }
+
+    /// Whether any resident lane is still solving.
+    #[inline]
+    pub fn any_active(&self) -> bool {
+        self.active.iter().any(|&a| a)
+    }
+
+    /// Whether baseline slot `l` is currently occupied (the interleaved host fills idle ones).
+    #[inline]
+    pub fn slot_active(&self, l: usize) -> bool {
+        self.active[l]
+    }
+
+    /// Load query `q` into slot `l` (initial fill or refill), marking it active and
+    /// resetting its kind counts.
+    #[inline]
+    pub fn load(&mut self, l: usize, q: &SolveQuery) {
+        load_query(&mut self.r, &mut self.unsolved, l, q);
+        self.counts[l] = [0; NUM];
+        self.active[l] = true;
+    }
+
+    /// ONE [`warp_pass_full`] over the resident active lanes + service. A lane that reaches
+    /// a terminal verdict is **deactivated** and reported via `on_verdict(slot, trace)`
+    /// (the caller refills via [`load`](Self::load) or leaves the slot idle); a stuck lane
+    /// takes one scalar [`subset_step`] in place (rejoining the warp if a subset fired).
+    /// The stepping primitive the interleaved host drives; the streaming [`drive`] is this
+    /// in a loop with immediate refill. `VEC_LC`/`try_lc` mirror [`drive`]'s LC placement.
+    fn step<const VEC_LC: bool, F: FnMut(usize, SolveTrace)>(
+        &mut self,
+        allowed: KindMask,
+        try_lc: bool,
+        mut on_verdict: F,
+    ) {
+        let active_mask = M::from_array(self.active);
+        if !active_mask.any() {
+            return;
+        }
+        sstat_add(0, 1);
+        sstat_add(1, active_mask.to_bitmask().count_ones() as u64);
+        let (changed, dead, solved) =
+            warp_pass_full::<VEC_LC>(&mut self.r, &mut self.unsolved, active_mask);
+
+        let active_b = active_mask.to_bitmask();
+        let solved_b = solved.to_bitmask();
+        let dead_b = dead.to_bitmask();
+        let changed_b = changed.to_bitmask();
+        let mut service = active_b & (solved_b | dead_b | !changed_b);
+        while service != 0 {
+            let l = service.trailing_zeros() as usize;
+            service &= service - 1;
+            let bit = 1u64 << l;
+            let mut verdict: Option<bool> = None;
+            if solved_b & bit != 0 {
+                verdict = Some(true);
+            } else if dead_b & bit != 0 {
+                verdict = Some(false); // contradiction: unsolvable under the toolbox
+            } else {
+                match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc) {
+                    Some(k) => self.counts[l][k] = self.counts[l][k].saturating_add(1),
+                    None => verdict = Some(false), // no subset applies: unsolvable
+                }
+            }
+            if let Some(v) = verdict {
+                let trace = SolveTrace { solved: v, counts: self.counts[l] };
+                self.active[l] = false;
+                on_verdict(l, trace);
+            }
+        }
+    }
+
+    /// LC-off-warp stepping (the production default — see [`run_stream`](Self::run_stream))
+    /// for the interleaved host: ONE pass + service, terminations reported via `on_verdict`.
+    pub fn step_default<F: FnMut(usize, SolveTrace)>(&mut self, allowed: KindMask, on_verdict: F) {
+        let try_lc = allowed & (1 << LC_POINTING) != 0;
+        self.step::<false, F>(allowed, try_lc, on_verdict);
     }
 
     /// Drive the warp as a **streaming** baseline solver under the `allowed` toolbox:
@@ -525,61 +764,33 @@ impl PackedSolver {
         // stall step runs LC (before subsets) so a stalled lane still reaches the LC
         // fixpoint. With LC in the closure (or absent), the stall step skips it.
         let try_lc = !VEC_LC && (allowed & (1 << LC_POINTING) != 0);
-        let mut r = [[ZERO; 3]; 9];
-        let mut unsolved = [ZERO; 3];
-        let mut active = [false; LANES];
-        let mut counts = [[0u16; NUM]; LANES];
+        self.active = [false; LANES];
 
         // Initial fill: ask for one query per lane.
         for l in 0..LANES {
             if let Some(q) = next(l, None) {
-                load_query(&mut r, &mut unsolved, l, &q);
-                counts[l] = [0; NUM];
-                active[l] = true;
+                self.load(l, &q);
             }
         }
-
-        let mut active_mask = M::from_array(active);
-        while active_mask.any() {
-            let (changed, dead, solved) = warp_pass_full::<VEC_LC>(&mut r, &mut unsolved, active_mask);
-
-            // Service only the lanes that reached a decision: solved, dead, or stuck
-            // (active but unchanged). A lane still propagating is skipped (the common
-            // case). Verdict masks reduced to integers once, as in the prober.
-            let active_b = active_mask.to_bitmask();
-            let solved_b = solved.to_bitmask();
-            let dead_b = dead.to_bitmask();
-            let changed_b = changed.to_bitmask();
-            let mut service = active_b & (solved_b | dead_b | !changed_b);
-            while service != 0 {
-                let l = service.trailing_zeros() as usize;
-                service &= service - 1;
-                let bit = 1u64 << l;
-                let mut verdict: Option<bool> = None;
-                if solved_b & bit != 0 {
-                    verdict = Some(true);
-                } else if dead_b & bit != 0 {
-                    verdict = Some(false); // contradiction: unsolvable under the toolbox
-                } else {
-                    // Stuck at the cheap fixpoint with cells left: try one scalar step.
-                    match subset_step(&mut r, &mut unsolved, l, allowed, try_lc) {
-                        Some(k) => counts[l][k] = counts[l][k].saturating_add(1),
-                        None => verdict = Some(false), // no subset applies: unsolvable
-                    }
-                }
-
-                if let Some(v) = verdict {
-                    let trace = SolveTrace { solved: v, counts: counts[l] };
-                    if let Some(q) = next(l, Some(trace)) {
-                        load_query(&mut r, &mut unsolved, l, &q);
-                        counts[l] = [0; NUM];
-                        // active[l] stays true
-                    } else {
-                        active[l] = false;
-                    }
+        // One pass + service per iteration, refilling each terminated slot on demand.
+        // Terminations are collected from `step` (which can't re-borrow `self` to call
+        // `next`) then refilled here — the lanes are independent, so deferring the refill
+        // to after the pass is byte-identical to the inline refill it replaced.
+        while self.any_active() {
+            let mut ts = [0usize; LANES];
+            let mut tt = [SolveTrace::default(); LANES];
+            let mut tn = 0usize;
+            self.step::<VEC_LC, _>(allowed, try_lc, |l, tr| {
+                ts[tn] = l;
+                tt[tn] = tr;
+                tn += 1;
+            });
+            for i in 0..tn {
+                let l = ts[i];
+                if let Some(q) = next(l, Some(tt[i])) {
+                    self.load(l, &q);
                 }
             }
-            active_mask = M::from_array(active);
         }
     }
 
@@ -613,5 +824,232 @@ impl PackedSolver {
                 None
             }
         });
+    }
+}
+
+// ===========================================================================
+// Unified warp: probe + baseline lanes in ONE warp
+// ===========================================================================
+//
+// The two-warp hosts ([`crate::generate::random_simt`]) keep a [`PackedProber`] and a
+// [`PackedSolver`] and try to feed the latter from the former. That starves the baseline
+// warp: unique-gate boards trickle in too slowly to keep an 8-wide consumer full unless
+// the host oversubscribes to L=64 macro-lanes (`simtutil`: baseline util 48%@16 ->
+// 86%@64; probe ~100% throughout).
+//
+// `UnifiedWarp` removes the second warp entirely. Both gates run on the SAME 8 SIMD
+// lanes, each lane tagged probe- or baseline-mode. The kernel is [`warp_pass_full`] (the
+// baseline closure: naked + hidden singles incl. columns, LC off-warp), which is **sound
+// for a probe lane too** — extra propagation only prunes the existence search, never
+// changes the "does a completion exist" verdict. So a slot stays bound to its macro-lane
+// and flips probe -> baseline **in place** the instant the prober reaches a unique
+// verdict, with no batch, no inter-warp queue, and no oversubscription: the warp is full
+// whenever work of EITHER kind exists, and probes are always plentiful. Active set = 8.
+//
+// Per-lane service diverges by mode (it already does in both engines — service is scalar):
+// a probe lane branches / backtracks / yields a uniqueness verdict; a baseline lane drops
+// to the scalar subset+LC step / yields a [`SolveTrace`]. The vectorized pass is uniform.
+
+/// A resolved unified-warp lane's verdict, tagged by the mode the lane was in.
+#[derive(Clone, Copy)]
+pub enum UnifiedVerdict {
+    /// A probe lane finished: `true` = an alternate completion exists (strip non-unique).
+    Probe(bool),
+    /// A baseline lane finished: the logic solver's trace (`solved` + subset-kind counts).
+    Baseline(SolveTrace),
+}
+
+/// What the host hands a freed unified slot for its next pass.
+pub enum UnifiedRefill {
+    /// Load a uniqueness probe (the slot enters/continues probe mode).
+    Probe(Probe),
+    /// Load a baseline query (the slot enters baseline mode — typically the in-place
+    /// probe->baseline flip when the just-finished probe was unique).
+    Baseline(SolveQuery),
+    /// No more work for this slot.
+    Idle,
+}
+
+/// The unified probe+baseline warp (see the section comment). Holds the resident SoA
+/// board plus per-lane mode, the prober's per-lane branch stacks, and the baseline's
+/// per-lane subset-kind counts. Drives both gate kinds across the same 8 lanes.
+pub struct UnifiedWarp {
+    r: [[V; 3]; 9],
+    unsolved: [V; 3],
+    active: [bool; LANES],
+    /// `true` = baseline mode, `false` = probe mode (per lane).
+    baseline_mode: [bool; LANES],
+    /// Probe-mode branch stacks (unused while a lane is in baseline mode).
+    stacks: [Vec<Frame>; LANES],
+    /// Baseline-mode subset-kind counts (reset on each baseline (re)load).
+    counts: [[u16; NUM]; LANES],
+    /// Kernel selector (the experiment #2 A/B): `false` = full closure
+    /// ([`warp_pass_full`], columns vectorized for every lane); `true` = **lean** — the
+    /// cheap [`warp_pass`] (naked + row/box singles, NO columns) for every lane, and columns
+    /// recovered SCALAR per stalled baseline lane in the service loop ([`scalar_col_assign`],
+    /// assign + let the smear place it). The bet: probe lanes (the majority of passes) never
+    /// touch column ALU — SIMD or scalar — and only baseline lanes pay, on stall.
+    ///
+    /// (An earlier lean attempt recovered columns with a *masked SIMD* `warp_pass_full` pass
+    /// — measured DEAD because the column fold runs warp-wide regardless of the mask, so it
+    /// paid columns for everyone anyway, doing 32% more passes. The scalar recovery here is
+    /// the genuine test of the lean premise: it never runs a full pass.)
+    lean: bool,
+}
+
+impl Default for UnifiedWarp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UnifiedWarp {
+    pub fn new() -> Self {
+        Self::with_lean(false)
+    }
+
+    /// The **lean**-kernel variant (experiment #2): see [`UnifiedWarp::lean`].
+    pub fn new_lean() -> Self {
+        Self::with_lean(true)
+    }
+
+    fn with_lean(lean: bool) -> Self {
+        UnifiedWarp {
+            r: [[ZERO; 3]; 9],
+            unsolved: [ZERO; 3],
+            active: [false; LANES],
+            baseline_mode: [false; LANES],
+            stacks: core::array::from_fn(|_| Vec::with_capacity(64)),
+            counts: [[0u16; NUM]; LANES],
+            lean,
+        }
+    }
+
+    #[inline]
+    fn any_active(&self) -> bool {
+        self.active.iter().any(|&a| a)
+    }
+
+    /// Load a probe into slot `l` (probe mode): the alts-restricted board + a cleared stack.
+    #[inline]
+    fn load_probe(&mut self, l: usize, p: &Probe) {
+        load_lane(&mut self.r, &mut self.unsolved, l, p);
+        self.stacks[l].clear();
+        self.baseline_mode[l] = false;
+        self.active[l] = true;
+    }
+
+    /// Load a baseline query into slot `l` (baseline mode): the plain stripped board + zeroed counts.
+    #[inline]
+    fn load_baseline(&mut self, l: usize, q: &SolveQuery) {
+        load_query(&mut self.r, &mut self.unsolved, l, q);
+        self.counts[l] = [0; NUM];
+        self.baseline_mode[l] = true;
+        self.active[l] = true;
+    }
+
+    /// ONE [`warp_pass_full`] over the active lanes + per-lane service dispatched by mode.
+    /// Terminations are reported via `on_verdict(slot, UnifiedVerdict)`; a non-terminal
+    /// probe lane branches/backtracks in place, a non-terminal baseline lane takes one
+    /// scalar subset step in place.
+    fn step<F: FnMut(usize, UnifiedVerdict)>(&mut self, allowed: KindMask, try_lc: bool, mut on_verdict: F) {
+        let active_mask = M::from_array(self.active);
+        if !active_mask.any() {
+            return;
+        }
+        let active_b = active_mask.to_bitmask();
+        uwstat_add(0, 1);
+        uwstat_add(1, active_b.count_ones() as u64);
+        // LC stays off the warp (the measured winner); a stalled baseline lane runs the
+        // scalar LC fixpoint inside `subset_step` (gated by `try_lc`), and probe lanes
+        // never need LC at all. So the closure is `warp_pass_full::<false>` (full) or, in
+        // the lean experiment, the cheap `warp_pass` (no column hidden singles) — columns
+        // are then recovered SCALAR, per stalled baseline lane, in the service loop below.
+        let (changed, dead, solved) = if self.lean {
+            warp_pass(&mut self.r, &mut self.unsolved, active_mask)
+        } else {
+            warp_pass_full::<false>(&mut self.r, &mut self.unsolved, active_mask)
+        };
+
+        let solved_b = solved.to_bitmask();
+        let dead_b = dead.to_bitmask();
+        let changed_b = changed.to_bitmask();
+        let mut service = active_b & (solved_b | dead_b | !changed_b);
+        while service != 0 {
+            let l = service.trailing_zeros() as usize;
+            service &= service - 1;
+            let bit = 1u64 << l;
+            let mut verdict: Option<UnifiedVerdict> = None;
+            if self.baseline_mode[l] {
+                if solved_b & bit != 0 {
+                    verdict = Some(UnifiedVerdict::Baseline(SolveTrace { solved: true, counts: self.counts[l] }));
+                } else if dead_b & bit != 0 {
+                    verdict = Some(UnifiedVerdict::Baseline(SolveTrace { solved: false, counts: self.counts[l] }));
+                } else if self.lean && scalar_col_assign(&mut self.r, &self.unsolved, l) {
+                    // Lean kernel omits column hidden singles: recover them scalar for this
+                    // one stalled baseline lane (assign each, the next `warp_pass` smears it
+                    // in as a naked single). Made progress -> stay active, rejoin the warp,
+                    // no verdict. Only fall to subsets once columns ALSO stall (full closure
+                    // exhausted), matching `warp_pass_full`'s "stuck" point exactly.
+                } else {
+                    match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc) {
+                        Some(k) => self.counts[l][k] = self.counts[l][k].saturating_add(1),
+                        None => verdict = Some(UnifiedVerdict::Baseline(SolveTrace { solved: false, counts: self.counts[l] })),
+                    }
+                }
+            } else if solved_b & bit != 0 {
+                verdict = Some(UnifiedVerdict::Probe(true)); // a completion exists
+            } else if dead_b & bit != 0 {
+                if !backtrack_lane(&mut self.r, &mut self.unsolved, &mut self.stacks[l], l) {
+                    verdict = Some(UnifiedVerdict::Probe(false)); // tree exhausted: unique
+                }
+            } else {
+                branch_lane(&mut self.r, &mut self.unsolved, &mut self.stacks[l], l);
+            }
+            if let Some(v) = verdict {
+                self.active[l] = false;
+                on_verdict(l, v);
+            }
+        }
+    }
+
+    /// Drive the unified warp streaming: each freed lane is refilled by `next(slot,
+    /// verdict)` (`None` verdict on the initial fill). The callback decides the slot's
+    /// next load — a fresh/continuing probe, the baseline query for an in-place
+    /// probe->baseline flip, or idle. One iteration = one [`step`](Self::step).
+    pub fn run_stream<F>(&mut self, allowed: KindMask, mut next: F)
+    where
+        F: FnMut(usize, Option<UnifiedVerdict>) -> UnifiedRefill,
+    {
+        let try_lc = allowed & (1 << LC_POINTING) != 0;
+        self.active = [false; LANES];
+        for s in &mut self.stacks {
+            s.clear();
+        }
+        for l in 0..LANES {
+            match next(l, None) {
+                UnifiedRefill::Probe(p) => self.load_probe(l, &p),
+                UnifiedRefill::Baseline(q) => self.load_baseline(l, &q),
+                UnifiedRefill::Idle => {}
+            }
+        }
+        while self.any_active() {
+            let mut ts = [0usize; LANES];
+            let mut tv = [UnifiedVerdict::Probe(false); LANES];
+            let mut tn = 0usize;
+            self.step(allowed, try_lc, |l, v| {
+                ts[tn] = l;
+                tv[tn] = v;
+                tn += 1;
+            });
+            for i in 0..tn {
+                let l = ts[i];
+                match next(l, Some(tv[i])) {
+                    UnifiedRefill::Probe(p) => self.load_probe(l, &p),
+                    UnifiedRefill::Baseline(q) => self.load_baseline(l, &q),
+                    UnifiedRefill::Idle => {}
+                }
+            }
+        }
     }
 }

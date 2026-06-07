@@ -32,17 +32,6 @@ impl<B: Banding> Bands<B> {
         self.0.to_array()
     }
 
-    /// Rebuild a banded set from raw 27-bit words in the low three lanes — the
-    /// inverse of [`to_lanes`](Bands::to_lanes). The SIMT baseline solver
-    /// ([`crate::solve::simt`]) snapshots a stalled warp lane back into a scalar
-    /// [`SolverState`](crate::repr::SolverState) to run the rare subset step on it;
-    /// this rebuilds each per-digit band from that snapshot. Lane 3 must be zero
-    /// (the unused high band), preserving the canonical-bands invariant.
-    #[inline]
-    pub(crate) fn from_lanes(a: [u32; 4]) -> Self {
-        Bands(Simd::from_array(a), PhantomData)
-    }
-
     /// Extract band `i` (0..3) as a scalar [`Band`] for a per-band unit sweep. The
     /// escape hatch the fused hidden-single prober needs: a band's 27 bits read off
     /// one lane drive a whole band's row/box scan, work the cell-at-a-time

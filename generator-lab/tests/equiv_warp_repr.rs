@@ -9,7 +9,8 @@
 //! `Search` prober the sequential path uses.)
 
 use generator_lab::generate::random_simt::{
-    find_puzzles, run_warp, run_warp_pingpong, run_warp_pipelined,
+    find_puzzles, run_warp, run_warp_interleaved, run_warp_pingpong, run_warp_pipelined,
+    run_warp_simt, run_warp_unified, run_warp_unified_lean,
 };
 use generator_lab::generate::{generate, run_attempts};
 use generator_lab::rng::Rng;
@@ -54,6 +55,10 @@ fn check_baseline_hosts(mode: u32, base_seed: u64, lanes: usize, attempts_per_la
     for (name, res) in [
         ("pipelined", run_warp_pipelined(base_seed, &spec, lanes, attempts_per_lane)),
         ("pingpong", run_warp_pingpong(base_seed, &spec, lanes, attempts_per_lane)),
+        ("simt", run_warp_simt(base_seed, &spec, lanes, attempts_per_lane)),
+        ("interleaved", run_warp_interleaved(base_seed, &spec, lanes, attempts_per_lane)),
+        ("unified", run_warp_unified(base_seed, &spec, lanes, attempts_per_lane)),
+        ("unified_lean", run_warp_unified_lean(base_seed, &spec, lanes, attempts_per_lane)),
     ] {
         assert_eq!(res.per_lane.len(), bar.per_lane.len(), "{name} mode {mode}: lane count");
         for (l, (a, b)) in res.per_lane.iter().zip(bar.per_lane.iter()).enumerate() {

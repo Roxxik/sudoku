@@ -1,11 +1,15 @@
 //! A/B for vectorizing the **baseline gate** in the SIMT generator. Compares the current
-//! warp ([`run_warp`], packed prober + scalar per-lane baseline) against the two decoupled
-//! two-warp prototypes that also vectorize the baseline onto the packed
-//! [`PackedSolver`](generator_lab::solve::simt::PackedSolver):
-//!   - [`run_warp_pipelined`] (A1, nested flush: continuous prober, batched solver flush),
-//!   - [`run_warp_pingpong`]  (A2, alternating full prober/solver passes),
-//! swept over the in-flight logical-lane count (oversubscription) since both need lanes >> 8
-//! to keep both warps fed. Same total work everywhere.
+//! warp ([`run_warp`], packed prober + scalar per-lane baseline) against the prototypes that
+//! also vectorize the baseline:
+//!   - **two-warp, coupled** — a [`PackedProber`] feeds a [`PackedSolver`]:
+//!     [`run_warp_pipelined`] (A1, continuous prober + batched solver flush) and
+//!     [`run_warp_interleaved`] (one pass each per outer step). Both need lanes >> 8
+//!     (oversubscription) to keep the baseline warp fed — `simtutil` shows baseline util
+//!     48%@16 -> 86%@64.
+//!   - **one warp, unified** — [`run_warp_unified`]: probe AND baseline lanes share a single
+//!     [`UnifiedWarp`](generator_lab::solve::simt::UnifiedWarp), a slot flipping probe->
+//!     baseline in place. ~100% util at active set = 8 (no oversubscription) — the win.
+//! Swept over the in-flight logical-lane count; same total work everywhere.
 //!
 //! Correctness: each prototype is cross-checked against `run_warp` at a matched lane count
 //! — per-lane `(stats, fp)` must be byte-identical (the packed baseline solver is pinned to
@@ -14,7 +18,8 @@
 //! Usage: cargo run --release --example simtbaselinebench -- [total=96000] [reps=3]
 
 use generator_lab::generate::random_simt::{
-    WarpResult, run_warp, run_warp_pingpong, run_warp_pipelined,
+    WarpResult, run_warp, run_warp_interleaved, run_warp_pingpong, run_warp_pipelined,
+    run_warp_simt, run_warp_unified, run_warp_unified_lean,
 };
 use generator_lab::spec::Spec;
 use generator_lab::spec_for_mode;
@@ -24,6 +29,10 @@ fn check_match(name: &str, spec: &Spec, lanes: usize, per_lane: usize) {
     let bar = run_warp(1, spec, lanes, per_lane);
     let mine = match name {
         "pipelined" => run_warp_pipelined(1, spec, lanes, per_lane),
+        "simt" => run_warp_simt(1, spec, lanes, per_lane),
+        "interleaved" => run_warp_interleaved(1, spec, lanes, per_lane),
+        "unified" => run_warp_unified(1, spec, lanes, per_lane),
+        "unified_lean" => run_warp_unified_lean(1, spec, lanes, per_lane),
         _ => run_warp_pingpong(1, spec, lanes, per_lane),
     };
     assert_eq!(mine.per_lane.len(), bar.per_lane.len(), "{name}: lane count");
@@ -55,20 +64,27 @@ fn main() {
 
         // Correctness: prototypes match run_warp at a matched (small) lane count.
         check_match("pipelined", &spec, 16, 2000);
-        check_match("pingpong", &spec, 16, 2000);
+        check_match("interleaved", &spec, 16, 2000);
+        check_match("unified", &spec, 16, 2000);
+        check_match("unified_lean", &spec, 16, 2000);
 
         let bar = time(total, reps, || run_warp(1, &spec, 8, total / 8));
         println!("== {label} ==   (total {total} att, {reps} reps, best of)");
         println!("  run_warp (scalar baseline, 8 lanes) : {bar:>8.3} us/att   1.00x");
 
-        for &lanes in &[32usize, 64, 128, 256, 512] {
+        // The unified warp keeps its active set at 8 intrinsically (8 in flight regardless
+        // of the macro-lane count), so its natural config is L=8; the larger L only change
+        // total work per macro-lane, not occupancy. Reported across the same sweep for A/B.
+        for &lanes in &[8usize, 16, 24, 32, 64] {
             let per_lane = total / lanes;
-            let pl = time(total, reps, || run_warp_pipelined(1, &spec, lanes, per_lane));
-            let pp = time(total, reps, || run_warp_pingpong(1, &spec, lanes, per_lane));
+            let pl = if lanes >= 16 { time(total, reps, || run_warp_pipelined(1, &spec, lanes, per_lane)) } else { f64::NAN };
+            let un = time(total, reps, || run_warp_unified(1, &spec, lanes, per_lane));
+            let ul = time(total, reps, || run_warp_unified_lean(1, &spec, lanes, per_lane));
             println!(
-                "  L={lanes:<4} pipelined {pl:>8.3} us/att {:>6.2}x   pingpong {pp:>8.3} us/att {:>6.2}x",
+                "  L={lanes:<4} opportunistic {pl:>8.3} {:>5.2}x    unified {un:>8.3} {:>5.2}x    unified_lean {ul:>8.3} {:>5.2}x",
                 bar / pl,
-                bar / pp
+                bar / un,
+                bar / ul,
             );
         }
         println!();

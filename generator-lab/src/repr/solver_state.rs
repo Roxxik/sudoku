@@ -29,17 +29,6 @@ pub struct SolverState<M: GridMask> {
 }
 
 impl<M: GridMask> SolverState<M> {
-    /// Assemble a state directly from its parts — the inverse of the
-    /// [`candidates`](SolverState::candidates)/[`unsolved`](SolverState::unsolved)
-    /// readers. The SIMT baseline solver ([`crate::solve::simt`]) rebuilds a scalar
-    /// state from a stalled warp lane's snapshot to run the rare subset step; the
-    /// caller is responsible for the parts being consistent (every decided cell out
-    /// of `unsolved`), as a snapshot of a valid board is.
-    #[inline]
-    pub(crate) fn from_parts(candidates: PerDigit<M>, unsolved: M) -> Self {
-        SolverState { candidates, unsolved }
-    }
-
     /// The per-digit candidate cell-sets — what a [`scan`](crate::scan) reads.
     #[inline]
     pub fn candidates(&self) -> &PerDigit<M> {

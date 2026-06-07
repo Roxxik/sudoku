@@ -166,6 +166,19 @@ counter_block!(PSTAT: 3, inc = pstat_bump, add = pstat_add, snapshot = pstat_sna
 // tallies; it is a no-op when the feature is off, so its call sites need no gating.
 counter_block!(DSTAT: 4, inc = dstat_inc, add = dstat_add, snapshot = dstat_snapshot, reset = dstat_reset);
 
+// Per-lane "did the just-resolved probe ever branch" flag, stashed right before the
+// refill callback so a count-instrumented host can correlate a gate's probe-branch with
+// its baseline outcome (the "no-branch => baseline-trivial?" study). Single-threaded.
+#[cfg(feature = "count")]
+static mut LAST_BRANCHED: [bool; LANES] = [false; LANES];
+/// Whether the probe slot `l` just resolved had to branch (read it in the refill
+/// callback, immediately after receiving the verdict). `feature = "count"` only.
+#[cfg(feature = "count")]
+pub fn last_branched(l: usize) -> bool {
+    // SAFETY: single-threaded lab.
+    unsafe { LAST_BRANCHED[l] }
+}
+
 /// One lane's input to the packed prober: its row-major candidate bands and empty
 /// mask (from a [`SolverState<Bands<RowMajor>>`](crate::repr::SolverState) row view,
 /// via [`crate::repr::banded::Bands::to_lanes`]), the stripped `cell`, and the
@@ -188,7 +201,7 @@ impl Probe {
 /// alternate digits `alts` (clear the non-alternate digits' bit there). This is
 /// the refill path — the per-lane scalar store of a fresh query.
 #[inline]
-fn load_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, p: &Probe) {
+pub(crate) fn load_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, p: &Probe) {
     let cl = rm_lane(p.cell);
     let cbit = 1u32 << rm_bit(p.cell);
     // The cell's band gets a per-digit AND-mask that clears `cbit` for every non-alternate
@@ -238,7 +251,7 @@ pub(crate) fn restore_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize,
 /// other digit's candidate there. The cell stays unsolved — the next [`warp_pass`]
 /// sees it as a naked single and places it via the smear (gather-free branch).
 #[inline]
-fn assign(r: &mut [[V; 3]; 9], l: usize, cell: usize, dd: usize) {
+pub(crate) fn assign(r: &mut [[V; 3]; 9], l: usize, cell: usize, dd: usize) {
     let cl = rm_lane(cell);
     let cbit = 1u32 << rm_bit(cell);
     for d in 0..9 {
@@ -258,7 +271,7 @@ fn assign(r: &mut [[V; 3]; 9], l: usize, cell: usize, dd: usize) {
 /// closure, so the per-lane fixpoint is identical (the closure is confluent) — only the
 /// pass granularity differs.
 #[cfg_attr(feature = "profiling", inline(never))]
-fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
+pub(crate) fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
     let mut changed = M::splat(false);
     let mut dead = M::splat(false);
 
@@ -322,7 +335,7 @@ fn warp_pass(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M)
 /// bands + empty mask) as it was *before* any branch digit was tried at `cell`,
 /// and `remaining` = the candidate digits not yet tried there.
 #[derive(Clone, Copy)]
-struct Frame {
+pub(crate) struct Frame {
     r: [[u32; 3]; 9],
     unsolved: [u32; 3],
     cell: u32,
@@ -336,6 +349,15 @@ struct Frame {
 /// allocations.
 pub struct PackedProber {
     stacks: [Vec<Frame>; LANES],
+    // Resident warp state (was local to `run_stream`) so the warp can be **stepped** one
+    // pass at a time — the interleaved host
+    // ([`crate::generate::random_simt::run_warp_interleaved`]) drives this alongside a
+    // baseline warp; `run_stream` is just `step` in a loop with immediate refill.
+    r: [[V; 3]; 9],
+    unsolved: [V; 3],
+    active: [bool; LANES],
+    /// Per-lane "this probe ever branched" flag (the packdiag split / `last_branched`).
+    branched: [bool; LANES],
 }
 
 impl Default for PackedProber {
@@ -346,7 +368,83 @@ impl Default for PackedProber {
 
 impl PackedProber {
     pub fn new() -> Self {
-        PackedProber { stacks: core::array::from_fn(|_| Vec::with_capacity(64)) }
+        PackedProber {
+            stacks: core::array::from_fn(|_| Vec::with_capacity(64)),
+            r: [[ZERO; 3]; 9],
+            unsolved: [ZERO; 3],
+            active: [false; LANES],
+            branched: [false; LANES],
+        }
+    }
+
+    /// Whether any resident lane is still searching.
+    #[inline]
+    pub fn any_active(&self) -> bool {
+        self.active.iter().any(|&a| a)
+    }
+
+    /// Whether probe slot `l` is currently occupied (the interleaved host fills idle slots).
+    #[inline]
+    pub fn slot_active(&self, l: usize) -> bool {
+        self.active[l]
+    }
+
+    /// Load probe `p` into slot `l` (initial fill or refill), marking it active.
+    #[inline]
+    pub fn load(&mut self, l: usize, p: &Probe) {
+        load_lane(&mut self.r, &mut self.unsolved, l, p);
+        self.stacks[l].clear();
+        self.branched[l] = false;
+        self.active[l] = true;
+        dstat_add(0, 1);
+    }
+
+    /// ONE [`warp_pass`] over the resident active lanes + service. A lane that reaches a
+    /// terminal verdict this pass is **deactivated** and reported via `on_verdict(slot,
+    /// nonunique)` (the caller refills via [`load`](Self::load) or leaves the slot idle);
+    /// a stuck lane branches and a dead lane backtracks **in place**, with no callback.
+    /// The stepping primitive the interleaved host drives; [`run_stream`](Self::run_stream)
+    /// is this in a loop with immediate refill.
+    pub fn step<F: FnMut(usize, bool)>(&mut self, mut on_verdict: F) {
+        let active_mask = M::from_array(self.active);
+        if !active_mask.any() {
+            return;
+        }
+        dstat_add(1, 1);
+        dstat_add(3, active_mask.to_bitmask().count_ones() as u64);
+        let (changed, dead, solved) = warp_pass(&mut self.r, &mut self.unsolved, active_mask);
+
+        let active_b = active_mask.to_bitmask();
+        let solved_b = solved.to_bitmask();
+        let dead_b = dead.to_bitmask();
+        let changed_b = changed.to_bitmask();
+        let mut service = active_b & (solved_b | dead_b | !changed_b);
+        while service != 0 {
+            let l = service.trailing_zeros() as usize;
+            service &= service - 1;
+            let bit = 1u64 << l;
+            let mut verdict: Option<bool> = None;
+            if solved_b & bit != 0 {
+                verdict = Some(true);
+            } else if dead_b & bit != 0 {
+                if !self.backtrack(l) {
+                    verdict = Some(false); // tree exhausted: no alternate completion
+                }
+            } else {
+                self.branch(l);
+                self.branched[l] = true;
+            }
+            if let Some(v) = verdict {
+                #[cfg(feature = "count")]
+                {
+                    pstat_bump(if self.branched[l] { 2 } else if v { 0 } else { 1 });
+                    // SAFETY: single-threaded lab.
+                    unsafe { LAST_BRANCHED[l] = self.branched[l] };
+                }
+                self.active[l] = false;
+                on_verdict(l, v);
+            }
+        }
     }
 
     /// Drive the warp as a **streaming** existence prober: rather than consuming a
@@ -370,76 +468,36 @@ impl PackedProber {
     where
         F: FnMut(usize, Option<bool>) -> Option<Probe>,
     {
-        let mut r = [[ZERO; 3]; 9];
-        let mut unsolved = [ZERO; 3];
-        let mut active = [false; LANES];
-        // Per-lane "this probe ever branched" flag, for the packdiag split.
-        let mut branched = [false; LANES];
+        self.active = [false; LANES];
+        self.branched = [false; LANES];
         for s in &mut self.stacks {
             s.clear();
         }
-
         // Initial fill: ask for one probe per lane.
         for l in 0..LANES {
             if let Some(p) = next(l, None) {
-                load_lane(&mut r, &mut unsolved, l, &p);
-                self.stacks[l].clear();
-                branched[l] = false;
-                active[l] = true;
-                dstat_add(0, 1);
+                self.load(l, &p);
             }
         }
-
-        let mut active_mask = M::from_array(active);
-        while active_mask.any() {
-            dstat_add(1, 1);
-            dstat_add(3, active_mask.to_bitmask().count_ones() as u64);
-            let (changed, dead, solved) = warp_pass(&mut r, &mut unsolved, active_mask);
-
-            // Service only the lanes that reached a decision this pass, found by bitmask
-            // rather than a per-lane `Mask::test` extract: a lane needs servicing iff it is
-            // solved, dead, or stuck (active but unchanged). The common case — a lane still
-            // propagating — is skipped entirely, and the three verdict masks are reduced to
-            // integers once (three `movemask`s) instead of per-lane lane-extracts.
-            let active_b = active_mask.to_bitmask();
-            let solved_b = solved.to_bitmask();
-            let dead_b = dead.to_bitmask();
-            let changed_b = changed.to_bitmask();
-            let mut service = active_b & (solved_b | dead_b | !changed_b);
-            while service != 0 {
-                let l = service.trailing_zeros() as usize;
-                service &= service - 1;
-                let bit = 1u64 << l;
-                let mut verdict: Option<bool> = None;
-                if solved_b & bit != 0 {
-                    verdict = Some(true);
-                } else if dead_b & bit != 0 {
-                    // Backtrack to the nearest frame with an untried digit.
-                    if !self.backtrack(&mut r, &mut unsolved, l) {
-                        verdict = Some(false); // tree exhausted: no alternate completion
-                    }
-                } else {
-                    // Stuck at a fixpoint with cells remaining (active & !changed): branch.
-                    self.branch(&mut r, &mut unsolved, l);
-                    branched[l] = true;
-                }
-
-                if let Some(v) = verdict {
-                    #[cfg(feature = "count")]
-                    pstat_bump(if branched[l] { 2 } else if v { 0 } else { 1 });
-                    // Refill this lane on demand.
-                    if let Some(p) = next(l, Some(v)) {
-                        load_lane(&mut r, &mut unsolved, l, &p);
-                        self.stacks[l].clear();
-                        branched[l] = false;
-                        dstat_add(0, 1);
-                        // active[l] stays true
-                    } else {
-                        active[l] = false;
-                    }
+        // One pass + service per iteration, refilling each terminated slot on demand.
+        // Terminations are collected from `step` (which can't re-borrow `self` to call
+        // `next`) then refilled here — the lanes are independent, so deferring the refill
+        // to after the pass is byte-identical to the inline refill it replaced.
+        while self.any_active() {
+            let mut ts = [0usize; LANES];
+            let mut tv = [false; LANES];
+            let mut tn = 0usize;
+            self.step(|l, v| {
+                ts[tn] = l;
+                tv[tn] = v;
+                tn += 1;
+            });
+            for i in 0..tn {
+                let l = ts[i];
+                if let Some(p) = next(l, Some(tv[i])) {
+                    self.load(l, &p);
                 }
             }
-            active_mask = M::from_array(active);
         }
     }
 
@@ -467,50 +525,94 @@ impl PackedProber {
     /// Branch lane `l`: pick a cell (a bivalue cell if any, else any unsolved one),
     /// push a frame saving the pre-branch board and the cell's untried digits, and
     /// assign its first candidate (the next pass places it via the smear).
-    fn branch(&mut self, r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize) {
+    fn branch(&mut self, l: usize) {
         dstat_add(2, 1);
-        let (cell, mask) = branch_cell(r, unsolved, l);
-        let (sr, su) = snapshot_lane(r, unsolved, l);
+        let (sr, su) = snapshot_lane(&self.r, &self.unsolved, l);
+        let (cell, mask) = branch_cell(&sr, &su);
         let d = mask.trailing_zeros() as usize;
         self.stacks[l].push(Frame { r: sr, unsolved: su, cell: cell as u32, remaining: mask & (mask - 1) });
-        assign(r, l, cell, d);
+        assign(&mut self.r, l, cell, d);
     }
 
     /// Backtrack lane `l` to the shallowest frame with an untried digit: restore
     /// that frame's board and assign its next candidate. Returns false if the whole
     /// search tree is exhausted (no completion).
-    fn backtrack(&mut self, r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize) -> bool {
+    fn backtrack(&mut self, l: usize) -> bool {
         loop {
-            let Some(frame) = self.stacks[l].last_mut() else {
-                return false;
+            // Scope the frame borrow so the board restore can take `&mut self.r`.
+            let (cell, d, sr, su) = {
+                let Some(frame) = self.stacks[l].last_mut() else {
+                    return false;
+                };
+                if frame.remaining == 0 {
+                    self.stacks[l].pop();
+                    continue;
+                }
+                let cell = frame.cell as usize;
+                let d = frame.remaining.trailing_zeros() as usize;
+                frame.remaining &= frame.remaining - 1;
+                (cell, d, frame.r, frame.unsolved)
             };
-            if frame.remaining == 0 {
-                self.stacks[l].pop();
-                continue;
-            }
-            let cell = frame.cell as usize;
-            let d = frame.remaining.trailing_zeros() as usize;
-            frame.remaining &= frame.remaining - 1;
-            let (sr, su) = (frame.r, frame.unsolved);
-            restore_lane(r, unsolved, l, &sr, &su);
-            assign(r, l, cell, d);
+            restore_lane(&mut self.r, &mut self.unsolved, l, &sr, &su);
+            assign(&mut self.r, l, cell, d);
             return true;
         }
     }
 }
 
-/// Pick lane `l`'s branch cell + its candidate-digit mask: prefer a bivalue cell
-/// (exactly two candidates) to keep the branching factor at 2, else the lowest
-/// unsolved cell. A stalled lane has no naked single, so the pick has >= 2 digits.
+/// Branch lane `l` on an **externally-owned** frame stack (the unified-warp engine in
+/// [`crate::solve::simt`] keeps the prober's per-lane stacks itself rather than going
+/// through [`PackedProber`]). Pick a cell, push the pre-branch board + untried digits,
+/// assign the first candidate. Mirror of [`PackedProber::branch`], stack passed in.
+pub(crate) fn branch_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], stack: &mut Vec<Frame>, l: usize) {
+    dstat_add(2, 1);
+    let (sr, su) = snapshot_lane(r, unsolved, l);
+    let (cell, mask) = branch_cell(&sr, &su);
+    let d = mask.trailing_zeros() as usize;
+    stack.push(Frame { r: sr, unsolved: su, cell: cell as u32, remaining: mask & (mask - 1) });
+    assign(r, l, cell, d);
+}
+
+/// Backtrack lane `l` on an externally-owned frame stack — mirror of
+/// [`PackedProber::backtrack`]. Returns false if the tree is exhausted (no completion).
+pub(crate) fn backtrack_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], stack: &mut Vec<Frame>, l: usize) -> bool {
+    loop {
+        let (cell, d, sr, su) = {
+            let Some(frame) = stack.last_mut() else {
+                return false;
+            };
+            if frame.remaining == 0 {
+                stack.pop();
+                continue;
+            }
+            let cell = frame.cell as usize;
+            let d = frame.remaining.trailing_zeros() as usize;
+            frame.remaining &= frame.remaining - 1;
+            (cell, d, frame.r, frame.unsolved)
+        };
+        restore_lane(r, unsolved, l, &sr, &su);
+        assign(r, l, cell, d);
+        return true;
+    }
+}
+
+/// Pick the branch cell + its candidate-digit mask from a lane's **already-snapshotted**
+/// scalar board (`sr`/`su` from [`snapshot_lane`]): prefer a bivalue cell (exactly two
+/// candidates) to keep the branching factor at 2, else the lowest unsolved cell. A stalled
+/// lane has no naked single, so the pick has >= 2 digits.
+///
+/// Reads the scalar snapshot rather than re-extracting lane `l` out of the SoA warp: every
+/// caller snapshots anyway (to push the pre-branch frame), so taking the pick off that copy
+/// saves ~36 SIMD lane-gathers per branch — the fold over all 9x3 bands plus the mask scan,
+/// which previously pulled each `r[d][b]`/`unsolved[b]` element out a second time.
 #[cfg_attr(feature = "profiling", inline(never))]
-fn branch_cell(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> (usize, u16) {
-    let u = [unsolved[0].as_array()[l], unsolved[1].as_array()[l], unsolved[2].as_array()[l]];
+pub(crate) fn branch_cell(sr: &[[u32; 3]; 9], su: &[u32; 3]) -> (usize, u16) {
     let mut ones = [0u32; 3];
     let mut twos = [0u32; 3];
     let mut threes = [0u32; 3];
     for d in 0..9 {
         for b in 0..3 {
-            let x = r[d][b].as_array()[l];
+            let x = sr[d][b];
             threes[b] |= twos[b] & x;
             twos[b] |= ones[b] & x;
             ones[b] |= x;
@@ -518,7 +620,7 @@ fn branch_cell(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> (usize, u16) {
     }
     let mut cell = usize::MAX;
     for b in 0..3 {
-        let biv = u[b] & twos[b] & !threes[b];
+        let biv = su[b] & twos[b] & !threes[b];
         if biv != 0 {
             cell = rm_cell(b, biv.trailing_zeros());
             break;
@@ -526,8 +628,8 @@ fn branch_cell(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> (usize, u16) {
     }
     if cell == usize::MAX {
         for b in 0..3 {
-            if u[b] != 0 {
-                cell = rm_cell(b, u[b].trailing_zeros());
+            if su[b] != 0 {
+                cell = rm_cell(b, su[b].trailing_zeros());
                 break;
             }
         }
@@ -536,7 +638,7 @@ fn branch_cell(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> (usize, u16) {
     let cbit = 1u32 << rm_bit(cell);
     let mut mask = 0u16;
     for d in 0..9 {
-        if r[d][cl].as_array()[l] & cbit != 0 {
+        if sr[d][cl] & cbit != 0 {
             mask |= 1 << d;
         }
     }

@@ -45,6 +45,11 @@ pub use logic::LogicSolver;
 #[cfg(feature = "count")]
 pub use fused::{fstat_reset, fstat_snapshot};
 
+/// Packed baseline-solver warp-utilization counters (`feature = "count"`) — read by
+/// the `simtutil` example.
+#[cfg(all(feature = "count", not(target_arch = "wasm32")))]
+pub use simt::{sstat_reset, sstat_snapshot, uwstat_reset, uwstat_snapshot};
+
 use crate::spec::kinds::{KindMask, SolveTrace};
 
 /// A technique-driven solver over board `B` — the swap point between engines, so the

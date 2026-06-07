@@ -40,7 +40,9 @@ use crate::fill::random_solution;
 use crate::probe::simt::{LANES, PackedProber, Probe};
 use crate::repr::{CELLS, Digit, DigitGrid, Solution};
 use crate::rng::Rng;
-use crate::solve::simt::{PackedSolver, SolveQuery};
+use crate::solve::simt::{
+    PackedSolver, SolveQuery, UnifiedRefill, UnifiedVerdict, UnifiedWarp,
+};
 use crate::spec::Spec;
 use crate::spec::kinds::{KindMask, SolveTrace};
 use crate::fingerprint::{FNV_OFFSET, FNV_PRIME, fnv_fold_cells};
@@ -443,13 +445,21 @@ pub fn collect_baseline_boards(
     boards
 }
 
-/// Generate **exactly one puzzle per seed** in `seeds`, racing the W=8 packed prober
+/// Generate **exactly one puzzle per seed** in `seeds`, racing the W=8 **unified warp**
+/// ([`UnifiedWarp`]: both the uniqueness and baseline gates on the same 8 SIMD lanes)
 /// across the seeds and **streaming** each result to `on_found(seed, puzzle)` the moment
 /// it is produced. Each seed is run to its *first* success — the same single puzzle
 /// scalar [`generate`](crate::generate::generate) yields from `Rng::from_seed(seed)` —
 /// so the relation is a pure `seed -> puzzle` map, independent of how the 8 slots
 /// interleave or how many slots there are. Returns the aggregate attempt stats;
 /// `stats.successes` == the number of `on_found` calls.
+///
+/// **The production batch path, on the unified warp.** Eight slot-bound lanes, each a seed
+/// in flight; a slot flips probe -> baseline in place on a unique gate (no second warp, no
+/// oversubscription — see [`run_warp_unified`]) and rolls to the next seed on a success. So
+/// the warp is full whenever seeds remain, at active set = 8. Byte-identical to the
+/// sequential generator per seed (the packed baseline solver is pinned to the scalar one),
+/// pinned by `tests/equiv_warp_repr::find_puzzles_matches_scalar_per_seed`.
 ///
 /// **Streaming, not collected.** Puzzles are handed to `on_found` as soon as they finish
 /// (in warp-completion order, *not* seed order), so a caller can persist/print each one
@@ -473,36 +483,50 @@ where
     F: FnMut(u64, GeneratedPuzzle),
 {
     let baseline = spec.baseline_mask();
-    let fast = baseline_fast_applicable(spec);
     let mut seeds = seeds.into_iter();
 
     // One slot-bound lane per SIMD slot; each is (re)assigned seeds pulled from `seeds`
     // as it finishes. `usize::MAX` quota = "retry the current seed until it yields".
     let mut ls: Vec<Lane> =
         (0..LANES).map(|_| Lane::new(Rng::from_seed(0), usize::MAX)).collect();
-    let mut prober = PackedProber::new();
+    let mut warp = UnifiedWarp::new();
+    // Per-slot probe cache: a unique gate's baseline query reuses the just-built probe's
+    // exported board (the strip is unchanged between), saving a second `export_r`.
+    let mut slot_probe = [Probe::EMPTY; LANES];
 
-    prober.run_stream(|slot, verdict| {
+    warp.run_stream(baseline, |slot, verdict| {
         let lane = &mut ls[slot];
+        // 1. Apply the slot's verdict (or take its first seed on the initial fill).
         match verdict {
-            // Apply the verdict for the gate this slot just probed, then continue below.
-            Some(v) => resolve_gate_with(lane, spec, baseline, fast, v),
-            // Initial fill for this slot: take its first seed (or idle if none left).
             None => match seeds.next() {
                 Some(s) => lane.assign_seed(s),
-                None => return None,
+                None => return UnifiedRefill::Idle,
             },
+            Some(UnifiedVerdict::Probe(nonunique)) => {
+                if nonunique {
+                    on_uniqueness(lane, true); // revert + clear the gate
+                } else {
+                    // Unique: flip THIS slot to baseline in place, reusing the cached export.
+                    let p = &slot_probe[slot];
+                    return UnifiedRefill::Baseline(SolveQuery { r: p.r, unsolved: p.unsolved });
+                }
+            }
+            Some(UnifiedVerdict::Baseline(trace)) => on_baseline(lane, spec, &trace),
         }
-        // Drive the current seed to its single puzzle, then roll onto the next seed,
-        // until the lane parks at a gate (hand back the probe) or the seeds run out.
+        // 2. Drive the current seed to its single puzzle, then roll onto the next seed,
+        //    until the lane parks at a gate (hand back the probe) or the seeds run out.
         loop {
             match lane.advance_until_success(spec) {
-                None => return Some(probe_of(lane)), // parked at a uniqueness gate
-                Some(p) => {
-                    on_found(lane.seed, p); // stream it out immediately
+                None => {
+                    let p = probe_of(lane); // parked at a uniqueness gate
+                    slot_probe[slot] = p;
+                    return UnifiedRefill::Probe(p);
+                }
+                Some(puzzle) => {
+                    on_found(lane.seed, puzzle); // stream it out immediately
                     match seeds.next() {
                         Some(s) => lane.assign_seed(s),
-                        None => return None, // seed supply drained: free this slot
+                        None => return UnifiedRefill::Idle, // seed supply drained
                     }
                 }
             }
@@ -514,6 +538,109 @@ where
         stats.add(&lane.stats);
     }
     stats
+}
+
+/// Per-group tallies for the "no-branch probe => baseline-trivial?" study
+/// ([`branch_baseline_corr`]). One instance for the probes that branched and one for
+/// those that didn't; the question is whether the no-branch group is ~entirely trivial
+/// (solved in one closure pass, no subset => HiddenQuad cannot have fired => req not met),
+/// in which case those gates could skip the baseline solve entirely.
+#[cfg(feature = "count")]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct CorrGroup {
+    pub gates: u64,
+    pub solved: u64,
+    pub one_pass: u64,
+    pub subset_fired: u64,
+    /// solved AND one_pass AND no subset — the "skippable" baseline calls.
+    pub trivial: u64,
+    pub passes: u64,
+}
+
+/// Correlate, per **unique** gate (the only ones the baseline runs on), whether the
+/// uniqueness probe had to branch with the baseline solve's outcome. Returns
+/// `(no_branch, branched)` tallies. Drives the real warp so the gate distribution is
+/// faithful; on each unique verdict it reads the prober's `last_branched` flag and runs
+/// the scalar [`FusedLogicSolver`] once (tallying this call's pass count via the `fstat`
+/// delta), then applies the verdict so the trajectory continues correctly.
+#[cfg(feature = "count")]
+pub fn branch_baseline_corr(
+    base_seed: u64,
+    spec: &Spec,
+    lanes: usize,
+    attempts_per_lane: usize,
+) -> (CorrGroup, CorrGroup) {
+    use crate::probe::simt::last_branched;
+    use crate::solve::{FusedLogicSolver, Solver, fstat_snapshot};
+    use crate::spec::kinds::{NAKED_PAIR, NUM};
+
+    let baseline = spec.baseline_mask();
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut slot_lane = [usize::MAX; LANES];
+    let mut next_lane = 0usize;
+    let mut nb = CorrGroup::default();
+    let mut br = CorrGroup::default();
+
+    prober.run_stream(|slot, verdict| {
+        if let Some(v) = verdict {
+            let ll = slot_lane[slot];
+            let (cell, orig, _alts) = ls[ll].pending.expect("verdict on lane with no gate");
+            if v {
+                ls[ll].strip.revert_gate(cell, orig);
+                ls[ll].pending = None;
+            } else {
+                // Unique gate: this is a baseline call. Classify by probe-branch and the
+                // baseline outcome (passes via fstat[1] delta).
+                let branched = last_branched(slot);
+                let p0 = fstat_snapshot()[1];
+                let trace = FusedLogicSolver::solve_tracked(ls[ll].strip.dual(), baseline);
+                let passes = fstat_snapshot()[1] - p0;
+                let subset: u64 = (NAKED_PAIR..NUM).map(|k| trace.counts[k] as u64).sum();
+                let g = if branched { &mut br } else { &mut nb };
+                g.gates += 1;
+                g.passes += passes;
+                if trace.solved {
+                    g.solved += 1;
+                }
+                if passes <= 1 {
+                    g.one_pass += 1;
+                }
+                if subset > 0 {
+                    g.subset_fired += 1;
+                }
+                if trace.solved && passes <= 1 && subset == 0 {
+                    g.trivial += 1;
+                }
+                ls[ll].pending = None;
+                ls[ll].strip.apply_baseline(cell, orig, &trace, spec);
+            }
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                return Some(probe_of(&ls[ll]));
+            }
+        }
+        loop {
+            if next_lane >= ls.len() {
+                return None;
+            }
+            let ll = next_lane;
+            next_lane += 1;
+            if ls[ll].remaining == 0 {
+                continue;
+            }
+            ls[ll].start_attempt();
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                slot_lane[slot] = ll;
+                return Some(probe_of(&ls[ll]));
+            }
+        }
+    });
+
+    (nb, br)
 }
 
 // ===========================================================================
@@ -652,6 +779,364 @@ pub fn run_warp_pipelined(base_seed: u64, spec: &Spec, lanes: usize, attempts_pe
                 continue;
             }
             return None;
+        }
+    });
+
+    let mut stats = Stats::default();
+    let mut per_lane = Vec::with_capacity(lanes);
+    for lane in &ls {
+        stats.add(&lane.stats);
+        per_lane.push((lane.stats, lane.fp));
+    }
+    WarpResult { stats, per_lane }
+}
+
+/// Upper bound on in-flight macro-lanes for the production host's fixed parking buffer
+/// (no heap Vecs on the hot path — warp width is constant and the buffer is bounded by the
+/// lane pool). Plenty for the L<=64 sweep; production runs L=16-32.
+const MAX_LANES: usize = 256;
+
+/// **Production host.** The pipelined two-warp design distilled: probe warp runs
+/// continuously, baseline gates are captured into a deferred batch and **fired the instant
+/// 8 accumulate** (a full baseline warp — no opportunistic small flushes), with fixed
+/// parking buffers (no per-flush heap Vec). `lanes` macro-lanes in flight; the minimal
+/// hot set is ~16 (8 probe + 8 buffer). Byte-identical per lane to [`run_warp`]. The rare
+/// board (~5%) the cheap closure can't finish in the warp is resolved by the packed
+/// solver's own scalar subset fallback inside the fire.
+pub fn run_warp_simt(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
+    assert!(lanes <= MAX_LANES, "lanes {lanes} exceeds MAX_LANES {MAX_LANES}");
+    let baseline = spec.baseline_mask();
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut solver = PackedSolver::new();
+    let mut slot_lane = [usize::MAX; LANES];
+    let mut next_lane = 0usize;
+
+    // Fixed parking buffers — bounded by warp width / lane pool, no heap on the hot path.
+    let mut probe_ready = [0usize; MAX_LANES]; // lanes whose baseline resolved, awaiting a probe
+    let mut pr_len = 0usize;
+    let mut bp_lane = [0usize; LANES]; // the deferred baseline batch (fires at 8)
+    let mut bp_query = [SolveQuery::EMPTY; LANES];
+    let mut bp_out = [SolveTrace::default(); LANES];
+    let mut bp_len = 0usize;
+
+    // The flush: solve the parked batch on the baseline warp, then advance each lane to its
+    // next gate (re-queued for the probe) or retire it. A macro to keep it inline with the
+    // closure's borrows (single-threaded; warp width constant).
+    macro_rules! flush {
+        () => {{
+            solver.solve(baseline, &bp_query[..bp_len], &mut bp_out[..bp_len]);
+            for i in 0..bp_len {
+                let ll = bp_lane[i];
+                on_baseline(&mut ls[ll], spec, &bp_out[i]);
+                ls[ll].advance_to_gate(spec, &mut |_| {});
+                if ls[ll].pending.is_some() {
+                    probe_ready[pr_len] = ll;
+                    pr_len += 1;
+                }
+            }
+            bp_len = 0;
+        }};
+    }
+
+    prober.run_stream(|slot, verdict| {
+        if let Some(v) = verdict {
+            let ll = slot_lane[slot];
+            match on_uniqueness(&mut ls[ll], v) {
+                Some(q) => {
+                    bp_lane[bp_len] = ll;
+                    bp_query[bp_len] = q;
+                    bp_len += 1;
+                    if bp_len == LANES {
+                        flush!(); // fire-at-8: a full baseline warp
+                    }
+                }
+                None => {
+                    ls[ll].advance_to_gate(spec, &mut |_| {});
+                    if ls[ll].pending.is_some() {
+                        return Some(probe_of(&ls[ll]));
+                    }
+                }
+            }
+        }
+        loop {
+            if pr_len > 0 {
+                pr_len -= 1;
+                let ll = probe_ready[pr_len];
+                slot_lane[slot] = ll;
+                return Some(probe_of(&ls[ll]));
+            }
+            if next_lane < ls.len() {
+                let ll = next_lane;
+                next_lane += 1;
+                if ls[ll].remaining == 0 {
+                    continue;
+                }
+                ls[ll].start_attempt();
+                ls[ll].advance_to_gate(spec, &mut |_| {});
+                if ls[ll].pending.is_some() {
+                    slot_lane[slot] = ll;
+                    return Some(probe_of(&ls[ll]));
+                }
+                continue;
+            }
+            if bp_len > 0 {
+                flush!(); // drain the final partial batch
+                continue;
+            }
+            return None;
+        }
+    });
+
+    let mut stats = Stats::default();
+    let mut per_lane = Vec::with_capacity(lanes);
+    for lane in &ls {
+        stats.add(&lane.stats);
+        per_lane.push((lane.stats, lane.fp));
+    }
+    WarpResult { stats, per_lane }
+}
+
+/// **Interleaved host (P2).** Both warps stay resident and are **stepped one pass each per
+/// outer iteration** ([`PackedProber::step`] + [`PackedSolver::step_default`]), so the
+/// baseline warp is fed *continuously* from a shallow buffer rather than fired as a closed
+/// batch — killing the per-fire drain that caps the batched hosts' baseline utilization.
+/// The probe warp produces unique-gate boards into `to_baseline`; the baseline warp drains
+/// it; finished baseline lanes advance to their next gate and re-enter `probe_ready`.
+///
+/// Each iteration: (1) fill idle probe slots from `probe_ready`/fresh lanes; (2) one probe
+/// pass, routing terminations (non-unique => revert+advance => `probe_ready`; unique =>
+/// board to `to_baseline`); (3) fill idle baseline slots from `to_baseline`; (4) one
+/// baseline pass, routing terminations (apply verdict + advance => `probe_ready` or retire).
+/// Slots are always refilled *before* their warp's pass, so neither warp idles mid-pass
+/// while work exists. `lanes` macro-lanes in flight; byte-identical per lane to [`run_warp`].
+pub fn run_warp_interleaved(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
+    assert!(lanes <= MAX_LANES, "lanes {lanes} exceeds MAX_LANES {MAX_LANES}");
+    let baseline = spec.baseline_mask();
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut prober = PackedProber::new();
+    let mut solver = PackedSolver::new();
+    let mut slot_lane_p = [usize::MAX; LANES]; // probe slot -> macro-lane
+    let mut slot_lane_b = [usize::MAX; LANES]; // baseline slot -> macro-lane
+    let mut next_lane = 0usize;
+
+    // Shallow inter-stage buffers (fixed, no heap on the hot path).
+    let mut probe_ready = [0usize; MAX_LANES]; // macro-lanes awaiting a probe slot
+    let mut pr_len = 0usize;
+    let mut tb_lane = [0usize; MAX_LANES]; // macro-lanes awaiting a baseline slot
+    let mut tb_query = [SolveQuery::EMPTY; MAX_LANES];
+    let mut tb_len = 0usize;
+
+    // Collected terminations per pass (step can't re-borrow the warp to refill/route).
+    let mut term_slot = [0usize; LANES];
+    let mut term_p = [false; LANES]; // probe verdicts
+    let mut term_t = [SolveTrace::default(); LANES]; // baseline verdicts
+
+    loop {
+        // 1. Fill idle probe slots from the ready queue, else a fresh logical lane.
+        for l in 0..LANES {
+            if prober.slot_active(l) {
+                continue;
+            }
+            loop {
+                if pr_len > 0 {
+                    pr_len -= 1;
+                    let ll = probe_ready[pr_len];
+                    slot_lane_p[l] = ll;
+                    prober.load(l, &probe_of(&ls[ll]));
+                    break;
+                }
+                if next_lane < ls.len() {
+                    let ll = next_lane;
+                    next_lane += 1;
+                    if ls[ll].remaining == 0 {
+                        continue;
+                    }
+                    ls[ll].start_attempt();
+                    ls[ll].advance_to_gate(spec, &mut |_| {});
+                    if ls[ll].pending.is_some() {
+                        slot_lane_p[l] = ll;
+                        prober.load(l, &probe_of(&ls[ll]));
+                        break; // slot filled
+                    }
+                    continue; // retired with no gate: try the next fresh lane
+                }
+                break; // no work for this slot
+            }
+        }
+
+        // 2. One probe pass; collect terminations, then route them.
+        let mut tn = 0usize;
+        prober.step(|slot, v| {
+            term_slot[tn] = slot;
+            term_p[tn] = v;
+            tn += 1;
+        });
+        for i in 0..tn {
+            let slot = term_slot[i];
+            let ll = slot_lane_p[slot];
+            match on_uniqueness(&mut ls[ll], term_p[i]) {
+                Some(q) => {
+                    tb_lane[tb_len] = ll;
+                    tb_query[tb_len] = q;
+                    tb_len += 1;
+                }
+                None => {
+                    ls[ll].advance_to_gate(spec, &mut |_| {});
+                    if ls[ll].pending.is_some() {
+                        probe_ready[pr_len] = ll;
+                        pr_len += 1;
+                    }
+                }
+            }
+        }
+
+        // 3. Fill idle baseline slots from the to-baseline buffer.
+        for l in 0..LANES {
+            if solver.slot_active(l) || tb_len == 0 {
+                continue;
+            }
+            tb_len -= 1;
+            slot_lane_b[l] = tb_lane[tb_len];
+            solver.load(l, &tb_query[tb_len]);
+        }
+
+        // 4. One baseline pass; collect terminations, then apply + advance.
+        let mut bn = 0usize;
+        solver.step_default(baseline, |slot, tr| {
+            term_slot[bn] = slot;
+            term_t[bn] = tr;
+            bn += 1;
+        });
+        for i in 0..bn {
+            let slot = term_slot[i];
+            let ll = slot_lane_b[slot];
+            on_baseline(&mut ls[ll], spec, &term_t[i]);
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                probe_ready[pr_len] = ll;
+                pr_len += 1;
+            }
+        }
+
+        // Done when both warps are drained and no work remains to feed them.
+        if !prober.any_active()
+            && !solver.any_active()
+            && pr_len == 0
+            && tb_len == 0
+            && next_lane >= ls.len()
+        {
+            break;
+        }
+    }
+
+    let mut stats = Stats::default();
+    let mut per_lane = Vec::with_capacity(lanes);
+    for lane in &ls {
+        stats.add(&lane.stats);
+        per_lane.push((lane.stats, lane.fp));
+    }
+    WarpResult { stats, per_lane }
+}
+
+/// **Unified warp (U).** One [`UnifiedWarp`] runs the uniqueness and baseline gates on the
+/// SAME 8 SIMD lanes instead of two coupled warps. A slot stays bound to its macro-lane and
+/// flips probe -> baseline *in place* the instant the prober verdict is unique (no batch, no
+/// inter-warp queue), then baseline -> probe (advance the strip) when the baseline resolves;
+/// when the macro-lane retires the slot grabs the next fresh one. The combined warp is full
+/// whenever work of either kind exists and probes are always plentiful, so utilization is
+/// ~100% at active set = 8 — no oversubscription. `lanes` is just the total work split into
+/// macro-lanes (8 in flight at a time); byte-identical per lane to [`run_warp`]. The kernel
+/// is the baseline closure ([`warp_pass_full`]), sound for a probe lane since extra
+/// propagation only prunes the existence search.
+pub fn run_warp_unified(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
+    run_warp_unified_impl(base_seed, spec, lanes, attempts_per_lane, false)
+}
+
+/// **Lean-kernel unified warp (experiment #2).** As [`run_warp_unified`] but the engine
+/// runs the cheap [`crate::probe::simt`] `warp_pass` (no column hidden singles) for every
+/// lane, recovering columns only for the baseline lanes that stall (a masked full-closure
+/// pass). The bet: probe lanes (the majority) skip the column ALU. Byte-identical per lane
+/// to [`run_warp`] (column recovery keeps baseline verdicts exact). A/B it against the
+/// full-kernel [`run_warp_unified`] in `simtbaselinebench`.
+pub fn run_warp_unified_lean(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
+    run_warp_unified_impl(base_seed, spec, lanes, attempts_per_lane, true)
+}
+
+fn run_warp_unified_impl(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize, lean: bool) -> WarpResult {
+    let baseline = spec.baseline_mask();
+
+    let mut ls: Vec<Lane> = (0..lanes)
+        .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
+        .collect();
+    let mut warp = if lean { UnifiedWarp::new_lean() } else { UnifiedWarp::new() };
+    let mut slot_lane = [usize::MAX; LANES];
+    let mut next_lane = 0usize;
+    // Per-slot cache of the probe last loaded into that slot — the strip's exported row
+    // view. A unique gate's baseline query is the SAME board (the strip is unchanged
+    // between building the probe and its verdict), and a `Probe`'s `r`/`unsolved` are the
+    // unrestricted stripped board (the alts restriction is applied at load), so the flip to
+    // baseline reuses this verbatim instead of calling `export_r` a second time.
+    let mut slot_probe = [Probe::EMPTY; LANES];
+
+    warp.run_stream(baseline, |slot, verdict| {
+        // 1. Apply the slot's verdict (skipped on the initial fill) and continue its
+        //    macro-lane: a unique probe flips the slot to baseline in place; a non-unique
+        //    probe or a resolved baseline advances the strip to the next gate.
+        if let Some(v) = verdict {
+            let ll = slot_lane[slot];
+            let next_probe = match v {
+                UnifiedVerdict::Probe(nonunique) => {
+                    if nonunique {
+                        // Non-unique: revert + clear the gate, then walk to the next gate.
+                        on_uniqueness(&mut ls[ll], true); // reverts, clears `pending`
+                        ls[ll].advance_to_gate(spec, &mut |_| {});
+                        ls[ll].pending.is_some()
+                    } else {
+                        // Unique: flip to baseline on the SAME slot/macro-lane, reusing the
+                        // cached export (no second `export_r`). `pending` stays set for the
+                        // later `on_baseline`.
+                        let p = &slot_probe[slot];
+                        return UnifiedRefill::Baseline(SolveQuery { r: p.r, unsolved: p.unsolved });
+                    }
+                }
+                UnifiedVerdict::Baseline(trace) => {
+                    on_baseline(&mut ls[ll], spec, &trace);
+                    ls[ll].advance_to_gate(spec, &mut |_| {});
+                    ls[ll].pending.is_some()
+                }
+            };
+            if next_probe {
+                let p = probe_of(&ls[ll]);
+                slot_probe[slot] = p;
+                return UnifiedRefill::Probe(p);
+            }
+            // else the macro-lane exhausted its quota — acquire a fresh one below.
+        }
+        // 2. Bind this slot to the next unstarted macro-lane that has a gate.
+        loop {
+            if next_lane >= ls.len() {
+                return UnifiedRefill::Idle;
+            }
+            let ll = next_lane;
+            next_lane += 1;
+            if ls[ll].remaining == 0 {
+                continue;
+            }
+            ls[ll].start_attempt();
+            ls[ll].advance_to_gate(spec, &mut |_| {});
+            if ls[ll].pending.is_some() {
+                slot_lane[slot] = ll;
+                let p = probe_of(&ls[ll]);
+                slot_probe[slot] = p;
+                return UnifiedRefill::Probe(p);
+            }
         }
     });
 
