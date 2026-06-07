@@ -100,6 +100,17 @@ impl DualSolverState {
         self.col.place_group_with(d, col_group, col_peers);
     }
 
+    /// The fully-decided dual state (no unsolved cells, no candidates in either view) —
+    /// what [`from_digits`](Marks::from_digits) yields for a *complete* grid, built
+    /// directly instead of running the 81-cell peer-clear loop twice (once per view) only
+    /// to clear nothing. The seed a strip of a full solution starts from; the strip then
+    /// reopens cells incrementally with [`clear_clue`]. `debug_assert`-equal to
+    /// `from_digits` of any complete grid (the `StripState::new` invariant).
+    #[inline]
+    pub fn solved() -> Self {
+        DualSolverState { row: SolverState::solved(), col: SolverState::solved() }
+    }
+
     /// The per-digit clue cells of `digits` — the row-major seed `clue` map for an
     /// incremental dual strip, paired with a `from_digits` of the same grid. The map is
     /// row-major because the clue-survival/blocked logic ([`clear_clue`]) reads it

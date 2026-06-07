@@ -12,11 +12,18 @@
 //! exp H) — is a drop-in `Fill<Bands<RowMajor>>` swap, kept byte-identical by the
 //! `banded_fill_matches_flat` test (and swappable once confirmed on ARM).
 
+use crate::counters::counter_block;
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{Branchable, Digit, DigitGrid, PerDigit, Solution};
 use crate::rng::Rng;
 use crate::scan::{BranchStrategy, Mrv, Scan};
 use std::marker::PhantomData;
+
+// Per-node MRV min-candidate-count histogram (`feature = "count"`): slot `k` counts the
+// branch nodes whose chosen cell had exactly `k` candidates. Slot 1 = naked singles — the
+// fraction that decides whether a depth-2 fast path (skip the depth-4 sieve when a naked
+// single exists) is worth it. Read by `fillbench` under `count`.
+counter_block!(FILLSTAT: 10, inc = fillstat_inc, add = fillstat_add, snapshot = fillstat_snapshot, reset = fillstat_reset);
 
 /// A random complete [`Solution`]. Same MRV+shuffle search as core — identical
 /// grid and RNG stream for a given seed. The fill is scan-bound (~83 nodes/grid,
@@ -69,6 +76,7 @@ impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
             Scan::Solved => return true,
             Scan::Branch { cell, candidates } => (cell, candidates),
         };
+        fillstat_add((mask.count_ones() as usize).min(9), 1);
         // Candidate digits as 0-based indices (ascending == iter_digits order) on
         // a stack array, then shuffled — same `n` elements in the same order as
         // the scalar fill, so the RNG stream and produced grid are byte-identical.

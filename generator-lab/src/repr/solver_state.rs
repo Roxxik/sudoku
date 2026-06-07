@@ -29,6 +29,17 @@ pub struct SolverState<M: GridMask> {
 }
 
 impl<M: GridMask> SolverState<M> {
+    /// The fully-decided state: no unsolved cells, no candidates — exactly what
+    /// [`from_digits`](Marks::from_digits) yields for a *complete* grid (every cell
+    /// placed leaves `unsolved` empty and every candidate board empty), built directly
+    /// instead of by the 81-cell placement loop. The seed an incremental strip of a
+    /// full solution starts from before [`clear_clue`](SolverState::clear_clue) reopens
+    /// cells. `debug_assert`-equal to `from_digits` of any complete grid.
+    #[inline]
+    pub fn solved() -> Self {
+        SolverState { candidates: PerDigit::new([M::EMPTY; 9]), unsolved: M::EMPTY }
+    }
+
     /// The per-digit candidate cell-sets — what a [`scan`](crate::scan) reads.
     #[inline]
     pub fn candidates(&self) -> &PerDigit<M> {

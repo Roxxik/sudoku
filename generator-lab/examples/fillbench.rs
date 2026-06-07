@@ -23,6 +23,8 @@ fn main() {
         let cells: [u8; CELLS] = core::array::from_fn(|i| g.0.get(i).map_or(0, |d| d.get()));
         fnv_fold_cells(&mut fp, &cells);
     }
+    #[cfg(feature = "count")]
+    generator_lab::fill::fillstat_reset();
     let t = Instant::now();
     let mut fp = FNV_OFFSET;
     for seed in 0..n {
@@ -36,4 +38,18 @@ fn main() {
         el.as_secs_f64() * 1e6 / n as f64,
         el.as_secs_f64() * 1e3
     );
+
+    #[cfg(feature = "count")]
+    {
+        let h = generator_lab::fill::fillstat_snapshot();
+        let total: u64 = h.iter().sum();
+        println!("MRV min-candidate-count distribution over {total} branch nodes ({:.1}/grid):", total as f64 / n as f64);
+        for (k, &c) in h.iter().enumerate().skip(1) {
+            if c > 0 {
+                println!("  min={k}: {c:>12}  ({:.1}%)", 100.0 * c as f64 / total as f64);
+            }
+        }
+        let singles = h[1];
+        println!("  => naked singles (min=1): {:.1}% of nodes", 100.0 * singles as f64 / total as f64);
+    }
 }

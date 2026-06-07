@@ -128,11 +128,24 @@ pub(in crate::generate) struct StripState {
 }
 
 impl StripState {
-    /// Fresh state stripping the full `solution` grid (nothing removed yet). The one
-    /// `from_digits` of the whole attempt — the strip mutates `dual` in place thereafter.
+    /// Fresh state stripping the full `solution` grid (nothing removed yet). The strip
+    /// mutates `dual` in place thereafter.
+    ///
+    /// `solution` is always a *complete* grid (the fill's output), and `from_digits` of a
+    /// complete grid is the trivial solved state — every cell placed leaves no unsolved
+    /// cells and no candidates — so [`DualSolverState::solved`] builds it directly instead
+    /// of running the 81-cell peer-clear loop twice (once per view) only to clear nothing
+    /// (~4% of the fill's cost, all of it wasted). The strip then reopens cells one at a
+    /// time via [`clear_clue`](DualSolverState::clear_clue). `clue_map` still walks the
+    /// placements (the clue map is genuinely the full grid).
     pub(in crate::generate) fn new(solution: &Solution) -> Self {
         let digits = solution.0.clone();
-        let dual = DualSolverState::from_digits(&digits);
+        debug_assert!(digits.is_complete(), "strip must start from a complete solution");
+        let dual = DualSolverState::solved();
+        debug_assert!(
+            dual == DualSolverState::from_digits(&digits),
+            "solved() must equal from_digits of a complete grid"
+        );
         let clue = DualSolverState::clue_map(&digits);
         StripState { digits, dual, clue, best: None, req_met: false }
     }
