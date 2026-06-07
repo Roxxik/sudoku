@@ -56,4 +56,12 @@ pub trait GridMask:
 pub trait Branchable: GridMask {
     /// The lowest-indexed set cell. Caller guarantees the set is non-empty.
     fn first(self) -> CellIdx;
+
+    /// Whether `cell` is in the set. A single-cell membership test, cheaper than the
+    /// general `(self & Self::cell(cell)).any()`: that builds the singleton mask,
+    /// ANDs the whole set, and does a SIMD horizontal reduction; this reads only the
+    /// one word (band lane / `u128`) holding `cell` and tests its bit. The branch step
+    /// calls it nine times per node — once per digit board — to gather the chosen
+    /// cell's candidates, so the saved reductions add up.
+    fn contains(self, cell: CellIdx) -> bool;
 }

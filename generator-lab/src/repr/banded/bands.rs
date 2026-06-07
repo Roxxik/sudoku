@@ -125,4 +125,11 @@ impl Branchable for Bands<RowMajor> {
             54 + self.0[2].trailing_zeros() as usize
         }
     }
+    #[inline]
+    fn contains(self, cell: CellIdx) -> bool {
+        // RowMajor packs `cell = 27*band + bit`, so `cell` lives in exactly one band
+        // word — read that lane and test its bit (a scalar load of 4 bytes), not the
+        // whole 16-byte register through a `simd_ne`/reduce.
+        self.0[cell / 27] & (1u32 << (cell % 27)) != 0
+    }
 }

@@ -70,10 +70,9 @@ fn scan_with<M: Branchable, const D: usize>(
 #[inline]
 fn branch<M: Branchable>(board: &PerDigit<M>, tier: M) -> Scan {
     let cell = tier.first();
-    let cb = M::cell(cell);
     let mut candidates = 0u16;
     for (d, &m) in board.each().iter().enumerate() {
-        if (m & cb).any() {
+        if m.contains(cell) {
             candidates |= 1 << d;
         }
     }

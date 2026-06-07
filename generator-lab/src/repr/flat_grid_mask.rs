@@ -54,6 +54,11 @@ impl Branchable for FlatGridMask {
     fn first(self) -> CellIdx {
         self.0.trailing_zeros() as usize
     }
+    #[inline]
+    fn contains(self, cell: CellIdx) -> bool {
+        // Identity layout: cell index is bit position.
+        self.0 & (1u128 << cell) != 0
+    }
 }
 
 impl BitAnd for FlatGridMask {
