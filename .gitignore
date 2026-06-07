@@ -8,3 +8,5 @@
 # generator-lab: built wasm copied into web/, and phone-reported results
 generator-lab/web/generator_lab.wasm
 generator-lab/web/results.jsonl
+
+.claude/

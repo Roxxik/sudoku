@@ -18,6 +18,7 @@
 use super::LogicBoard;
 use crate::repr::{CELLS, CellIdx, Digit, Mark, PEER_MASK, UNITS};
 use super::combinations::for_each_combination;
+use crate::spec::kinds::{JELLYFISH, KindMask, SWORDFISH, W_WING, X_WING, XYZ_WING, XY_WING};
 
 /// Whether cell `s` sees cell `c` (shares a row, column, or box) — one bit test on
 /// the precomputed peer mask, the wing family's hot "is a peer of" check (replacing a
@@ -238,35 +239,83 @@ fn fish_cell(row_base: bool, b: usize, x: usize) -> CellIdx {
     if row_base { b * 9 + x } else { x * 9 + b }
 }
 
+/// Per-`(orientation, digit, base-line)` candidate-position masks for the basic fish:
+/// bit `x` of `pos[o][d][b]` is set iff digit `d` is a candidate at base line `b`,
+/// cross position `x` (orientation `o`: `0` = rows as base lines, `1` = columns). What
+/// distinguishes X-Wing / Swordfish / Jellyfish is *how many* base lines combine into a
+/// cover — the per-line masks themselves are size-independent, so [`fish_step`] scans
+/// the board once and the three sizes share it instead of each rebuilding it. The scan
+/// is the fish's read-heavy half (81 cells x 9 digits x 2 orientations of [`get`]).
+struct FishPositions {
+    pos: [[[u16; 9]; 9]; 2],
+}
+
+impl FishPositions {
+    /// Read every cell's candidates once into the per-line masks. The only board-reading
+    /// pass the fish ladder makes per stall.
+    fn scan<V: LogicBoard>(v: &V) -> Self {
+        let mut pos = [[[0u16; 9]; 9]; 2];
+        for di in 0..9 {
+            let d = Digit::from_index(di);
+            // Two orientations: rows as base lines (cross = columns), then columns as base.
+            for (o, row_base) in [true, false].into_iter().enumerate() {
+                for b in 0..9 {
+                    let mut m = 0u16;
+                    for x in 0..9 {
+                        if v.get(fish_cell(row_base, b, x)).contains(d) {
+                            m |= 1 << x;
+                        }
+                    }
+                    pos[o][di][b] = m;
+                }
+            }
+        }
+        Self { pos }
+    }
+}
+
+/// Try the three basic fishes in size-ascending order (X-Wing, then Swordfish, then
+/// Jellyfish), sharing a single [`FishPositions`] scan across all three. Honours
+/// `allowed` and preserves the exact first-applicable order of the three separate
+/// `fish(b, size)` ladder entries it replaces (size outer, then digit, then
+/// orientation), so the produced verdict and elimination set are byte-identical.
+/// Returns the fired kind index, or `None`.
+pub(super) fn fish_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<usize> {
+    const ANY_FISH: KindMask = (1 << X_WING) | (1 << SWORDFISH) | (1 << JELLYFISH);
+    if allowed & ANY_FISH == 0 {
+        return None;
+    }
+    let fp = FishPositions::scan(v);
+    for (bit, size) in [(X_WING, 2usize), (SWORDFISH, 3), (JELLYFISH, 4)] {
+        if allowed & (1 << bit) != 0 && fish_sized(v, size, &fp) {
+            return Some(bit);
+        }
+    }
+    None
+}
+
 /// **Basic fish** of `size` (X-Wing 2, Swordfish 3, Jellyfish 4): for one digit,
 /// `size` base lines (all rows, or all columns) whose candidate cells for that digit
 /// span exactly `size` cross-lines — the digit then leaves those cross-lines in every
 /// *other* base line. The single-digit / Fish branch's first-applicable body, ported
 /// from core's `fish::find_oriented_each` over the generic [`LogicBoard`] view.
-/// Non-finned only (the basic fish the curriculum's Fish branch surfaces).
+/// Non-finned only (the basic fish the curriculum's Fish branch surfaces). The
+/// per-line candidate masks come precomputed in `fp` (see [`FishPositions`]).
 ///
 /// Reads candidates only: a base line where `digit` is already placed has it in no
 /// candidate cell (the [`Marks`] invariant), so its position mask is empty and it
 /// self-excludes — no separate "is it placed" check, the same trick the subset bodies
 /// use. A placed cross-cell likewise reads empty, so the elimination scan skips it.
-pub(super) fn fish<V: LogicBoard>(v: &mut V, size: usize) -> bool {
+fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool {
     for di in 0..9 {
         let d = Digit::from_index(di);
-        // Two orientations: rows as base lines (cross = columns), then columns as base.
-        for row_base in [true, false] {
+        for (o, row_base) in [true, false].into_iter().enumerate() {
             // Per base line, the 9-bit mask of cross-positions where `d` is a candidate.
-            let mut positions = [0u16; 9];
+            let positions = &fp.pos[o][di];
             let mut bases = [0usize; 9];
             let mut n = 0;
             for b in 0..9 {
-                let mut pos = 0u16;
-                for x in 0..9 {
-                    if v.get(fish_cell(row_base, b, x)).contains(d) {
-                        pos |= 1 << x;
-                    }
-                }
-                positions[b] = pos;
-                let pc = pos.count_ones() as usize;
+                let pc = positions[b].count_ones() as usize;
                 if (2..=size).contains(&pc) {
                     bases[n] = b;
                     n += 1;
@@ -425,13 +474,43 @@ fn eliminate_common_peers<V: LogicBoard>(
     did
 }
 
+/// Try the three bivalue-chain wings in difficulty order (XY-Wing, then XYZ-Wing, then
+/// W-Wing), sharing a single bivalue-cell scan across all three. The bivalue list (and
+/// the trivalue list the XYZ pivot needs) is the wings' read-heavy raw material; each
+/// wing body rebuilt it independently, so the all-81-cells scan ran up to three times
+/// per stall. Honours `allowed` and preserves the exact first-applicable order of the
+/// three separate ladder entries it replaces, so the verdict and elimination set are
+/// byte-identical. A wing that fires returns immediately (the ladder restarts), so a
+/// non-firing wing leaves the board — and thus the cached lists — unchanged for the
+/// next. Returns the fired kind index, or `None`.
+pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<usize> {
+    const ANY_WING: KindMask = (1 << XY_WING) | (1 << XYZ_WING) | (1 << W_WING);
+    if allowed & ANY_WING == 0 {
+        return None;
+    }
+    let bivalues = cells_with_n_candidates(v, 2);
+    if allowed & (1 << XY_WING) != 0 && xy_wing(v, &bivalues) {
+        return Some(XY_WING);
+    }
+    if allowed & (1 << XYZ_WING) != 0 {
+        let trivalues = cells_with_n_candidates(v, 3);
+        if xyz_wing(v, &bivalues, &trivalues) {
+            return Some(XYZ_WING);
+        }
+    }
+    if allowed & (1 << W_WING) != 0 && w_wing(v, &bivalues) {
+        return Some(W_WING);
+    }
+    None
+}
+
 /// **XY-Wing**: a bivalue pivot `{X,Y}` with two bivalue wings `{X,Z}` and `{Y,Z}`,
 /// each a peer of the pivot. Whichever digit the pivot takes, one wing is forced to
 /// `Z`, so `Z` leaves every cell that sees *both* wings. The Bivalue branch's
-/// first-applicable body, ported from core's `xy_wing::find_each`.
-pub(super) fn xy_wing<V: LogicBoard>(v: &mut V) -> bool {
-    let bivalues = cells_with_n_candidates(v, 2);
-    for &(pivot, pcands) in &bivalues {
+/// first-applicable body, ported from core's `xy_wing::find_each`. `bivalues` is the
+/// shared bivalue-cell list (see [`wing_step`]).
+fn xy_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)]) -> bool {
+    for &(pivot, pcands) in bivalues {
         for (ai, &(a, acands)) in bivalues.iter().enumerate() {
             if a == pivot || !sees(pivot, a) {
                 continue;
@@ -466,10 +545,13 @@ pub(super) fn xy_wing<V: LogicBoard>(v: &mut V) -> bool {
 /// the pivot with candidates a subset of the pivot's, sharing exactly one digit `Z`
 /// and together covering all three pivot digits. `Z` then leaves every cell that
 /// sees the pivot *and* both wings. Ported from core's `xy_wing::find_xyz_wing_each`.
-pub(super) fn xyz_wing<V: LogicBoard>(v: &mut V) -> bool {
-    let bivalues = cells_with_n_candidates(v, 2);
-    let trivalues = cells_with_n_candidates(v, 3);
-    for &(pivot, pcands) in &trivalues {
+/// `bivalues` / `trivalues` are the shared candidate-count lists (see [`wing_step`]).
+fn xyz_wing<V: LogicBoard>(
+    v: &mut V,
+    bivalues: &[(CellIdx, Mark)],
+    trivalues: &[(CellIdx, Mark)],
+) -> bool {
+    for &(pivot, pcands) in trivalues {
         // Bivalue peers of the pivot whose candidates lie inside the pivot's.
         let wings: Vec<(CellIdx, Mark)> = bivalues
             .iter()
@@ -503,52 +585,106 @@ pub(super) fn xyz_wing<V: LogicBoard>(v: &mut V) -> bool {
     false
 }
 
+/// Per-digit **conjugate pairs** of a board: for each digit `d`, the units (walked in
+/// [`UNITS`] order) that hold `d` in exactly two cells, recorded as that cell pair —
+/// the raw material of the W-Wing's strong link. The board is constant across a single
+/// [`w_wing`] scan (it eliminates only on the firing step, then returns), so the table
+/// is built once and every [`w_wing_link`] attempt reads it instead of rescanning all
+/// 27 units per bivalue pair x link digit. Unit order is preserved, so the first firing
+/// link — and thus the verdict — is byte-identical to the per-attempt rescan.
+struct ConjugatePairs {
+    /// `pairs[d][..len[d]]`: digit `d`'s conjugate cell pairs, in unit order. At most
+    /// one per unit, so 27 bounds each digit's list.
+    pairs: [[(CellIdx, CellIdx); 27]; 9],
+    len: [u8; 9],
+}
+
+impl ConjugatePairs {
+    /// One pass over the 27 units: per unit, tally each digit's holder cells, and emit
+    /// a conjugate pair for every digit held by exactly two of them.
+    fn scan<V: LogicBoard>(v: &V) -> Self {
+        let mut pairs = [[(0usize, 0usize); 27]; 9];
+        let mut len = [0u8; 9];
+        for unit in &UNITS {
+            let mut cnt = [0u8; 9];
+            let mut ends = [(0usize, 0usize); 9];
+            for &c in unit {
+                let mut bits = v.get(c).bits();
+                while bits != 0 {
+                    let di = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    match cnt[di] {
+                        0 => ends[di].0 = c,
+                        1 => ends[di].1 = c,
+                        _ => {}
+                    }
+                    cnt[di] += 1;
+                }
+            }
+            for di in 0..9 {
+                if cnt[di] == 2 {
+                    pairs[di][len[di] as usize] = ends[di];
+                    len[di] += 1;
+                }
+            }
+        }
+        Self { pairs, len }
+    }
+
+    #[inline]
+    fn for_digit(&self, d: Digit) -> &[(CellIdx, CellIdx)] {
+        let di = d.index();
+        &self.pairs[di][..self.len[di] as usize]
+    }
+}
+
 /// **W-Wing**: two bivalue cells `X`, `Y` with the *same* candidates `{P,Q}` that are
 /// not peers, joined by a conjugate pair on one digit (say `P`) in some unit — its
 /// two cells seeing `X` and `Y` respectively. Then `Q` leaves every cell that sees
-/// both `X` and `Y`. Ported from core's `w_wing::find_each` + `try_link`.
-pub(super) fn w_wing<V: LogicBoard>(v: &mut V) -> bool {
-    let bivalues = cells_with_n_candidates(v, 2);
+/// both `X` and `Y`. Ported from core's `w_wing::find_each` + `try_link`. `bivalues`
+/// is the shared bivalue-cell list (see [`wing_step`]).
+///
+/// The strong-link search needs the board's conjugate pairs ([`ConjugatePairs`]); they
+/// are built lazily on the first matching `{P,Q}` pair, so a board with no such pair
+/// pays nothing (matching the old per-attempt scan, which never ran without one).
+fn w_wing<V: LogicBoard>(v: &mut V, bivalues: &[(CellIdx, Mark)]) -> bool {
+    let mut conj: Option<ConjugatePairs> = None;
     for (i, &(x, xcands)) in bivalues.iter().enumerate() {
         for &(y, ycands) in bivalues.iter().skip(i + 1) {
             if xcands != ycands || sees(x, y) {
                 continue;
             }
+            if conj.is_none() {
+                conj = Some(ConjugatePairs::scan(v));
+            }
+            let conj = conj.as_ref().expect("just built");
             // Try each of the two shared digits as the strong-link (conjugate) digit;
-            // the other is the one eliminated.
-            let digits: Vec<Digit> = xcands.iter().collect();
-            for di in 0..2 {
-                if w_wing_link(v, x, y, digits[di], digits[1 - di]) {
-                    return true;
-                }
+            // the other is the one eliminated (ascending digit order, as before).
+            let mut bits = xcands.bits();
+            let d0 = Digit::from_index(bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+            let d1 = Digit::from_index(bits.trailing_zeros() as usize);
+            if w_wing_link(v, conj, x, y, d0, d1) || w_wing_link(v, conj, x, y, d1, d0) {
+                return true;
             }
         }
     }
     false
 }
 
-/// One W-Wing strong-link attempt: scan units for a conjugate pair on `link` (a unit
-/// with exactly two cells holding it) whose endpoints see `x` and `y` respectively;
-/// if found, `other` leaves every cell seeing both `x` and `y`. Returns whether it
-/// eliminated anything (first firing unit wins).
-fn w_wing_link<V: LogicBoard>(v: &mut V, x: CellIdx, y: CellIdx, link: Digit, other: Digit) -> bool {
-    for unit in &UNITS {
-        // The unit's cells that still hold `link` — must be exactly two (a conjugate
-        // pair). A filled cell reads empty, so it never counts.
-        let mut pair = [0usize; 2];
-        let mut n = 0;
-        for &c in unit {
-            if v.get(c).contains(link) {
-                if n < 2 {
-                    pair[n] = c;
-                }
-                n += 1;
-            }
-        }
-        if n != 2 {
-            continue;
-        }
-        let (c1, c2) = (pair[0], pair[1]);
+/// One W-Wing strong-link attempt: among the precomputed conjugate pairs on `link`
+/// (in unit order), find one whose endpoints see `x` and `y` respectively; if found,
+/// `other` leaves every cell seeing both `x` and `y`. Returns whether it eliminated
+/// anything (first firing pair wins).
+fn w_wing_link<V: LogicBoard>(
+    v: &mut V,
+    conj: &ConjugatePairs,
+    x: CellIdx,
+    y: CellIdx,
+    link: Digit,
+    other: Digit,
+) -> bool {
+    for &(c1, c2) in conj.for_digit(link) {
         if c1 == x || c1 == y || c2 == x || c2 == y {
             continue;
         }

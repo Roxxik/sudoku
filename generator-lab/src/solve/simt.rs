@@ -55,9 +55,8 @@ use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState};
 use crate::solve::{Eliminate, LogicBoard};
 use crate::spec::kinds::{
-    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, JELLYFISH, KindMask, LC_CLAIMING, LC_POINTING,
-    NAKED_PAIR, NAKED_QUAD, NAKED_TRIPLE, NUM, SWORDFISH, SolveTrace, W_WING, X_WING, XYZ_WING,
-    XY_WING,
+    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_PAIR,
+    NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
 };
 use std::simd::cmp::SimdPartialEq;
 use std::simd::num::SimdUint;
@@ -361,12 +360,12 @@ fn scalar_step_harder<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usi
     try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
     try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
     try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
-    try_kind!(X_WING, techniques::fish(b, 2));
-    try_kind!(SWORDFISH, techniques::fish(b, 3));
-    try_kind!(JELLYFISH, techniques::fish(b, 4));
-    try_kind!(XY_WING, techniques::xy_wing(b));
-    try_kind!(XYZ_WING, techniques::xyz_wing(b));
-    try_kind!(W_WING, techniques::w_wing(b));
+    if let Some(k) = techniques::fish_step(b, allowed) {
+        return Some(k);
+    }
+    if let Some(k) = techniques::wing_step(b, allowed) {
+        return Some(k);
+    }
     None
 }
 

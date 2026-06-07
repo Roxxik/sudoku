@@ -117,6 +117,15 @@ fn main() {
     let res = run_warp(base_seed, &spec, lanes, per_lane);
     let dt = t0.elapsed();
 
+    // Combined fingerprint over every lane's per-puzzle-cells FNV fp (lane order fixed),
+    // so two builds match iff they produce the byte-identical set of puzzles.
+    let mut combo_fp = generator_lab::fingerprint::FNV_OFFSET;
+    for (_, fp) in &res.per_lane {
+        combo_fp ^= fp;
+        combo_fp = combo_fp.wrapping_mul(generator_lab::fingerprint::FNV_PRIME);
+    }
+    println!("  fp: {combo_fp:#018x}");
+
     let us_per_att = dt.as_secs_f64() * 1e6 / total as f64;
     let s = &res.stats;
     let att_per_puz = s.attempts as f64 / s.successes.max(1) as f64;
