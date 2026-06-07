@@ -231,14 +231,6 @@ pub(super) fn naked_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
     false
 }
 
-/// Cell at base line `b`, cross position `x`, in the given fish orientation: a row
-/// base maps `(row b, col x)`, a column base maps `(col b, row x)`. Row-major
-/// `row * 9 + col` — the one piece of geometry the fish scan needs.
-#[inline]
-fn fish_cell(row_base: bool, b: usize, x: usize) -> CellIdx {
-    if row_base { b * 9 + x } else { x * 9 + b }
-}
-
 /// Per-`(orientation, digit, base-line)` candidate-position masks for the basic fish:
 /// bit `x` of `pos[o][d][b]` is set iff digit `d` is a candidate at base line `b`,
 /// cross position `x` (orientation `o`: `0` = rows as base lines, `1` = columns). What
@@ -262,14 +254,18 @@ impl FishPositions {
     /// invariant), so it contributes nothing and the digit loop skips it for free.
     fn scan<V: LogicBoard>(v: &V) -> Self {
         let mut pos = [[[0u16; 9]; 9]; 2];
-        for cell in 0..CELLS {
-            let m = v.get(cell);
-            let row = cell / 9;
-            let col = cell % 9;
-            for d in m.iter() {
-                let di = d.index();
-                pos[0][di][row] |= 1 << col; // rows as base lines: cross position = col
-                pos[1][di][col] |= 1 << row; // columns as base lines: cross position = row
+        // `row`/`col` are loop counters rather than `cell / 9` / `cell % 9` per cell, so
+        // the per-cell magic divide-by-nine drops out of the one board-reading pass.
+        let mut cell = 0;
+        for row in 0..9 {
+            for col in 0..9 {
+                let m = v.get(cell);
+                for d in m.iter() {
+                    let di = d.index();
+                    pos[0][di][row] |= 1 << col; // rows as base lines: cross position = col
+                    pos[1][di][col] |= 1 << row; // columns as base lines: cross position = row
+                }
+                cell += 1;
             }
         }
         Self { pos }
@@ -316,14 +312,18 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
             // Keep the viable base lines and their masks side by side so the combination
             // search reads `posv[i]` directly instead of re-indexing `positions[bases[i]]`.
             let positions = &fp.pos[o][di];
-            let mut bases = [0usize; 9];
             let mut posv = [0u16; 9];
+            // Cover base lines are excluded from the elimination scan by a bitmask
+            // (`base_mask`), so carry each viable line's bit alongside its position mask
+            // and union both incrementally down the combination search — the bit set is
+            // the linear `combo.contains(&y)` scan turned into one `& (1 << y)` test.
+            let mut basebit = [0u16; 9];
             let mut n = 0;
             for b in 0..9 {
                 let pc = positions[b].count_ones() as usize;
                 if (2..=size).contains(&pc) {
-                    bases[n] = b;
                     posv[n] = positions[b];
+                    basebit[n] = 1 << b;
                     n += 1;
                 }
             }
@@ -348,7 +348,8 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
                             if union.count_ones() != 2 {
                                 continue;
                             }
-                            if fish_eliminate(v, d, row_base, &[bases[i], bases[j]], union) {
+                            let base_mask = basebit[i] | basebit[j];
+                            if fish_eliminate(v, d, row_base, positions, base_mask, union) {
                                 return true;
                             }
                         }
@@ -361,13 +362,14 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
                             if uij.count_ones() > 3 {
                                 continue; // prune: this pair already over-spills the cover
                             }
+                            let bmij = basebit[i] | basebit[j];
                             for k in j + 1..n {
                                 let union = uij | posv[k];
                                 if union.count_ones() != 3 {
                                     continue;
                                 }
-                                let combo = [bases[i], bases[j], bases[k]];
-                                if fish_eliminate(v, d, row_base, &combo, union) {
+                                let base_mask = bmij | basebit[k];
+                                if fish_eliminate(v, d, row_base, positions, base_mask, union) {
                                     return true;
                                 }
                             }
@@ -382,18 +384,20 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
                             if uij.count_ones() > 4 {
                                 continue; // prune the whole (k, l) sub-tree
                             }
+                            let bmij = basebit[i] | basebit[j];
                             for k in j + 1..n {
                                 let uijk = uij | posv[k];
                                 if uijk.count_ones() > 4 {
                                     continue; // prune the whole l sub-tree
                                 }
+                                let bmijk = bmij | basebit[k];
                                 for l in k + 1..n {
                                     let union = uijk | posv[l];
                                     if union.count_ones() != 4 {
                                         continue;
                                     }
-                                    let combo = [bases[i], bases[j], bases[k], bases[l]];
-                                    if fish_eliminate(v, d, row_base, &combo, union) {
+                                    let base_mask = bmijk | basebit[l];
+                                    if fish_eliminate(v, d, row_base, positions, base_mask, union) {
                                         return true;
                                     }
                                 }
@@ -408,29 +412,43 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
 }
 
 /// Eliminate `d` from the cover cross-lines (`union`) in every base line NOT in the
-/// cover `combo`. Returns whether anything was removed. A placed cross-cell reads as
-/// "no candidate" (the [`Marks`] invariant) so the `contains` guard skips it for free.
+/// cover (`base_mask`'s bits are the cover lines). Returns whether anything was removed.
+///
+/// The cells to clear are read straight off `positions` — the same per-base-line
+/// candidate masks `fish_sized` already searched (`positions[y] == fp.pos[o][di][y]`),
+/// not by re-`get`ting each cover cell: for a non-cover base line `y`, `positions[y] &
+/// union` is exactly the cross-positions where `d` is a candidate *and* in the cover, so
+/// those are the eliminations. This both replaces the scattered per-cell `get`/`contains`
+/// gather with a mask-and over already-loaded data and only walks cells that actually
+/// hold `d`. `positions` is consistent with the board here: only a *successful* call
+/// mutates `v`, and the first such call ends the whole fish search, so no earlier
+/// elimination can have staled the masks. The cell-index geometry (a row base maps
+/// `(y, x) -> y * 9 + x`, a column base maps `(x, y) -> x * 9 + y`) reduces to a
+/// base/stride pair that is loop-invariant in `y`, so the orientation branch is hoisted
+/// out of the inner walk.
 fn fish_eliminate<V: LogicBoard>(
     v: &mut V,
     d: Digit,
     row_base: bool,
-    combo: &[usize],
+    positions: &[u16; 9],
+    base_mask: u16,
     union: u16,
 ) -> bool {
     let mut did = false;
-    for x in 0..9 {
-        if union & (1 << x) == 0 {
+    for y in 0..9 {
+        if base_mask & (1 << y) != 0 {
             continue;
         }
-        for y in 0..9 {
-            if combo.contains(&y) {
-                continue;
-            }
-            let cell = fish_cell(row_base, y, x);
-            if v.get(cell).contains(d) {
-                v.eliminate(cell, d);
-                did = true;
-            }
+        // Cells of base line `y` at cover cross-positions that still hold `d`.
+        let mut elim = positions[y] & union;
+        // fish_cell(row_base, y, x): a row base walks cells (y, x) -> cross x strides by 1
+        // within row y; a column base walks (x, y) -> cross x strides by a full row (9).
+        let (base, stride) = if row_base { (y * 9, 1) } else { (y, 9) };
+        while elim != 0 {
+            let x = elim.trailing_zeros() as usize;
+            elim &= elim - 1;
+            v.eliminate(base + x * stride, d);
+            did = true;
         }
     }
     did
