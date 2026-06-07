@@ -311,51 +311,127 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
         let d = Digit::from_index(di);
         for (o, row_base) in [true, false].into_iter().enumerate() {
             // Per base line, the 9-bit mask of cross-positions where `d` is a candidate.
+            // Keep the viable base lines and their masks side by side so the combination
+            // search reads `posv[i]` directly instead of re-indexing `positions[bases[i]]`.
             let positions = &fp.pos[o][di];
             let mut bases = [0usize; 9];
+            let mut posv = [0u16; 9];
             let mut n = 0;
             for b in 0..9 {
                 let pc = positions[b].count_ones() as usize;
                 if (2..=size).contains(&pc) {
                     bases[n] = b;
+                    posv[n] = positions[b];
                     n += 1;
                 }
             }
             if n < size {
                 continue;
             }
-            let mut applied = false;
-            for_each_combination(&bases[..n], size, |combo| {
-                let union: u16 = combo.iter().map(|&b| positions[b]).fold(0, |a, x| a | x);
-                if union.count_ones() as usize != size {
-                    return true; // not a cover of exactly `size` cross-lines — keep searching
-                }
-                // Eliminate `d` from the cover cross-lines in every NON-base line.
-                let mut did = false;
-                for x in 0..9 {
-                    if union & (1 << x) == 0 {
-                        continue;
-                    }
-                    for y in 0..9 {
-                        if combo.contains(&y) {
-                            continue;
+            // Search for `size` base lines whose candidate positions union to exactly
+            // `size` cross-lines (a valid cover). The union is built incrementally down
+            // the nested loops, and any prefix that already spans more than `size`
+            // cross-lines is pruned — the union only grows, so an over-spilled prefix can
+            // never tighten back to an exact cover, and the whole sub-tree under it is
+            // dead. (The previous code re-folded the full `size`-element union per combo
+            // and only rejected at the leaf, visiting every pruned sub-tree in full.) The
+            // first cover that eliminates anything wins, honouring the first-applicable
+            // contract; pruned covers are exactly those the leaf check would reject with
+            // `count != size`, so the elimination set is byte-identical.
+            match size {
+                2 => {
+                    for i in 0..n {
+                        for j in i + 1..n {
+                            let union = posv[i] | posv[j];
+                            if union.count_ones() != 2 {
+                                continue;
+                            }
+                            if fish_eliminate(v, d, row_base, &[bases[i], bases[j]], union) {
+                                return true;
+                            }
                         }
-                        let cell = fish_cell(row_base, y, x);
-                        if v.get(cell).contains(d) {
-                            v.eliminate(cell, d);
-                            did = true;
+                    }
+                }
+                3 => {
+                    for i in 0..n {
+                        for j in i + 1..n {
+                            let uij = posv[i] | posv[j];
+                            if uij.count_ones() > 3 {
+                                continue; // prune: this pair already over-spills the cover
+                            }
+                            for k in j + 1..n {
+                                let union = uij | posv[k];
+                                if union.count_ones() != 3 {
+                                    continue;
+                                }
+                                let combo = [bases[i], bases[j], bases[k]];
+                                if fish_eliminate(v, d, row_base, &combo, union) {
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
-                applied = did;
-                !did // stop once we eliminated something
-            });
-            if applied {
-                return true;
+                _ => {
+                    // size == 4 (Jellyfish); the ladder never asks for a larger fish.
+                    for i in 0..n {
+                        for j in i + 1..n {
+                            let uij = posv[i] | posv[j];
+                            if uij.count_ones() > 4 {
+                                continue; // prune the whole (k, l) sub-tree
+                            }
+                            for k in j + 1..n {
+                                let uijk = uij | posv[k];
+                                if uijk.count_ones() > 4 {
+                                    continue; // prune the whole l sub-tree
+                                }
+                                for l in k + 1..n {
+                                    let union = uijk | posv[l];
+                                    if union.count_ones() != 4 {
+                                        continue;
+                                    }
+                                    let combo = [bases[i], bases[j], bases[k], bases[l]];
+                                    if fish_eliminate(v, d, row_base, &combo, union) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     false
+}
+
+/// Eliminate `d` from the cover cross-lines (`union`) in every base line NOT in the
+/// cover `combo`. Returns whether anything was removed. A placed cross-cell reads as
+/// "no candidate" (the [`Marks`] invariant) so the `contains` guard skips it for free.
+fn fish_eliminate<V: LogicBoard>(
+    v: &mut V,
+    d: Digit,
+    row_base: bool,
+    combo: &[usize],
+    union: u16,
+) -> bool {
+    let mut did = false;
+    for x in 0..9 {
+        if union & (1 << x) == 0 {
+            continue;
+        }
+        for y in 0..9 {
+            if combo.contains(&y) {
+                continue;
+            }
+            let cell = fish_cell(row_base, y, x);
+            if v.get(cell).contains(d) {
+                v.eliminate(cell, d);
+                did = true;
+            }
+        }
+    }
+    did
 }
 
 /// **Hidden subset** of `size`: `size` digits confined to the same `size` cells of
