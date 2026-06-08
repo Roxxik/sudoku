@@ -1,3 +1,0 @@
-# label=t_fused seeds=10 attempts=20000 reps=3 core=2 gov=powersave
-seed	train_us	drill_us	train_fp	drill_fp
-1	526.3	180.6	0x21f20da5	0x21f20da5
