@@ -326,6 +326,7 @@ pub fn run_warp(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: us
     WarpResult { stats, per_lane }
 }
 
+/// INSTRUMENTATION
 /// Harvest the **faithful corpus of uniqueness probes** a fixed-work [`run_warp`] would
 /// hand the packed prober, for the isolated prober benchmark (`proberbench`). Runs the
 /// real generator — strip walk + prober verdicts drive the trajectory exactly as
@@ -382,6 +383,7 @@ pub fn collect_probes(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_la
     probes
 }
 
+/// INSTRUMENTATION
 /// Harvest the **faithful corpus of baseline-gate boards** a fixed-work [`run_warp`]
 /// would hand the scalar baseline solver, for the isolated SIMT-baseline-solver
 /// benchmark/parity (`baselinebench`, `tests/equiv_baseline_simt`). Runs the real
