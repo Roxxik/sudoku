@@ -797,6 +797,7 @@ pub fn run_warp_simt(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lan
     WarpResult { stats, per_lane }
 }
 
+
 /// **Unified warp (U).** One [`UnifiedWarp`] runs the uniqueness and baseline gates on the
 /// SAME 8 SIMD lanes instead of two coupled warps. A slot stays bound to its macro-lane and
 /// flips probe -> baseline *in place* the instant the prober verdict is unique (no batch, no
@@ -808,26 +809,12 @@ pub fn run_warp_simt(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lan
 /// is the baseline closure ([`warp_pass_full`]), sound for a probe lane since extra
 /// propagation only prunes the existence search.
 pub fn run_warp_unified(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
-    run_warp_unified_impl(base_seed, spec, lanes, attempts_per_lane, false)
-}
-
-/// **Lean-kernel unified warp (experiment #2).** As [`run_warp_unified`] but the engine
-/// runs the cheap [`crate::probe::simt`] `warp_pass` (no column hidden singles) for every
-/// lane, recovering columns only for the baseline lanes that stall (a masked full-closure
-/// pass). The bet: probe lanes (the majority) skip the column ALU. Byte-identical per lane
-/// to [`run_warp`] (column recovery keeps baseline verdicts exact). A/B it against the
-/// full-kernel [`run_warp_unified`] in `simtbaselinebench`.
-pub fn run_warp_unified_lean(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize) -> WarpResult {
-    run_warp_unified_impl(base_seed, spec, lanes, attempts_per_lane, true)
-}
-
-fn run_warp_unified_impl(base_seed: u64, spec: &Spec, lanes: usize, attempts_per_lane: usize, lean: bool) -> WarpResult {
     let baseline = spec.baseline_mask();
 
     let mut ls: Vec<Lane> = (0..lanes)
         .map(|l| Lane::new(Rng::from_seed(base_seed + l as u64), attempts_per_lane))
         .collect();
-    let mut warp = if lean { UnifiedWarp::new_lean() } else { UnifiedWarp::new() };
+    let mut warp = UnifiedWarp::new();
     let mut slot_lane = [usize::MAX; LANES];
     let mut next_lane = 0usize;
     // Per-slot cache of the probe last loaded into that slot — the strip's exported row

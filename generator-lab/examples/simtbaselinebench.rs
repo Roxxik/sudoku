@@ -16,7 +16,7 @@
 //! Usage: cargo run --release --example simtbaselinebench -- [total=96000] [reps=3]
 
 use generator_lab::generate::random_simt::{
-    WarpResult, run_warp, run_warp_simt, run_warp_unified, run_warp_unified_lean,
+    WarpResult, run_warp, run_warp_simt, run_warp_unified,
 };
 use generator_lab::spec::Spec;
 use generator_lab::subset_spec_for_mode;
@@ -26,8 +26,7 @@ fn check_match(name: &str, spec: &Spec, lanes: usize, per_lane: usize) {
     let bar = run_warp(1, spec, lanes, per_lane);
     let mine = match name {
         "simt" => run_warp_simt(1, spec, lanes, per_lane),
-        "unified" => run_warp_unified(1, spec, lanes, per_lane),
-        _ => run_warp_unified_lean(1, spec, lanes, per_lane),
+        _ => run_warp_unified(1, spec, lanes, per_lane),
     };
     assert_eq!(mine.per_lane.len(), bar.per_lane.len(), "{name}: lane count");
     for (l, (a, b)) in mine.per_lane.iter().zip(bar.per_lane.iter()).enumerate() {
@@ -72,12 +71,10 @@ fn main() {
             let per_lane = total / lanes;
             let sm = if lanes >= 16 { time(total, reps, || run_warp_simt(1, &spec, lanes, per_lane)) } else { f64::NAN };
             let un = time(total, reps, || run_warp_unified(1, &spec, lanes, per_lane));
-            let ul = time(total, reps, || run_warp_unified_lean(1, &spec, lanes, per_lane));
             println!(
-                "  L={lanes:<4} batched-simt {sm:>8.3} {:>5.2}x    unified {un:>8.3} {:>5.2}x    unified_lean {ul:>8.3} {:>5.2}x",
+                "  L={lanes:<4} batched-simt {sm:>8.3} {:>5.2}x    unified {un:>8.3} {:>5.2}x",
                 bar / sm,
                 bar / un,
-                bar / ul,
             );
         }
         println!();

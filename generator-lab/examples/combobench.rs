@@ -114,7 +114,10 @@ fn main() {
     println!("combobench[{label}] toolbox={toolbox}: {lanes} lanes x {per_lane} = {total} attempts");
 
     #[cfg(feature = "count")]
-    generator_lab::repr::banded::psg_reset();
+    {
+        generator_lab::repr::banded::psg_reset();
+        generator_lab::solve::uwstat_reset();
+    }
     let t0 = std::time::Instant::now();
     let res = run_warp_unified(base_seed, &spec, lanes, per_lane);
     let dt = t0.elapsed();
@@ -126,6 +129,18 @@ fn main() {
             h.iter().map(|&c| format!("{:.1}%", 100.0 * c as f64 / total.max(1) as f64)).collect();
         println!("  place_single_group group-size histogram (cells): {h:?}");
         println!("    share: {}", pct.join(" "));
+        // Honest unified-warp lane utilization for THIS workload: avg active lanes per
+        // pass / LANES (active = slot bound to live work). uw = [passes, active-lane-sum].
+        let uw = generator_lab::solve::uwstat_snapshot();
+        let lanes_const = generator_lab::probe::simt::LANES;
+        let util = uw[1] as f64 / (lanes_const as f64 * uw[0].max(1) as f64);
+        println!(
+            "  warp LANES={lanes_const}  passes {}  util {:.3} ({:.2}/{lanes_const} lanes)  passes/att {:.2}",
+            uw[0],
+            util,
+            uw[1] as f64 / uw[0].max(1) as f64,
+            uw[0] as f64 / (lanes * per_lane) as f64,
+        );
     }
 
     // Combined fingerprint over every lane's per-puzzle-cells FNV fp (lane order fixed),

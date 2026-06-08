@@ -31,7 +31,9 @@ fn main() {
         let res = f();
         std::hint::black_box(res.stats.successes);
         let u = uwstat_snapshot();
-        (100.0 * u[1] as f64 / (8.0 * u[0] as f64), u[0])
+        // Normalize by the actual SIMD width, not a hardcoded 8, so util is honest for any
+        // LANES (a LANES=16 build was reading ~199% against the old 8.0 divisor).
+        (100.0 * u[1] as f64 / (generator_lab::probe::simt::LANES as f64 * u[0] as f64), u[0])
     };
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {

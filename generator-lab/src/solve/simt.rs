@@ -50,7 +50,7 @@ use super::techniques;
 use crate::counters::counter_block;
 use crate::probe::simt::{
     BOX_CELLS, Frame, LANES, M, ONE, Probe, ROW_MASK, V, ZERO, assign, backtrack_lane, branch_lane,
-    load_lane, one_bit, restore_lane, rm_cell, smear_v, snapshot_lane, warp_pass,
+    load_lane, one_bit, restore_lane, rm_cell, smear_v, snapshot_lane,
 };
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState, UNITS};
@@ -733,6 +733,7 @@ fn scalar_lc_fast(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
 /// block. Returns whether anything was assigned (then the lane rejoins the warp). This is
 /// the gather-free, full-pass-free way to keep columns off the probe lanes (the masked
 /// SIMD recovery it replaces paid the column ALU warp-wide regardless of the mask).
+#[allow(dead_code)]
 fn scalar_col_assign(r: &mut [[V; 3]; 9], unsolved: &[V; 3], l: usize) -> bool {
     let u = [unsolved[0].as_array()[l], unsolved[1].as_array()[l], unsolved[2].as_array()[l]];
     let mut assigned = false;
@@ -1052,18 +1053,6 @@ pub struct UnifiedWarp {
     stacks: [Vec<Frame>; LANES],
     /// Baseline-mode subset-kind counts (reset on each baseline (re)load).
     counts: [[u16; NUM]; LANES],
-    /// Kernel selector (the experiment #2 A/B): `false` = full closure
-    /// ([`warp_pass_full`], columns vectorized for every lane); `true` = **lean** — the
-    /// cheap [`warp_pass`] (naked + row/box singles, NO columns) for every lane, and columns
-    /// recovered SCALAR per stalled baseline lane in the service loop ([`scalar_col_assign`],
-    /// assign + let the smear place it). The bet: probe lanes (the majority of passes) never
-    /// touch column ALU — SIMD or scalar — and only baseline lanes pay, on stall.
-    ///
-    /// (An earlier lean attempt recovered columns with a *masked SIMD* `warp_pass_full` pass
-    /// — measured DEAD because the column fold runs warp-wide regardless of the mask, so it
-    /// paid columns for everyone anyway, doing 32% more passes. The scalar recovery here is
-    /// the genuine test of the lean premise: it never runs a full pass.)
-    lean: bool,
 }
 
 impl Default for UnifiedWarp {
@@ -1074,15 +1063,6 @@ impl Default for UnifiedWarp {
 
 impl UnifiedWarp {
     pub fn new() -> Self {
-        Self::with_lean(false)
-    }
-
-    /// The **lean**-kernel variant (experiment #2): see [`UnifiedWarp::lean`].
-    pub fn new_lean() -> Self {
-        Self::with_lean(true)
-    }
-
-    fn with_lean(lean: bool) -> Self {
         UnifiedWarp {
             r: [[ZERO; 3]; 9],
             unsolved: [ZERO; 3],
@@ -1090,7 +1070,6 @@ impl UnifiedWarp {
             baseline_mode: [false; LANES],
             stacks: core::array::from_fn(|_| Vec::with_capacity(64)),
             counts: [[0u16; NUM]; LANES],
-            lean,
         }
     }
 
@@ -1134,11 +1113,8 @@ impl UnifiedWarp {
         // never need LC at all. So the closure is `warp_pass_full::<false>` (full) or, in
         // the lean experiment, the cheap `warp_pass` (no column hidden singles) — columns
         // are then recovered SCALAR, per stalled baseline lane, in the service loop below.
-        let (changed, dead, solved) = if self.lean {
-            warp_pass(&mut self.r, &mut self.unsolved, active_mask)
-        } else {
-            warp_pass_full::<false>(&mut self.r, &mut self.unsolved, active_mask)
-        };
+        let (changed, dead, solved) = 
+            warp_pass_full::<false>(&mut self.r, &mut self.unsolved, active_mask);
 
         let solved_b = solved.to_bitmask();
         let dead_b = dead.to_bitmask();
@@ -1154,12 +1130,6 @@ impl UnifiedWarp {
                     verdict = Some(UnifiedVerdict::Baseline(SolveTrace { solved: true, counts: self.counts[l] }));
                 } else if dead_b & bit != 0 {
                     verdict = Some(UnifiedVerdict::Baseline(SolveTrace { solved: false, counts: self.counts[l] }));
-                } else if self.lean && scalar_col_assign(&mut self.r, &self.unsolved, l) {
-                    // Lean kernel omits column hidden singles: recover them scalar for this
-                    // one stalled baseline lane (assign each, the next `warp_pass` smears it
-                    // in as a naked single). Made progress -> stay active, rejoin the warp,
-                    // no verdict. Only fall to subsets once columns ALSO stall (full closure
-                    // exhausted), matching `warp_pass_full`'s "stuck" point exactly.
                 } else {
                     match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc) {
                         Some(k) => self.counts[l][k] = self.counts[l][k].saturating_add(1),
