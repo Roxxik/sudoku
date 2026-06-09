@@ -29,10 +29,10 @@ mod fused;
 mod logic;
 mod techniques;
 
-// The packed W=8 SoA baseline logic solver — the `solve` analogue of
-// [`probe::simt`](crate::probe::simt), batching the strip loop's baseline gates
-// across SIMD lanes. An AVX native play (the wasm cdylib ships the scalar fused
-// path), so keep it and its `std::simd` warp out of the wasm binary.
+// The packed W=8 SoA baseline-solver machinery — the `solve` analogue of
+// [`probe::simt`](crate::probe::simt): the vectorized baseline closure and scalar subset
+// fallback the unified warp drives across SIMD lanes. An AVX native play (the wasm cdylib
+// ships the scalar fused path), so keep it and its `std::simd` warp out of the wasm binary.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod simt;
 
@@ -41,17 +41,17 @@ pub use fused::FusedLogicSolver;
 pub use logic::LogicSolver;
 /// Confluence-test surface: the reorderable harder ladder and a fixpoint solve that
 /// takes its order, for `examples/confluence.rs`.
-pub use logic::{HARD_STEPS_DEFAULT, HardStep, solve_fixpoint_with_order};
+pub use logic::{HARD_STEPS_DEFAULT, HardStep, closure_probe, solve_fixpoint_with_order};
 
 /// Baseline-gate workload counters (`feature = "count"`), for the SIMT-baseline
 /// solver design study — read by the `baselinestat` example.
 #[cfg(feature = "count")]
 pub use fused::{fstat_reset, fstat_snapshot};
 
-/// Packed baseline-solver warp-utilization counters (`feature = "count"`) — read by
-/// the `simtutil` example.
+/// Unified-warp utilization counters (`feature = "count"`) — read by the `simtutil`
+/// example.
 #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
-pub use simt::{sstat_reset, sstat_snapshot, uwstat_reset, uwstat_snapshot};
+pub use simt::{uwstat_reset, uwstat_snapshot};
 
 use crate::spec::kinds::{KindMask, SolveTrace};
 

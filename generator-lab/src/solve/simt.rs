@@ -1,8 +1,11 @@
-//! Packed SoA **baseline logic solver** on the `repr` layer: the `solve` analogue of
-//! [`probe::simt`](crate::probe::simt). Where the packed prober batches the strip
-//! loop's *uniqueness* gates across W=8 SIMD lanes, this batches its *baseline* gates
-//! — the technique-driven, non-backtracking [`FusedLogicSolver`](super::FusedLogicSolver)
-//! the SIMT codepath still runs per lane (the remaining scalar half of the warp).
+//! Packed SoA **baseline logic solver** machinery on the `repr` layer: the `solve`
+//! analogue of [`probe::simt`](crate::probe::simt). Where the packed prober batches the
+//! strip loop's *uniqueness* gates across W=8 SIMD lanes, this vectorizes its *baseline*
+//! gates — the technique-driven, non-backtracking
+//! [`FusedLogicSolver`](super::FusedLogicSolver) the strip runs per lane. The consumer is
+//! [`UnifiedWarp`] (below), which runs the probe and baseline gates on one shared warp;
+//! this module provides the baseline closure ([`warp_pass_full`]) and the scalar subset
+//! fallback ([`subset_step`]) it drives.
 //!
 //! ## The cheap-closure / subset split (data-driven)
 //!
@@ -26,21 +29,16 @@
 //!
 //! ## Where locked candidates run (measured)
 //!
-//! LC has two implementations, selectable via [`PackedSolver::run_stream_with`]:
-//!   - **off the warp (default):** the closure does only singles; a stalled lane runs
-//!     the fast table-driven scalar LC fixpoint ([`scalar_lc_fast`], the same `DROP_TRIP`
-//!     LC `FusedLogicSolver` uses) before the subsets, then rejoins.
-//!   - **in the closure (research):** a vectorized single LC round per pass
-//!     ([`lc_eliminate`], gather-free), the outer loop reaching the fixpoint.
-//!
-//! Off-warp wins on the bench (`baselinebench`): train isolated **1.87x** vs **1.36x**
-//! for in-closure. The closure's LC taxes every lane every pass, but ~70% of calls never
-//! need LC (singles solve them), whereas off-warp only pays LC on the ~30% that stall.
-//! The in-closure path is kept (behind the knob, parity-tested) for future work — the
-//! gap is narrow and the vectorized round may yet be cheapened.
+//! LC runs **off the warp**: the closure does only singles, and a stalled lane runs the
+//! fast table-driven scalar LC fixpoint ([`scalar_lc_fast`], the same `DROP_TRIP` LC
+//! `FusedLogicSolver` uses) before the subsets, then rejoins. This beat a vectorized
+//! in-closure LC round on the bench (train isolated **1.87x** vs **1.36x**): the closure's
+//! LC would tax every lane every pass, but ~70% of calls never need LC (singles solve
+//! them), whereas off-warp only pays LC on the ~30% that stall. (The in-closure variant
+//! rode behind a knob on the standalone packed solver; both were removed.)
 //!
 //! Verdicts (`solved` + the subset-kind counts the spec's requirement check reads) are
-//! identical to [`FusedLogicSolver`](super::FusedLogicSolver), so the solver is a
+//! identical to [`FusedLogicSolver`](super::FusedLogicSolver), so the closure is a
 //! drop-in for the warp's baseline gate. Cheap-kind counts are not tracked (the fused
 //! contract leaves them undefined, and the fast path's requirement check never reads
 //! one — a Forced cheap kind routes off the fused/SIMT path entirely).
@@ -49,25 +47,19 @@ use super::combinations::for_each_combination;
 use super::techniques;
 use crate::counters::counter_block;
 use crate::probe::simt::{
-    BOX_CELLS, Frame, LANES, M, ONE, Probe, ROW_MASK, V, ZERO, assign, backtrack_lane, branch_lane,
+    BOX_CELLS, Frame, LANES, M, Probe, ROW_MASK, V, ZERO, assign, backtrack_lane, branch_lane,
     load_lane, one_bit, restore_lane, rm_cell, smear_v, snapshot_lane,
 };
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState, UNITS};
 use crate::solve::Eliminate;
 use crate::spec::kinds::{
-    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING, NAKED_PAIR,
+    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_POINTING, NAKED_PAIR,
     NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
 };
 use std::simd::cmp::SimdPartialEq;
 use std::simd::num::SimdUint;
 use std::simd::{Select, Simd};
-
-// --- packed baseline-solver utilization (feature = "count") -------------------
-// [0] warp passes (ticks), [1] active-lane-sum over ticks. utilization =
-// active_lane_sum / (LANES * ticks) — the baseline warp's analogue of the prober's
-// DSTAT[3]/(LANES*DSTAT[1]). Read by the `simtutil` example to size the buffer.
-counter_block!(SSTAT: 2, inc = sstat_inc, add = sstat_add, snapshot = sstat_snapshot, reset = sstat_reset);
 
 // --- unified-warp utilization (feature = "count") -----------------------------
 // The single warp that runs probe AND baseline lanes together ([`UnifiedWarp`]):
@@ -119,10 +111,10 @@ fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q: &SolveQue
 /// singles + hidden singles in **every** unit (rows, boxes, AND columns) fused into one
 /// per-digit placement sweep. Returns per-lane `(changed, dead, solved)`; the scheduler
 /// iterates until each lane is solved / dead / stuck. The naked-single sieve and the
-/// row/box hidden-single detection + [`smear_v`] placement are the prober's
-/// [`warp_pass`](crate::probe::simt) verbatim; the **column** hidden singles are the
-/// one addition a non-backtracking solver needs (the prober reaches columns by
-/// branching, so its pass omits them).
+/// row/box hidden-single detection + [`smear_v`] placement reuse the prober's gather-free
+/// geometry (the [`probe::simt`](crate::probe::simt) [`smear_v`]/[`one_bit`] kernel); the
+/// **column** hidden singles are the one addition a non-backtracking solver needs (the
+/// prober reaches columns by branching, so its pass omits them).
 ///
 /// **Columns, gather-free.** A column `c` (0..9) holds its candidate cells at bit
 /// positions `c`, `c+9`, `c+18` of each of the three bands. Folding those nine 9-bit
@@ -132,12 +124,10 @@ fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q: &SolveQue
 /// the live board picks the single forced cell, in whichever band/row it sits, with no
 /// transpose and no column-major view.
 ///
-/// `LC` (a const, monomorphized away for drill, whose baseline has no locked
-/// candidates) adds one round of pointing+claiming per pass ([`lc_eliminate`]); the
-/// outer warp loop iterates the closure, so a single round per pass reaches the same
-/// within-band LC fixpoint the scalar table reaches in one shot — gather-free.
+/// Locked candidates run **off the warp** (a stalled lane's scalar [`subset_step`], via
+/// [`scalar_lc_fast`]), so this closure does singles only.
 #[cfg_attr(feature = "profiling", inline(never))]
-fn warp_pass_full<const LC: bool>(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
+fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
     let mut changed = M::splat(false);
     let mut dead = M::splat(false);
 
@@ -203,138 +193,11 @@ fn warp_pass_full<const LC: bool>(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], ac
         }
     }
 
-    // Locked candidates (one round; the outer loop reaches the fixpoint). Eliminations
-    // on the post-placement board; any LC-induced dead cell is caught next pass by the
-    // naked-single sieve (`unsolved & !ones`), exactly as the scalar engine defers it to
-    // the next propagate.
-    if LC {
-        changed |= lc_eliminate(r, unsolved, active);
-    }
-
     dead &= active;
     changed &= active;
     let empties = unsolved[0].count_ones() + unsolved[1].count_ones() + unsolved[2].count_ones();
     let solved = active & empties.simd_eq(ZERO) & !dead;
     (changed, dead, solved)
-}
-
-/// A band's 9-bit triplet occupancy off its live candidates: bit `t` (`t = 3*row +
-/// boxcol`) set iff the triplet's three cells `[3t, 3t+3)` hold any candidate.
-#[inline]
-fn triplet_occ(live: V) -> V {
-    let mut occ = ZERO;
-    for t in 0..9u32 {
-        let tm = Simd::splat(0b111u32 << (3 * t));
-        occ |= (live & tm).simd_ne(ZERO).select(Simd::splat(1u32 << t), ZERO);
-    }
-    occ
-}
-
-/// ONE round of within-band locked candidates (pointing + claiming) over a 9-bit
-/// triplet occupancy `occ` (bit `3*row + col`): the occupied triplets it eliminates.
-/// Pointing — a box-column whose occupied triplets lie in a single band-row clears that
-/// row's other columns; claiming — a band-row whose occupied triplets lie in a single
-/// box-column clears that column's other rows. Reads the same `occ` throughout (a
-/// single round, all-at-once); the outer warp loop re-runs the closure, and the
-/// clearing is monotone, so the global fixpoint matches the scalar table's. Vectorized
-/// ALU, no `DROP_TRIP` gather.
-#[inline]
-fn lc_round_drop(occ: V) -> V {
-    let mut dropped = ZERO;
-    // Pointing: for each box-column k, if exactly one band-row is occupied, drop that
-    // row's other two columns.
-    for k in 0..3u32 {
-        let r0 = (occ >> Simd::splat(k)) & ONE;
-        let r1 = (occ >> Simd::splat(3 + k)) & ONE;
-        let r2 = (occ >> Simd::splat(6 + k)) & ONE;
-        let single = (r0 + r1 + r2).simd_eq(ONE);
-        for rr in 0..3u32 {
-            let row_has = ((occ >> Simd::splat(3 * rr + k)) & ONE).simd_eq(ONE);
-            let active = single & row_has; // band-row rr is the single occupied row
-            let dropmask = (0b111u32 << (3 * rr)) & !(1u32 << (3 * rr + k));
-            dropped |= active.select(Simd::splat(dropmask) & occ, ZERO);
-        }
-    }
-    // Claiming: for each band-row r, if exactly one box-column is occupied, drop that
-    // column's other two rows.
-    for r in 0..3u32 {
-        let c0 = (occ >> Simd::splat(3 * r)) & ONE;
-        let c1 = (occ >> Simd::splat(3 * r + 1)) & ONE;
-        let c2 = (occ >> Simd::splat(3 * r + 2)) & ONE;
-        let single = (c0 + c1 + c2).simd_eq(ONE);
-        for kk in 0..3u32 {
-            let col_has = ((occ >> Simd::splat(3 * r + kk)) & ONE).simd_eq(ONE);
-            let active = single & col_has;
-            let dropmask = ((1u32 << kk) | (1 << (3 + kk)) | (1 << (6 + kk))) & !(1u32 << (3 * r + kk));
-            dropped |= active.select(Simd::splat(dropmask) & occ, ZERO);
-        }
-    }
-    dropped
-}
-
-/// Expand a 9-bit dropped-triplet mask to the 27-bit cell mask it clears (each triplet
-/// `t` -> its three cells `0b111 << 3t`).
-#[inline]
-fn expand_triplets(dropped: V) -> V {
-    let mut clear = ZERO;
-    for t in 0..9u32 {
-        let has = ((dropped >> Simd::splat(t)) & ONE).simd_eq(ONE);
-        clear |= has.select(Simd::splat(0b111u32 << (3 * t)), ZERO);
-    }
-    clear
-}
-
-/// One round of locked candidates across the warp, both orientations, applied to
-/// `active` lanes — returns the lanes that changed. Box↔row LC is in-lane per band
-/// ([`triplet_occ`] + [`lc_round_drop`] + [`expand_triplets`]); box↔column LC reads the
-/// column-major triplet occupancy folded across the three row bands (no second view),
-/// and its eliminations clear a column-segment in the triplet's band.
-#[inline]
-fn lc_eliminate(r: &mut [[V; 3]; 9], unsolved: &[V; 3], active: M) -> M {
-    let mut changed = M::splat(false);
-
-    // Box <-> row: each band's three boxes against its three rows, all in-lane.
-    for b in 0..3 {
-        for d in 0..9 {
-            let live = r[d][b] & unsolved[b];
-            let dropped = lc_round_drop(triplet_occ(live));
-            let clear = expand_triplets(dropped);
-            r[d][b] &= !active.select(clear, ZERO);
-            changed |= active & dropped.simd_ne(ZERO);
-        }
-    }
-
-    // Box <-> column: each stack's three boxes against its three columns. The
-    // column-major triplet (a = column-in-stack, g = band) occupies bit `3a + g`, read
-    // from the three row bands; its elimination clears column `3s + a`'s three cells in
-    // band `g`.
-    for s in 0..3u32 {
-        for d in 0..9 {
-            let mut occ = ZERO;
-            for a in 0..3u32 {
-                let c = 3 * s + a;
-                let cm: V = Simd::splat((1u32 << c) | (1 << (c + 9)) | (1 << (c + 18)));
-                for gi in 0..3usize {
-                    let live = r[d][gi] & unsolved[gi];
-                    occ |= (live & cm)
-                        .simd_ne(ZERO)
-                        .select(Simd::splat(1u32 << (3 * a + gi as u32)), ZERO);
-                }
-            }
-            let dropped = lc_round_drop(occ);
-            for t in 0..9u32 {
-                let has = ((dropped >> Simd::splat(t)) & ONE).simd_eq(ONE);
-                let a = t / 3;
-                let g = (t % 3) as usize;
-                let c = 3 * s + a;
-                let cm: V = Simd::splat((1u32 << c) | (1 << (c + 9)) | (1 << (c + 18)));
-                r[d][g] &= !(active & has).select(cm, ZERO);
-            }
-            changed |= active & dropped.simd_ne(ZERO);
-        }
-    }
-
-    changed
 }
 
 /// The discrete "harder than the cheap closure" ladder, gated by `allowed` — the
@@ -770,233 +633,6 @@ fn scalar_col_assign(r: &mut [[V; 3]; 9], unsolved: &[V; 3], l: usize) -> bool {
     assigned
 }
 
-/// The packed baseline logic solver: 8 SIMD lanes, each running one query's cheap
-/// closure in the SoA rep, refilled as it finishes via [`Self::run_stream`] (on demand
-/// from the host) or [`Self::solve`] (from a slice). Holds resident warp state so the
-/// warp can be **stepped** one pass at a time ([`Self::step_default`]) — scaffolding for a
-/// two-warp host that drives it alongside a probe warp (the interleaved prototype that used
-/// it was retired in favour of the unified warp); the type mirrors
-/// [`PackedProber`](crate::probe::simt::PackedProber) so such a host owns one of each.
-pub struct PackedSolver {
-    r: [[V; 3]; 9],
-    unsolved: [V; 3],
-    active: [bool; LANES],
-    counts: [[u16; NUM]; LANES],
-}
-
-impl Default for PackedSolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PackedSolver {
-    pub fn new() -> Self {
-        PackedSolver {
-            r: [[ZERO; 3]; 9],
-            unsolved: [ZERO; 3],
-            active: [false; LANES],
-            counts: [[0u16; NUM]; LANES],
-        }
-    }
-
-    /// Whether any resident lane is still solving.
-    #[inline]
-    pub fn any_active(&self) -> bool {
-        self.active.iter().any(|&a| a)
-    }
-
-    /// Whether baseline slot `l` is currently occupied (a stepping host fills idle ones).
-    #[inline]
-    pub fn slot_active(&self, l: usize) -> bool {
-        self.active[l]
-    }
-
-    /// Load query `q` into slot `l` (initial fill or refill), marking it active and
-    /// resetting its kind counts.
-    #[inline]
-    pub fn load(&mut self, l: usize, q: &SolveQuery) {
-        load_query(&mut self.r, &mut self.unsolved, l, q);
-        self.counts[l] = [0; NUM];
-        self.active[l] = true;
-    }
-
-    /// ONE [`warp_pass_full`] over the resident active lanes + service. A lane that reaches
-    /// a terminal verdict is **deactivated** and reported via `on_verdict(slot, trace)`
-    /// (the caller refills via [`load`](Self::load) or leaves the slot idle); a stuck lane
-    /// takes one scalar [`subset_step`] in place (rejoining the warp if a subset fired).
-    /// The stepping primitive a two-warp host drives; the streaming [`drive`] is this
-    /// in a loop with immediate refill. `VEC_LC`/`try_lc` mirror [`drive`]'s LC placement.
-    fn step<const VEC_LC: bool, F: FnMut(usize, SolveTrace)>(
-        &mut self,
-        allowed: KindMask,
-        try_lc: bool,
-        mut on_verdict: F,
-    ) {
-        let active_mask = M::from_array(self.active);
-        if !active_mask.any() {
-            return;
-        }
-        sstat_add(0, 1);
-        sstat_add(1, active_mask.to_bitmask().count_ones() as u64);
-        let (changed, dead, solved) =
-            warp_pass_full::<VEC_LC>(&mut self.r, &mut self.unsolved, active_mask);
-
-        let active_b = active_mask.to_bitmask();
-        let solved_b = solved.to_bitmask();
-        let dead_b = dead.to_bitmask();
-        let changed_b = changed.to_bitmask();
-        let mut service = active_b & (solved_b | dead_b | !changed_b);
-        while service != 0 {
-            let l = service.trailing_zeros() as usize;
-            service &= service - 1;
-            let bit = 1u64 << l;
-            let mut verdict: Option<bool> = None;
-            if solved_b & bit != 0 {
-                verdict = Some(true);
-            } else if dead_b & bit != 0 {
-                verdict = Some(false); // contradiction: unsolvable under the toolbox
-            } else {
-                match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc) {
-                    Some(k) => self.counts[l][k] = self.counts[l][k].saturating_add(1),
-                    None => verdict = Some(false), // no subset applies: unsolvable
-                }
-            }
-            if let Some(v) = verdict {
-                let trace = SolveTrace { solved: v, counts: self.counts[l] };
-                self.active[l] = false;
-                on_verdict(l, trace);
-            }
-        }
-    }
-
-    /// LC-off-warp stepping (the production default — see [`run_stream`](Self::run_stream))
-    /// for a two-warp host: ONE pass + service, terminations reported via `on_verdict`.
-    pub fn step_default<F: FnMut(usize, SolveTrace)>(&mut self, allowed: KindMask, on_verdict: F) {
-        let try_lc = allowed & (1 << LC_POINTING) != 0;
-        self.step::<false, F>(allowed, try_lc, on_verdict);
-    }
-
-    /// Drive the warp as a **streaming** baseline solver under the `allowed` toolbox:
-    /// each freed SIMD lane is refilled by `next(slot, verdict)`. The callback receives
-    /// the just-finished query's [`SolveTrace`] (`None` on the initial fill) and returns
-    /// the next [`SolveQuery`] for that lane, or `None` when the lane has no more work.
-    ///
-    /// One iteration = one [`warp_pass_full`] over the active lanes + per-lane service:
-    /// a solved lane is a verdict (`solved = true`); a dead lane is a verdict
-    /// (`solved = false`, contradiction); a stalled lane (a full pass changed nothing,
-    /// still unsolved) drops to a scalar [`subset_step`] — if a subset fires it rejoins
-    /// the warp, else it is a verdict (`solved = false`, stuck); a still-changing lane
-    /// keeps propagating in place. Subset counts accumulate per lane and ride out in the
-    /// verdict's `counts`.
-    pub fn run_stream<F>(&mut self, allowed: KindMask, next: F)
-    where
-        F: FnMut(usize, Option<SolveTrace>) -> Option<SolveQuery>,
-    {
-        // LC off the warp is the measured winner (train isolated 1.87x vs 1.36x for
-        // LC-in-closure): the vectorized LC taxes every lane every pass, but ~70% of
-        // calls never need LC, whereas the off-warp table LC only fires on the ~30% that
-        // stall. See `examples/baselinebench` (the A/B knob).
-        self.run_stream_with::<F>(allowed, false, next);
-    }
-
-    /// As [`run_stream`](Self::run_stream) but with `lc_in_closure` selecting where
-    /// locked candidates run: `true` (default) vectorizes them in [`warp_pass_full`];
-    /// `false` is the **LC-off-warp** experiment — the closure does only singles, and a
-    /// stalled lane runs LC scalar before the subsets (so a lane needing LC drops out
-    /// each time, like a subset step). Lets the bench A/B the two without a fork.
-    pub fn run_stream_with<F>(&mut self, allowed: KindMask, lc_in_closure: bool, next: F)
-    where
-        F: FnMut(usize, Option<SolveTrace>) -> Option<SolveQuery>,
-    {
-        // Locked candidates are monomorphized away when the toolbox excludes them (drill),
-        // and the fast path's both-or-neither precondition (mirroring `FusedLogicSolver`)
-        // lets a single bit decide. Running LC for a no-LC baseline would over-solve, so
-        // this gate is load-bearing, not just a speed knob.
-        let lc_tool = allowed & (1 << LC_POINTING) != 0;
-        debug_assert_eq!(
-            lc_tool,
-            allowed & (1 << LC_CLAIMING) != 0,
-            "SIMT baseline fast path requires LC both-or-neither (mask {allowed:#b})"
-        );
-        if lc_tool && lc_in_closure {
-            self.drive::<true, F>(allowed, next);
-        } else {
-            self.drive::<false, F>(allowed, next);
-        }
-    }
-
-    fn drive<const VEC_LC: bool, F>(&mut self, allowed: KindMask, mut next: F)
-    where
-        F: FnMut(usize, Option<SolveTrace>) -> Option<SolveQuery>,
-    {
-        // When the closure does NOT vectorize LC but the toolbox has it, the scalar
-        // stall step runs LC (before subsets) so a stalled lane still reaches the LC
-        // fixpoint. With LC in the closure (or absent), the stall step skips it.
-        let try_lc = !VEC_LC && (allowed & (1 << LC_POINTING) != 0);
-        self.active = [false; LANES];
-
-        // Initial fill: ask for one query per lane.
-        for l in 0..LANES {
-            if let Some(q) = next(l, None) {
-                self.load(l, &q);
-            }
-        }
-        // One pass + service per iteration, refilling each terminated slot on demand.
-        // Terminations are collected from `step` (which can't re-borrow `self` to call
-        // `next`) then refilled here — the lanes are independent, so deferring the refill
-        // to after the pass is byte-identical to the inline refill it replaced.
-        while self.any_active() {
-            let mut ts = [0usize; LANES];
-            let mut tt = [SolveTrace::default(); LANES];
-            let mut tn = 0usize;
-            self.step::<VEC_LC, _>(allowed, try_lc, |l, tr| {
-                ts[tn] = l;
-                tt[tn] = tr;
-                tn += 1;
-            });
-            for i in 0..tn {
-                let l = ts[i];
-                if let Some(q) = next(l, Some(tt[i])) {
-                    self.load(l, &q);
-                }
-            }
-        }
-    }
-
-    /// Resolve a fixed batch of queries, writing `out[i]` = the [`SolveTrace`] for
-    /// `queries[i]`. A thin [`Self::run_stream`] wrapper feeding `queries` in order —
-    /// the isolated bench and the parity test. `out.len()` must be `>= queries.len()`.
-    pub fn solve(&mut self, allowed: KindMask, queries: &[SolveQuery], out: &mut [SolveTrace]) {
-        self.solve_with(allowed, false, queries, out);
-    }
-
-    /// As [`solve`](Self::solve) but selecting `lc_in_closure` (see
-    /// [`run_stream_with`](Self::run_stream_with)) — the bench's A/B knob.
-    pub fn solve_with(
-        &mut self,
-        allowed: KindMask,
-        lc_in_closure: bool,
-        queries: &[SolveQuery],
-        out: &mut [SolveTrace],
-    ) {
-        let mut idx = 0usize;
-        let mut lane_q = [0usize; LANES];
-        self.run_stream_with(allowed, lc_in_closure, |slot, verdict| {
-            if let Some(t) = verdict {
-                out[lane_q[slot]] = t;
-            }
-            if idx < queries.len() {
-                lane_q[slot] = idx;
-                idx += 1;
-                Some(queries[idx - 1])
-            } else {
-                None
-            }
-        });
-    }
-}
-
 // ===========================================================================
 // Unified warp: probe + baseline lanes in ONE warp
 // ===========================================================================
@@ -1110,11 +746,10 @@ impl UnifiedWarp {
         uwstat_add(1, active_b.count_ones() as u64);
         // LC stays off the warp (the measured winner); a stalled baseline lane runs the
         // scalar LC fixpoint inside `subset_step` (gated by `try_lc`), and probe lanes
-        // never need LC at all. So the closure is `warp_pass_full::<false>` (full) or, in
-        // the lean experiment, the cheap `warp_pass` (no column hidden singles) — columns
-        // are then recovered SCALAR, per stalled baseline lane, in the service loop below.
-        let (changed, dead, solved) = 
-            warp_pass_full::<false>(&mut self.r, &mut self.unsolved, active_mask);
+        // never need LC at all. So the closure is the full singles pass `warp_pass_full`
+        // (naked + hidden singles incl. columns).
+        let (changed, dead, solved) =
+            warp_pass_full(&mut self.r, &mut self.unsolved, active_mask);
 
         let solved_b = solved.to_bitmask();
         let dead_b = dead.to_bitmask();

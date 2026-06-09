@@ -194,22 +194,6 @@ impl StripState {
         self.digits.get(cell)
     }
 
-    /// The current (mid-strip) placements grid — the board the baseline gate runs on
-    /// (`self.dual == from_digits(self.digits)` by the strip invariant). The SIMT
-    /// baseline-solver corpus harvester clones it at each gate to replay the exact
-    /// boards the baseline solves.
-    pub(in crate::generate) fn board_digits(&self) -> DigitGrid {
-        self.digits.clone()
-    }
-
-    /// The incremental dual-banded board the baseline gate runs on — for the
-    /// count-gated `branch_baseline_corr` diagnostic, which runs the scalar
-    /// [`FusedLogicSolver`] directly on it to tally per-gate baseline outcomes.
-    #[cfg(feature = "count")]
-    pub(in crate::generate) fn dual(&self) -> &DualSolverState {
-        &self.dual
-    }
-
     pub(in crate::generate) fn export_r(&self) -> ([[u32; 4]; 9], [u32; 4]) {
         let row = self.dual.row();
         let cand = row.candidates();
