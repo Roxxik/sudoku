@@ -19,7 +19,8 @@ mod random;
 pub mod random_simt;
 
 pub use random::{
-    AttemptResult, GeneratedPuzzle, Stats, attempt, determinism_fp, generate, run_attempts, verify,
+    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, attempt, determinism_fp, generate,
+    reforce_stat, run_attempts, verify,
 };
 
 use crate::probe::{Prober, Search};

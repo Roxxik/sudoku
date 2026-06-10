@@ -9,8 +9,10 @@
 //! after the strip, if a `best` exists and it passes [`verify`], the attempt succeeds.
 //! This is the exact gate sequence — `alts == 0` fast path, uniqueness gate, baseline
 //! gate, `req_met`/`best`/verify — of the old bb-based `generator` strip attempt it
-//! replaced, so for a given seed it produces byte-identical puzzles (the warp still
-//! runs that bb strip; `tests/equiv_warp` pins the two lane-for-lane).
+//! replaced, plus the trajectory-invariant hidden-single re-force fast path
+//! ([`StripState::reforced`], which skips gates whose verdict is implied), so for a
+//! given seed it produces byte-identical puzzles (the warp still runs that bb strip;
+//! `tests/equiv_warp` pins the two lane-for-lane).
 //!
 //! The candidate state is carried incrementally across the 81 strip steps exactly as
 //! bb does: a single [`DualSolverState`] plus a `clue` map, reopened/reclosed in
@@ -194,6 +196,39 @@ impl StripState {
         (core::array::from_fn(|e| cand.each()[e].to_lanes()), row.unsolved().to_lanes())
     }
 
+    /// After a speculative strip of `cell` (held `orig`) that left alternates
+    /// (`alts != 0`): the units in which `orig` is still a **hidden single** for `cell`
+    /// — bit 0 row, bit 1 column, bit 2 box; `0` = not re-forced. A non-zero mask
+    /// proves the strip is trivially keepable, because every completion must put
+    /// `orig` back at `cell` (the digit has no other candidate home in that unit), so
+    /// the board's completions — and, one closure fixpoint later, its baseline trace —
+    /// are exactly the accepted board's. Both gates are then skippable like the
+    /// `alts == 0` fast path, and the trajectory is invariant (byte-identical
+    /// puzzles); ~23% of gates / ~43% of accepts hit, worth ~5-7% e2e
+    /// (`examples/reforcestat` tallies, `examples/reforceab` is the A/B). Reads each
+    /// unit's candidate positions off the view where it is in-lane (row/box from the
+    /// row view, column from the column view): three AND+popcount, no scan.
+    pub(in crate::generate) fn reforced(&self, cell: usize, orig: Digit) -> u8 {
+        let row = self.dual.row();
+        let col = self.dual.col();
+        // Candidates are gated by `unsolved` (decided cells carry stale bits).
+        let r = (row.candidates()[orig] & row.unsolved()).to_lanes();
+        let c = (col.candidates()[orig] & col.unsolved()).to_lanes();
+        let row_word = r[cell / 27];
+        let col_word = c[(cell % 9) / 3];
+        // In-band 9-bit run of the cell's row / column; 3-bit-per-row block of its box.
+        let row_mask = 0x1FFu32 << (9 * ((cell / 9) % 3));
+        let col_mask = 0x1FFu32 << (9 * ((cell % 9) % 3));
+        let box_mask = 0b111_000_000_111_000_000_111u32 << (3 * ((cell % 9) / 3));
+        // `orig` is among `cell`'s candidates after the clear, so a popcount of 1
+        // means the lone home IS `cell` — the strip is re-forced in that unit.
+        let mut m = 0u8;
+        m |= ((row_word & row_mask).count_ones() == 1) as u8;
+        m |= (((col_word & col_mask).count_ones() == 1) as u8) << 1;
+        m |= (((row_word & box_mask).count_ones() == 1) as u8) << 2;
+        m
+    }
+
     /// The scalar uniqueness verdict for stripping `cell` (held `orig`): forbid `orig` on a
     /// clone of the row view and ask the existence prober whether an *alternate* completion
     /// exists (`true` = the strip is non-unique). [`attempt`] runs this inline at each gate;
@@ -306,6 +341,18 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
             }
             continue;
         }
+        // Hidden-single re-force fast path (see [`StripState::reforced`]): `orig` has no
+        // other candidate home in one of `cell`'s units, so every completion re-forces it
+        // — uniqueness and the baseline trace are exactly the accepted board's. Skip both
+        // gates and carry the verdict, like `alts == 0`. Gated on the fused fast path
+        // (a forced cheap kind reads exact cheap counts, which the skipped re-derivation
+        // would shift by one hidden single).
+        if fast && st.reforced(cell, orig) != 0 {
+            if st.req_met {
+                st.best = Some(st.digits.clone());
+            }
+            continue;
+        }
         // Uniqueness gate: forbid `orig` to restrict the cell to its alternates and ask
         // a single existence query (bb's `any_alt_solves`).
         let nonunique = st.scalar_nonunique(cell, orig);
@@ -391,6 +438,100 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
         }
     }
     (stats, fp)
+}
+
+/// Tallies from a [`reforce_stat`] walk — the diagnostic for the hidden-single
+/// re-force fast path (see [`StripState::reforced`]). The three `hit_*`
+/// violation counters check the soundness claims empirically and must all be zero:
+/// a hit gate must be unique, baseline-solvable, and leave the requirement verdict
+/// exactly as carried (the values the fast path would skip computing).
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ReforceStat {
+    pub attempts: usize,
+    /// `alts == 0` fast-path keeps (the existing trivial path).
+    pub trivial: usize,
+    /// `alts != 0` gates (probe + maybe baseline today).
+    pub gates: usize,
+    pub accepted: usize,
+    pub rejected_nonunique: usize,
+    pub rejected_unsolvable: usize,
+    /// Gates where [`StripState::reforced`] fired (any unit) — each would skip both gates.
+    pub hits: usize,
+    pub hit_row: usize,
+    pub hit_col: usize,
+    pub hit_box: usize,
+    // Soundness violations — must be zero.
+    pub hit_nonunique: usize,
+    pub hit_unsolvable: usize,
+    pub hit_req_drift: usize,
+}
+
+/// Walk `attempts` faithful scalar strip attempts from `base_seed` and tally, at every
+/// `alts != 0` gate, whether the hidden-single re-force test fires and whether its
+/// soundness claims hold against the real gate verdicts (which are computed and applied
+/// as in production, so the walk's trajectory is exactly [`attempt`]'s — every gate is
+/// evaluated here even where production now skips it; that is the point). Diagnostic
+/// only; the production fast path lives in [`attempt`] / the warp's `step_to_gate`.
+pub fn reforce_stat(base_seed: u64, spec: &Spec, attempts: usize) -> ReforceStat {
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+    let mut rng = Rng::from_seed(base_seed);
+    let mut s = ReforceStat::default();
+    for _ in 0..attempts {
+        s.attempts += 1;
+        let solution = random_solution(&mut rng);
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        let mut st = StripState::new(&solution);
+        for cell in positions {
+            let Some(orig) = st.digits.get(cell) else {
+                continue;
+            };
+            let alts = st.strip(cell, orig);
+            if alts == 0 {
+                st.keep_trivial();
+                s.trivial += 1;
+                continue;
+            }
+            s.gates += 1;
+            let rf = st.reforced(cell, orig);
+            if rf != 0 {
+                s.hits += 1;
+                s.hit_row += (rf & 1 != 0) as usize;
+                s.hit_col += (rf & 2 != 0) as usize;
+                s.hit_box += (rf & 4 != 0) as usize;
+            }
+            // The real gates, inlined from `resolve_gate` so the trace is visible.
+            let nonunique = st.scalar_nonunique(cell, orig);
+            if nonunique {
+                s.rejected_nonunique += 1;
+                s.hit_nonunique += (rf != 0) as usize;
+                st.revert_gate(cell, orig);
+                continue;
+            }
+            let trace = if fast {
+                FusedLogicSolver::solve_tracked(&st.dual, baseline)
+            } else {
+                LogicSolver::solve_tracked(&st.dual, baseline)
+            };
+            if !trace.solved {
+                s.rejected_unsolvable += 1;
+                s.hit_unsolvable += (rf != 0) as usize;
+                st.revert_gate(cell, orig);
+                continue;
+            }
+            s.accepted += 1;
+            let req = spec.requirement_met(&trace.counts);
+            if rf != 0 && req != st.req_met {
+                s.hit_req_drift += 1;
+            }
+            st.req_met = req;
+            if req {
+                st.best = Some(st.digits.clone());
+            }
+        }
+    }
+    s
 }
 
 /// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG stream.

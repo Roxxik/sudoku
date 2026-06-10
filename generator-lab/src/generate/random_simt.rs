@@ -133,7 +133,7 @@ impl Lane {
     /// uniqueness-gate decision (sets `pending`, returns [`Step::Gate`]) or runs the
     /// attempt out (finalizes it, returns [`Step::Done`] with the outcome). It does NOT
     /// start the next attempt — the [`PuzzleStream`] refill policy decides that.
-    fn step_to_gate(&mut self, spec: &Spec) -> Step {
+    fn step_to_gate(&mut self, spec: &Spec, reforce: bool) -> Step {
         loop {
             if self.pos_idx >= CELLS {
                 let outcome = self.finalize(spec);
@@ -147,6 +147,12 @@ impl Lane {
             };
             let alts = self.strip.strip(i, orig);
             if alts == 0 {
+                self.strip.keep_trivial();
+                continue;
+            }
+            // Hidden-single re-force fast path — the twin of [`attempt`]'s (see
+            // [`StripState::reforced`]): both gates skippable, verdict carried.
+            if reforce && self.strip.reforced(i, orig) != 0 {
                 self.strip.keep_trivial();
                 continue;
             }
@@ -231,6 +237,10 @@ pub fn collect_probes(base_seed: u64, spec: &Spec, attempts: usize) -> Vec<(Prob
                 st.keep_trivial();
                 continue; // `alts == 0` fast path: no gate
             }
+            if fast && st.reforced(cell, orig) != 0 {
+                st.keep_trivial();
+                continue; // hidden-single re-force fast path: production issues no probe
+            }
             let (r, unsolved) = st.export_r();
             let nonunique = st.scalar_nonunique(cell, orig);
             out.push((Probe { r, unsolved, cell, alts }, nonunique));
@@ -269,6 +279,9 @@ pub struct PuzzleStream<'a, I> {
     spec: &'a Spec,
     allowed: KindMask,
     try_lc: bool,
+    /// Hidden-single re-force fast path enabled (production: on; off only for the
+    /// A/B harness). Pre-AND-ed with [`baseline_fast_applicable`].
+    reforce: bool,
     /// Puzzles completed but not yet handed out — a single tick can finish several lanes.
     ready: VecDeque<(u64, GeneratedPuzzle)>,
     /// Reusable per-tick event buffer (alloc-free).
@@ -278,6 +291,13 @@ pub struct PuzzleStream<'a, I> {
 impl<'a, I: Iterator<Item = u64>> PuzzleStream<'a, I> {
     /// Race `seeds` through the warp, one puzzle per seed (each retried until it yields).
     pub fn new(seeds: I, spec: &'a Spec) -> Self {
+        Self::new_with(seeds, spec, true)
+    }
+
+    /// [`new`](Self::new) with the hidden-single re-force fast path toggleable — the
+    /// A/B harness entry (`examples/reforceab`). The fast path is trajectory-invariant
+    /// (sound), so both settings produce identical puzzles; only the cost differs.
+    pub fn new_with(seeds: I, spec: &'a Spec, reforce: bool) -> Self {
         let allowed = spec.baseline_mask();
         let mut s = PuzzleStream {
             warp: UnifiedWarp::new(),
@@ -286,6 +306,7 @@ impl<'a, I: Iterator<Item = u64>> PuzzleStream<'a, I> {
             spec,
             allowed,
             try_lc: UnifiedWarp::try_lc(allowed),
+            reforce: reforce && baseline_fast_applicable(spec),
             ready: VecDeque::new(),
             events: StepEvents::new(),
         };
@@ -345,8 +366,9 @@ impl<'a, I: Iterator<Item = u64>> PuzzleStream<'a, I> {
     /// reached or the attempt budget / seed supply runs out (then the lane goes idle).
     fn refill_slot(&mut self, slot: usize) {
         let spec = self.spec;
+        let reforce = self.reforce;
         loop {
-            match self.lanes[slot].step_to_gate(spec) {
+            match self.lanes[slot].step_to_gate(spec, reforce) {
                 Step::Gate => {
                     let p = probe_of(&self.lanes[slot]);
                     self.warp.load_probe(slot, &p);
