@@ -3,4 +3,5 @@ resolver = "3"
 members = ["core", "cli", "wasm", "solver-lab", "generator-lab"]
 
 [profile.release]
-debug = "line-tables-only"
+debug = 2
+strip = false

@@ -101,10 +101,11 @@ pub(crate) fn one_bit(x: V) -> M {
 }
 
 /*
-fn one_bit(x: V) -> M {
+#[inline(always)]
+pub fn one_bit(x: V) -> M {
     x.count_ones().simd_eq(ONE)
-}
-*/
+}*/
+
 
 /// The peer union of a placed group (the cells to clear digit `d` from) plus the
 /// per-lane contradiction mask, as uniform band ALU — no per-cell `PEER_MASK` gather.
