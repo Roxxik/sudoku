@@ -8,7 +8,7 @@
 //! Release mode (it does real SIMT generation): `cargo test --release -p generator-lab`.
 
 use generator_lab::expert_spec;
-use generator_lab::generate::random_simt::{PuzzleStream, Pumped};
+use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::repr::Board;
 use generator_lab::solve::{
     HARD_STEPS_DEFAULT, HardStep, LogicSolver, Solver, solve_fixpoint_with_order,
@@ -46,7 +46,7 @@ fn assert_confluent(spec: &Spec, count: u64) {
     let perms = permutations();
 
     let mut boards: Vec<(u64, Board)> = Vec::new();
-    let mut stream = PuzzleStream::new(1..1 + count, spec);
+    let mut stream = GateStream::new(1..1 + count, spec);
     loop {
         match stream.pump(4096) {
             Pumped::Found(seed, p) => boards.push((seed, Board::from_digits(&p.puzzle.0))),

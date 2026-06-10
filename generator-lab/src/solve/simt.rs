@@ -3,9 +3,9 @@
 //! strip loop's *uniqueness* gates across W=8 SIMD lanes, this vectorizes its *baseline*
 //! gates — the technique-driven, non-backtracking
 //! [`FusedLogicSolver`](super::FusedLogicSolver) the strip runs per lane. The consumer is
-//! [`UnifiedWarp`] (below), which runs the probe and baseline gates on one shared warp;
-//! this module provides the baseline closure ([`warp_pass_full`]) and the scalar subset
-//! fallback ([`subset_step`]) it drives.
+//! the SIMT warp host ([`crate::generate::warp_host`]), which runs the probe and baseline
+//! gates on one shared warp; this module provides the baseline closure ([`warp_pass_full`])
+//! and the scalar subset fallback ([`subset_step`]) it drives.
 //!
 //! ## The cheap-closure / subset split (data-driven)
 //!
@@ -55,18 +55,18 @@ use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState
 use crate::solve::Eliminate;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_POINTING, NAKED_PAIR,
-    NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
+    NAKED_QUAD, NAKED_TRIPLE, SolveTrace,
 };
 use std::simd::cmp::SimdPartialEq;
 use std::simd::num::SimdUint;
 use std::simd::{Select, Simd};
 
 // --- unified-warp utilization (feature = "count") -----------------------------
-// The single warp that runs probe AND baseline lanes together ([`UnifiedWarp`]):
-// [0] warp passes, [1] active-lane-sum over passes. util = [1]/(LANES*[0]). Unlike
-// the two-warp hosts (separate probe DSTAT / baseline SSTAT), this is ONE number —
-// the whole point of unifying is that the combined warp is full whenever either kind
-// of work exists, so no oversubscription is needed to fill it. Read by `simtutil`.
+// The single warp the host runs probe AND baseline lanes on together
+// ([`crate::generate::warp_host`]): [0] warp passes, [1] active-lane-sum over passes.
+// util = [1]/(LANES*[0]). One number, not separate probe/baseline counters — the whole
+// point of unifying is that the combined warp is full whenever either kind of work
+// exists, so no oversubscription is needed to fill it. Read by `simtutil`.
 counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_snapshot, reset = uwstat_reset);
 
 // --- subset-ladder memo effectiveness (feature = "count") ----------------------
@@ -99,6 +99,12 @@ pub(crate) struct LadderMemo {
 impl LadderMemo {
     pub(crate) const INVALID: LadderMemo =
         LadderMemo { prev: [[0; 3]; 9], no_fire: [0; 27], valid: false };
+
+    /// Mark the memo as describing a dead board (call on every lane (re)load).
+    #[inline]
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+    }
 }
 
 /// One lane's input to the packed baseline solver: its row-major per-digit candidate
@@ -128,7 +134,7 @@ impl SolveQuery {
 /// Load query `q` into lane `l` of the SoA boards — the per-lane scalar store of a
 /// fresh baseline board (the refill path).
 #[inline]
-fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q: &SolveQuery) {
+pub(crate) fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q: &SolveQuery) {
     for d in 0..9 {
         for b in 0..3 {
             r[d][b].as_mut_array()[l] = q.r[d][b];
@@ -159,7 +165,7 @@ fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q: &SolveQue
 /// Locked candidates run **off the warp** (a stalled lane's scalar [`subset_step`], via
 /// [`scalar_lc_fast`]), so this closure does singles only.
 #[cfg_attr(feature = "profiling", inline(never))]
-fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
+pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
     let mut changed = M::splat(false);
     let mut dead = M::splat(false);
 
@@ -465,14 +471,16 @@ fn cached_hidden_subset(
 /// the A/B baseline): consecutive stalls of one baseline solve change only a few
 /// cells, so the subset ladder skips every (kind, unit) verified no-fire on a unit
 /// whose gated bands are unchanged since that scan — exact, first-fire preserved.
-fn subset_step(
+pub(crate) fn subset_step(
     r: &mut [[V; 3]; 9],
     unsolved: &mut [V; 3],
     l: usize,
     allowed: KindMask,
-    try_lc: bool,
     memo: Option<&mut LadderMemo>,
 ) -> Option<usize> {
+    // The off-warp LC pass is in scope iff the toolbox allows it (pointing/claiming run
+    // together); derived from `allowed` rather than carried as a redundant flag.
+    let try_lc = allowed & (1 << LC_POINTING) != 0;
     let (mut sr, su) = snapshot_lane(r, unsolved, l);
     // LC-off-warp: run the FAST (table-driven) scalar LC fixpoint on the snapshot before
     // the subsets; if it pruned anything, rejoin the warp so the vectorized singles
@@ -757,11 +765,12 @@ fn scalar_col_assign(r: &mut [[V; 3]; 9], unsolved: &[V; 3], l: usize) -> bool {
 /// the lane terminated (`Some(true)` = an alternate completion exists -> non-unique;
 /// `Some(false)` = the search tree is exhausted -> unique), or `None` if it keeps searching
 /// (descended into a branch, or backtracked to an untried alternative). `solved`/`dead` are
-/// this lane's bits from the pass. Shared by [`UnifiedWarp::step`] (which flips a unique
-/// lane to baseline in place) and [`resolve_probes`] (which just reports the verdict), so
-/// the production prober and the test/bench prober can't drift.
+/// this lane's bits from the pass. Shared by the host's
+/// [`GateJob`](crate::generate::warp_host::GateJob) (which flips a unique lane to baseline
+/// in place) and [`resolve_probes`] (which just reports the verdict), so the production
+/// prober and the test/bench prober can't drift.
 #[inline]
-fn prober_service(
+pub(crate) fn prober_service(
     r: &mut [[V; 3]; 9],
     unsolved: &mut [V; 3],
     stack: &mut Vec<Frame>,
@@ -784,12 +793,12 @@ fn prober_service(
 }
 
 /// Resolve a batch of uniqueness [`Probe`]s on the packed W=8 warp, returning per probe
-/// whether an alternate completion exists (`true` = non-unique). This is the prober half of
-/// [`UnifiedWarp`] in isolation: the same `warp_pass_full` pass and per-lane
-/// [`prober_service`], with no baseline flip. The entry point the prober bench and the
-/// scalar/SIMT verdict-equivalence test (`tests/prober_equiv`) drive — it pins exactly the
-/// verdict the production warp computes, surfacing the "false unique" the unified warp's
-/// auto-flip would otherwise hide.
+/// whether an alternate completion exists (`true` = non-unique). This is the host's prober
+/// phase in isolation: the same `warp_pass_full` pass and per-lane [`prober_service`], with
+/// no baseline flip. The entry point the prober bench and the scalar/SIMT
+/// verdict-equivalence test (`tests/prober_equiv`) drive — it pins exactly the verdict the
+/// production warp computes, surfacing the "false unique" the host's auto-flip would
+/// otherwise hide.
 pub fn resolve_probes(probes: &[Probe]) -> Vec<bool> {
     let mut out = vec![false; probes.len()];
     if probes.is_empty() {
@@ -851,248 +860,15 @@ pub fn resolve_probes(probes: &[Probe]) -> Vec<bool> {
     out
 }
 
-// ===========================================================================
-// Unified warp: probe + baseline lanes in ONE warp
-// ===========================================================================
-//
-// The two-warp hosts ([`crate::generate::random_simt`]) keep a [`PackedProber`] and a
-// [`PackedSolver`] and try to feed the latter from the former. That starves the baseline
-// warp: unique-gate boards trickle in too slowly to keep an 8-wide consumer full unless
-// the host oversubscribes to L=64 macro-lanes (`simtutil`: baseline util 48%@16 ->
-// 86%@64; probe ~100% throughout).
-//
-// `UnifiedWarp` removes the second warp entirely. Both gates run on the SAME 8 SIMD
-// lanes, each lane tagged probe- or baseline-mode. The kernel is [`warp_pass_full`] (the
-// baseline closure: naked + hidden singles incl. columns, LC off-warp), which is **sound
-// for a probe lane too** — extra propagation only prunes the existence search, never
-// changes the "does a completion exist" verdict. So a slot stays bound to its macro-lane
-// and flips probe -> baseline **in place** the instant the prober reaches a unique
-// verdict, with no batch, no inter-warp queue, and no oversubscription: the warp is full
-// whenever work of EITHER kind exists, and probes are always plentiful. Active set = 8.
-//
-// Per-lane service diverges by mode (it already does in both engines — service is scalar):
-// a probe lane branches / backtracks / yields a uniqueness verdict; a baseline lane drops
-// to the scalar subset+LC step / yields a [`SolveTrace`]. The vectorized pass is uniform.
-
-/// A freed lane's verdict that the **host** must act on. The unique-probe case never
-/// appears here: on a unique verdict the warp flips the lane to baseline *in place*
-/// (see [`UnifiedWarp::step`]), so the host only ever sees a non-unique probe or a
-/// finished baseline.
+/// A freed warp lane's verdict — the resume value the host hands back to its lane
+/// coroutine. The unique-probe case never appears here: on a unique verdict the warp
+/// flips the lane to its baseline phase *in place* (see
+/// [`GateJob`](crate::generate::warp_host::GateJob)), so the host only ever sees a
+/// non-unique probe or a finished baseline.
 #[derive(Clone, Copy)]
 pub enum GateResult {
     /// A probe lane found an alternate completion — the strip is non-unique.
     ProbeNonUnique,
     /// A baseline lane finished: the logic solver's trace (`solved` + subset-kind counts).
     Baseline(SolveTrace),
-}
-
-/// One freed-lane event from a [`UnifiedWarp::step`]: which slot, and its verdict.
-#[derive(Clone, Copy)]
-pub struct StepEvent {
-    pub slot: usize,
-    pub result: GateResult,
-}
-
-/// The freed-lane events of a single [`UnifiedWarp::step`] — a reusable, alloc-free inline
-/// buffer (a step frees at most [`LANES`] lanes). The host owns one and clears it per step,
-/// so the hot loop never returns a large array by value nor touches the heap.
-pub struct StepEvents {
-    buf: [StepEvent; LANES],
-    len: usize,
-}
-
-impl Default for StepEvents {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StepEvents {
-    const EMPTY: StepEvent = StepEvent { slot: 0, result: GateResult::ProbeNonUnique };
-
-    pub fn new() -> Self {
-        StepEvents { buf: [Self::EMPTY; LANES], len: 0 }
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    #[inline]
-    fn push(&mut self, slot: usize, result: GateResult) {
-        self.buf[self.len] = StepEvent { slot, result };
-        self.len += 1;
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[StepEvent] {
-        &self.buf[..self.len]
-    }
-}
-
-/// The unified probe+baseline warp (see the section comment). Holds the resident SoA
-/// board plus per-lane mode, the prober's per-lane branch stacks, and the baseline's
-/// per-lane subset-kind counts. Drives both gate kinds across the same 8 lanes. The host
-/// ([`crate::generate::random_simt::PuzzleStream`]) owns the loop: it loads probe slots,
-/// calls [`step`](Self::step), and services the returned events.
-pub struct UnifiedWarp {
-    r: [[V; 3]; 9],
-    unsolved: [V; 3],
-    active: [bool; LANES],
-    /// `true` = baseline mode, `false` = probe mode (per lane).
-    baseline_mode: [bool; LANES],
-    /// Probe-mode branch stacks (unused while a lane is in baseline mode).
-    stacks: [Vec<Frame>; LANES],
-    /// Baseline-mode subset-kind counts (reset on each baseline (re)load).
-    counts: [[u16; NUM]; LANES],
-    /// The raw (pre-restriction) stripped board last loaded as a probe into each lane —
-    /// kept so a unique verdict can flip the lane to baseline in place without a host
-    /// round-trip. A `Probe`'s `r`/`unsolved` are exactly that board (the alts restriction
-    /// is applied at load), and the strip is unchanged between probe and verdict, so this
-    /// is the baseline query verbatim. Meaningful only while the lane is in probe mode.
-    query: [SolveQuery; LANES],
-    /// Per-lane cross-stall subset-ladder memos (invalidated on every lane load).
-    memo: [LadderMemo; LANES],
-    /// Use the ladder memo (production: on; off only for the A/B harness).
-    ladder_memo: bool,
-}
-
-impl Default for UnifiedWarp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl UnifiedWarp {
-    pub fn new() -> Self {
-        Self::new_with(true)
-    }
-
-    /// [`new`](Self::new) with the cross-stall subset-ladder memo toggleable — the A/B
-    /// harness entry (`examples/laddermemoab`). The memo is exact (first-fire-preserving),
-    /// so both settings produce identical verdicts; only the cost differs.
-    pub fn new_with(ladder_memo: bool) -> Self {
-        UnifiedWarp {
-            r: [[ZERO; 3]; 9],
-            unsolved: [ZERO; 3],
-            active: [false; LANES],
-            baseline_mode: [false; LANES],
-            stacks: core::array::from_fn(|_| Vec::with_capacity(64)),
-            counts: [[0u16; NUM]; LANES],
-            query: [SolveQuery::EMPTY; LANES],
-            memo: [LadderMemo::INVALID; LANES],
-            ladder_memo,
-        }
-    }
-
-    /// `try_lc` for [`step`](Self::step), derived from the spec's baseline mask once.
-    #[inline]
-    pub fn try_lc(allowed: KindMask) -> bool {
-        allowed & (1 << LC_POINTING) != 0
-    }
-
-    #[inline]
-    pub fn any_active(&self) -> bool {
-        self.active.iter().any(|&a| a)
-    }
-
-    /// Load a probe into slot `l` (probe mode): the alts-restricted board + a cleared
-    /// stack. Caches the raw board for a later in-place probe->baseline flip.
-    #[inline]
-    pub fn load_probe(&mut self, l: usize, p: &Probe) {
-        load_lane(&mut self.r, &mut self.unsolved, l, p);
-        self.query[l] = SolveQuery { r: p.r, unsolved: p.unsolved };
-        self.stacks[l].clear();
-        self.baseline_mode[l] = false;
-        self.active[l] = true;
-        self.memo[l].valid = false;
-    }
-
-    /// Load a baseline query into slot `l` (baseline mode): the plain stripped board + zeroed counts.
-    #[inline]
-    fn load_baseline(&mut self, l: usize, q: &SolveQuery) {
-        load_query(&mut self.r, &mut self.unsolved, l, q);
-        self.counts[l] = [0; NUM];
-        self.baseline_mode[l] = true;
-        self.active[l] = true;
-        self.memo[l].valid = false;
-    }
-
-    /// ONE [`warp_pass_full`] over the active lanes + per-lane service dispatched by mode,
-    /// appending each freed lane's host-facing verdict to `events` (cleared first). A
-    /// non-terminal probe lane branches/backtracks in place; a non-terminal baseline lane
-    /// takes one scalar subset step in place. A **unique** probe lane is flipped to
-    /// baseline in place here (reusing the cached raw board) and produces no event — the
-    /// host never has to route the flip.
-    pub fn step(&mut self, allowed: KindMask, try_lc: bool, events: &mut StepEvents) {
-        events.clear();
-        let active_mask = M::from_array(self.active);
-        if !active_mask.any() {
-            return;
-        }
-        let active_b = active_mask.to_bitmask();
-        uwstat_add(0, 1);
-        uwstat_add(1, active_b.count_ones() as u64);
-        // LC stays off the warp (the measured winner); a stalled baseline lane runs the
-        // scalar LC fixpoint inside `subset_step` (gated by `try_lc`), and probe lanes
-        // never need LC at all. So the closure is the full singles pass `warp_pass_full`
-        // (naked + hidden singles incl. columns).
-        let (changed, dead, solved) =
-            warp_pass_full(&mut self.r, &mut self.unsolved, active_mask);
-
-        let solved_b = solved.to_bitmask();
-        let dead_b = dead.to_bitmask();
-        let changed_b = changed.to_bitmask();
-        let mut service = active_b & (solved_b | dead_b | !changed_b);
-        while service != 0 {
-            let l = service.trailing_zeros() as usize;
-            service &= service - 1;
-            let bit = 1u64 << l;
-            if self.baseline_mode[l] {
-                if solved_b & bit != 0 {
-                    self.active[l] = false;
-                    events.push(l, GateResult::Baseline(SolveTrace { solved: true, counts: self.counts[l] }));
-                } else if dead_b & bit != 0 {
-                    self.active[l] = false;
-                    events.push(l, GateResult::Baseline(SolveTrace { solved: false, counts: self.counts[l] }));
-                } else {
-                    let memo = self.ladder_memo.then_some(&mut self.memo[l]);
-                    match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc, memo) {
-                        Some(k) => self.counts[l][k] = self.counts[l][k].saturating_add(1),
-                        None => {
-                            self.active[l] = false;
-                            events.push(l, GateResult::Baseline(SolveTrace { solved: false, counts: self.counts[l] }));
-                        }
-                    }
-                }
-            } else {
-                // Probe lane: the shared prober service decides its uniqueness verdict.
-                match prober_service(
-                    &mut self.r,
-                    &mut self.unsolved,
-                    &mut self.stacks[l],
-                    l,
-                    solved_b & bit != 0,
-                    dead_b & bit != 0,
-                ) {
-                    Some(true) => {
-                        // A completion exists: the strip is non-unique.
-                        self.active[l] = false;
-                        events.push(l, GateResult::ProbeNonUnique);
-                    }
-                    Some(false) => {
-                        // Tree exhausted: unique. Flip THIS lane to baseline in place,
-                        // reusing the cached raw board. The lane stays active (now baseline
-                        // mode) and is not re-serviced this step (`service` is a snapshot),
-                        // so it takes its first baseline pass next step. No host round-trip,
-                        // no event.
-                        let q = self.query[l];
-                        self.load_baseline(l, &q);
-                    }
-                    None => {} // branched / backtracked: keep searching
-                }
-            }
-        }
-    }
 }

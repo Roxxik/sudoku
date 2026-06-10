@@ -38,13 +38,17 @@
 //!   half of every attempt.
 //! - [`generate`]: the strip-generate pipeline on the `repr` layer (the [`probe`]
 //!   prober + [`solve`] gate). [`generate::random`] is the shipped scalar/wasm
-//!   path; [`generate::random_simt`] (native only) is the W=8 SIMT warp host that
+//!   path; [`generate::warp_host`] (native only) is the W=8 SIMT warp host that
 //!   batches the strip loop's uniqueness gates onto [`probe::simt`]. SIMT is a
 //!   native AVX play; on wasm simd128 the packing ceiling is too small to pay, so
 //!   the wasm cdylib ships the scalar path.
 
 #![feature(portable_simd)]
 #![feature(const_trait_impl)]
+// The SIMT warp host's per-lane resumable strip attempts are compiler-generated
+// coroutines (`generate::warp_host::lane_co`); the TAIT names the unnameable coroutine
+// type so the stream can hold its lanes inline (no boxing, no dyn dispatch).
+#![feature(coroutines, coroutine_trait, type_alias_impl_trait)]
 
 pub mod repr;
 pub(crate) mod counters;

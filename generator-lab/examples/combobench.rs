@@ -11,8 +11,8 @@
 //! kind) while making the puzzle much rarer, which is exactly the slow+rare
 //! codepath we want to surface.
 //!
-//! Work is FIXED (`run_warp_unified`, lanes x per_lane attempts) so a truly-rare combo
-//! is capped instead of running forever; us/att is yield-independent so it measures
+//! Work is FIXED (lanes x per_lane attempts, capped from outside on `stats().attempts`)
+//! so a truly-rare combo is capped instead of running forever; us/att is yield-independent so it measures
 //! cleanly even at zero yield, and the yield (successes/attempts) gives the
 //! attempts/puzzle needed to project the average s/puzzle.
 //!
@@ -27,7 +27,7 @@
 //! that target's branch); `--toolbox full` allows the entire 16-kind ladder
 //! (more substitutes => rarer).
 
-use generator_lab::generate::random_simt::{Pumped, PuzzleStream};
+use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::{DIFFICULTY, NAMES, NUM, Tier, branch_of, tier_of};
 
@@ -123,7 +123,7 @@ fn main() {
     // terminates even for a combo that never yields). Fold an order-independent fingerprint
     // over the produced puzzles so two builds match iff they produce the same puzzle set.
     let t0 = std::time::Instant::now();
-    let mut stream = PuzzleStream::new(base_seed.., &spec);
+    let mut stream = GateStream::new(base_seed.., &spec);
     let mut combo_fp = 0u64; // XOR-fold of per-puzzle fps: order-independent
     // Pump ONE tick at a time so the outside cap overshoots `total` by at most a tick's
     // worth of attempts; a tick (a full 8-wide warp pass) dwarfs the per-call cost.

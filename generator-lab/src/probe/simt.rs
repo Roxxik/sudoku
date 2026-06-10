@@ -1,4 +1,4 @@
-//! Packed SoA prober on the `repr` layer: the [`crate::generate::random_simt`] batch
+//! Packed SoA prober on the `repr` layer: the [`crate::generate::warp_host`] batch
 //! point. Instead of K scalar uniqueness queries, it lays them out across SIMD lanes
 //! and propagates them in lockstep — W=8 independent existence DFS searches, one per
 //! lane, fed by a work-stealing refill queue so a lane that reaches a verdict
@@ -72,8 +72,10 @@ pub(crate) fn rm_cell(lane: usize, bit: u32) -> usize {
 /// was a wash: Zen 4 double-pumps it, so no raw-throughput gain.)
 pub const LANES: usize = 8;
 
-pub(crate) type V = Simd<u32, LANES>;
-pub(crate) type M = Mask<i32, LANES>;
+// `pub` (not crate): they appear in the [`crate::generate::warp_host::WarpJob`]
+// trait's method signatures (the boards a job's scalar service mutates).
+pub type V = Simd<u32, LANES>;
+pub type M = Mask<i32, LANES>;
 pub(crate) const ZERO: V = Simd::from_array([0; LANES]);
 pub(crate) const ONE: V = Simd::from_array([1; LANES]);
 
@@ -97,6 +99,12 @@ pub(crate) const BOX_CELLS: [u32; 3] = {
 pub(crate) fn one_bit(x: V) -> M {
     x.simd_ne(ZERO) & (x & (x - ONE)).simd_eq(ZERO)
 }
+
+/*
+fn one_bit(x: V) -> M {
+    x.count_ones().simd_eq(ONE)
+}
+*/
 
 /// The peer union of a placed group (the cells to clear digit `d` from) plus the
 /// per-lane contradiction mask, as uniform band ALU — no per-cell `PEER_MASK` gather.

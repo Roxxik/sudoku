@@ -1,5 +1,5 @@
-//! Correctness anchor for the `repr`-layer warp ([`generate::random_simt`]). The
-//! [`PuzzleStream`] runs each seed to its *first* success, racing W=8 seeds across the
+//! Correctness anchor for the `repr`-layer warp ([`generate::warp_host`]). The
+//! [`GateStream`] runs each seed to its *first* success, racing W=8 seeds across the
 //! warp; that produced puzzle must be byte-identical to the one scalar
 //! [`generate`](generator_lab::generate::generate) yields from the same seed, regardless
 //! of how the 8 slots interleave. Equality of the actual puzzle line (not just a count)
@@ -13,14 +13,14 @@
 //! verdicts too, not just the success path.
 
 use generator_lab::generate::generate;
-use generator_lab::generate::random_simt::{PuzzleStream, Pumped};
+use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::rng::Rng;
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::NAKED_PAIR;
 
-/// Drain a finite-seed [`PuzzleStream`] to its terminal, collecting every `(seed, puzzle)`.
+/// Drain a finite-seed [`GateStream`] to its terminal, collecting every `(seed, puzzle)`.
 fn collect<I: Iterator<Item = u64>>(spec: &Spec, seeds: I) -> Vec<(u64, generator_lab::generate::GeneratedPuzzle)> {
-    let mut stream = PuzzleStream::new(seeds, spec);
+    let mut stream = GateStream::new(seeds, spec);
     let mut produced = Vec::new();
     loop {
         match stream.pump(4096) {

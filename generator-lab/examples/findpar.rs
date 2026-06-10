@@ -1,12 +1,12 @@
 //! Generate one puzzle per seed for train/drill(HiddenQuad) by racing the seeds through
-//! the packed SIMT prober (`random_simt::find_puzzles`), W=8 in flight. Prints each
+//! the packed SIMT warp host (`warp_host::GateStream`), W=8 in flight. Prints each
 //! seed's 81-char puzzle line plus its solution, so they can be fed straight to core's
 //! CLI/verifier.
 //!
 //! The seed -> puzzle relation is a pure function of the seed (each seed is run to its
 //! first success, identical to scalar `find` from that seed), so this is the batch way
 //! to fill a persisted seed -> puzzle map: pass the seeds that don't have a puzzle yet.
-//! Here we use the contiguous range `base..base+count`; `find_puzzles` takes any seed
+//! Here we use the contiguous range `base..base+count`; `GateStream` takes any seed
 //! iterator, so a non-contiguous set of missing seeds plugs in the same way.
 //!
 //! Puzzles are streamed to stdout as they finish (warp-completion order, NOT seed order)
@@ -26,7 +26,7 @@
 //! concedes them).
 
 use generator_lab::expert_spec;
-use generator_lab::generate::random_simt::{Pumped, PuzzleStream};
+use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::spec::kinds::NAMES;
 
 fn main() {
@@ -54,7 +54,7 @@ fn main() {
     let t0 = std::time::Instant::now();
     // Print each puzzle the instant it is produced (out of seed order) so a Ctrl-C loses
     // nothing already emitted. stdout stays clean puzzle data (pipeable to the verifier).
-    let mut stream = PuzzleStream::new(base..base + count, &spec);
+    let mut stream = GateStream::new(base..base + count, &spec);
     loop {
         match stream.pump(4096) {
             Pumped::Found(seed, p) => {

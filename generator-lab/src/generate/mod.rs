@@ -7,16 +7,17 @@
 //!
 //! - [`random`]: the shipped scalar/wasm path — one attempt at a time over an
 //!   incrementally-maintained dual-banded strip state.
-//! - [`random_simt`] (native only): the W=8 SIMT warp host, running K attempts in
+//! - [`warp_host`] (native only): the W=8 SIMT warp host, running K attempts in
 //!   lockstep over [`crate::probe::simt`] with per-lane refill.
 
 mod random;
 
-// The packed W=8 SIMT warp host, driving the `crate::probe::simt` packed prober over
-// resumable per-lane strips. An AVX native play, so it (and the `std::simd` warp it
-// batches onto) stays out of the wasm cdylib, which ships the scalar `run_attempts` path.
+// The SIMT warp host (the production native generator): a job/lane-factored W=8 warp
+// driving the `crate::probe::simt` packed prober over resumable per-lane strip coroutines.
+// An AVX native play, so it (and the `std::simd` warp it batches onto) stays out of the
+// wasm cdylib, which ships the scalar `run_attempts` path.
 #[cfg(not(target_arch = "wasm32"))]
-pub mod random_simt;
+pub mod warp_host;
 
 pub use random::{
     AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt, determinism_fp,

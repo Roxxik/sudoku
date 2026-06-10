@@ -10,7 +10,7 @@
 //! from a cheap spec, but the prover logic it exercises is the same the expensive specs
 //! use, so agreement here is spec-rarity-independent.
 
-use generator_lab::generate::random_simt::collect_probes;
+use generator_lab::generate::warp_host::collect_probes;
 use generator_lab::solve::simt::resolve_probes;
 use generator_lab::subset_spec_for_mode;
 
