@@ -69,6 +69,38 @@ use std::simd::{Select, Simd};
 // of work exists, so no oversubscription is needed to fill it. Read by `simtutil`.
 counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_snapshot, reset = uwstat_reset);
 
+// --- subset-ladder memo effectiveness (feature = "count") ----------------------
+// [0] ladder entries (subset_step calls that reach the subset scans), [1] per-kind
+// unit scans run, [2] per-kind unit scans skipped by the cross-stall memo. The skip
+// share [2]/([1]+[2]) is the memo's bite. Read by `laddermemoab`.
+counter_block!(LSTAT: 3, inc = lstat_inc, add = lstat_add, snapshot = lstat_snapshot, reset = lstat_reset);
+
+/// Cross-stall memo for one lane's subset ladder (see [`subset_step`]): the
+/// unsolved-gated candidate bands as the ladder **last scanned them**, plus, per
+/// unit, which subset kinds have been verified no-fire on exactly that state. A
+/// subset fires or not as a function of its unit's marks alone, so a unit whose
+/// gated bands are unchanged since a kind scanned it clean cannot fire that kind —
+/// the rescan is skipped and first-fire order is preserved exactly. Diffing the
+/// fresh snapshot against `prev` on ladder entry catches every mutation source
+/// between stalls uniformly (the previous fire's eliminations, the closure's
+/// placements and peer clears, the off-warp LC prunes), so nothing on the closure
+/// spine needs to track changes.
+pub(crate) struct LadderMemo {
+    /// `candidates & unsolved` per digit band as last scanned (the state the
+    /// `no_fire` verdicts are about).
+    prev: [[u32; 3]; 9],
+    /// Bit `k` = ladder kind `k` (pair..quad in difficulty order, see
+    /// [`cellmarks_step_harder`]) verified no-fire on unit `u` for `prev`.
+    no_fire: [u8; 27],
+    /// False after a lane (re)load: `prev`/`no_fire` describe a dead board.
+    valid: bool,
+}
+
+impl LadderMemo {
+    pub(crate) const INVALID: LadderMemo =
+        LadderMemo { prev: [[0; 3]; 9], no_fire: [0; 27], valid: false };
+}
+
 /// One lane's input to the packed baseline solver: its row-major per-digit candidate
 /// bands and empty mask — the same row view ([`SolverState<Bands<RowMajor>>`] via
 /// [`Bands::to_lanes`](crate::repr::banded)) the strip hands the prober, minus the
@@ -215,7 +247,7 @@ fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, 
 /// out entirely for the subset-only HiddenQuad toolbox — fall back to the generic
 /// [`super::techniques`] bodies on the cell-major `cm` (every unit reachable via `get`,
 /// columns included).
-fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask) -> Option<usize> {
+fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask, no_fire: &mut [u8; 27]) -> Option<usize> {
     const ANY_SUBSET: KindMask = (1 << NAKED_PAIR)
         | (1 << HIDDEN_PAIR)
         | (1 << NAKED_TRIPLE)
@@ -224,7 +256,10 @@ fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask) -> Option<usize>
         | (1 << HIDDEN_QUAD);
     // The cache only feeds the subset ladder; a subset-free toolbox (e.g. drill, whose
     // baseline is singles-only) skips the build entirely and falls straight through.
+    // `no_fire` is the caller's cross-stall memo (all-zero = scan everything); the
+    // ladder-order bit per kind below indexes it.
     if allowed & ANY_SUBSET != 0 {
+        lstat_inc(0);
         let cache = SubsetCache::build(cm);
         macro_rules! try_kind {
             ($bit:expr, $call:expr) => {
@@ -233,12 +268,12 @@ fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask) -> Option<usize>
                 }
             };
         }
-        try_kind!(NAKED_PAIR, cached_naked_subset(cm, &cache, 2));
-        try_kind!(HIDDEN_PAIR, cached_hidden_subset(cm, &cache, 2));
-        try_kind!(NAKED_TRIPLE, cached_naked_subset(cm, &cache, 3));
-        try_kind!(HIDDEN_TRIPLE, cached_hidden_subset(cm, &cache, 3));
-        try_kind!(NAKED_QUAD, cached_naked_subset(cm, &cache, 4));
-        try_kind!(HIDDEN_QUAD, cached_hidden_subset(cm, &cache, 4));
+        try_kind!(NAKED_PAIR, cached_naked_subset(cm, &cache, 2, 0, no_fire));
+        try_kind!(HIDDEN_PAIR, cached_hidden_subset(cm, &cache, 2, 1, no_fire));
+        try_kind!(NAKED_TRIPLE, cached_naked_subset(cm, &cache, 3, 2, no_fire));
+        try_kind!(HIDDEN_TRIPLE, cached_hidden_subset(cm, &cache, 3, 3, no_fire));
+        try_kind!(NAKED_QUAD, cached_naked_subset(cm, &cache, 4, 4, no_fire));
+        try_kind!(HIDDEN_QUAD, cached_hidden_subset(cm, &cache, 4, 5, no_fire));
     }
     if let Some(k) = techniques::fish_step(cm, allowed) {
         return Some(k);
@@ -294,9 +329,23 @@ impl SubsetCache {
 /// Cache-fed [`techniques::naked_subset`] (see [`SubsetCache`]): identical first-fire
 /// logic and elimination order, reading the precomputed per-unit marks instead of
 /// re-gathering them per size. Eliminations are logged into `cm` (only ever on the
-/// firing step, after which the ladder returns).
-fn cached_naked_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) -> bool {
+/// firing step, after which the ladder returns). `ladder_bit`/`no_fire` is the
+/// cross-stall memo (see [`LadderMemo`]): units verified no-fire on an unchanged
+/// board are skipped; a clean full scan of a unit sets its bit.
+fn cached_naked_subset(
+    cm: &mut CellMarks,
+    cache: &SubsetCache,
+    size: usize,
+    ladder_bit: u8,
+    no_fire: &mut [u8; 27],
+) -> bool {
+    let bit = 1u8 << ladder_bit;
     for u in 0..27 {
+        if no_fire[u] & bit != 0 {
+            lstat_inc(2);
+            continue;
+        }
+        lstat_inc(1);
         let marks = &cache.marks[u];
         // Candidate slots: empty cells with 2..=size candidates (a filled cell reads as
         // the empty mark, so `len` 0 excludes it). `cand` holds slot indices 0..9.
@@ -335,15 +384,29 @@ fn cached_naked_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) -> 
         if applied {
             return true;
         }
+        no_fire[u] |= bit;
     }
     false
 }
 
 /// Cache-fed [`techniques::hidden_subset`] (see [`SubsetCache`]): identical first-fire
 /// logic and elimination order, reading the precomputed per-unit position masks instead
-/// of rebuilding the digit-position transpose per size.
-fn cached_hidden_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) -> bool {
+/// of rebuilding the digit-position transpose per size. `ladder_bit`/`no_fire` as in
+/// [`cached_naked_subset`].
+fn cached_hidden_subset(
+    cm: &mut CellMarks,
+    cache: &SubsetCache,
+    size: usize,
+    ladder_bit: u8,
+    no_fire: &mut [u8; 27],
+) -> bool {
+    let bit = 1u8 << ladder_bit;
     for u in 0..27 {
+        if no_fire[u] & bit != 0 {
+            lstat_inc(2);
+            continue;
+        }
+        lstat_inc(1);
         let marks = &cache.marks[u];
         let pos_all = &cache.positions[u];
         // Digits with 2..=size candidate cells in this unit (a placed digit has none).
@@ -386,6 +449,7 @@ fn cached_hidden_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) ->
         if applied {
             return true;
         }
+        no_fire[u] |= bit;
     }
     false
 }
@@ -396,12 +460,26 @@ fn cached_hidden_subset(cm: &mut CellMarks, cache: &SubsetCache, size: usize) ->
 /// that fired, or `None` when nothing applies (the lane is unsolvable under the
 /// toolbox). Snapshot/restore is the prober's per-branch clone path; the harder search
 /// is the rare ~2% tail, so paying it per-lane scalar is cheap.
-fn subset_step(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, allowed: KindMask, try_lc: bool) -> Option<usize> {
+///
+/// `memo` is the lane's cross-stall [`LadderMemo`] (`None` = memo off, full rescan —
+/// the A/B baseline): consecutive stalls of one baseline solve change only a few
+/// cells, so the subset ladder skips every (kind, unit) verified no-fire on a unit
+/// whose gated bands are unchanged since that scan — exact, first-fire preserved.
+fn subset_step(
+    r: &mut [[V; 3]; 9],
+    unsolved: &mut [V; 3],
+    l: usize,
+    allowed: KindMask,
+    try_lc: bool,
+    memo: Option<&mut LadderMemo>,
+) -> Option<usize> {
     let (mut sr, su) = snapshot_lane(r, unsolved, l);
     // LC-off-warp: run the FAST (table-driven) scalar LC fixpoint on the snapshot before
     // the subsets; if it pruned anything, rejoin the warp so the vectorized singles
     // resume. This is the fair off-warp comparison — same `DROP_TRIP` LC the scalar
-    // `FusedLogicSolver` uses, not the slow composable one.
+    // `FusedLogicSolver` uses, not the slow composable one. The memo is untouched on
+    // this early return: `prev` stays the last-SCANNED state, so the next entry's diff
+    // sees the LC prunes (restored into the lane below) as dirt.
     if try_lc && scalar_lc_fast(&mut sr, &su) {
         restore_lane(r, unsolved, l, &sr, &su);
         return Some(LC_POINTING); // a cheap kind: counted-but-never-read, signals "progress"
@@ -413,7 +491,45 @@ fn subset_step(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, allowed: Ki
     // same fast surface `verify` uses (`Board`). Subsets only prune (never place), so the
     // empty mask is unchanged and only the candidate bands are read back.
     let mut cm = CellMarks::from_bands(&sr, &su);
-    let k = cellmarks_step_harder(&mut cm, allowed)?;
+    // Cross-stall memo: diff the gated bands against the last-scanned state; every
+    // changed cell dirties its three units (clears their no-fire bits). This catches
+    // the previous fire's eliminations, the closure's work, and LC prunes uniformly.
+    // `prev` then becomes the current state — the one the scans below run on.
+    let mut no_scratch = [0u8; 27];
+    let no_fire: &mut [u8; 27] = match memo {
+        Some(memo) => {
+            if memo.valid {
+                let mut changed = [0u32; 3];
+                for d in 0..9 {
+                    for b in 0..3 {
+                        let eff = sr[d][b] & su[b];
+                        changed[b] |= eff ^ memo.prev[d][b];
+                        memo.prev[d][b] = eff;
+                    }
+                }
+                for (b, mut w) in changed.into_iter().enumerate() {
+                    while w != 0 {
+                        let cell = rm_cell(b, w.trailing_zeros());
+                        w &= w - 1;
+                        memo.no_fire[cell / 9] = 0;
+                        memo.no_fire[9 + cell % 9] = 0;
+                        memo.no_fire[18 + 3 * (cell / 27) + (cell % 9) / 3] = 0;
+                    }
+                }
+            } else {
+                for d in 0..9 {
+                    for b in 0..3 {
+                        memo.prev[d][b] = sr[d][b] & su[b];
+                    }
+                }
+                memo.no_fire = [0; 27];
+                memo.valid = true;
+            }
+            &mut memo.no_fire
+        }
+        None => &mut no_scratch,
+    };
+    let k = cellmarks_step_harder(&mut cm, allowed, no_fire)?;
     // A fired subset removes only a handful of candidates, so write them straight into the
     // warp lane (one bit clear each) rather than rebuilding + scattering the whole board.
     // `r` is untouched since the snapshot (the LC fixpoint runs on the local copy `sr`), so
@@ -836,6 +952,10 @@ pub struct UnifiedWarp {
     /// is applied at load), and the strip is unchanged between probe and verdict, so this
     /// is the baseline query verbatim. Meaningful only while the lane is in probe mode.
     query: [SolveQuery; LANES],
+    /// Per-lane cross-stall subset-ladder memos (invalidated on every lane load).
+    memo: [LadderMemo; LANES],
+    /// Use the ladder memo (production: on; off only for the A/B harness).
+    ladder_memo: bool,
 }
 
 impl Default for UnifiedWarp {
@@ -846,6 +966,13 @@ impl Default for UnifiedWarp {
 
 impl UnifiedWarp {
     pub fn new() -> Self {
+        Self::new_with(true)
+    }
+
+    /// [`new`](Self::new) with the cross-stall subset-ladder memo toggleable — the A/B
+    /// harness entry (`examples/laddermemoab`). The memo is exact (first-fire-preserving),
+    /// so both settings produce identical verdicts; only the cost differs.
+    pub fn new_with(ladder_memo: bool) -> Self {
         UnifiedWarp {
             r: [[ZERO; 3]; 9],
             unsolved: [ZERO; 3],
@@ -854,6 +981,8 @@ impl UnifiedWarp {
             stacks: core::array::from_fn(|_| Vec::with_capacity(64)),
             counts: [[0u16; NUM]; LANES],
             query: [SolveQuery::EMPTY; LANES],
+            memo: [LadderMemo::INVALID; LANES],
+            ladder_memo,
         }
     }
 
@@ -877,6 +1006,7 @@ impl UnifiedWarp {
         self.stacks[l].clear();
         self.baseline_mode[l] = false;
         self.active[l] = true;
+        self.memo[l].valid = false;
     }
 
     /// Load a baseline query into slot `l` (baseline mode): the plain stripped board + zeroed counts.
@@ -886,6 +1016,7 @@ impl UnifiedWarp {
         self.counts[l] = [0; NUM];
         self.baseline_mode[l] = true;
         self.active[l] = true;
+        self.memo[l].valid = false;
     }
 
     /// ONE [`warp_pass_full`] over the active lanes + per-lane service dispatched by mode,
@@ -926,7 +1057,8 @@ impl UnifiedWarp {
                     self.active[l] = false;
                     events.push(l, GateResult::Baseline(SolveTrace { solved: false, counts: self.counts[l] }));
                 } else {
-                    match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc) {
+                    let memo = self.ladder_memo.then_some(&mut self.memo[l]);
+                    match subset_step(&mut self.r, &mut self.unsolved, l, allowed, try_lc, memo) {
                         Some(k) => self.counts[l][k] = self.counts[l][k].saturating_add(1),
                         None => {
                             self.active[l] = false;

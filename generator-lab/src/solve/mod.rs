@@ -53,6 +53,11 @@ pub use fused::{fstat_reset, fstat_snapshot};
 #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
 pub use simt::{uwstat_reset, uwstat_snapshot};
 
+/// Subset-ladder memo counters (`feature = "count"`) — read by the `laddermemoab`
+/// example.
+#[cfg(all(feature = "count", not(target_arch = "wasm32")))]
+pub use simt::{lstat_reset, lstat_snapshot};
+
 use crate::spec::kinds::{KindMask, SolveTrace};
 
 /// A technique-driven solver over board `B` — the swap point between engines, so the

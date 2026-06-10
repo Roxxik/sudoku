@@ -291,16 +291,24 @@ pub struct PuzzleStream<'a, I> {
 impl<'a, I: Iterator<Item = u64>> PuzzleStream<'a, I> {
     /// Race `seeds` through the warp, one puzzle per seed (each retried until it yields).
     pub fn new(seeds: I, spec: &'a Spec) -> Self {
-        Self::new_with(seeds, spec, true)
+        Self::new_opts(seeds, spec, true, true)
     }
 
     /// [`new`](Self::new) with the hidden-single re-force fast path toggleable — the
     /// A/B harness entry (`examples/reforceab`). The fast path is trajectory-invariant
     /// (sound), so both settings produce identical puzzles; only the cost differs.
     pub fn new_with(seeds: I, spec: &'a Spec, reforce: bool) -> Self {
+        Self::new_opts(seeds, spec, reforce, true)
+    }
+
+    /// [`new`](Self::new) with both optimization toggles — `reforce` (the
+    /// hidden-single re-force strip fast path) and `ladder_memo` (the warp's
+    /// cross-stall subset-ladder memo, `examples/laddermemoab`). Both are exact, so
+    /// every combination produces identical puzzles; only the cost differs.
+    pub fn new_opts(seeds: I, spec: &'a Spec, reforce: bool, ladder_memo: bool) -> Self {
         let allowed = spec.baseline_mask();
         let mut s = PuzzleStream {
-            warp: UnifiedWarp::new(),
+            warp: UnifiedWarp::new_with(ladder_memo),
             lanes: core::array::from_fn(|_| Lane::new(Rng::from_seed(0))),
             seeds,
             spec,
