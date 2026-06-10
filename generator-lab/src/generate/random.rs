@@ -26,7 +26,7 @@
 use crate::fill::random_solution;
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, DualSolverState, RowMajor};
-use crate::repr::{Board, CELLS, Digit, DigitGrid, Mark, Marks, PerDigit, Puzzle, Solution};
+use crate::repr::{Board, CELLS, Digit, DigitGrid, GridMask, Mark, Marks, PerDigit, Puzzle, Solution, SolverState};
 use crate::rng::Rng;
 use crate::scan::Bivalue;
 use crate::solve::{FusedLogicSolver, LogicSolver, Solver};
@@ -41,6 +41,99 @@ type RM = Bands<RowMajor>;
 /// The uniqueness prober: the scan/sieve [`Search`] with the [`Bivalue`] branch
 /// strategy — the optimal prober strategy for the strip (see the prober memos).
 type P = Search<Bivalue>;
+
+/// The strip's candidate-state capability — the incremental clue board the 81 removal
+/// attempts mutate in place, abstracted so each strip driver carries only the views it
+/// reads. The scalar/wasm [`attempt`] strips on the dual-banded [`DualSolverState`]
+/// (its scalar baseline gate reads both views), while the SIMT host strips on a single
+/// row-major [`SolverState`]: the warp consumes only row bands ([`StripState::export_r`]),
+/// the prober and the gate tests are row-only, and the baseline trace comes back from
+/// the warp — so maintaining a column view per clue clear/restore there would be pure
+/// waste (~half the strip's fixed band traffic). Both impls run the identical
+/// clue-survival algebra, so every gate decision — and hence the trajectory and the
+/// produced puzzles — is byte-identical across instantiations.
+pub trait StripView: Marks + PartialEq {
+    /// The fully-decided state (a complete grid's `from_digits`, built directly).
+    fn solved() -> Self;
+    /// The per-digit clue map seed (row-major; the survival logic reads it
+    /// banding-independently).
+    fn clue_map(digits: &DigitGrid) -> PerDigit<RM>;
+    /// Remove the clue digit `d` at `cell`, reopening candidates in every carried
+    /// view; returns the cell's naked candidates (the strip's `alts` source).
+    fn clear_clue(&mut self, clue: &mut PerDigit<RM>, cell: usize, d: Digit) -> Mark;
+    /// Restore the clue digit `d` at `cell` in every carried view (the strip's revert).
+    fn place_clue(&mut self, clue: &mut PerDigit<RM>, cell: usize, d: Digit);
+    /// The row-major view — what the prober/warp exports and the gate tests read.
+    fn row(&self) -> &SolverState<RM>;
+}
+
+impl StripView for DualSolverState {
+    fn solved() -> Self {
+        DualSolverState::solved()
+    }
+    fn clue_map(digits: &DigitGrid) -> PerDigit<RM> {
+        DualSolverState::clue_map(digits)
+    }
+    fn clear_clue(&mut self, clue: &mut PerDigit<RM>, cell: usize, d: Digit) -> Mark {
+        DualSolverState::clear_clue(self, clue, cell, d)
+    }
+    fn place_clue(&mut self, clue: &mut PerDigit<RM>, cell: usize, d: Digit) {
+        DualSolverState::place_clue(self, clue, cell, d)
+    }
+    fn row(&self) -> &SolverState<RM> {
+        DualSolverState::row(self)
+    }
+}
+
+impl StripView for SolverState<RM> {
+    fn solved() -> Self {
+        SolverState::solved()
+    }
+    fn clue_map(digits: &DigitGrid) -> PerDigit<RM> {
+        SolverState::<RM>::clue_map(digits)
+    }
+    /// The dual's [`clear_clue`](DualSolverState::clear_clue) row half, verbatim minus
+    /// the column view — NOT the generic [`SolverState::clear_clue`], whose blocked-cell
+    /// walk goes through `any()`/`first()`/`cell()` (a cross-lane branch + a table load
+    /// per visited clue, measurably slower; the dual replaced it with the per-lane
+    /// scalar bit-walk below for exactly that reason, see its comment).
+    fn clear_clue(&mut self, clue: &mut PerDigit<RM>, cell: usize, d: Digit) -> Mark {
+        let r_cell = <RM as GridMask>::cell(cell);
+        let r_peers = <RM as GridMask>::peers(cell);
+        clue[d] &= !r_cell; // cell stops being a clue before peer occupancy is read
+
+        // (1) cell -> empty; candidate digit `e` survives iff no present peer holds it.
+        let mut cand = Mark::EMPTY;
+        for e in 0..9 {
+            let dig = Digit::from_index(e);
+            if !(clue[dig] & r_peers).any() {
+                cand.insert(dig);
+            }
+        }
+        self.open_cell(r_cell, cand);
+
+        // (2) reopen `d` on cell's empty peers outside the union of the other present
+        // `d`-clues' peer masks — the per-lane scalar bit-walk (`cell = 27*lane + bit`).
+        let mut r_blocked = <RM as GridMask>::EMPTY;
+        let lanes = clue[d].to_lanes();
+        for (lane, mut w) in lanes[..3].iter().copied().enumerate() {
+            let base = lane * 27;
+            while w != 0 {
+                let q = base + w.trailing_zeros() as usize;
+                w &= w - 1;
+                r_blocked |= <RM as GridMask>::peers(q);
+            }
+        }
+        self.open_digit_on_peers(d, r_peers, r_blocked);
+        cand
+    }
+    fn place_clue(&mut self, clue: &mut PerDigit<RM>, cell: usize, d: Digit) {
+        SolverState::place_clue(self, clue, cell, d)
+    }
+    fn row(&self) -> &SolverState<RM> {
+        self
+    }
+}
 
 /// A generated puzzle and the full solution it was stripped from.
 pub struct GeneratedPuzzle {
@@ -105,15 +198,15 @@ pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
 }
 
 /// The mutable state of one strip attempt and its per-cell gate logic. The single
-/// candidate source is one incrementally
-/// maintained dual-banded board (`dual`) + its row-major `clue` map, mutated in place
+/// candidate source is one incrementally maintained board (`state`, a [`StripView`])
+/// + its row-major `clue` map, mutated in place
 /// across the 81 removal attempts (bb's `apply_clear`/`apply_place`) — so the uniqueness
-/// prober reads its row view and the baseline gate reads both views with **no per-gate
+/// prober reads its row view (and the scalar baseline gate both views) with **no per-gate
 /// rebuild**, exactly as bb reuses one dual `BitBoard`. `digits` is the placements shadow
 /// the produced puzzle reads (and the strip's `alts==0`/`get` source `clue` can't give).
-pub(in crate::generate) struct StripState {
+pub(in crate::generate) struct StripState<S: StripView = DualSolverState> {
     digits: DigitGrid,
-    dual: DualSolverState,
+    state: S,
     clue: PerDigit<RM>,
     /// The most-stripped requirement-meeting grid; the candidate state is rebuilt from
     /// it (by `verify`) only if the attempt succeeds.
@@ -123,34 +216,34 @@ pub(in crate::generate) struct StripState {
     req_met: bool,
 }
 
-impl StripState {
+impl<S: StripView> StripState<S> {
     /// Fresh state stripping the full `solution` grid (nothing removed yet). The strip
-    /// mutates `dual` in place thereafter.
+    /// mutates `state` in place thereafter.
     ///
     /// `solution` is always a *complete* grid (the fill's output), and `from_digits` of a
     /// complete grid is the trivial solved state — every cell placed leaves no unsolved
-    /// cells and no candidates — so [`DualSolverState::solved`] builds it directly instead
-    /// of running the 81-cell peer-clear loop twice (once per view) only to clear nothing
+    /// cells and no candidates — so [`StripView::solved`] builds it directly instead
+    /// of running the 81-cell peer-clear loop (per carried view) only to clear nothing
     /// (~4% of the fill's cost, all of it wasted). The strip then reopens cells one at a
-    /// time via [`clear_clue`](DualSolverState::clear_clue). `clue_map` still walks the
+    /// time via [`StripView::clear_clue`]. `clue_map` still walks the
     /// placements (the clue map is genuinely the full grid).
     pub(in crate::generate) fn new(solution: &Solution) -> Self {
         let digits = solution.0.clone();
         debug_assert!(digits.is_complete(), "strip must start from a complete solution");
-        let dual = DualSolverState::solved();
+        let state = S::solved();
         debug_assert!(
-            dual == DualSolverState::from_digits(&digits),
+            state == S::from_digits(&digits),
             "solved() must equal from_digits of a complete grid"
         );
-        let clue = DualSolverState::clue_map(&digits);
-        StripState { digits, dual, clue, best: None, req_met: false }
+        let clue = S::clue_map(&digits);
+        StripState { digits, state, clue, best: None, req_met: false }
     }
 
     /// Revert a rejected strip of `cell` (held `orig`): restore the clue in both the
-    /// placements shadow and the incremental candidate board (both views).
+    /// placements shadow and the incremental candidate board (every carried view).
     fn revert(&mut self, cell: usize, orig: Digit) {
         self.digits.set(cell, orig);
-        self.dual.place_clue(&mut self.clue, cell, orig);
+        self.state.place_clue(&mut self.clue, cell, orig);
     }
 
     /// Speculatively strip `cell` (holding `orig`): clear it from the placements shadow
@@ -162,10 +255,10 @@ impl StripState {
     /// is the `alts == 0` fast path.
     pub(in crate::generate) fn strip(&mut self, cell: usize, orig: Digit) -> u16 {
         self.digits.clear(cell);
-        let cand = self.dual.clear_clue(&mut self.clue, cell, orig);
+        let cand = self.state.clear_clue(&mut self.clue, cell, orig);
         debug_assert!(
-            self.dual == DualSolverState::from_digits(&self.digits),
-            "incremental dual drift after clear at {cell}"
+            self.state == S::from_digits(&self.digits),
+            "incremental strip-state drift after clear at {cell}"
         );
         cand.without(Mark::single(orig)).bits()
     }
@@ -182,7 +275,7 @@ impl StripState {
     /// The row-view candidate bands + empty mask as the packed prober's SoA input
     /// ([`crate::probe::simt::Probe`]'s `r`/`unsolved`) — bb's `export_r` twin: per digit
     /// its three 27-bit row-major bands ([`Bands::to_lanes`]), plus the still-empty mask.
-    /// The carried `dual` is read directly — no per-gate rebuild.
+    /// The carried `state` is read directly — no per-gate rebuild.
     /// The digit currently at `cell` in the placements shadow, or `None` if it has been
     /// stripped — the warp host's strip-walk reads it to skip already-removed cells (the
     /// `digits.get` of [`attempt`]'s loop).
@@ -191,7 +284,7 @@ impl StripState {
     }
 
     pub(in crate::generate) fn export_r(&self) -> ([[u32; 4]; 9], [u32; 4]) {
-        let row = self.dual.row();
+        let row = self.state.row();
         let cand = row.candidates();
         (core::array::from_fn(|e| cand.each()[e].to_lanes()), row.unsolved().to_lanes())
     }
@@ -205,26 +298,30 @@ impl StripState {
     /// are exactly the accepted board's. Both gates are then skippable like the
     /// `alts == 0` fast path, and the trajectory is invariant (byte-identical
     /// puzzles); ~23% of gates / ~43% of accepts hit, worth ~5-7% e2e
-    /// (`examples/reforcestat` tallies, `examples/reforceab` is the A/B). Reads each
-    /// unit's candidate positions off the view where it is in-lane (row/box from the
-    /// row view, column from the column view): three AND+popcount, no scan.
+    /// (`examples/reforcestat` tallies, `examples/reforceab` is the A/B). Reads
+    /// everything off the row view: row and box are in-lane (one AND+popcount each);
+    /// the column is its nine bits at offset `c` of each 9-bit row run across the
+    /// three bands, summed — no column view needed, so the single-view strip state
+    /// pays nothing extra for this test.
     pub(in crate::generate) fn reforced(&self, cell: usize, orig: Digit) -> u8 {
-        let row = self.dual.row();
-        let col = self.dual.col();
+        let row = self.state.row();
         // Candidates are gated by `unsolved` (decided cells carry stale bits).
         let r = (row.candidates()[orig] & row.unsolved()).to_lanes();
-        let c = (col.candidates()[orig] & col.unsolved()).to_lanes();
         let row_word = r[cell / 27];
-        let col_word = c[(cell % 9) / 3];
-        // In-band 9-bit run of the cell's row / column; 3-bit-per-row block of its box.
+        // In-band 9-bit run of the cell's row; 3-bit-per-row block of its box.
         let row_mask = 0x1FFu32 << (9 * ((cell / 9) % 3));
-        let col_mask = 0x1FFu32 << (9 * ((cell % 9) % 3));
         let box_mask = 0b111_000_000_111_000_000_111u32 << (3 * ((cell % 9) / 3));
-        // `orig` is among `cell`'s candidates after the clear, so a popcount of 1
+        // Column `cc` occupies bit `cc` of each of the three 9-bit row runs, per band.
+        let cc = cell % 9;
+        let mut col_count = 0u32;
+        for w in [r[0] >> cc, r[1] >> cc, r[2] >> cc] {
+            col_count += (w & 1) + ((w >> 9) & 1) + ((w >> 18) & 1);
+        }
+        // `orig` is among `cell`'s candidates after the clear, so a count of 1
         // means the lone home IS `cell` — the strip is re-forced in that unit.
         let mut m = 0u8;
         m |= ((row_word & row_mask).count_ones() == 1) as u8;
-        m |= (((col_word & col_mask).count_ones() == 1) as u8) << 1;
+        m |= ((col_count == 1) as u8) << 1;
         m |= (((row_word & box_mask).count_ones() == 1) as u8) << 2;
         m
     }
@@ -235,45 +332,9 @@ impl StripState {
     /// it is factored out so the packed-prober corpus (`collect_probes`) can record the exact
     /// reference verdict the SIMT `resolve_probes` must reproduce.
     pub(in crate::generate) fn scalar_nonunique(&self, cell: usize, orig: Digit) -> bool {
-        let mut probe = self.dual.row().clone();
+        let mut probe = self.state.row().clone();
         probe.forbid(cell, orig);
         P::has_completion(probe)
-    }
-
-    /// Resolve the gates for the strip of `cell` (held `orig`) given the already-decided
-    /// uniqueness verdict `nonunique`: if non-unique, revert; else run the baseline gate
-    /// and either accept (updating `req_met`/`best`) or revert. `baseline` is the toolbox
-    /// mask and `fast` selects the fused fast path vs the exact engine (see
-    /// [`baseline_fast_applicable`]). The baseline reads the incrementally-maintained
-    /// `dual` directly — no per-gate rebuild — and the solver clones it internally, so
-    /// the carried strip state is untouched.
-    pub(in crate::generate) fn resolve_gate(
-        &mut self,
-        cell: usize,
-        orig: Digit,
-        nonunique: bool,
-        spec: &Spec,
-        baseline: KindMask,
-        fast: bool,
-    ) {
-        if nonunique {
-            self.revert(cell, orig);
-            return;
-        }
-        // The baseline view is the incrementally-maintained `dual` itself — no rebuild.
-        let trace = if fast {
-            FusedLogicSolver::solve_tracked(&self.dual, baseline)
-        } else {
-            LogicSolver::solve_tracked(&self.dual, baseline)
-        };
-        if !trace.solved {
-            self.revert(cell, orig);
-            return;
-        }
-        self.req_met = spec.requirement_met(&trace.counts);
-        if self.req_met {
-            self.best = Some(self.digits.clone());
-        }
     }
 
     /// Revert a rejected gate (the prober found the strip non-unique) — the public twin
@@ -310,6 +371,48 @@ impl StripState {
     }
 }
 
+/// The scalar gate resolution — only on the dual-banded instantiation, because the
+/// scalar baseline engines ([`FusedLogicSolver`]/[`LogicSolver`]) read both views.
+/// The SIMT host never calls this (its baseline trace comes from the warp), which is
+/// exactly why its strip can drop the column view.
+impl StripState<DualSolverState> {
+    /// Resolve the gates for the strip of `cell` (held `orig`) given the already-decided
+    /// uniqueness verdict `nonunique`: if non-unique, revert; else run the baseline gate
+    /// and either accept (updating `req_met`/`best`) or revert. `baseline` is the toolbox
+    /// mask and `fast` selects the fused fast path vs the exact engine (see
+    /// [`baseline_fast_applicable`]). The baseline reads the incrementally-maintained
+    /// dual state directly — no per-gate rebuild — and the solver clones it internally,
+    /// so the carried strip state is untouched.
+    pub(in crate::generate) fn resolve_gate(
+        &mut self,
+        cell: usize,
+        orig: Digit,
+        nonunique: bool,
+        spec: &Spec,
+        baseline: KindMask,
+        fast: bool,
+    ) {
+        if nonunique {
+            self.revert(cell, orig);
+            return;
+        }
+        // The baseline view is the incrementally-maintained dual state — no rebuild.
+        let trace = if fast {
+            FusedLogicSolver::solve_tracked(&self.state, baseline)
+        } else {
+            LogicSolver::solve_tracked(&self.state, baseline)
+        };
+        if !trace.solved {
+            self.revert(cell, orig);
+            return;
+        }
+        self.req_met = spec.requirement_met(&trace.counts);
+        if self.req_met {
+            self.best = Some(self.digits.clone());
+        }
+    }
+}
+
 /// One full strip attempt for `spec`. Mirrors the old bb `generator`'s strip-attempt gate for
 /// gate, on the new prober/solver stack.
 pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
@@ -321,24 +424,19 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
     rng.shuffle(&mut positions);
 
-    let mut st = StripState::new(&solution);
+    // The scalar attempt strips on the dual-banded state (the default `StripView`):
+    // its baseline gate below runs the scalar engines, which read both views.
+    let mut st: StripState = StripState::new(&solution);
     for cell in positions {
-        let Some(orig) = st.digits.get(cell) else {
+        let Some(orig) = st.digit_at(cell) else {
             continue;
         };
-        st.digits.clear(cell);
-        let cand = st.dual.clear_clue(&mut st.clue, cell, orig);
-        debug_assert!(
-            st.dual == DualSolverState::from_digits(&st.digits),
-            "incremental dual drift after clear at {cell}"
-        );
+        let alts = st.strip(cell, orig);
         // `alts == 0` fast path: the cleared cell is still a naked single, so its peers
         // already force `orig` — the strip stays unique AND baseline-solvable and the
         // requirement verdict is unchanged. Skip both gates; just carry `req_met`.
-        if cand.len() == 1 {
-            if st.req_met {
-                st.best = Some(st.digits.clone());
-            }
+        if alts == 0 {
+            st.keep_trivial();
             continue;
         }
         // Hidden-single re-force fast path (see [`StripState::reforced`]): `orig` has no
@@ -348,9 +446,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
         // (a forced cheap kind reads exact cheap counts, which the skipped re-derivation
         // would shift by one hidden single).
         if fast && st.reforced(cell, orig) != 0 {
-            if st.req_met {
-                st.best = Some(st.digits.clone());
-            }
+            st.keep_trivial();
             continue;
         }
         // Uniqueness gate: forbid `orig` to restrict the cell to its alternates and ask
@@ -482,9 +578,9 @@ pub fn reforce_stat(base_seed: u64, spec: &Spec, attempts: usize) -> ReforceStat
         let solution = random_solution(&mut rng);
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
-        let mut st = StripState::new(&solution);
+        let mut st: StripState = StripState::new(&solution);
         for cell in positions {
-            let Some(orig) = st.digits.get(cell) else {
+            let Some(orig) = st.digit_at(cell) else {
                 continue;
             };
             let alts = st.strip(cell, orig);
@@ -510,9 +606,9 @@ pub fn reforce_stat(base_seed: u64, spec: &Spec, attempts: usize) -> ReforceStat
                 continue;
             }
             let trace = if fast {
-                FusedLogicSolver::solve_tracked(&st.dual, baseline)
+                FusedLogicSolver::solve_tracked(&st.state, baseline)
             } else {
-                LogicSolver::solve_tracked(&st.dual, baseline)
+                LogicSolver::solve_tracked(&st.state, baseline)
             };
             if !trace.solved {
                 s.rejected_unsolvable += 1;

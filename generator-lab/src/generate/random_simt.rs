@@ -41,10 +41,11 @@
 //! (`tests/equiv_warp_repr.rs` pins each lane byte-identical to its sequential
 //! [`crate::generate::run_attempts`] run).
 
-use super::random::{GeneratedPuzzle, Stats, StripState, baseline_fast_applicable, verify};
+use super::random::{GeneratedPuzzle, Stats, StripState, StripView, baseline_fast_applicable, verify};
 use crate::fill::random_solution;
 use crate::probe::simt::{LANES, Probe};
-use crate::repr::{CELLS, Digit, DigitGrid, Solution};
+use crate::repr::banded::{Bands, RowMajor};
+use crate::repr::{CELLS, Digit, DigitGrid, Solution, SolverState};
 use crate::rng::Rng;
 use crate::solve::simt::{GateResult, StepEvents, UnifiedWarp};
 use crate::spec::Spec;
@@ -60,12 +61,20 @@ enum Step {
     Done(Option<GeneratedPuzzle>),
 }
 
+/// The strip state the warp's lanes carry: a **single row-major view**. The warp
+/// consumes only row bands (`export_r`), the gate tests are row-only, and the baseline
+/// trace comes back from the warp — so the dual state's column view, maintained on
+/// every `clear_clue`/`place_clue`, would be pure waste here. The scalar [`attempt`]
+/// (whose baseline gate reads both views) keeps the dual default.
+pub type RowStrip = SolverState<Bands<RowMajor>>;
+
 /// One lane = one in-flight attempt plus the running tallies of every attempt this lane
 /// has retired. The board state and per-cell gate logic are the
 /// shared [`StripState`]; the lane adds the resumable walk (strip order + cursor) and
 /// the retired-attempt accounting, kept across slot refills so the attempt can be
-/// paused at its uniqueness gate.
-struct Lane {
+/// paused at its uniqueness gate. Generic over the [`StripView`] only so the A/B
+/// harness can race the dual-state variant against the production [`RowStrip`].
+struct Lane<S: StripView = RowStrip> {
     rng: Rng,
     /// The seed this lane's RNG was created from — the key the produced puzzle is tagged
     /// with so a [`PuzzleStream`] can return a seed -> puzzle map.
@@ -79,7 +88,7 @@ struct Lane {
     // --- in-flight attempt state (valid iff `active`) ---
     /// The board being stripped + the shared gate logic (the same `StripState` the
     /// sequential `attempt` drives).
-    strip: StripState,
+    strip: StripState<S>,
     /// The full solution grid this attempt is stripping, kept so a success can report
     /// its solution like the scalar `generate`.
     solution: Solution,
@@ -90,7 +99,7 @@ struct Lane {
     stats: Stats,
 }
 
-impl Lane {
+impl<S: StripView> Lane<S> {
     fn new(rng: Rng) -> Self {
         Lane {
             rng,
@@ -206,7 +215,7 @@ impl Lane {
 
 /// Snapshot a lane's pending gate as a [`Probe`] for the packed prober: the dual board's
 /// row-major bands + empty mask, the stripped cell, and its alternates.
-fn probe_of(lane: &Lane) -> Probe {
+fn probe_of<S: StripView>(lane: &Lane<S>) -> Probe {
     let (cell, _orig, alts) = lane.pending.expect("probe_of on a lane with no gate");
     let (r, unsolved) = lane.strip.export_r();
     Probe { r, unsolved, cell, alts }
@@ -227,7 +236,7 @@ pub fn collect_probes(base_seed: u64, spec: &Spec, attempts: usize) -> Vec<(Prob
         let solution = random_solution(&mut rng);
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
-        let mut st = StripState::new(&solution);
+        let mut st: StripState = StripState::new(&solution);
         for cell in positions {
             let Some(orig) = st.digit_at(cell) else {
                 continue; // already stripped
@@ -272,9 +281,9 @@ pub enum Pumped {
 /// *outside*, stopping once [`stats`](Self::stats)`.attempts` reaches the target (the
 /// counter climbs on every attempt, including retries, so this terminates even on a spec
 /// that never yields). That keeps the production loop free of any instrumentation.
-pub struct PuzzleStream<'a, I> {
+pub struct PuzzleStream<'a, I, S: StripView = RowStrip> {
     warp: UnifiedWarp,
-    lanes: [Lane; LANES],
+    lanes: [Lane<S>; LANES],
     seeds: I,
     spec: &'a Spec,
     allowed: KindMask,
@@ -306,6 +315,16 @@ impl<'a, I: Iterator<Item = u64>> PuzzleStream<'a, I> {
     /// cross-stall subset-ladder memo, `examples/laddermemoab`). Both are exact, so
     /// every combination produces identical puzzles; only the cost differs.
     pub fn new_opts(seeds: I, spec: &'a Spec, reforce: bool, ladder_memo: bool) -> Self {
+        Self::new_in(seeds, spec, reforce, ladder_memo)
+    }
+}
+
+impl<'a, I: Iterator<Item = u64>, S: StripView> PuzzleStream<'a, I, S> {
+    /// The fully generic constructor — [`new_opts`](Self::new_opts) with the lane
+    /// [`StripView`] chosen by turbofish. Only the strip-state A/B harness
+    /// (`examples/stripviewab`) names a non-default `S`; the concrete entries above
+    /// pin the production [`RowStrip`] so plain `PuzzleStream::new(..)` infers.
+    pub fn new_in(seeds: I, spec: &'a Spec, reforce: bool, ladder_memo: bool) -> Self {
         let allowed = spec.baseline_mask();
         let mut s = PuzzleStream {
             warp: UnifiedWarp::new_with(ladder_memo),
