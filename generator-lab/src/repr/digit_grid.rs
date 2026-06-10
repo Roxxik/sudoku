@@ -66,6 +66,13 @@ impl DigitGrid {
         &self.0
     }
 
+    /// The 81 cells as raw bytes — `1..=9` for a digit, `0` for empty (the line/byte form;
+    /// [`cells`](Self::cells) keeps the `Option`s). Used for fingerprint folding.
+    #[inline]
+    pub fn cell_bytes(&self) -> [u8; CELLS] {
+        core::array::from_fn(|i| self.0[i].map_or(0, |d| d.get()))
+    }
+
     #[inline]
     pub fn is_empty(&self, i: CellIdx) -> bool {
         self.0[i].is_none()

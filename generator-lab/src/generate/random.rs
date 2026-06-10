@@ -58,12 +58,6 @@ pub enum AttemptResult {
     NeverFired,
 }
 
-/// The cells of `digits` as a bare `[u8; 81]` (`0` = empty) — the form the
-/// cross-backend determinism fingerprint folds (see [`fnv_fold_cells`](crate::fingerprint::fnv_fold_cells)).
-pub(in crate::generate) fn cells_u8(digits: &DigitGrid) -> [u8; CELLS] {
-    core::array::from_fn(|i| digits.get(i).map_or(0, |d| d.get()))
-}
-
 /// Whether the [`FusedLogicSolver`] fast path is valid for `spec`'s baseline gate —
 /// bb's strategy dispatch on the `forced` mask, lifted to the solve layer. The fused
 /// closure does naked + hidden singles always and both LC orientations together, and
@@ -200,6 +194,17 @@ impl StripState {
         (core::array::from_fn(|e| cand.each()[e].to_lanes()), row.unsolved().to_lanes())
     }
 
+    /// The scalar uniqueness verdict for stripping `cell` (held `orig`): forbid `orig` on a
+    /// clone of the row view and ask the existence prober whether an *alternate* completion
+    /// exists (`true` = the strip is non-unique). [`attempt`] runs this inline at each gate;
+    /// it is factored out so the packed-prober corpus (`collect_probes`) can record the exact
+    /// reference verdict the SIMT `resolve_probes` must reproduce.
+    pub(in crate::generate) fn scalar_nonunique(&self, cell: usize, orig: Digit) -> bool {
+        let mut probe = self.dual.row().clone();
+        probe.forbid(cell, orig);
+        P::has_completion(probe)
+    }
+
     /// Resolve the gates for the strip of `cell` (held `orig`) given the already-decided
     /// uniqueness verdict `nonunique`: if non-unique, revert; else run the baseline gate
     /// and either accept (updating `req_met`/`best`) or revert. `baseline` is the toolbox
@@ -302,12 +307,8 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
             continue;
         }
         // Uniqueness gate: forbid `orig` to restrict the cell to its alternates and ask
-        // a single existence query (bb's `any_alt_solves`). The probe runs on a clone of
-        // the dual's row view so the carried board stays the clue-only naked-candidate
-        // state.
-        let mut probe = st.dual.row().clone();
-        probe.forbid(cell, orig);
-        let nonunique = P::has_completion(probe);
+        // a single existence query (bb's `any_alt_solves`).
+        let nonunique = st.scalar_nonunique(cell, orig);
         st.resolve_gate(cell, orig, nonunique, spec, baseline, fast);
     }
 
@@ -377,7 +378,7 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
             AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
-                fnv_fold_cells(&mut fp, &cells_u8(&p.puzzle.0));
+                fnv_fold_cells(&mut fp, &p.puzzle.0.cell_bytes());
             }
             AttemptResult::NotForced => {
                 stats.not_forced += 1;
@@ -400,12 +401,12 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
 /// the guard that the Lemire `range`/shuffle and the fill are target-independent. It walks
 /// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so it is a
 /// faithful probe. This is a correctness guard, not a perf metric. The digit fold via
-/// [`cells_u8`] is pinned per seed in `tests/faithful` (and cross-checked by the wasm
-/// `det_fp` export).
+/// [`DigitGrid::cell_bytes`] is pinned per seed in `tests/faithful` (and cross-checked by
+/// the wasm `det_fp` export).
 pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
     let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {
-        let cells = cells_u8(&random_solution(rng).0);
+        let cells = random_solution(rng).0.cell_bytes();
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
         for i in 0..CELLS {

@@ -41,7 +41,7 @@ pub use fused::FusedLogicSolver;
 pub use logic::LogicSolver;
 /// Confluence-test surface: the reorderable harder ladder and a fixpoint solve that
 /// takes its order, for `examples/confluence.rs`.
-pub use logic::{HARD_STEPS_DEFAULT, HardStep, closure_probe, solve_fixpoint_with_order};
+pub use logic::{HARD_STEPS_DEFAULT, HardStep, solve_fixpoint_with_order};
 
 /// Baseline-gate workload counters (`feature = "count"`), for the SIMT-baseline
 /// solver design study — read by the `baselinestat` example.

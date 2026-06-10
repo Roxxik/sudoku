@@ -26,7 +26,7 @@
 //! concedes them).
 
 use generator_lab::expert_spec;
-use generator_lab::generate::random_simt::find_puzzles;
+use generator_lab::generate::random_simt::{Pumped, PuzzleStream};
 use generator_lab::spec::kinds::NAMES;
 
 fn main() {
@@ -54,10 +54,18 @@ fn main() {
     let t0 = std::time::Instant::now();
     // Print each puzzle the instant it is produced (out of seed order) so a Ctrl-C loses
     // nothing already emitted. stdout stays clean puzzle data (pipeable to the verifier).
-    let stats = find_puzzles(base..base + count, &spec, |seed, p| {
-        println!("seed {seed}: {} ({} givens)", p.puzzle.to_line(), p.givens);
-        println!("solution: {}", p.solution.to_line());
-    });
+    let mut stream = PuzzleStream::new(base..base + count, &spec);
+    loop {
+        match stream.pump(4096) {
+            Pumped::Found(seed, p) => {
+                println!("seed {seed}: {} ({} givens)", p.puzzle.to_line(), p.givens);
+                println!("solution: {}", p.solution.to_line());
+            }
+            Pumped::StepCountReached => {}
+            Pumped::NoMorePuzzles => break,
+        }
+    }
+    let stats = stream.stats();
     let elapsed = t0.elapsed();
 
     // Summary on stderr, at the end.

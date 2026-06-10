@@ -1,99 +1,51 @@
-//! Correctness anchor for the `repr`-layer warp ([`generate::random_simt`]): each lane
-//! runs a fixed seed, so lane `l` must produce byte-identical results to
-//! [`generate::run_attempts`]'s *sequential* run from seed `l` — same tallies, same
-//! fingerprint. If the warp ever reorders work in a way that changes a lane's outcome,
-//! this catches it. The fingerprint folds every produced puzzle, so equality means the
-//! actual puzzles match, not just the counts. (The spec `verify` inside the warp
-//! independently guarantees every emitted puzzle satisfies the spec; this additionally
-//! pins faithfulness — and that the new packed prober's verdicts match the scalar
-//! `Search` prober the sequential path uses.)
+//! Correctness anchor for the `repr`-layer warp ([`generate::random_simt`]). The
+//! [`PuzzleStream`] runs each seed to its *first* success, racing W=8 seeds across the
+//! warp; that produced puzzle must be byte-identical to the one scalar
+//! [`generate`](generator_lab::generate::generate) yields from the same seed, regardless
+//! of how the 8 slots interleave. Equality of the actual puzzle line (not just a count)
+//! pins both faithfulness and that the packed prober's + baseline closure's verdicts match
+//! the scalar `Search` prober / `FusedLogicSolver` the sequential path uses.
+//!
+//! Coverage note: because a seed is run to its first success, every *failing* attempt
+//! along the way must also produce the scalar-identical verdict — otherwise the seed would
+//! yield at a different attempt or a different puzzle. So a spec that needs several
+//! attempts per seed (e.g. `train(NAKED_PAIR)`) transitively exercises the failure-path
+//! verdicts too, not just the success path.
 
-use generator_lab::generate::random_simt::{find_puzzles, run_warp_unified};
-use generator_lab::generate::{generate, run_attempts};
+use generator_lab::generate::generate;
+use generator_lab::generate::random_simt::{PuzzleStream, Pumped};
 use generator_lab::rng::Rng;
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::NAKED_PAIR;
-use generator_lab::subset_spec_for_mode;
 
-/// For each `mode`, run a warp of several lanes and check every lane reproduces the
-/// sequential generator's `(stats, fp)` for its seed.
-fn check_mode(mode: u32, base_seed: u64, lanes: usize, attempts_per_lane: usize) {
-    let spec = subset_spec_for_mode(mode);
-    let res = run_warp_unified(base_seed, &spec, lanes, attempts_per_lane);
-    assert_eq!(res.per_lane.len(), lanes);
-
-    for (l, &(stats, fp)) in res.per_lane.iter().enumerate() {
-        let seed = base_seed + l as u64;
-        let mut rng = Rng::from_seed(seed);
-        let (ref_stats, ref_fp) = run_attempts(&mut rng, &spec, attempts_per_lane);
-
-        assert_eq!(stats.attempts, ref_stats.attempts, "mode {mode} lane {l}: attempts");
-        assert_eq!(stats.successes, ref_stats.successes, "mode {mode} lane {l}: successes");
-        assert_eq!(stats.never_fired, ref_stats.never_fired, "mode {mode} lane {l}: never_fired");
-        assert_eq!(stats.not_forced, ref_stats.not_forced, "mode {mode} lane {l}: not_forced");
-        assert_eq!(stats.total_givens, ref_stats.total_givens, "mode {mode} lane {l}: total_givens");
-        assert_eq!(fp, ref_fp, "mode {mode} lane {l}: fingerprint diverged (puzzles differ)");
+/// Drain a finite-seed [`PuzzleStream`] to its terminal, collecting every `(seed, puzzle)`.
+fn collect<I: Iterator<Item = u64>>(spec: &Spec, seeds: I) -> Vec<(u64, generator_lab::generate::GeneratedPuzzle)> {
+    let mut stream = PuzzleStream::new(seeds, spec);
+    let mut produced = Vec::new();
+    loop {
+        match stream.pump(4096) {
+            Pumped::Found(seed, p) => produced.push((seed, p)),
+            Pumped::StepCountReached => {}
+            Pumped::NoMorePuzzles => break,
+        }
     }
+    produced
 }
 
-#[test]
-fn train_warp_matches_sequential() {
-    check_mode(0, 1, 8, 40);
-}
-
-/// A lane count > 8 so the oversubscription/refill paths (a slot's macro-lane retiring
-/// and the slot grabbing a fresh one) are exercised, not just the initial 8-wide fill.
-#[test]
-fn wide_warp_matches_sequential() {
-    check_mode(0, 1, 24, 60);
-    check_mode(1, 1, 24, 60);
-    // Offset seeds + a lane count not a multiple of the 8-wide warp.
-    check_mode(0, 500, 19, 40);
-    check_mode(1, 500, 19, 40);
-}
-
-#[test]
-fn drill_warp_matches_sequential() {
-    check_mode(1, 1, 8, 40);
-}
-
-/// A wider warp from a different seed base, to shake out lane-count / refill scheduling
-/// assumptions (uneven attempt lengths across lanes).
-#[test]
-fn wide_warp_offset_seeds() {
-    check_mode(0, 1000, 13, 25);
-    check_mode(1, 1000, 13, 25);
-}
-
-/// The Success path: seed 4 yields a train puzzle at attempt ~18370, so a warp based at
-/// seed 1 with 6 lanes (seeds 1..6, incl. 4) running past that yields at least one
-/// success — the `verify`-accept + per-puzzle fingerprint fold that the rarer (0-yield)
-/// seeds never exercise. Still must match the sequential run lane for lane. Slow (~6
-/// lanes x 19k attempts), hence the explicit opt-in by name.
-#[test]
-#[ignore = "slow (~19k attempts/lane to reach the success path); run with --ignored"]
-fn warp_success_path_matches_sequential() {
-    check_mode(0, 1, 6, 19000);
-}
-
-/// [`find_puzzles`]'s seed -> puzzle map must be a pure function of the seed: each seed's
-/// batched puzzle must equal the one scalar [`generate`] produces from the same seed,
-/// regardless of how the W=8 warp interleaves the seeds. The per-attempt warp/scalar
-/// verdict equivalence is already pinned above (`check_mode`); this pins the new
-/// control flow — run a seed to its *first* success, then roll onto the next seed.
+/// The stream's seed -> puzzle map must be a pure function of the seed: each seed's batched
+/// puzzle equals the one scalar [`generate`] produces from the same seed, regardless of how
+/// the W=8 warp interleaves the seeds.
 ///
-/// Uses `train(NakedPair)` rather than the production HiddenQuad spec purely so the test
-/// is fast: it yields in a handful of attempts per seed yet still drives the same fused
-/// fast path (both singles + both LC allowed, a non-cheap forced kind). The batch has
-/// more seeds than slots, so they genuinely interleave.
-fn check_find_puzzles(spec: &Spec, base: u64, count: u64) {
-    let mut produced: Vec<(u64, _)> = Vec::new();
-    let stats = find_puzzles(base..base + count, spec, |s, p| produced.push((s, p)));
+/// Uses `train(NakedPair)` rather than the production HiddenQuad spec purely so the test is
+/// fast: it yields in a handful of attempts per seed yet still drives the same fused fast
+/// path (both singles + both LC allowed, a non-cheap forced kind). The batch has more seeds
+/// than slots, so they genuinely interleave.
+fn check_per_seed(spec: &Spec, base: u64, count: u64) {
+    let mut produced = collect(spec, base..base + count);
     produced.sort_by_key(|(s, _)| *s); // streamed out of order
 
     // One puzzle per seed.
     assert_eq!(produced.len() as u64, count, "one puzzle per seed");
-    assert_eq!(stats.successes as u64, count, "successes == seed count");
     for (i, (seed, _)) in produced.iter().enumerate() {
         assert_eq!(*seed, base + i as u64, "produced[{i}] seed (after sort)");
     }
@@ -116,18 +68,17 @@ fn check_find_puzzles(spec: &Spec, base: u64, count: u64) {
 }
 
 #[test]
-fn find_puzzles_matches_scalar_per_seed() {
-    check_find_puzzles(&Spec::train(NAKED_PAIR), 1, 20);
+fn stream_matches_scalar_per_seed() {
+    check_per_seed(&Spec::train(NAKED_PAIR), 1, 20);
 }
 
-/// Non-contiguous and out-of-order seed iterators must work the same — the result is
-/// keyed by seed, not by position.
+/// Non-contiguous and out-of-order seed iterators must work the same — the result is keyed
+/// by seed, not by position.
 #[test]
-fn find_puzzles_non_contiguous_seeds() {
+fn stream_non_contiguous_seeds() {
     let spec = Spec::train(NAKED_PAIR);
     let seeds = [97u64, 3, 51, 2, 88, 17];
-    let mut produced: Vec<(u64, _)> = Vec::new();
-    find_puzzles(seeds, &spec, |s, p| produced.push((s, p)));
+    let mut produced = collect(&spec, seeds.into_iter());
     produced.sort_by_key(|(s, _)| *s);
 
     let mut sorted = seeds;

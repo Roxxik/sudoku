@@ -27,7 +27,7 @@
 //! that target's branch); `--toolbox full` allows the entire 16-kind ladder
 //! (more substitutes => rarer).
 
-use generator_lab::generate::random_simt::run_warp_unified;
+use generator_lab::generate::random_simt::{Pumped, PuzzleStream};
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::{DIFFICULTY, NAMES, NUM, Tier, branch_of, tier_of};
 
@@ -118,9 +118,24 @@ fn main() {
         generator_lab::repr::banded::psg_reset();
         generator_lab::solve::uwstat_reset();
     }
+    // Fixed work, capped from the OUTSIDE: pump the production stream until `total`
+    // attempts have started (the counter climbs on every attempt incl. retries, so this
+    // terminates even for a combo that never yields). Fold an order-independent fingerprint
+    // over the produced puzzles so two builds match iff they produce the same puzzle set.
     let t0 = std::time::Instant::now();
-    let res = run_warp_unified(base_seed, &spec, lanes, per_lane);
+    let mut stream = PuzzleStream::new(base_seed.., &spec);
+    let mut combo_fp = 0u64; // XOR-fold of per-puzzle fps: order-independent
+    // Pump ONE tick at a time so the outside cap overshoots `total` by at most a tick's
+    // worth of attempts; a tick (a full 8-wide warp pass) dwarfs the per-call cost.
+    while stream.stats().attempts < total {
+        match stream.pump(1) {
+            Pumped::Found(_, p) => combo_fp ^= generator_lab::fingerprint::grid_fp(&p.puzzle.0),
+            Pumped::StepCountReached => {}
+            Pumped::NoMorePuzzles => break, // unbounded seeds: unreachable
+        }
+    }
     let dt = t0.elapsed();
+    let stats = stream.stats();
     #[cfg(feature = "count")]
     {
         let h = generator_lab::repr::banded::psg_snapshot();
@@ -143,17 +158,11 @@ fn main() {
         );
     }
 
-    // Combined fingerprint over every lane's per-puzzle-cells FNV fp (lane order fixed),
-    // so two builds match iff they produce the byte-identical set of puzzles.
-    let mut combo_fp = generator_lab::fingerprint::FNV_OFFSET;
-    for (_, fp) in &res.per_lane {
-        combo_fp ^= fp;
-        combo_fp = combo_fp.wrapping_mul(generator_lab::fingerprint::FNV_PRIME);
-    }
+    // Two builds match iff they produce the same set of puzzles.
     println!("  fp: {combo_fp:#018x}");
 
-    let us_per_att = dt.as_secs_f64() * 1e6 / total as f64;
-    let s = &res.stats;
+    let s = &stats;
+    let us_per_att = dt.as_secs_f64() * 1e6 / s.attempts.max(1) as f64;
     let att_per_puz = s.attempts as f64 / s.successes.max(1) as f64;
     // Average wall time for the W=8 warp to produce one puzzle.
     let s_per_puzzle = us_per_att * att_per_puz / 1e6;
