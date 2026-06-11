@@ -629,26 +629,43 @@ impl UaFilter {
                     // component's minimum row), so ids land in the scalar build's first-row order
                     // — keeping the emitted library bit-identical. Each emitted row contributes
                     // its a-cell and b-cell and `+2` to the UA's given count (`|U| = 2 x rows`).
+                    //
+                    // Emission runs unchecked here (the section-6/11 follow-up): the two
+                    // soundness fallbacks the scalar `enumerate_2digit` carries — `alloc_ua`'s
+                    // `UA_CAP` truncation and the per-cell `UA_PER_CELL` membership cap — are
+                    // provably dead for a 2-digit library, so the branches and their bounds
+                    // checks are dropped. A board emits <= 144 UAs (<= 4 even components per pair
+                    // x 36 pairs), so `nua` never reaches `UA_CAP` (192) and the id is never
+                    // `u8::MAX`; a cell of digit `d` joins one UA per partner digit (the 8 pairs
+                    // containing `d`, once each), so `lens[cell] <= 8 = UA_PER_CELL` and the slot
+                    // is always in range. The `<= 144` bound is pinned by
+                    // `library_sizes_match_anchors`; `packed_equals_scalar` carries `lens`
+                    // bit-identical to the checked scalar build. These are the two scalar-tail
+                    // hot spots section 11 names (`alloc_ua` cap check, the `cell_uas` byte
+                    // stores).
                     let mut label_ua = [u8::MAX; 9];
                     for r in 0..9 {
                         let m = fin[r] as usize;
                         let id = if label_ua[m] == u8::MAX {
-                            let id = self.alloc_ua();
+                            // Unchecked `alloc_ua`: nua <= 144 < UA_CAP, so no cap check.
+                            let id = self.nua as u8;
+                            // SAFETY: nua <= 144 < UA_CAP = counts.len().
+                            *self.counts.get_unchecked_mut(self.nua) = 0;
+                            self.nua += 1;
                             label_ua[m] = id;
                             id
                         } else {
                             label_ua[m]
                         };
-                        if id == u8::MAX {
-                            continue; // truncated UA (never reached: <=144 UAs/board)
-                        }
-                        self.counts[id as usize] += 2;
+                        // SAFETY: id <= 143 < UA_CAP = counts.len().
+                        *self.counts.get_unchecked_mut(id as usize) += 2;
                         for cell in [r * 9 + col_of[r][a] as usize, r * 9 + col_of[r][b] as usize] {
-                            let ln = self.lens[cell] as usize;
-                            if ln < UA_PER_CELL {
-                                self.cell_uas[cell][ln] = id;
-                                self.lens[cell] = (ln + 1) as u8;
-                            }
+                            // SAFETY: cell < CELLS (= cell_uas.len()), and lens[cell] < 8 =
+                            // UA_PER_CELL before this push (a cell joins <= 8 UAs total), so the
+                            // membership slot index is in range.
+                            let ln = *self.lens.get_unchecked(cell) as usize;
+                            *self.cell_uas.get_unchecked_mut(cell).get_unchecked_mut(ln) = id;
+                            *self.lens.get_unchecked_mut(cell) = (ln + 1) as u8;
                         }
                     }
                 }

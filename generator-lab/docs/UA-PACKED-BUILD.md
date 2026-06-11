@@ -245,3 +245,24 @@ with scalar). Closing the rest is the section-6 follow-up, and a **separate** ch
 (one-change-at-a-time): vectorize the box-merge (`M = pshufb(M, M)` propagation over the edge
 list) and/or restructure emission (buffer-and-flush, drop bounds/cap checks via the known
 `<=144`/`<=8` invariants). Measure each on its own `ua_build_cost` before/after.
+
+## 12. Follow-up landed (2026-06-11): unchecked emission
+
+First of the section-11 follow-ups: the packed engine's emission now runs **unchecked**,
+dropping the two soundness fallbacks `enumerate_2digit` carries — `alloc_ua`'s `UA_CAP`
+truncation and the per-cell `UA_PER_CELL` membership cap — and the bounds checks they imply.
+Both are provably dead for a 2-digit library: a board emits `<= 144` UAs (`<= 4` even
+components per pair x 36 pairs, pinned by `library_sizes_match_anchors`), so `nua` never reaches
+`UA_CAP` (192) and the id is never `u8::MAX`; a cell of digit `d` joins one UA per partner digit
+(the 8 pairs containing `d`, once each), so `lens[cell] <= 8 = UA_PER_CELL` and the slot index is
+always in range. Output is unchanged — still bit-identical to scalar (`packed_equals_scalar`,
+200 seeds), fingerprint still `0x4621f425`, `tests/ua_filter` per-engine/tier identity green.
+This is exactly the two scalar-tail hot spots section 11 names (`alloc_ua` cap check, the
+`cell_uas` byte stores); the scalar build keeps the checks (it is the unchanged differential
+oracle and the wasm/other-arch path).
+
+Build cost (`examples/bench`, 8000 att, core-pinned, best-of, paired A/B by stashing the diff):
+packed Full **~2270 -> ~2110 ns/board, ~6-7% off** at the same 34.3 UAs/board (seeds 1/2/3:
+2275->2149, 2264->2097, 2275->2114). e2e shifts are within noise (the build is a small slice of
+the strip). Remaining section-6 follow-ups (box-merge vectorization, emission buffer-and-flush)
+are still open and stay separate, one-change-at-a-time measurements.
