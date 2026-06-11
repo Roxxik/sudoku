@@ -37,10 +37,24 @@ count = []
 # shipped build. Build the web wasm with this on for on-device profiling.
 profiling = []
 
+# Opens the `bench_seam` module (otherwise pub(crate) warp kernel) for the criterion
+# microbench in benches/. Off by default, so the hot path's visibility stays tight in
+# normal/wasm builds; the bench target below requires it.
+bench = []
+
 # Tests only: cross-check generated puzzles against core's real verifier/Spec so
 # we know train/drill generation is faithful. No production coupling.
 [dev-dependencies]
 sudoku-core = { path = "../core" }
+# Terminal-only criterion (no plotters/rayon) for the warp_pass microbench.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Criterion harness for warp_pass_full; needs the `bench` feature for the seam.
+# Run: cargo bench --features bench --bench warp_pass
+[[bench]]
+name = "warp_pass"
+harness = false
+required-features = ["bench"]
 
 # `--cfg prof_solver` marks the solver internals (sieve/place_singles/band_update*
 # /propagate/branch_cell) #[inline(never)] so a profiler attributes per-function

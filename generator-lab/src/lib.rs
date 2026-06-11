@@ -61,6 +61,74 @@ pub mod scan;
 pub mod solve;
 pub mod spec;
 
+/// Public seam for the criterion microbench in `benches/warp_pass.rs` (feature =
+/// `bench`). The SIMT cheap-closure kernel [`warp_pass_full`](solve::simt) and its
+/// `V`/`M` board types are `pub(crate)`, so a separate bench crate cannot call them.
+/// Rather than widen the hot path's visibility in normal/wasm builds, this module —
+/// compiled ONLY under `--features bench` — re-exports the kernel behind a small
+/// [`WarpInput`] fixture so the bench can drive one warp pass on a freshly-loaded
+/// board without any production coupling.
+#[cfg(feature = "bench")]
+pub mod bench_seam {
+    use crate::probe::simt::{LANES, M, V, ZERO};
+    use crate::repr::DigitGrid;
+    use crate::solve::simt::{SolveQuery, load_query, warp_pass_full};
+
+    /// The eight warp lanes loaded with stripped boards, ready for one
+    /// [`warp_pass_full`]. `Copy` so the bench can stamp a fresh, identically-loaded
+    /// warp for each timed call — the kernel mutates the board toward solved in place,
+    /// so without a fresh copy a benchmark loop would measure the no-op steady state.
+    #[derive(Clone, Copy)]
+    pub struct WarpInput {
+        r: [[V; 3]; 9],
+        unsolved: [V; 3],
+        active: M,
+    }
+
+    impl WarpInput {
+        /// Number of SIMD lanes in one warp (the max boards per [`WarpInput`]).
+        pub const LANES: usize = LANES;
+
+        /// Load up to [`LANES`](Self::LANES) stripped boards into a fresh warp; lanes
+        /// past `grids.len()` stay empty/inactive. This is bench *setup* (the
+        /// `from_digits` band build is not part of the timed kernel).
+        pub fn from_grids(grids: &[DigitGrid]) -> Self {
+            let mut r = [[ZERO; 3]; 9];
+            let mut unsolved = [ZERO; 3];
+            let mut active = [false; LANES];
+            for (l, g) in grids.iter().take(LANES).enumerate() {
+                load_query(&mut r, &mut unsolved, l, &SolveQuery::from_digits(g));
+                active[l] = true;
+            }
+            WarpInput { r, unsolved, active: M::from_array(active) }
+        }
+
+        /// ONE cheap-closure pass across the active lanes — the timed kernel. Returns
+        /// per-lane `(changed, dead, solved)`.
+        #[inline]
+        pub fn pass(&mut self) -> (M, M, M) {
+            warp_pass_full(&mut self.r, &mut self.unsolved, self.active)
+        }
+
+        /// Drive the warp to fixpoint: repeat [`pass`](Self::pass) until no active lane
+        /// makes progress (solved/dead lanes drop out of `active`; a stalled lane that
+        /// needs the off-warp subset ladder simply stops the loop). Closer to the real
+        /// per-strip baseline cost than a single pass. Returns the pass count.
+        #[inline]
+        pub fn to_fixpoint(&mut self) -> u32 {
+            let mut passes = 0;
+            loop {
+                let (changed, dead, solved) = self.pass();
+                passes += 1;
+                self.active &= !(dead | solved);
+                if !(changed & self.active).any() {
+                    return passes;
+                }
+            }
+        }
+    }
+}
+
 use spec::Spec;
 use spec::kinds::{DIFFICULTY, HIDDEN_QUAD, NUM, Tier, branch_of, tier_of};
 
