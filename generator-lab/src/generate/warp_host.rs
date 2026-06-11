@@ -36,7 +36,7 @@
 //! it batches onto) stays out of the wasm cdylib, which ships the scalar `run_attempts`
 //! path.
 
-use super::random::{GeneratedPuzzle, Stats, StripState, baseline_fast_applicable, verify};
+use super::random::{GeneratedPuzzle, Stats, StripState, UaTier, baseline_fast_applicable, verify};
 use crate::counters::counter_block;
 use crate::fill::random_solution;
 use crate::probe::simt::{Frame, LANES, M, Probe, V, ZERO, load_lane};
@@ -308,6 +308,7 @@ pub type Attempt<I: Iterator<Item = u64>> = impl Coroutine<GateResult, Yield = P
 pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
     shared: SharedRef<I>,
     spec: Spec,
+    tier: UaTier,
 ) -> Attempt<I> {
     // The hidden-single re-force fast path is sound only when the fused baseline fast
     // path applies (a forced cheap kind reads exact cheap counts the skipped
@@ -324,7 +325,7 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
             loop {
                 shared.borrow_mut().stats.attempts += 1;
                 let solution = random_solution(&mut rng);
-                let mut strip: StripState<RowStrip> = StripState::new(&solution);
+                let mut strip: StripState<RowStrip> = StripState::new_ua(&solution, tier);
                 let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
                 rng.shuffle(&mut positions);
                 for idx in 0..CELLS {
@@ -334,13 +335,19 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                     };
                     let alts = strip.strip(cell, orig);
                     if alts == 0 {
-                        strip.keep_trivial();
+                        strip.keep_trivial(cell);
                         continue;
                     }
                     // Hidden-single re-force fast path: both gates skippable,
                     // verdict carried (see [`StripState::reforced`]).
                     if fast && strip.reforced(cell, orig) != 0 {
-                        strip.keep_trivial();
+                        strip.keep_trivial(cell);
+                        continue;
+                    }
+                    // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
+                    // unavoidable set is a provable non-unique — revert without yielding a
+                    // probe to the warp (one fewer probe lane-pass). No-op for `UaTier::Off`.
+                    if strip.ua_revert_if_caught(cell, orig) {
                         continue;
                     }
                     // The uniqueness gate: suspend here; the warp decides. A unique
@@ -477,10 +484,11 @@ fn gate_ticket<I: Iterator<Item = u64>>(
     shared: &SharedRef<I>,
     spec: &Spec,
     ladder_memo: bool,
+    tier: UaTier,
 ) -> Ticket<GateEngine, Attempt<I>> {
     Ticket {
         engine: GateEngine::new(spec, ladder_memo),
-        attempt: attempt(shared.clone(), spec.clone()),
+        attempt: attempt(shared.clone(), spec.clone(), tier),
     }
 }
 
@@ -630,7 +638,7 @@ where
 
 impl<I: Iterator<Item = u64>> GateStream<I> {
     /// Race `seeds` through the warp, one puzzle per seed (each retried until it
-    /// yields).
+    /// yields). Carries the production UA pre-filter tier ([`UaTier::SIMT`]).
     pub fn new(seeds: I, spec: &Spec) -> Self {
         Self::new_opts(seeds, spec, true)
     }
@@ -639,7 +647,15 @@ impl<I: Iterator<Item = u64>> GateStream<I> {
     /// (exact/first-fire-preserving, so both settings produce identical puzzles; only
     /// the cost differs).
     pub fn new_opts(seeds: I, spec: &Spec, ladder_memo: bool) -> Self {
-        PuzzleStream::assemble(seeds, |shared| gate_ticket(shared, spec, ladder_memo))
+        Self::new_ua(seeds, spec, ladder_memo, UaTier::SIMT)
+    }
+
+    /// [`new_opts`](Self::new_opts) at an explicit UA pre-filter [`tier`](UaTier) — the A/B
+    /// entry for the filter-on-vs-off fingerprint test and `combobench`. The produced
+    /// puzzles are tier-independent (the filter is sound), so any tier stays lane-for-lane
+    /// identical to the scalar [`generate`](super::generate).
+    pub fn new_ua(seeds: I, spec: &Spec, ladder_memo: bool, tier: UaTier) -> Self {
+        PuzzleStream::assemble(seeds, |shared| gate_ticket(shared, spec, ladder_memo, tier))
     }
 }
 
@@ -665,11 +681,11 @@ pub fn collect_probes(base_seed: u64, spec: &Spec, attempts: usize) -> Vec<(Prob
             };
             let alts = st.strip(cell, orig);
             if alts == 0 {
-                st.keep_trivial();
+                st.keep_trivial(cell);
                 continue; // `alts == 0` fast path: no gate
             }
             if fast && st.reforced(cell, orig) != 0 {
-                st.keep_trivial();
+                st.keep_trivial(cell);
                 continue; // hidden-single re-force fast path: production issues no probe
             }
             let (r, unsolved) = st.export_r();

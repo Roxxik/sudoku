@@ -153,6 +153,289 @@ pub enum AttemptResult {
     NeverFired,
 }
 
+/// Which unavoidable-set (UA) pre-filter library the strip carries — the deadly-pattern
+/// filter of `docs/UA-FILTER.md`. Every UA of the solution grid must keep at least one
+/// given or the puzzle is non-unique, so a strip that would empty a library UA is provably
+/// a prober revert and can skip the probe entirely. Sound: it only ever fast-rejects gates
+/// the prober would revert, so the strip trajectory — and hence the produced puzzles and
+/// the `run_attempts` fingerprint — are bit-identical to [`UaTier::Off`]. The scalar and
+/// SIMT paths may carry different tiers safely, since the verdicts are unchanged either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UaTier {
+    /// No pre-filter: every uniqueness gate poses a probe (the pre-filter baseline).
+    Off,
+    /// Size-4 UAs only (the deadly rectangles) — ~650 compares/board to build.
+    Ua4,
+    /// The full 2-digit-cycle UA library (sizes 4..=18).
+    Full,
+}
+
+impl UaTier {
+    /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]).
+    pub const SCALAR: UaTier = UaTier::Ua4;
+    /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]).
+    pub const SIMT: UaTier = UaTier::Ua4;
+}
+
+/// Max UAs carried per board. The true maximum is 144 (36 digit pairs x <=4 components
+/// each); the headroom lets a miscount degrade by truncation (sound: a dropped UA is only
+/// a missed catch, never a wrong verdict) rather than panic. `u8` UA ids cap it at 255.
+const UA_CAP: usize = 192;
+/// Max UAs a single cell belongs to. A cell holding digit `d` joins exactly one component
+/// per partner digit, so it is in at most 8 UAs (one per `{d, x}` pair) — an exact bound,
+/// never truncated in practice.
+const UA_PER_CELL: usize = 8;
+
+/// The per-board UA pre-filter state ([`UaTier`]). Holds the library's `cell -> containing
+/// UA` index plus a per-UA *given count*, maintained along the strip walk: a UA's count is
+/// the number of its cells still given, starting at `|U|` (the walk begins from a full
+/// board) and dropping by one each time one of its cells is kept-stripped. Stripping a cell
+/// whose count is 1 would empty that UA — a provable non-unique — so the gate reverts
+/// without a probe (see [`caught`](Self::caught)). Reverted cells stay givens, so their
+/// count is untouched. All storage is fixed-capacity (no per-gate or per-attempt heap
+/// allocation); [`UaTier::Off`] leaves it empty, so [`caught`](Self::caught) is always
+/// `false` at zero cost.
+struct UaFilter {
+    /// Remaining given count per UA id (`0..nua`).
+    counts: [u8; UA_CAP],
+    /// `cell -> UA ids containing it`; the first `lens[cell]` entries are valid.
+    cell_uas: [[u8; UA_PER_CELL]; CELLS],
+    /// Number of valid entries in each `cell_uas` row.
+    lens: [u8; CELLS],
+    /// Number of UAs registered (`<= UA_CAP`).
+    nua: usize,
+}
+
+impl UaFilter {
+    const fn empty() -> Self {
+        UaFilter {
+            counts: [0; UA_CAP],
+            cell_uas: [[0; UA_PER_CELL]; CELLS],
+            lens: [0; CELLS],
+            nua: 0,
+        }
+    }
+
+    /// Build the `tier`'s UA library for the complete solution grid `sol`. The grid is
+    /// flattened to a dense `[u8; 81]` once (the enumerations index it) — the banded
+    /// [`DigitGrid::get`] is ~an order of magnitude pricier than an array read, and the
+    /// enumerations touch hundreds of cells per board, so the flatten dominates the per-board
+    /// cost.
+    fn build(sol: &DigitGrid, tier: UaTier) -> Self {
+        let mut f = UaFilter::empty();
+        match tier {
+            UaTier::Off => {}
+            UaTier::Ua4 => f.enumerate_ua4(&Self::dense(sol)),
+            UaTier::Full => f.enumerate_2digit(&Self::dense(sol)),
+        }
+        f
+    }
+
+    /// The complete solution as a dense row-major digit array (`0..=8`). A complete grid has
+    /// every cell placed, so the `unwrap_or` is never taken.
+    fn dense(sol: &DigitGrid) -> [u8; CELLS] {
+        core::array::from_fn(|c| sol.get(c).map_or(0, |d| d.index() as u8))
+    }
+
+    /// Register a UA spanning `cells` (count initialized to `|cells|`). Truncation-safe:
+    /// past [`UA_CAP`] the UA is dropped, and a cell already at [`UA_PER_CELL`] drops the
+    /// membership — both only lose catches, never flip a verdict (neither happens for a
+    /// valid 2-digit library).
+    #[inline]
+    fn push_ua(&mut self, cells: &[usize]) {
+        if self.nua >= UA_CAP {
+            return;
+        }
+        let id = self.nua as u8;
+        self.counts[self.nua] = cells.len() as u8;
+        self.nua += 1;
+        for &c in cells {
+            let n = self.lens[c] as usize;
+            if n < UA_PER_CELL {
+                self.cell_uas[c][n] = id;
+                self.lens[c] = (n + 1) as u8;
+            }
+        }
+    }
+
+    /// Would stripping `cell` empty some library UA? `cell` is still a committed given at
+    /// the gate, so a UA count of 1 means `cell` is that UA's sole remaining given —
+    /// removing it leaves the UA givenless, i.e. an alternate completion exists (the
+    /// non-unique the prober would revert). Sound: it never fires on a unique gate
+    /// (measured `false_positive: 0`, M-UA-LIB).
+    #[inline]
+    fn caught(&self, cell: usize) -> bool {
+        let n = self.lens[cell] as usize;
+        self.cell_uas[cell][..n].iter().any(|&u| self.counts[u as usize] == 1)
+    }
+
+    /// Commit a kept strip of `cell`: it leaves the given set, so every UA containing it
+    /// loses a given. Called on every keep (both fast paths and the baseline accept);
+    /// reverts do not call it (the cell stays a given). The count is `>= 1` here (`cell`
+    /// itself is one of those givens), so the decrement never underflows.
+    #[inline]
+    fn kept(&mut self, cell: usize) {
+        let n = self.lens[cell] as usize;
+        for i in 0..n {
+            let u = self.cell_uas[cell][i] as usize;
+            self.counts[u] -= 1;
+        }
+    }
+
+    /// Enumerate the size-4 UAs (deadly rectangles) of the complete solution `g`. A UA4 is a
+    /// rectangle whose `a<->b` swap is another valid grid: along one line pair the two cross
+    /// lines hold the two digits in opposite order. In a valid grid this forces the rectangle
+    /// to span exactly two boxes — the line pair shares a band/stack and the cross lines lie
+    /// in different stacks/bands (a one-box rectangle would repeat a digit in that box, which
+    /// the swap match then never satisfies). So every UA4 is found exactly once by scanning,
+    /// for each of the 9 same-band row pairs (then 9 same-stack column pairs), the 9 cross
+    /// lines: a cross line with digit signature `(x, y)` pairs with an earlier one of
+    /// signature `(y, x)`. A generation-stamped table records each signature's cross line, so
+    /// the scan is `O(9)` per line pair (no per-pair clear): 9*9 + 9*9 = 162 cell visits for
+    /// ~10.7 UA4s/board (vs 648 for the brute-force rectangle scan; pinned equal by
+    /// `ua4_equals_full_size4`). Note `x != y` always (two cells of one line differ), so a
+    /// signature never collides with its own swap.
+    fn enumerate_ua4(&mut self, g: &[u8; CELLS]) {
+        // `seen[sig]` = the cross line carrying signature `sig`, valid iff `stamp[sig]` is the
+        // current line pair's generation. `sig = x * 9 + y` for digits `x` (first line) and
+        // `y` (second line).
+        let mut seen = [0u8; 81];
+        let mut stamp = [0u16; 81];
+        let mut era = 0u16;
+        let mut scan = |me: &mut Self, era: u16, cells: [[usize; 2]; 9]| {
+            for (cross, &[p, q]) in cells.iter().enumerate() {
+                let (x, y) = (g[p], g[q]);
+                let swapped = (y * 9 + x) as usize;
+                if stamp[swapped] == era {
+                    let other = seen[swapped] as usize;
+                    me.push_ua(&[cells[other][0], cells[other][1], p, q]);
+                }
+                let sig = (x * 9 + y) as usize;
+                seen[sig] = cross as u8;
+                stamp[sig] = era;
+            }
+        };
+        // Same-band row pairs: line pair = rows (r1, r2), cross line = column c.
+        for band in 0..3 {
+            for i in 0..3 {
+                for j in (i + 1)..3 {
+                    let (r1, r2) = (band * 3 + i, band * 3 + j);
+                    era += 1;
+                    scan(self, era, core::array::from_fn(|c| [r1 * 9 + c, r2 * 9 + c]));
+                }
+            }
+        }
+        // Same-stack column pairs: line pair = columns (c1, c2), cross line = row r.
+        for stack in 0..3 {
+            for i in 0..3 {
+                for j in (i + 1)..3 {
+                    let (c1, c2) = (stack * 3 + i, stack * 3 + j);
+                    era += 1;
+                    scan(self, era, core::array::from_fn(|r| [r * 9 + c1, r * 9 + c2]));
+                }
+            }
+        }
+    }
+
+    /// Enumerate the full 2-digit UA library of the complete solution `sol` (sizes 4..=18,
+    /// superseding [`enumerate_ua4`](Self::enumerate_ua4)). Ported from the M-UA-LIB counter
+    /// `enumerate_2digit_uas`: for each of the 36 digit pairs `{a, b}`, union-find over the
+    /// 18 cells holding `a` or `b`, joining each unit's (row/column/box) two pair-cells; the
+    /// connected components are the minimal UAs (an `a<->b` swap on any one is another valid
+    /// grid). ~55 UAs/board. Fixed-capacity scratch — no per-board heap allocation.
+    fn enumerate_2digit(&mut self, g: &[u8; CELLS]) {
+        fn find(p: &mut [usize; CELLS], x: usize) -> usize {
+            let mut r = x;
+            while p[r] != r {
+                r = p[r];
+            }
+            let mut c = x;
+            while p[c] != r {
+                let n = p[c];
+                p[c] = r;
+                c = n;
+            }
+            r
+        }
+        // The `k`-th cell of unit `u` of kind 0=row / 1=column / 2=box.
+        let unit_cell = |kind: usize, u: usize, k: usize| -> usize {
+            match kind {
+                0 => u * 9 + k,
+                1 => k * 9 + u,
+                _ => ((u / 3) * 3 + k / 3) * 9 + ((u % 3) * 3 + k % 3),
+            }
+        };
+        let mut parent = [0usize; CELLS];
+        let mut cells = [0usize; 18];
+        let mut roots: [(usize, u8); 18] = [(usize::MAX, 0); 18];
+        for a in 0..9u8 {
+            for b in (a + 1)..9u8 {
+                for (c, p) in parent.iter_mut().enumerate() {
+                    *p = c;
+                }
+                for kind in 0..3 {
+                    for u in 0..9 {
+                        // Each unit holds exactly one `a`-cell and one `b`-cell; join them.
+                        let mut found = [usize::MAX; 2];
+                        let mut n = 0;
+                        for k in 0..9 {
+                            let cell = unit_cell(kind, u, k);
+                            if g[cell] == a || g[cell] == b {
+                                if n < 2 {
+                                    found[n] = cell;
+                                }
+                                n += 1;
+                            }
+                        }
+                        if n == 2 {
+                            let (ra, rb) = (find(&mut parent, found[0]), find(&mut parent, found[1]));
+                            if ra != rb {
+                                parent[ra] = rb;
+                            }
+                        }
+                    }
+                }
+                // This pair's cells, then grouped by root into one UA per component.
+                let mut ncells = 0;
+                for cell in 0..CELLS {
+                    if g[cell] == a || g[cell] == b {
+                        cells[ncells] = cell;
+                        ncells += 1;
+                    }
+                }
+                let mut nroots = 0;
+                for i in 0..ncells {
+                    let cell = cells[i];
+                    let r = find(&mut parent, cell);
+                    let mut id = u8::MAX;
+                    for &(rr, ri) in &roots[..nroots] {
+                        if rr == r {
+                            id = ri;
+                            break;
+                        }
+                    }
+                    if id == u8::MAX {
+                        if self.nua >= UA_CAP {
+                            continue; // truncation-safe (never reached: <=144 UAs/board)
+                        }
+                        id = self.nua as u8;
+                        self.counts[self.nua] = 0;
+                        self.nua += 1;
+                        roots[nroots] = (r, id);
+                        nroots += 1;
+                    }
+                    self.counts[id as usize] += 1;
+                    let ln = self.lens[cell] as usize;
+                    if ln < UA_PER_CELL {
+                        self.cell_uas[cell][ln] = id;
+                        self.lens[cell] = (ln + 1) as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Whether the [`FusedLogicSolver`] fast path is valid for `spec`'s baseline gate —
 /// bb's strategy dispatch on the `forced` mask, lifted to the solve layer. The fused
 /// closure does naked + hidden singles always and both LC orientations together, and
@@ -214,6 +497,8 @@ pub(in crate::generate) struct StripState<S: StripView = DualSolverState> {
     /// The running requirement verdict of the current accepted board (carried across
     /// the `alts == 0` fast path). The full grid fires nothing, so it starts false.
     req_met: bool,
+    /// The unavoidable-set pre-filter (see [`UaFilter`]); empty for [`UaTier::Off`].
+    ua: UaFilter,
 }
 
 impl<S: StripView> StripState<S> {
@@ -227,7 +512,18 @@ impl<S: StripView> StripState<S> {
     /// (~4% of the fill's cost, all of it wasted). The strip then reopens cells one at a
     /// time via [`StripView::clear_clue`]. `clue_map` still walks the
     /// placements (the clue map is genuinely the full grid).
+    ///
+    /// Carries no UA pre-filter ([`UaTier::Off`]) — the diagnostic walks use this so they
+    /// pay nothing and measure the unfiltered baseline. Production strips use
+    /// [`new_ua`](Self::new_ua).
     pub(in crate::generate) fn new(solution: &Solution) -> Self {
+        Self::new_ua(solution, UaTier::Off)
+    }
+
+    /// [`new`](Self::new) carrying the `tier`'s UA pre-filter, built once from the full
+    /// solution grid. The filter is sound (only fast-rejects prober reverts), so the strip
+    /// trajectory is identical to [`UaTier::Off`] regardless of `tier`.
+    pub(in crate::generate) fn new_ua(solution: &Solution, tier: UaTier) -> Self {
         let digits = solution.0.clone();
         debug_assert!(digits.is_complete(), "strip must start from a complete solution");
         let state = S::solved();
@@ -236,7 +532,8 @@ impl<S: StripView> StripState<S> {
             "solved() must equal from_digits of a complete grid"
         );
         let clue = S::clue_map(&digits);
-        StripState { digits, state, clue, best: None, req_met: false }
+        let ua = UaFilter::build(&digits, tier);
+        StripState { digits, state, clue, best: None, req_met: false, ua }
     }
 
     /// Revert a rejected strip of `cell` (held `orig`): restore the clue in both the
@@ -263,12 +560,32 @@ impl<S: StripView> StripState<S> {
         cand.without(Mark::single(orig)).bits()
     }
 
-    /// `alts == 0` fast path (see [`attempt`]): the cleared cell is still a naked single,
-    /// so both gates are skippable — just carry the running requirement verdict into
-    /// `best`. The warp host's twin of the inline fast path.
-    pub(in crate::generate) fn keep_trivial(&mut self) {
+    /// Fast-path keep of `cell` (see [`attempt`]): the cleared cell is still forced (a
+    /// naked single, or a hidden single re-force), so both gates are skippable — commit the
+    /// keep to the UA pre-filter and carry the running requirement verdict into `best`. The
+    /// warp host's twin of the inline fast path.
+    pub(in crate::generate) fn keep_trivial(&mut self, cell: usize) {
+        self.ua.kept(cell);
         if self.req_met {
             self.best = Some(self.digits.clone());
+        }
+    }
+
+    /// The UA pre-filter verdict for stripping `cell` (held `orig`): if some library UA
+    /// would be emptied, the gate is a provable non-unique — revert it and return `true`,
+    /// so the caller skips the (now-redundant) uniqueness probe. Returns `false` when no UA
+    /// is emptied (pose the probe as usual). The cross-check (debug builds only) confirms
+    /// the prober agrees with every catch; production builds skip the probe entirely.
+    pub(in crate::generate) fn ua_revert_if_caught(&mut self, cell: usize, orig: Digit) -> bool {
+        if self.ua.caught(cell) {
+            debug_assert!(
+                self.scalar_nonunique(cell, orig),
+                "UA pre-filter false positive: prober finds cell {cell} unique"
+            );
+            self.revert(cell, orig);
+            true
+        } else {
+            false
         }
     }
 
@@ -364,6 +681,7 @@ impl<S: StripView> StripState<S> {
             self.revert(cell, orig);
             return;
         }
+        self.ua.kept(cell);
         self.req_met = spec.requirement_met(&trace.counts);
         if self.req_met {
             self.best = Some(self.digits.clone());
@@ -406,6 +724,7 @@ impl StripState<DualSolverState> {
             self.revert(cell, orig);
             return;
         }
+        self.ua.kept(cell);
         self.req_met = spec.requirement_met(&trace.counts);
         if self.req_met {
             self.best = Some(self.digits.clone());
@@ -413,9 +732,11 @@ impl StripState<DualSolverState> {
     }
 }
 
-/// One full strip attempt for `spec`. Mirrors the old bb `generator`'s strip-attempt gate for
-/// gate, on the new prober/solver stack.
-pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
+/// One full strip attempt for `spec` at UA pre-filter [`tier`](UaTier). Mirrors the old bb
+/// `generator`'s strip-attempt gate for gate, on the new prober/solver stack. The public
+/// [`run_attempts`] / [`generate`] use [`UaTier::SCALAR`]; the tier is a parameter so a
+/// bench/test can A/B it (the produced puzzles are tier-independent — the filter is sound).
+pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
     let baseline = spec.baseline_mask();
     let fast = baseline_fast_applicable(spec);
     let solution = random_solution(rng);
@@ -426,7 +747,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
 
     // The scalar attempt strips on the dual-banded state (the default `StripView`):
     // its baseline gate below runs the scalar engines, which read both views.
-    let mut st: StripState = StripState::new(&solution);
+    let mut st: StripState = StripState::new_ua(&solution, tier);
     for cell in positions {
         let Some(orig) = st.digit_at(cell) else {
             continue;
@@ -436,7 +757,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
         // already force `orig` — the strip stays unique AND baseline-solvable and the
         // requirement verdict is unchanged. Skip both gates; just carry `req_met`.
         if alts == 0 {
-            st.keep_trivial();
+            st.keep_trivial(cell);
             continue;
         }
         // Hidden-single re-force fast path (see [`StripState::reforced`]): `orig` has no
@@ -446,7 +767,13 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
         // (a forced cheap kind reads exact cheap counts, which the skipped re-derivation
         // would shift by one hidden single).
         if fast && st.reforced(cell, orig) != 0 {
-            st.keep_trivial();
+            st.keep_trivial(cell);
+            continue;
+        }
+        // UA pre-filter (docs/UA-FILTER.md): if stripping `cell` would empty a library
+        // unavoidable set, the gate is a provable non-unique — revert without posing the
+        // probe (a probe deleted, not made cheaper). No-op for `UaTier::Off`.
+        if st.ua_revert_if_caught(cell, orig) {
             continue;
         }
         // Uniqueness gate: forbid `orig` to restrict the cell to its alternates and ask
@@ -495,7 +822,7 @@ pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<Gene
     let mut stats = Stats::default();
     for _ in 0..max_attempts {
         stats.attempts += 1;
-        match attempt(rng, spec) {
+        match attempt(rng, spec, UaTier::SCALAR) {
             AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
@@ -511,13 +838,20 @@ pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<Gene
 /// Run exactly `n` attempts (NOT "until found") for `spec` — a fixed-work, deterministic
 /// benchmark of the per-attempt cost mix. Returns the tallies plus a fingerprint over
 /// produced puzzles folded identically to the old bb `generator`'s `run_attempts`, so the two
-/// fps are directly comparable.
+/// fps are directly comparable. Uses the production UA pre-filter tier ([`UaTier::SCALAR`]).
 pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
+    run_attempts_ua(rng, spec, n, UaTier::SCALAR)
+}
+
+/// [`run_attempts`] at an explicit UA pre-filter [`tier`](UaTier) — the A/B entry the
+/// filter-on-vs-off fingerprint test and the scalar bench drive. The fingerprint is
+/// tier-independent (the filter is sound: it never changes a verdict), which that test pins.
+pub fn run_attempts_ua(rng: &mut Rng, spec: &Spec, n: usize, tier: UaTier) -> (Stats, u64) {
     let mut stats = Stats::default();
     let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {
         stats.attempts += 1;
-        match attempt(rng, spec) {
+        match attempt(rng, spec, tier) {
             AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
@@ -585,7 +919,7 @@ pub fn reforce_stat(base_seed: u64, spec: &Spec, attempts: usize) -> ReforceStat
             };
             let alts = st.strip(cell, orig);
             if alts == 0 {
-                st.keep_trivial();
+                st.keep_trivial(cell);
                 s.trivial += 1;
                 continue;
             }
@@ -776,7 +1110,7 @@ pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
             // Fast paths: the cell stays stripped with no gate posed — a keep that a
             // deferred batch absorbs.
             if alts == 0 || (fast && st.reforced(cell, orig) != 0) {
-                st.keep_trivial();
+                st.keep_trivial(cell);
                 s.fastpath[clue] += 1;
                 run += 1;
                 continue;
@@ -1061,7 +1395,7 @@ pub fn ua_catch_stat(base_seed: u64, spec: &Spec, attempts: usize) -> UaCatchSta
             let mut nonuniq = false;
             let mut keep = false;
             if alts == 0 || (fast && st.reforced(cell, orig) != 0) {
-                st.keep_trivial();
+                st.keep_trivial(cell);
                 keep = true;
             } else {
                 pctr_reset();
@@ -1177,7 +1511,7 @@ pub fn verify_share(base_seed: u64, spec: &Spec, attempts: usize) -> VerifyShare
             };
             let alts = st.strip(cell, orig);
             if alts == 0 || (fast && st.reforced(cell, orig) != 0) {
-                st.keep_trivial();
+                st.keep_trivial(cell);
                 continue;
             }
             let tp = Instant::now();
@@ -1208,6 +1542,25 @@ pub fn verify_share(base_seed: u64, spec: &Spec, attempts: usize) -> VerifyShare
     vs
 }
 
+/// Wall time to build the UA pre-filter `tier`'s library over `attempts` random solutions
+/// from `base_seed` — the per-board enumeration cost in isolation (the stage-2 decision
+/// gate: on SIMT the full library only beats UA4-only if its build stays ~<= 1 us/board).
+/// Solutions are filled up front so only the enumeration is timed; returns `(total_nanos,
+/// total_uas)` for ns/board and avg library size. Diagnostic only (no `count` feature).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ua_build_cost(base_seed: u64, attempts: usize, tier: UaTier) -> (u64, u64) {
+    use std::time::Instant;
+    let mut rng = Rng::from_seed(base_seed);
+    let sols: Vec<DigitGrid> = (0..attempts).map(|_| random_solution(&mut rng).0).collect();
+    let mut uas = 0u64;
+    let t = Instant::now();
+    for s in &sols {
+        // `uas` accumulates the library size so the build cannot be optimized away.
+        uas += UaFilter::build(s, tier).nua as u64;
+    }
+    (t.elapsed().as_nanos() as u64, uas)
+}
+
 /// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG stream.
 /// Unlike [`run_attempts`]'s fp (which only folds *successful* puzzles, so it is blind to
 /// the grids when nothing succeeds), this folds the full solution grid AND the shuffled
@@ -1232,6 +1585,126 @@ pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
         }
     }
     fp
+}
+
+#[cfg(test)]
+mod ua_filter_tests {
+    use super::{CELLS, UaFilter, UaTier};
+    use crate::fill::random_solution;
+    use crate::repr::{Digit, DigitGrid};
+    use crate::rng::Rng;
+
+    /// Reconstruct each UA's sorted cell list from the filter's `cell -> UA` index, and
+    /// cross-check the per-UA `counts` (the full-board given count = `|U|`).
+    fn cellsets(f: &UaFilter) -> Vec<Vec<usize>> {
+        let mut sets: Vec<Vec<usize>> = vec![Vec::new(); f.nua];
+        for cell in 0..CELLS {
+            for &id in &f.cell_uas[cell][..f.lens[cell] as usize] {
+                sets[id as usize].push(cell);
+            }
+        }
+        for (id, s) in sets.iter_mut().enumerate() {
+            s.sort_unstable();
+            assert_eq!(f.counts[id] as usize, s.len(), "UA {id} count != membership");
+        }
+        sets
+    }
+
+    fn sorted(mut v: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+        v.sort();
+        v
+    }
+
+    fn is_valid_complete(g: &DigitGrid) -> bool {
+        let unit_cell = |kind: usize, u: usize, k: usize| -> usize {
+            match kind {
+                0 => u * 9 + k,
+                1 => k * 9 + u,
+                _ => ((u / 3) * 3 + k / 3) * 9 + ((u % 3) * 3 + k % 3),
+            }
+        };
+        for kind in 0..3 {
+            for u in 0..9 {
+                let mut seen = [false; 9];
+                for k in 0..9 {
+                    let Some(d) = g.get(unit_cell(kind, u, k)) else {
+                        return false;
+                    };
+                    if seen[d.index()] {
+                        return false;
+                    }
+                    seen[d.index()] = true;
+                }
+            }
+        }
+        true
+    }
+
+    /// The cheap UA4 rectangle enumeration must yield EXACTLY the size-4 components of the
+    /// full 2-digit union-find — otherwise the UA4-only tier would miss (or invent) deadly
+    /// rectangles, losing catch. (Soundness is independent: the filter only ever reverts.)
+    #[test]
+    fn ua4_equals_full_size4() {
+        for seed in 0..50 {
+            let mut rng = Rng::from_seed(seed);
+            let sol = random_solution(&mut rng).0;
+            let ua4 = sorted(cellsets(&UaFilter::build(&sol, UaTier::Ua4)));
+            let full = UaFilter::build(&sol, UaTier::Full);
+            let full_s4 = sorted(cellsets(&full).into_iter().filter(|s| s.len() == 4).collect());
+            assert!(ua4.iter().all(|s| s.len() == 4), "seed {seed}: non-size-4 UA in UA4 tier");
+            assert_eq!(ua4, full_s4, "seed {seed}: UA4 rectangle set != full size-4 components");
+        }
+    }
+
+    /// Every UA the full enumeration produces is a genuine unavoidable set: it spans 2
+    /// digits, has even size >= 4, and swapping those digits over its cells yields a
+    /// *different, still valid* complete grid. The non-count twin of
+    /// `ua_tests::enumerated_uas_are_genuine_unavoidable_sets` for the production
+    /// [`UaFilter::enumerate_2digit`] port.
+    #[test]
+    fn full_uas_are_genuine() {
+        for seed in 0..30 {
+            let mut rng = Rng::from_seed(seed);
+            let sol = random_solution(&mut rng).0;
+            let f = UaFilter::build(&sol, UaTier::Full);
+            assert!(f.nua > 0, "seed {seed}: empty full library");
+            for cells in cellsets(&f) {
+                assert!(cells.len() >= 4 && cells.len() % 2 == 0, "seed {seed}: bad UA size");
+                let mut digs: Vec<usize> = cells.iter().map(|&c| sol.get(c).unwrap().index()).collect();
+                digs.sort_unstable();
+                digs.dedup();
+                assert_eq!(digs.len(), 2, "seed {seed}: UA spans {} digits", digs.len());
+                let (a, b) = (digs[0], digs[1]);
+                let mut swapped = sol.clone();
+                for &c in &cells {
+                    let nd = if sol.get(c).unwrap().index() == a { b } else { a };
+                    swapped.set(c, Digit::from_index(nd));
+                }
+                assert!(is_valid_complete(&swapped), "seed {seed}: UA swap is not a valid grid");
+                assert_ne!(swapped.to_line(), sol.to_line(), "seed {seed}: UA swap is the identity");
+            }
+        }
+    }
+
+    /// Sanity anchors from M-UA-LIB (seed-1 fill distribution): ~10.7 UA4s/board and ~55
+    /// total 2-digit UAs/board, well under the [`super::UA_CAP`] of 192 (no truncation).
+    #[test]
+    fn library_sizes_match_anchors() {
+        let mut rng = Rng::from_seed(1);
+        let (mut ua4, mut full, mut max_nua) = (0usize, 0usize, 0usize);
+        let n = 400;
+        for _ in 0..n {
+            let sol = random_solution(&mut rng).0;
+            ua4 += UaFilter::build(&sol, UaTier::Ua4).nua;
+            let f = UaFilter::build(&sol, UaTier::Full);
+            full += f.nua;
+            max_nua = max_nua.max(f.nua);
+        }
+        let (a4, af) = (ua4 as f64 / n as f64, full as f64 / n as f64);
+        assert!((9.0..12.5).contains(&a4), "UA4/board {a4} off the ~10.7 anchor");
+        assert!((50.0..60.0).contains(&af), "UA/board {af} off the ~55 anchor");
+        assert!(max_nua < super::UA_CAP, "max UAs/board {max_nua} >= UA_CAP (would truncate)");
+    }
 }
 
 #[cfg(all(test, feature = "count"))]

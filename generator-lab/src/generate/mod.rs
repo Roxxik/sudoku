@@ -20,8 +20,8 @@ mod random;
 pub mod warp_host;
 
 pub use random::{
-    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt, determinism_fp,
-    generate, reforce_stat, run_attempts, verify,
+    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, UaTier, attempt,
+    determinism_fp, generate, reforce_stat, run_attempts, run_attempts_ua, verify,
 };
 // Deferred-strip (M1) + common-snapshot (M3) instrumentation — counter-gated.
 #[cfg(feature = "count")]
@@ -32,6 +32,9 @@ pub use random::{UaCatchStat, ua_catch_stat};
 // Verify-share (M2) wall-time split — native, no counters.
 #[cfg(not(target_arch = "wasm32"))]
 pub use random::{VerifyShare, verify_share};
+// UA pre-filter per-board build cost (stage-2 decision gate) — native, no counters.
+#[cfg(not(target_arch = "wasm32"))]
+pub use random::ua_build_cost;
 
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, RowMajor};
