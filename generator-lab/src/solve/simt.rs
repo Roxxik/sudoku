@@ -617,7 +617,11 @@ impl Marks for CellMarks {
     }
     #[inline]
     fn get(&self, cell: CellIdx) -> Mark {
-        self.marks[cell]
+        // SAFETY: `cell` is a `CellIdx` (0..81 by construction — UNITS/peer geometry
+        // and the technique scans only ever index in range) and `marks` has 81 slots,
+        // so the access is always in bounds. Eliding the check the compiler can't prove
+        // (the index reaches `get` via const geometry tables it won't range-analyse).
+        unsafe { *self.marks.get_unchecked(cell) }
     }
 }
 
