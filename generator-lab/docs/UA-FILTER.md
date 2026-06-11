@@ -1,9 +1,15 @@
 # UA strip pre-filter — implementation plan
 
-Status: LANDED, tier-split. Stage 1 = UA4-only on both engines; stage 2 = the full
-2-digit library on the scalar/wasm path (it wins there) but NOT on SIMT (UA4-only
-stays). Production: `UaTier::SCALAR = Full`, `UaTier::SIMT = Ua4`. Section 7 has the
-measured outcome; the original plan is below.
+Status: LANDED; tier-split RESOLVED to Full on both engines (2026-06-12). Stage 1 =
+UA4-only on both engines; stage 2 = the full 2-digit library on the scalar/wasm path,
+with SIMT initially staying UA4-only because the then-scalar Full build (~3.7-4 us)
+outweighed the extra catch on a ~35 us warp attempt (section 7). The packed-build
+follow-ups (`docs/UA-PACKED-BUILD.md` sections 11-14) cut the Full build to ~1.4
+us/board, which crosses section 7's break-even: remeasured on the same combobench
+workload, Full beats UA4 on SIMT by ~0.9-1.0 us/att (train ~33.6 -> ~32.7, drill
+~31.0 -> ~30.0; UA-PACKED-BUILD section 15). Production is now `UaTier::SCALAR =
+Full` AND `UaTier::SIMT = Full`; UA4 stays as the cheap-build tier and test oracle.
+Section 7 below records the original (pre-packed-build) verdict.
 
 ## 1. Idea and why it pays
 

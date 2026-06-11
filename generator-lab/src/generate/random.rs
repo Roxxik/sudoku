@@ -173,18 +173,20 @@ pub enum UaTier {
 impl UaTier {
     /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]). The
     /// full 2-digit library wins here: its build (the packed `pshufb`
-    /// [`enumerate_2digit_packed`](UaFilter::enumerate_2digit_packed) on x86_64, ~2.4 us/board,
+    /// [`enumerate_2digit_packed`](UaFilter::enumerate_2digit_packed) on x86_64, ~1.4 us/board,
     /// or the scalar [`enumerate_2digit`](UaFilter::enumerate_2digit) elsewhere; size-18
     /// single-component pairs dropped) is small against the ~95 us scalar attempt, so the extra
     /// revert catch (full 36% vs UA4 24% of the revert pool by nodes) nets out ahead (~-15% vs
     /// off, vs UA4's ~-12%).
     pub const SCALAR: UaTier = UaTier::Full;
-    /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]). UA4-only: on
-    /// the ~35 us warp attempt the full library's ~3.2 us build still outweighs its ~1.5 us
-    /// extra catch (measured full 34.9 vs UA4 33.7 us/att), so the cheap UA4 rectangle scan
-    /// (~0.5 us) stays the win even after the cap-14 build shrink. Tiers may differ per engine
-    /// because the strip trajectory is identical regardless of tier.
-    pub const SIMT: UaTier = UaTier::Ua4;
+    /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]). Full, since the
+    /// packed-build follow-ups: the original UA4-only verdict was set against the ~3.7 us scalar
+    /// Full build, which outweighed the extra catch on a ~35 us warp attempt. At the packed
+    /// build's ~1.4 us/board the extra catch wins (combobench, 160k att, hidden-quad: train
+    /// ~33.6 -> ~32.7, drill ~31.0 -> ~30.0 us/att vs UA4 — `docs/UA-PACKED-BUILD.md`
+    /// section 15). Tiers may differ per engine because the strip trajectory is identical
+    /// regardless of tier; UA4 stays as the cheap-build tier and test oracle.
+    pub const SIMT: UaTier = UaTier::Full;
 }
 
 /// Max UAs carried per board. The true maximum is 144 (36 digit pairs x <=4 components

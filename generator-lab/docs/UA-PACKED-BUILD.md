@@ -362,4 +362,25 @@ the section-2 SIMT flip bar; the arithmetic says otherwise. With one-shot builds
 and UA4 ~0.58 us, the section-2 condition reads `(1.36 - 0.58) + ~0.4 = ~1.18 us < 1.73 us` —
 the bar is **crossed** (and was already at section 13's numbers). Whether capped-full actually
 displaces UA4 on SIMT needs the SIMT-side measurement (the bar is a cost model, not a result);
-that is its own experiment, not part of this change.
+that is its own experiment, not part of this change. (Measured the next day: it does — section
+15.)
+
+## 15. SIMT flip measured and landed (2026-06-12): `UaTier::SIMT = Full`
+
+The SIMT-side measurement section 14 called for, on the same workload that set the original
+tier split (`docs/UA-FILTER.md` section 7): `combobench --force hidden-quad`, 8 lanes x 20000 =
+160k attempts, seed 1, pinned core; interleaved ua4/full runs, 3 reps in each order (ua4-first
+and full-first) to cancel warm-up drift. The trajectory is tier-invariant (pinned by
+`tests/ua_filter`), so the A/B is pure cost:
+
+    train: ua4 33.58 -> full 32.72 us/att  (-0.86, -2.6%)
+    drill: ua4 31.03 -> full 30.04 us/att  (-0.99, -3.2%)
+
+Full now beats UA4 on SIMT by ~0.9-1.0 us/att — a clean reversal of the original verdict (full
+was +6.4% worse when its build cost ~3.7 us), and slightly better than the section-2 model's
+~0.55 us margin. `UaTier::SIMT` flipped `Ua4 -> Full`; full release suite green (the
+cross-engine equiv pins now exercise SIMT at Full), and the default-tier combobench path
+reproduces the full-tier numbers (32.7 / 30.1 us/att). UA4 stays as the cheap-build tier and
+the `ua4_equals_full_size4` oracle; the section-2 idea of *deleting* the tier split entirely
+(one production tier everywhere) is now plausible but is its own cleanup, not part of this
+change.
