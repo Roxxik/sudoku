@@ -172,14 +172,16 @@ pub enum UaTier {
 
 impl UaTier {
     /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]). The
-    /// full 2-digit library wins here: its ~4 us/board cycle-decomposition build is small
-    /// against the ~95 us scalar attempt, so the extra revert catch (full 36% vs UA4 24% of
-    /// the revert pool by nodes) nets out ahead (~-14% vs off, vs UA4's ~-12%).
+    /// full 2-digit library wins here: its ~3.2 us/board cycle-decomposition build (size-18
+    /// single-component pairs dropped — see [`enumerate_2digit`](UaFilter::enumerate_2digit))
+    /// is small against the ~95 us scalar attempt, so the extra revert catch (full 36% vs UA4
+    /// 24% of the revert pool by nodes) nets out ahead (~-15% vs off, vs UA4's ~-12%).
     pub const SCALAR: UaTier = UaTier::Full;
     /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]). UA4-only: on
-    /// the ~35 us warp attempt the full library's ~4 us build outweighs its ~1.8 us extra
-    /// catch, so the cheap UA4 rectangle scan (~0.5 us) is the win. Tiers may differ per
-    /// engine because the strip trajectory is identical regardless of tier.
+    /// the ~35 us warp attempt the full library's ~3.2 us build still outweighs its ~1.5 us
+    /// extra catch (measured full 34.9 vs UA4 33.7 us/att), so the cheap UA4 rectangle scan
+    /// (~0.5 us) stays the win even after the cap-14 build shrink. Tiers may differ per engine
+    /// because the strip trajectory is identical regardless of tier.
     pub const SIMT: UaTier = UaTier::Ua4;
 }
 
@@ -416,39 +418,51 @@ impl UaFilter {
                     }
                     ncyc += 1;
                 }
-                // Resolve each cycle to its UA id, then emit each row's two cells. `pi` is
-                // fixed-point-free, so a single 9-cycle (the whole pair = one 18-cell UA, no
-                // box join can split it) is the common case (~1/3 of pairs) — handle it
-                // directly to skip the box-merge union-find and the per-row resolution.
-                let mut cid_to_ua = [0u8; 9];
+                // Resolve each cycle to its UA id, then emit each row's two cells — UNLESS the
+                // pair resolves to a single component, which is then the whole 18-cell UA
+                // (every component spans >=2 rows, so 18 is the only size above 14). That
+                // single-component case costs 58% of all library memberships (avg `lens` drops
+                // 8.00 -> 3.36) yet adds only 0.06pp of revert-node catch (M-UA-LIB finding 5,
+                // a cap-14 emission filter), so it is dropped here. Sound: a missed catch only
+                // poses a probe the prober reverts anyway — trajectory unchanged (still pinned
+                // by the `tests/ua_filter` tier-invariants). `pi` is fixed-point-free, so a
+                // single 9-cycle (~1/3 of pairs) is already the whole pair (no box join can
+                // split it) and is dropped directly, without the box-merge union-find.
                 if ncyc == 1 {
-                    cid_to_ua[0] = self.alloc_ua();
-                } else {
-                    // Box joins merge cycle ids: one edge per box, between the rows of its a/b
-                    // cells (each box's a-cell IS its row's a-cell, so in that row's cycle).
-                    for (i, c) in comp[..ncyc as usize].iter_mut().enumerate() {
-                        *c = i as u8;
+                    continue;
+                }
+                // Box joins merge cycle ids: one edge per box, between the rows of its a/b
+                // cells (each box's a-cell IS its row's a-cell, so in that row's cycle).
+                for (i, c) in comp[..ncyc as usize].iter_mut().enumerate() {
+                    *c = i as u8;
+                }
+                let mut merges = 0u8;
+                for bx in 0..9 {
+                    let ra = row_in_box[bx][a] as usize;
+                    let rb = row_in_box[bx][b] as usize;
+                    let (x, y) =
+                        (root(&mut comp, cid[ra] as usize), root(&mut comp, cid[rb] as usize));
+                    if x != y {
+                        comp[x] = y as u8;
+                        merges += 1;
                     }
-                    for bx in 0..9 {
-                        let ra = row_in_box[bx][a] as usize;
-                        let rb = row_in_box[bx][b] as usize;
-                        let (x, y) =
-                            (root(&mut comp, cid[ra] as usize), root(&mut comp, cid[rb] as usize));
-                        if x != y {
-                            comp[x] = y as u8;
-                        }
+                }
+                // `ncyc` cycles less the successful unions = the final component count; one
+                // lone component is again the whole 18-cell pair (cap 14), so drop it as above.
+                if ncyc - merges == 1 {
+                    continue;
+                }
+                // One UA per merged component, resolved once per cycle (not per row).
+                let mut cid_to_ua = [0u8; 9];
+                for u in comp_ua[..ncyc as usize].iter_mut() {
+                    *u = u8::MAX;
+                }
+                for c in 0..ncyc as usize {
+                    let fin = root(&mut comp, c);
+                    if comp_ua[fin] == u8::MAX {
+                        comp_ua[fin] = self.alloc_ua();
                     }
-                    // One UA per merged component, resolved once per cycle (not per row).
-                    for u in comp_ua[..ncyc as usize].iter_mut() {
-                        *u = u8::MAX;
-                    }
-                    for c in 0..ncyc as usize {
-                        let fin = root(&mut comp, c);
-                        if comp_ua[fin] == u8::MAX {
-                            comp_ua[fin] = self.alloc_ua();
-                        }
-                        cid_to_ua[c] = comp_ua[fin];
-                    }
+                    cid_to_ua[c] = comp_ua[fin];
                 }
                 for r in 0..9 {
                     let id = cid_to_ua[cid[r] as usize];
@@ -604,22 +618,30 @@ impl<S: StripView> StripState<S> {
         }
     }
 
-    /// The UA pre-filter verdict for stripping `cell` (held `orig`): if some library UA
-    /// would be emptied, the gate is a provable non-unique — revert it and return `true`,
-    /// so the caller skips the (now-redundant) uniqueness probe. Returns `false` when no UA
-    /// is emptied (pose the probe as usual). The cross-check (debug builds only) confirms
-    /// the prober agrees with every catch; production builds skip the probe entirely.
-    pub(in crate::generate) fn ua_revert_if_caught(&mut self, cell: usize, orig: Digit) -> bool {
-        if self.ua.caught(cell) {
+    /// The UA pre-filter verdict for `cell` (held `orig`), posed *before* the strip: if some
+    /// library UA would be emptied by stripping `cell`, the gate is a provable non-unique, so
+    /// return `true` and let the caller skip both the strip and the (now-redundant) uniqueness
+    /// probe. [`UaFilter::caught`] reads only the library counts (none of the state
+    /// [`strip`](Self::strip) mutates), so the check can gate the loop ahead of the strip — and
+    /// a caught cell then pays neither the strip nor a revert, because it was never cleared (it
+    /// stays a given, exactly as a revert would leave it). Sound and trajectory-identical: a
+    /// caught gate is provably non-unique, so it is never an `alts == 0` or re-force keep, and
+    /// posing the check first cannot change a verdict. The debug cross-check has to strip to
+    /// pose the probe (the prober reads the cleared state), assert the revert, then undo —
+    /// debug-only cost; production returns on the count check alone.
+    pub(in crate::generate) fn ua_caught_before_strip(&mut self, cell: usize, orig: Digit) -> bool {
+        let caught = self.ua.caught(cell);
+        #[cfg(debug_assertions)]
+        if caught {
+            self.strip(cell, orig);
             debug_assert!(
                 self.scalar_nonunique(cell, orig),
                 "UA pre-filter false positive: prober finds cell {cell} unique"
             );
             self.revert(cell, orig);
-            true
-        } else {
-            false
         }
+        let _ = orig; // release builds run no cross-check, so `orig` is otherwise unused
+        caught
     }
 
     /// The row-view candidate bands + empty mask as the packed prober's SoA input
@@ -785,22 +807,24 @@ pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
         let Some(orig) = st.digit_at(cell) else {
             continue;
         };
+        // UA pre-filter (docs/UA-FILTER.md): if stripping `cell` would empty a library
+        // unavoidable set, the gate is a provable non-unique — revert it without posing the
+        // probe (a probe deleted, not made cheaper). Posed BEFORE the strip because `caught`
+        // reads only the library counts (nothing the strip mutates), so a caught cell skips
+        // the strip and the revert entirely — it was never cleared, so it stays a given
+        // exactly as a revert would leave it. A caught gate is provably non-unique, so it is
+        // never an `alts == 0` or re-force keep (caught => non-unique, those => unique;
+        // mutually exclusive, as the debug cross-check pins) — checking it first is
+        // trajectory-identical. No-op for `UaTier::Off`.
+        if st.ua_caught_before_strip(cell, orig) {
+            continue;
+        }
         let alts = st.strip(cell, orig);
         // `alts == 0` fast path: the cleared cell is still a naked single, so its peers
         // already force `orig` — the strip stays unique AND baseline-solvable and the
         // requirement verdict is unchanged. Skip both gates; just carry `req_met`.
         if alts == 0 {
             st.keep_trivial(cell);
-            continue;
-        }
-        // UA pre-filter (docs/UA-FILTER.md): if stripping `cell` would empty a library
-        // unavoidable set, the gate is a provable non-unique — revert without posing the
-        // probe (a probe deleted, not made cheaper). Checked before the re-force scan
-        // because a caught gate can never be a re-force keep (caught => non-unique,
-        // re-force => unique; mutually exclusive, as the debug cross-check pins), so this
-        // ordering lets every catch skip the hidden-single derivation below — trajectory
-        // unchanged. No-op for `UaTier::Off`.
-        if st.ua_revert_if_caught(cell, orig) {
             continue;
         }
         // Hidden-single re-force fast path (see [`StripState::reforced`]): `orig` has no
@@ -1356,6 +1380,20 @@ pub struct UaCatchStat {
     pub caught_ua4_nd: [u64; 2],
     pub caught_all_ct: [u64; 2],
     pub caught_all_nd: [u64; 2],
+    /// Finding 5 (size-capped emission): reverts caught, bucketed by the MINIMUM size among
+    /// the catching library UAs (index = size, even `4..=18`). A cap `C` (emit only UAs of
+    /// size `<= C`) catches a revert iff its min-catching size is `<= C`, so the cumulative
+    /// sum over size IS the catch(cap) curve — by count, and weighted by the revert's prober
+    /// nodes (`_nd`) by cost (the revert pool is node-proportional, so `_nd` is the decision
+    /// metric). `caught_minsize_*[4]` is exactly the UA4-only catch; the full sum is
+    /// `caught_all_*`. Aggregated over both clue groups (a cap is clue-independent).
+    pub caught_minsize_ct: [u64; 19],
+    pub caught_minsize_nd: [u64; 19],
+    /// Per-board component-size histogram (index = size), summed over boards: `size_hist[s]`
+    /// is the total count of library UAs of size `s`. Converts a cap into dropped-UA and
+    /// dropped-membership counts — the build/walk savings side of finding 5 (total
+    /// memberships = `sum s*size_hist[s]` = 648/board exactly, so avg `lens` = 8).
+    pub size_hist: [u64; 19],
     /// Locked-cell census by clue count: sum and sample-count of the locked-cell tally
     /// (sole givens of some library UA) observed at each clue level.
     pub locked_sum: [u64; 82],
@@ -1383,6 +1421,9 @@ pub fn ua_catch_stat(base_seed: u64, spec: &Spec, attempts: usize) -> UaCatchSta
         caught_ua4_nd: [0; 2],
         caught_all_ct: [0; 2],
         caught_all_nd: [0; 2],
+        caught_minsize_ct: [0; 19],
+        caught_minsize_nd: [0; 19],
+        size_hist: [0; 19],
         locked_sum: [0; 82],
         locked_n: [0; 82],
         false_positive: 0,
@@ -1395,6 +1436,9 @@ pub fn ua_catch_stat(base_seed: u64, spec: &Spec, attempts: usize) -> UaCatchSta
         s.boards += 1;
         s.lib_uas += lib.uas.len() as u64;
         s.lib_ua4 += lib.uas.iter().filter(|u| u.1 == 4).count() as u64;
+        for u in &lib.uas {
+            s.size_hist[u.1.min(18)] += 1; // component-size histogram (finding 5 cost side)
+        }
 
         // Per-UA given count (full board: every cell a given), and the locked census.
         let mut gc: Vec<u32> = lib.uas.iter().map(|u| u.1 as u32).collect();
@@ -1418,10 +1462,12 @@ pub fn ua_catch_stat(base_seed: u64, spec: &Spec, attempts: usize) -> UaCatchSta
             // a committed given here, so a count of 1 means it is that UA's sole given.)
             let mut caught_ua4 = false;
             let mut caught_all = false;
+            let mut min_catch = usize::MAX; // smallest catching UA (finding 5 cap curve)
             for &u in &lib.cell_uas[cell] {
                 if gc[u] == 1 {
                     caught_all = true;
                     caught_ua4 |= lib.uas[u].1 == 4;
+                    min_catch = min_catch.min(lib.uas[u].1);
                 }
             }
 
@@ -1449,6 +1495,8 @@ pub fn ua_catch_stat(base_seed: u64, spec: &Spec, attempts: usize) -> UaCatchSta
                     if caught_all {
                         s.caught_all_ct[group] += 1;
                         s.caught_all_nd[group] += nodes;
+                        s.caught_minsize_ct[min_catch.min(18)] += 1;
+                        s.caught_minsize_nd[min_catch.min(18)] += nodes;
                     }
                     st.revert_gate(cell, orig);
                     givens += 1;
@@ -1723,8 +1771,10 @@ mod ua_filter_tests {
         }
     }
 
-    /// Sanity anchors from M-UA-LIB (seed-1 fill distribution): ~10.7 UA4s/board and ~55
-    /// total 2-digit UAs/board, well under the [`super::UA_CAP`] of 192 (no truncation).
+    /// Sanity anchors from M-UA-LIB (seed-1 fill distribution): ~10.7 UA4s/board and ~34.7
+    /// emitted 2-digit UAs/board, well under the [`super::UA_CAP`] of 192 (no truncation). The
+    /// emitted count is the ~55 full 2-digit components less the ~20.9 single-component (size-18)
+    /// pairs that [`UaFilter::enumerate_2digit`] drops (cap-14 filter, M-UA-LIB finding 5).
     #[test]
     fn library_sizes_match_anchors() {
         let mut rng = Rng::from_seed(1);
@@ -1738,10 +1788,11 @@ mod ua_filter_tests {
             max_nua = max_nua.max(f.nua);
         }
         let (a4, af) = (ua4 as f64 / n as f64, full as f64 / n as f64);
-        // Loose sanity around the ~10.7 / ~55 seed-1 anchors — wide enough to survive a fill
-        // distribution change, tight enough to catch gross breakage (empty / doubled).
+        // Loose sanity around the ~10.7 / ~34.7 seed-1 anchors — wide enough to survive a fill
+        // distribution change, tight enough to catch gross breakage (empty / doubled / the cap
+        // silently reverting to the full ~55 library).
         assert!((5.0..20.0).contains(&a4), "UA4/board {a4} far off the ~10.7 anchor");
-        assert!((35.0..75.0).contains(&af), "UA/board {af} far off the ~55 anchor");
+        assert!((25.0..45.0).contains(&af), "UA/board {af} far off the ~34.7 anchor");
         // Hard structural bound: <=4 even components per digit pair => <=144 UAs/board, which
         // must stay under UA_CAP so the fixed-capacity library never truncates.
         assert!(max_nua <= 144, "max UAs/board {max_nua} exceeds the <=144 structural bound");

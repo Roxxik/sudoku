@@ -333,17 +333,20 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                     let Some(orig) = strip.digit_at(cell) else {
                         continue; // already stripped
                     };
+                    // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
+                    // unavoidable set is a provable non-unique — revert without yielding a
+                    // probe to the warp (one fewer probe lane-pass). Posed BEFORE the strip:
+                    // `caught` reads only the library counts (nothing the strip mutates), so a
+                    // caught cell skips both the strip and the revert (it stays a given). A
+                    // caught gate is never an `alts == 0` or re-force keep (caught =>
+                    // non-unique, those => unique; mutually exclusive), so checking it first
+                    // is trajectory-identical. No-op for `Off`.
+                    if strip.ua_caught_before_strip(cell, orig) {
+                        continue;
+                    }
                     let alts = strip.strip(cell, orig);
                     if alts == 0 {
                         strip.keep_trivial(cell);
-                        continue;
-                    }
-                    // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
-                    // unavoidable set is a provable non-unique — revert without yielding a
-                    // probe to the warp (one fewer probe lane-pass). Before the re-force scan:
-                    // a caught gate is never a re-force keep (caught => non-unique, re-force
-                    // => unique; mutually exclusive), so a catch skips it. No-op for `Off`.
-                    if strip.ua_revert_if_caught(cell, orig) {
                         continue;
                     }
                     // Hidden-single re-force fast path: both gates skippable,

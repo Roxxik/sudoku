@@ -122,6 +122,47 @@ fn report_ua(label: &str, u: &generator_lab::generate::UaCatchStat) {
     };
     row("UA4-only", &u.caught_ua4_ct, &u.caught_ua4_nd);
     row("UA4+2digit", &u.caught_all_ct, &u.caught_all_nd);
+
+    // Finding 5: catch(cap) curve — emit only UAs of size <= cap. catch(cap) is the
+    // cumulative sum over min-catching size; by-nodes is the decision metric (revert pool
+    // is node-proportional). marg = the pp this size adds; loss = full(by-nodes) - cap.
+    let full_nd = pc(u.caught_all_nd[0] + u.caught_all_nd[1], rnd_all);
+    println!("  CATCH-BY-CAP (emit UAs of size <= cap; cumulative):");
+    println!("    {:>4} {:>10} {:>10} {:>11} {:>11}", "cap", "by-count", "by-nodes", "marg-nodes", "loss-nodes");
+    let (mut cum_ct, mut cum_nd) = (0u64, 0u64);
+    for cap in (4..=18).step_by(2) {
+        cum_ct += u.caught_minsize_ct[cap];
+        cum_nd += u.caught_minsize_nd[cap];
+        let by_nd = pc(cum_nd, rnd_all);
+        println!(
+            "    {:>4} {:>9.1}% {:>9.1}% {:>10.2}% {:>10.2}%",
+            cap,
+            pc(cum_ct, rev_all),
+            by_nd,
+            pc(u.caught_minsize_nd[cap], rnd_all),
+            full_nd - by_nd,
+        );
+    }
+
+    // Component-size histogram + memberships (the build/walk savings side). Dropped
+    // memberships at cap C = sum_{s>C} s * count(s); avg lens drops with kept memberships.
+    let bd = u.boards.max(1) as f64;
+    let total_mem: u64 = (4..=18).step_by(2).map(|s| s as u64 * u.size_hist[s]).sum();
+    print!("  size histogram (UAs/board):");
+    for s in (4..=18).step_by(2) {
+        if u.size_hist[s] > 0 {
+            print!(" {s}:{:.2}", u.size_hist[s] as f64 / bd);
+        }
+    }
+    println!("   memberships/board {:.1} (avg lens {:.2})", total_mem as f64 / bd, total_mem as f64 / bd / 81.0);
+    print!("    kept memberships / avg-lens by cap:");
+    let mut kept_mem = 0u64;
+    for cap in (4..=18).step_by(2) {
+        kept_mem += cap as u64 * u.size_hist[cap];
+        print!(" {cap}:{:.0}/{:.2}", kept_mem as f64 / bd, kept_mem as f64 / bd / 81.0);
+    }
+    println!();
+
     print!("  locked-cell census (avg sole-given cells at clue=K):");
     for k in [70usize, 60, 50, 40, 33, 32, 28, 26, 24, 22] {
         if u.locked_n[k] > 0 {
