@@ -266,3 +266,52 @@ packed Full **~2270 -> ~2110 ns/board, ~6-7% off** at the same 34.3 UAs/board (s
 2275->2149, 2264->2097, 2275->2114). e2e shifts are within noise (the build is a small slice of
 the strip). Remaining section-6 follow-ups (box-merge vectorization, emission buffer-and-flush)
 are still open and stay separate, one-change-at-a-time measurements.
+
+## 13. Follow-up landed (2026-06-11): vectorized box-merge (min-relaxation, no `root()`)
+
+Second of the section-11 follow-ups, and the big one: the box join no longer runs the scalar
+union-find. With the cycle walk and emission cap checks already gone, an isolated **pooled**
+profile (fill amortized out via `ua_build_cost_pooled` / `examples/uabuildprof`, so the build is
+~99% of the process) put the box-merge `root()` at **~41% of the build** — the single dominant
+hot region, all of it serial dependent-load pointer-chasing (the 18 union `root()` calls + the
+9 per-row resolution `root()` calls per emitting pair). Everything vectorized before it (the
+min-doubling) was ~3%.
+
+It is replaced by branchless `pshufb` **min-relaxation**. The merged components are the
+connected components of the cycle edges (`pi` and its inverse `pii`) plus one box edge per box;
+expressed as two row-space neighbor maps `na[r]` / `nb[r]` (both directions of every box edge),
+seeding `cur = lab` (cycles already collapsed to their min row) and relaxing
+`cur = min(cur, cur[pi], cur[pii], cur[na], cur[nb])` drives each lane to its component's
+minimum row — the same canonical, union-order-free label `root()` produced, so emission stays
+bit-identical. The `na`/`nb` maps are built scalar (a flat 9-iteration loop, no dependent
+chain); `pii` is one extra `pshufb`.
+
+`ROUNDS` (the fixed relaxation count) must reach the eccentricity of every component's min row,
+and reach it *fully*: an under-converged 9-row component would fail its all-zero cap-14 drop
+test and emit non-genuine UA fragments (a real correctness bug, not a verdict-safe drop). The
+exact tight bound is **4**, proven by exhaustion rather than sampled. The four maps
+(`pi`/`pii`/`na`/`nb`) depend only on where `a` and `b` sit, and in any completed grid that is a
+pair of *disjoint single-digit placements* (one cell per row/column/box — 46656 of them). So the
+**419,250,816 unordered disjoint placement pairs** are a sampling-free superset of every 2-digit
+configuration any board can contain. `examples/uaroundsall` enumerates them all: max
+rounds-to-fixpoint = **4** (round-4 = 746,496 pairs = 0.178%, 5+ never occurs), and round-4 is
+realized in real boards (the 36M-board `examples/uarounds` sample hits it ~0.2%). Hence `ROUNDS =
+4` always converges and `3` does not — exactly tight. (The generic graph bound is looser: a
+9-node min-degree-2 component graph — every row sits on a `>= 2`-cycle — has eccentricity `<= 7`,
+attained by a 2-2-2-3 cactus chain, but the Sudoku box structure never realizes that chain.)
+Output unchanged — bit-identical to scalar (`packed_equals_scalar`, 200 seeds), fingerprint still
+`0x4621f425`, `tests/ua_filter` per-engine/tier identity green.
+
+Build cost: isolated **pooled** loop (`uabuildprof`, 256 boards x 4000 rebuilds, core-pinned,
+best-of-5) **~1770 -> ~800 ns/board, ~55% off**; `examples/bench` `ua_build_cost` Full (with
+fill) **~2110 -> ~1355 ns/board, ~36% off**, same 34.3 UAs/board. e2e shifts stay within noise
+(the build is a small slice of the strip). Re-profiling the pooled build confirms `root()` is
+gone; the new tail is the relaxation shuffles/mins (where 41% of dependent-load chasing used to
+be) and the emission byte stores. This lands the build at ~800 ns/board pooled — still **above**
+the section-2 SIMT flip bar, so SIMT stays `UaTier::Ua4`. The last section-6 follow-up, emission
+buffer-and-flush, is still open and stays separate.
+
+Methodology note for the next fixed-iteration-bound decision: when a loop count gates correctness
+AND the relevant structure factors through a small enumerable configuration space, *exhaust the
+space* (here: all disjoint placement pairs) instead of sampling boards. It turns "proven 7,
+observed 4 over 36M boards" into "exactly 4" — no headroom guesswork, no rare-grid risk.

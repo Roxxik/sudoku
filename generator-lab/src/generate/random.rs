@@ -501,7 +501,7 @@ impl UaFilter {
     /// 2-digit library and the same cap-14 single-component drop, producing a **bit-identical**
     /// [`UaFilter`] — but the per-pair row+column cycle decomposition runs as `pshufb`
     /// (`_mm_shuffle_epi8`) shuffles over 9-element byte maps instead of the serial,
-    /// dependent-load 9-step walk and a per-cell union-find. The whole rewrite is a build-cost
+    /// dependent-load 9-step walk and the scalar union-find. The whole rewrite is a build-cost
     /// win on the same fixed output (see `docs/UA-PACKED-BUILD.md`); it carries no trajectory
     /// change, so the production fingerprint is unchanged.
     ///
@@ -509,9 +509,11 @@ impl UaFilter {
     /// `pi(r) = C_b[R_a[r]]` (one swizzle: the row of `b` in the column where `a` sits in row
     /// `r`). Four rounds of min-label doubling — `L = min(L, L[P]); P = P[P]`, `2^4 = 16 >= 9` —
     /// collapse each cycle to its minimum row index: a canonical, union-direction-free label.
-    /// Box joins then merge those labels (a tiny `<= 9`-element min-keeping union-find over the
-    /// nine box edges), and a merged label is again the component's minimum row. Emission
-    /// allocates one UA id per distinct final label in ascending order; because a component is
+    /// Box joins then merge those labels by **vectorized min-relaxation** rather than a scalar
+    /// union-find: relaxing `cur = min(cur, cur[pi], cur[pii], cur[na], cur[nb])` over the cycle
+    /// edges (`pi`/its inverse `pii`) and the two box-edge neighbor maps drives each lane to its
+    /// component's minimum row — the same canonical label, with no `root()` pointer-chasing.
+    /// Emission allocates one UA id per distinct final label in ascending order; because a component is
     /// first reached, scanning rows `0..9`, at the row equal to its minimum (its label), this is
     /// exactly the scalar build's first-row cycle-id allocation order — so `counts`, `cell_uas`,
     /// and `lens` come out byte-for-byte identical (pinned by `packed_equals_scalar`).
@@ -526,18 +528,6 @@ impl UaFilter {
         use core::arch::x86_64::*;
 
         const HI: u8 = 0x80; // don't-care fill for lanes 9..15
-
-        // Root of a `<= 9`-element min-keeping union-find (over cycle min-row labels). Keeping
-        // the smaller label as the root makes the resolved label each component's minimum row,
-        // matching the scalar build's canonical first-row ordering.
-        fn root(p: &mut [u8; 9], mut x: usize) -> usize {
-            while p[x] as usize != x {
-                let gp = p[p[x] as usize];
-                p[x] = gp;
-                x = gp as usize;
-            }
-            x
-        }
 
         // Precompute, once per board, each digit's coordinate within each line — the only
         // divisions in the enumeration, hoisted out of the per-pair loops (as in the scalar
@@ -598,32 +588,66 @@ impl UaFilter {
                     if (_mm_movemask_epi8(_mm_cmpeq_epi8(lab, zero)) & 0x1FF) == 0x1FF {
                         continue;
                     }
-                    let mut l = [0u8; 16];
-                    _mm_storeu_si128(l.as_mut_ptr() as *mut __m128i, lab);
-                    // Box joins: one edge per box, between the labels of its a-cell and b-cell
-                    // rows (each box's a-cell is its row's a-cell, hence in that row's cycle).
-                    // Self-loops (a and b in one row) union a label with itself — a no-op.
-                    let mut parent: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
-                    for bx in 0..9 {
-                        let la = l[row_in_box[bx][a] as usize] as usize;
-                        let lb = l[row_in_box[bx][b] as usize] as usize;
-                        let (x, y) = (root(&mut parent, la), root(&mut parent, lb));
-                        if x != y {
-                            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
-                            parent[hi] = lo as u8;
-                        }
-                    }
-                    // Final label per row = its merged component's minimum row. One lone label is
-                    // again the whole 18-cell pair (cap-14), so drop it as above.
-                    let mut fin = [0u8; 9];
-                    let mut single = true;
+                    // Box joins, vectorized as min-relaxation (replaces the scalar union-find
+                    // `root()` walk, which perf put at ~41% of this build). The merged
+                    // components are the connected components of the cycle edges (the
+                    // permutation `pi` and its inverse `pii`) plus one edge per box between the
+                    // box's a-cell row and b-cell row. As two row-space neighbor maps:
+                    //   na[r] = row of b in the box holding r's a-cell  (a-side box edge)
+                    //   nb[r] = row of a in the box holding r's b-cell  (b-side box edge)
+                    // Together na/nb are both directions of every box edge (self-loops where a
+                    // and b share a row are harmless under min). Seeding `cur = lab` (cycles
+                    // already collapsed to their min row) and relaxing
+                    //   cur = min(cur, cur[pi], cur[pii], cur[na], cur[nb])
+                    // drives each lane to the minimum row index over its whole component — the
+                    // same canonical, union-order-free label the scalar `root()` produced, so
+                    // emission stays bit-identical. Each round spreads the min one graph hop, so
+                    // `ROUNDS` must reach the eccentricity of every component's min row — and
+                    // fully, since an under-converged 9-row component would fail its all-zero
+                    // cap-14 drop test below and emit non-genuine fragments (a real correctness
+                    // bug, not a verdict-safe drop). ROUNDS = 4 is the EXACT tight bound, proven by
+                    // exhaustion: the four maps depend only on where a and b sit, and in any grid
+                    // that is a pair of disjoint single-digit placements (46656 of them), so the
+                    // 419,250,816 unordered disjoint pairs are a sampling-free superset of every
+                    // 2-digit configuration any board can hold. `examples/uaroundsall` enumerates
+                    // them all: max rounds-to-fixpoint = 4 (round-4 = 746,496 pairs, 5+ never), and
+                    // round-4 is realized in real boards (`examples/uarounds`). So 4 always
+                    // converges and 3 does not. (The generic graph bound is looser — a 9-node
+                    // min-degree-2 component has eccentricity <= 7 — but the Sudoku box structure
+                    // never realizes the 2-2-2-3 cactus chain that would need it.)
+                    // `packed_equals_scalar` pins the bit-identical output.
+                    const ROUNDS: usize = 4;
+                    let mut na = [HI; 16];
+                    let mut nb = [HI; 16];
                     for r in 0..9 {
-                        fin[r] = root(&mut parent, l[r] as usize) as u8;
-                        single &= fin[r] == 0;
+                        let band = (r / 3) * 3;
+                        na[r] = row_in_box[band + col_of[r][a] as usize / 3][b];
+                        nb[r] = row_in_box[band + col_of[r][b] as usize / 3][a];
                     }
-                    if single {
+                    let na_v = _mm_loadu_si128(na.as_ptr() as *const __m128i);
+                    let nb_v = _mm_loadu_si128(nb.as_ptr() as *const __m128i);
+                    // pii(r) = C_a[R_b[r]] — the inverse of `pi`, i.e. the other cycle direction,
+                    // so the min spreads both ways around each cycle.
+                    let pii = _mm_shuffle_epi8(c_vec[a], r_vec[b]);
+                    let mut cur = lab;
+                    for _ in 0..ROUNDS {
+                        let box_n = _mm_min_epu8(
+                            _mm_shuffle_epi8(cur, na_v),
+                            _mm_shuffle_epi8(cur, nb_v),
+                        );
+                        let cyc_n = _mm_min_epu8(
+                            _mm_shuffle_epi8(cur, pi),
+                            _mm_shuffle_epi8(cur, pii),
+                        );
+                        cur = _mm_min_epu8(_mm_min_epu8(cur, box_n), cyc_n);
+                    }
+                    // A lone final component (all rows merged to min row 0) is again the whole
+                    // 18-cell pair, which the cap-14 policy drops.
+                    if (_mm_movemask_epi8(_mm_cmpeq_epi8(cur, zero)) & 0x1FF) == 0x1FF {
                         continue;
                     }
+                    let mut fin = [0u8; 16];
+                    _mm_storeu_si128(fin.as_mut_ptr() as *mut __m128i, cur);
                     // One UA id per distinct final label, allocated in ascending-label order. The
                     // first row carrying label `m`, scanning `0..9`, is row `m` itself (a
                     // component's minimum row), so ids land in the scalar build's first-row order
@@ -1833,6 +1857,28 @@ pub fn ua_build_cost(base_seed: u64, attempts: usize, tier: UaTier) -> (u64, u64
     for s in &sols {
         // `uas` accumulates the library size so the build cannot be optimized away.
         uas += UaFilter::build(s, tier).nua as u64;
+    }
+    (t.elapsed().as_nanos() as u64, uas)
+}
+
+/// Like [`ua_build_cost`] but pre-fills `boards` solutions ONCE and rebuilds the whole pool
+/// `repeats` times, so [`random_solution`]'s fill cost amortizes to near-zero and the timed
+/// (and `perf`-sampled) region is ~entirely [`UaFilter::build`]. Returns `(total_nanos,
+/// total_uas)` over `boards * repeats` builds; divide nanos by that product for ns/board.
+/// This is the "isolated pooled loop" the `docs/UA-PACKED-BUILD.md` measurements use to make
+/// the build the dominant process symbol for `perf annotate`. Diagnostic only.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ua_build_cost_pooled(base_seed: u64, boards: usize, repeats: usize, tier: UaTier) -> (u64, u64) {
+    use std::time::Instant;
+    let mut rng = Rng::from_seed(base_seed);
+    let sols: Vec<DigitGrid> = (0..boards).map(|_| random_solution(&mut rng).0).collect();
+    let mut uas = 0u64;
+    let t = Instant::now();
+    for _ in 0..repeats {
+        for s in &sols {
+            // `uas` accumulates the library size so the build cannot be optimized away.
+            uas += UaFilter::build(s, tier).nua as u64;
+        }
     }
     (t.elapsed().as_nanos() as u64, uas)
 }
