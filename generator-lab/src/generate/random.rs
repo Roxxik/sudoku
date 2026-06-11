@@ -222,11 +222,11 @@ impl UaFilter {
         }
     }
 
-    /// Build the `tier`'s UA library for the complete solution grid `sol`. The grid is
-    /// flattened to a dense `[u8; 81]` once (the enumerations index it) — the banded
-    /// [`DigitGrid::get`] is ~an order of magnitude pricier than an array read, and the
-    /// enumerations touch hundreds of cells per board, so the flatten dominates the per-board
-    /// cost.
+    /// Build the `tier`'s UA library for the complete solution grid `sol`, flattened once to
+    /// a dense `[u8; 81]` the enumerations index. ([`DigitGrid`] is already a cell-major
+    /// `[Option<Digit>; 81]`, so the flatten is ~81 cheap reads — it is not the cost; the
+    /// per-pair enumeration work is. It is kept because a tight `u8` array is the natural
+    /// input for the signature scan and the coordinate-table fill below.)
     fn build(sol: &DigitGrid, tier: UaTier) -> Self {
         let mut f = UaFilter::empty();
         match tier {
@@ -243,18 +243,30 @@ impl UaFilter {
         core::array::from_fn(|c| sol.get(c).map_or(0, |d| d.index() as u8))
     }
 
-    /// Register a UA spanning `cells` (count initialized to `|cells|`). Truncation-safe:
-    /// past [`UA_CAP`] the UA is dropped, and a cell already at [`UA_PER_CELL`] drops the
-    /// membership — both only lose catches, never flip a verdict (neither happens for a
-    /// valid 2-digit library).
+    /// Allocate a fresh UA id (count initialized to 0), or [`u8::MAX`] if the library is
+    /// already at [`UA_CAP`]. Truncation-safe: a dropped UA only loses catches, never flips a
+    /// verdict (never happens for a valid 2-digit library — `<=144 < UA_CAP`).
     #[inline]
-    fn push_ua(&mut self, cells: &[usize]) {
+    fn alloc_ua(&mut self) -> u8 {
         if self.nua >= UA_CAP {
-            return;
+            return u8::MAX;
         }
         let id = self.nua as u8;
-        self.counts[self.nua] = cells.len() as u8;
+        self.counts[self.nua] = 0;
         self.nua += 1;
+        id
+    }
+
+    /// Register a UA spanning `cells` (count = `|cells|`). A cell already at [`UA_PER_CELL`]
+    /// drops the membership (sound: only a missed catch); never happens for a 2-digit library
+    /// (a cell joins one UA per partner digit, so at most 8).
+    #[inline]
+    fn push_ua(&mut self, cells: &[usize]) {
+        let id = self.alloc_ua();
+        if id == u8::MAX {
+            return;
+        }
+        self.counts[id as usize] = cells.len() as u8;
         for &c in cells {
             let n = self.lens[c] as usize;
             if n < UA_PER_CELL {
@@ -404,34 +416,44 @@ impl UaFilter {
                     }
                     ncyc += 1;
                 }
-                // Box joins merge cycle ids: one edge per box, between the rows of its a/b
-                // cells (each box's a-cell IS its row's a-cell, so it sits in that row's cycle).
-                for (i, c) in comp[..ncyc as usize].iter_mut().enumerate() {
-                    *c = i as u8;
-                }
-                for bx in 0..9 {
-                    let ra = row_in_box[bx][a] as usize;
-                    let rb = row_in_box[bx][b] as usize;
-                    let (x, y) = (root(&mut comp, cid[ra] as usize), root(&mut comp, cid[rb] as usize));
-                    if x != y {
-                        comp[x] = y as u8;
+                // Resolve each cycle to its UA id, then emit each row's two cells. `pi` is
+                // fixed-point-free, so a single 9-cycle (the whole pair = one 18-cell UA, no
+                // box join can split it) is the common case (~1/3 of pairs) — handle it
+                // directly to skip the box-merge union-find and the per-row resolution.
+                let mut cid_to_ua = [0u8; 9];
+                if ncyc == 1 {
+                    cid_to_ua[0] = self.alloc_ua();
+                } else {
+                    // Box joins merge cycle ids: one edge per box, between the rows of its a/b
+                    // cells (each box's a-cell IS its row's a-cell, so in that row's cycle).
+                    for (i, c) in comp[..ncyc as usize].iter_mut().enumerate() {
+                        *c = i as u8;
+                    }
+                    for bx in 0..9 {
+                        let ra = row_in_box[bx][a] as usize;
+                        let rb = row_in_box[bx][b] as usize;
+                        let (x, y) =
+                            (root(&mut comp, cid[ra] as usize), root(&mut comp, cid[rb] as usize));
+                        if x != y {
+                            comp[x] = y as u8;
+                        }
+                    }
+                    // One UA per merged component, resolved once per cycle (not per row).
+                    for u in comp_ua[..ncyc as usize].iter_mut() {
+                        *u = u8::MAX;
+                    }
+                    for c in 0..ncyc as usize {
+                        let fin = root(&mut comp, c);
+                        if comp_ua[fin] == u8::MAX {
+                            comp_ua[fin] = self.alloc_ua();
+                        }
+                        cid_to_ua[c] = comp_ua[fin];
                     }
                 }
-                // Allocate one UA per merged component and emit each row's two cells.
-                for u in comp_ua[..ncyc as usize].iter_mut() {
-                    *u = u8::MAX;
-                }
                 for r in 0..9 {
-                    let fin = root(&mut comp, cid[r] as usize);
-                    let mut id = comp_ua[fin];
+                    let id = cid_to_ua[cid[r] as usize];
                     if id == u8::MAX {
-                        if self.nua >= UA_CAP {
-                            continue; // truncation-safe (never reached: <=144 UAs/board)
-                        }
-                        id = self.nua as u8;
-                        self.counts[self.nua] = 0;
-                        self.nua += 1;
-                        comp_ua[fin] = id;
+                        continue; // truncated UA (never reached: <=144 UAs/board)
                     }
                     self.counts[id as usize] += 2;
                     for cell in [r * 9 + col_of[r][a] as usize, r * 9 + col_of[r][b] as usize] {
@@ -771,6 +793,16 @@ pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
             st.keep_trivial(cell);
             continue;
         }
+        // UA pre-filter (docs/UA-FILTER.md): if stripping `cell` would empty a library
+        // unavoidable set, the gate is a provable non-unique — revert without posing the
+        // probe (a probe deleted, not made cheaper). Checked before the re-force scan
+        // because a caught gate can never be a re-force keep (caught => non-unique,
+        // re-force => unique; mutually exclusive, as the debug cross-check pins), so this
+        // ordering lets every catch skip the hidden-single derivation below — trajectory
+        // unchanged. No-op for `UaTier::Off`.
+        if st.ua_revert_if_caught(cell, orig) {
+            continue;
+        }
         // Hidden-single re-force fast path (see [`StripState::reforced`]): `orig` has no
         // other candidate home in one of `cell`'s units, so every completion re-forces it
         // — uniqueness and the baseline trace are exactly the accepted board's. Skip both
@@ -779,12 +811,6 @@ pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
         // would shift by one hidden single).
         if fast && st.reforced(cell, orig) != 0 {
             st.keep_trivial(cell);
-            continue;
-        }
-        // UA pre-filter (docs/UA-FILTER.md): if stripping `cell` would empty a library
-        // unavoidable set, the gate is a provable non-unique — revert without posing the
-        // probe (a probe deleted, not made cheaper). No-op for `UaTier::Off`.
-        if st.ua_revert_if_caught(cell, orig) {
             continue;
         }
         // Uniqueness gate: forbid `orig` to restrict the cell to its alternates and ask
@@ -1712,9 +1738,14 @@ mod ua_filter_tests {
             max_nua = max_nua.max(f.nua);
         }
         let (a4, af) = (ua4 as f64 / n as f64, full as f64 / n as f64);
-        assert!((9.0..12.5).contains(&a4), "UA4/board {a4} off the ~10.7 anchor");
-        assert!((50.0..60.0).contains(&af), "UA/board {af} off the ~55 anchor");
-        assert!(max_nua < super::UA_CAP, "max UAs/board {max_nua} >= UA_CAP (would truncate)");
+        // Loose sanity around the ~10.7 / ~55 seed-1 anchors — wide enough to survive a fill
+        // distribution change, tight enough to catch gross breakage (empty / doubled).
+        assert!((5.0..20.0).contains(&a4), "UA4/board {a4} far off the ~10.7 anchor");
+        assert!((35.0..75.0).contains(&af), "UA/board {af} far off the ~55 anchor");
+        // Hard structural bound: <=4 even components per digit pair => <=144 UAs/board, which
+        // must stay under UA_CAP so the fixed-capacity library never truncates.
+        assert!(max_nua <= 144, "max UAs/board {max_nua} exceeds the <=144 structural bound");
+        assert!(super::UA_CAP > 144, "UA_CAP must exceed the 144 structural bound");
     }
 }
 

@@ -338,16 +338,18 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                         strip.keep_trivial(cell);
                         continue;
                     }
+                    // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
+                    // unavoidable set is a provable non-unique — revert without yielding a
+                    // probe to the warp (one fewer probe lane-pass). Before the re-force scan:
+                    // a caught gate is never a re-force keep (caught => non-unique, re-force
+                    // => unique; mutually exclusive), so a catch skips it. No-op for `Off`.
+                    if strip.ua_revert_if_caught(cell, orig) {
+                        continue;
+                    }
                     // Hidden-single re-force fast path: both gates skippable,
                     // verdict carried (see [`StripState::reforced`]).
                     if fast && strip.reforced(cell, orig) != 0 {
                         strip.keep_trivial(cell);
-                        continue;
-                    }
-                    // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
-                    // unavoidable set is a provable non-unique — revert without yielding a
-                    // probe to the warp (one fewer probe lane-pass). No-op for `UaTier::Off`.
-                    if strip.ua_revert_if_caught(cell, orig) {
                         continue;
                     }
                     // The uniqueness gate: suspend here; the warp decides. A unique
