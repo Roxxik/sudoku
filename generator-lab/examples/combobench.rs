@@ -19,21 +19,37 @@
 //! Usage:
 //!   cargo run --release -p generator-lab --example combobench -- \
 //!       --force NAME[:COUNT] [--force NAME[:COUNT] ...] \
-//!       [--toolbox train|full] [--lanes 8] [--per-lane 100000] [--seed 1]
+//!       [--toolbox train|drill|full] [--lanes 8] [--per-lane 100000] [--seed 1]
 //!
 //! NAME is any kind from `spec::kinds::NAMES` (e.g. `w-wing`, `naked-triple`,
 //! `jellyfish`). COUNT defaults to 1. `--toolbox train` (default) allows the
 //! union of each forced target's train-scope (Trunk + simpler-or-equal peers in
-//! that target's branch); `--toolbox full` allows the entire 16-kind ladder
-//! (more substitutes => rarer).
+//! that target's branch); `--toolbox drill` concedes those simpler same-branch
+//! peers instead of allowing them (the multi-force drill generalization — each
+//! forced kind fires in the baseline trace rather than being fast-pathed by a
+//! simpler peer); `--toolbox full` allows the entire 16-kind ladder (more
+//! substitutes => rarer).
 
 use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::spec::Spec;
-use generator_lab::spec::kinds::{DIFFICULTY, NAMES, NUM, Tier, branch_of, tier_of};
+use generator_lab::spec::kinds::{NAMES, NUM};
+use generator_lab::{drill_union, train_union};
+
+/// Which toolbox surrounds the forced kinds.
+#[derive(Clone, Copy, PartialEq)]
+enum Toolbox {
+    /// Union of each target's train-scope (Trunk + simpler-or-equal same-branch peers).
+    Train,
+    /// Union of each target's drill-scope: Trunk allowed, simpler same-branch peers
+    /// CONCEDED (avoid-walk only) — so each forced kind fires in the baseline trace.
+    Drill,
+    /// The entire 16-kind ladder allowed (more substitutes => rarer).
+    Full,
+}
 
 fn main() {
     let mut forces: Vec<(usize, u16)> = Vec::new();
-    let mut toolbox_full = false;
+    let mut toolbox = Toolbox::Train;
     let mut lanes = 8usize;
     let mut per_lane = 100_000usize;
     let mut base_seed = 1u64;
@@ -53,7 +69,13 @@ fn main() {
                 });
                 forces.push((idx, count));
             }
-            "--toolbox" => toolbox_full = matches!(it.next().as_deref(), Some("full")),
+            "--toolbox" => {
+                toolbox = match it.next().as_deref() {
+                    Some("full") => Toolbox::Full,
+                    Some("drill") => Toolbox::Drill,
+                    _ => Toolbox::Train,
+                }
+            }
             "--lanes" => lanes = it.next().and_then(|s| s.parse().ok()).unwrap_or(lanes),
             "--per-lane" => per_lane = it.next().and_then(|s| s.parse().ok()).unwrap_or(per_lane),
             "--seed" => base_seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(base_seed),
@@ -66,40 +88,22 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Build the allowed toolbox: either the full ladder, or the union of each
-    // forced target's train-scope (Trunk up to the target's tier + simpler-or-
-    // equal same-branch peers). Replicates Spec::train's allow rule per target.
-    let mut spec = Spec::explicit();
-    if toolbox_full {
-        for idx in 0..NUM {
-            spec = spec.allow(idx);
-        }
-    } else {
-        let mut allowed = [false; NUM];
-        for &(target, _) in &forces {
-            let target_tier = tier_of(target);
-            let target_branch = branch_of(target);
-            let target_diff = DIFFICULTY[target];
+    // Build the toolbox around the forced kinds. train/drill use the library union
+    // builders (the multi-force generalizations of Spec::train/Spec::drill); full allows
+    // the entire ladder. The union builders force at count 1, so re-force afterwards to
+    // honor any requested COUNT > 1 (force overrides the slot).
+    let idxs: Vec<usize> = forces.iter().map(|&(i, _)| i).collect();
+    let mut spec = match toolbox {
+        Toolbox::Train => train_union(&idxs),
+        Toolbox::Drill => drill_union(&idxs),
+        Toolbox::Full => {
+            let mut s = Spec::explicit();
             for idx in 0..NUM {
-                let tt = tier_of(idx);
-                if tt > target_tier {
-                    continue;
-                }
-                let ok = if tt <= Tier::Intermediate {
-                    true
-                } else {
-                    branch_of(idx) == target_branch && DIFFICULTY[idx] <= target_diff
-                };
-                allowed[idx] |= ok;
+                s = s.allow(idx);
             }
+            s
         }
-        for (idx, &a) in allowed.iter().enumerate() {
-            if a {
-                spec = spec.allow(idx);
-            }
-        }
-    }
-    // Force the requested kinds (overrides Allowed for those slots).
+    };
     for &(idx, count) in &forces {
         spec = spec.force(idx, count);
     }
@@ -109,7 +113,11 @@ fn main() {
         .map(|&(idx, c)| if c == 1 { NAMES[idx].to_string() } else { format!("{}x{c}", NAMES[idx]) })
         .collect::<Vec<_>>()
         .join(" + ");
-    let toolbox = if toolbox_full { "full" } else { "train-union" };
+    let toolbox = match toolbox {
+        Toolbox::Train => "train-union",
+        Toolbox::Drill => "drill-union",
+        Toolbox::Full => "full",
+    };
     let total = lanes * per_lane;
     println!("combobench[{label}] toolbox={toolbox}: {lanes} lanes x {per_lane} = {total} attempts");
 

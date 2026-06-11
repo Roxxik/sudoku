@@ -23,6 +23,12 @@ pub use random::{
     AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt, determinism_fp,
     generate, reforce_stat, run_attempts, verify,
 };
+// Deferred-strip (M1) + common-snapshot (M3) instrumentation — counter-gated.
+#[cfg(feature = "count")]
+pub use random::{DeferStat, defer_stat};
+// Verify-share (M2) wall-time split — native, no counters.
+#[cfg(not(target_arch = "wasm32"))]
+pub use random::{VerifyShare, verify_share};
 
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, RowMajor};

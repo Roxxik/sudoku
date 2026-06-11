@@ -630,6 +630,271 @@ pub fn reforce_stat(base_seed: u64, spec: &Spec, attempts: usize) -> ReforceStat
     s
 }
 
+/// Per-clue-count + run-shape tallies from a [`defer_stat`] walk — the deferred-strip
+/// (M1) and common-snapshot (M3) measurement. Every array is indexed by **clue count**
+/// (board fullness = givens still on the board at the gate, `0..=81`), the position axis
+/// the deferred analysis bins on, NOT the loop index. Posed probes split keep (the prober
+/// returned *unique*) vs revert (*non-unique*), with the prober DFS node count
+/// ([`crate::probe`] `PCTR[2]`) summed per disposition; the two fast paths (`alts == 0`,
+/// re-force) are tallied separately as skips. `run_hist[k]` counts maximal runs of `k`
+/// consecutive keeps among the strip steps, where a fast-path skip counts as a keep (a
+/// deferred batch would absorb it) and only a *non-unique* posed gate breaks a run — the
+/// k-distribution deferred stripping would exploit. The `*_passes`/`*_gates` sums are the
+/// M3 common-snapshot sizing: per kept gate, the prober's root drain (propagation before
+/// the first branch) vs its total propagation, and the baseline solve's initial
+/// closure-drain to first fixpoint vs its total — both measured by replaying the drain
+/// standalone on the just-stripped board and reading the relevant counter.
+#[cfg(feature = "count")]
+#[derive(Clone)]
+pub struct DeferStat {
+    pub attempts: usize,
+    /// Posed uniqueness probes (after both fast paths missed), by clue count.
+    pub posed: [u64; 82],
+    /// Fast-path skips (`alts == 0` or re-force), by clue count.
+    pub fastpath: [u64; 82],
+    /// Posed probes whose verdict was unique (keep), by clue count.
+    pub keeps: [u64; 82],
+    /// Posed probes whose verdict was non-unique (revert), by clue count.
+    pub reverts: [u64; 82],
+    /// Prober DFS nodes summed over unique (keep) probes, by clue count.
+    pub nodes_keep: [u64; 82],
+    /// Prober DFS nodes summed over non-unique (revert) probes, by clue count.
+    pub nodes_revert: [u64; 82],
+    /// Unique probes the baseline gate then reverted as unsolvable (a subset of
+    /// `keeps`; the uniqueness verdict was still a keep) — reported so the run
+    /// histogram's keep-by-uniqueness definition can be re-cut if desired.
+    pub baseline_revert: [u64; 82],
+    /// `run_hist[k]` = number of maximal consecutive-keep runs of length `k`
+    /// (`k` in `1..=81`; fast-path skips and unique probes are keeps, non-unique
+    /// probes break a run).
+    pub run_hist: [u64; 82],
+    /// M3 prober root-drain band-passes summed over keep (unique) gates.
+    pub probe_root_passes: u64,
+    /// M3 prober total band-passes summed over the same gates.
+    pub probe_total_passes: u64,
+    /// Number of keep gates the prober drain was measured on.
+    pub probe_drain_gates: u64,
+    /// M3 baseline closure-drain sieve-recomputes (drain to first fixpoint) summed
+    /// over accepted (unique + baseline-solvable) gates.
+    pub solve_drain_passes: u64,
+    /// M3 baseline total sieve-recomputes summed over the same gates.
+    pub solve_total_passes: u64,
+    /// Number of accepted gates the baseline drain was measured on.
+    pub solve_drain_gates: u64,
+}
+
+/// Walk `attempts` faithful scalar strip attempts from `base_seed` and record the
+/// deferred-strip (M1) and common-snapshot (M3) instrumentation — the trajectory is
+/// exactly [`attempt`]'s (every gate is evaluated and applied as in production), so the
+/// per-gate statistics transfer to the warp rig it is pinned to. Behind `feature =
+/// "count"`: it snapshots the prober node counter (`PCTR`), the prober band-pass counter
+/// (`BAND_CTR`), and the baseline sieve-recompute counter (`FSTAT`) per gate, so it must
+/// not be mixed with a wall-time A/B (the counters perturb timing). Diagnostic only.
+#[cfg(feature = "count")]
+pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
+    use crate::probe::{
+        Propagate, band_ctr_reset, band_ctr_snapshot, pctr_reset, pctr_snapshot,
+    };
+    use crate::solve::{fstat_reset, fstat_snapshot};
+
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+    assert!(fast, "defer_stat assumes the fused fast-path baseline (none of the bench specs need LogicSolver)");
+    // The cheap closure (singles + both LC) — solving with only this mask drains the
+    // board to its first fixpoint and then stalls (no harder kind is allowed), so its
+    // sieve-recompute count IS the baseline's initial closure-drain cost.
+    const NS: KindMask = 1 << NAKED_SINGLE;
+    const HS: KindMask = 1 << HIDDEN_SINGLE;
+    const LCP: KindMask = 1 << LC_POINTING;
+    const LCC: KindMask = 1 << LC_CLAIMING;
+    let cheap = baseline & (NS | HS | LCP | LCC);
+
+    let mut rng = Rng::from_seed(base_seed);
+    let mut s = DeferStat {
+        attempts: 0,
+        posed: [0; 82],
+        fastpath: [0; 82],
+        keeps: [0; 82],
+        reverts: [0; 82],
+        nodes_keep: [0; 82],
+        nodes_revert: [0; 82],
+        baseline_revert: [0; 82],
+        run_hist: [0; 82],
+        probe_root_passes: 0,
+        probe_total_passes: 0,
+        probe_drain_gates: 0,
+        solve_drain_passes: 0,
+        solve_total_passes: 0,
+        solve_drain_gates: 0,
+    };
+
+    for _ in 0..attempts {
+        s.attempts += 1;
+        let solution = random_solution(&mut rng);
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        let mut st: StripState = StripState::new(&solution);
+        // Clue count at the current gate = givens on the board after the speculative
+        // strip; starts at 81 (full grid), -1 per strip, +1 per revert.
+        let mut givens = CELLS;
+        // Length of the current maximal run of consecutive keeps.
+        let mut run = 0usize;
+        macro_rules! end_run {
+            () => {
+                if run > 0 {
+                    s.run_hist[run.min(81)] += 1;
+                    run = 0;
+                }
+            };
+        }
+
+        for cell in positions {
+            let Some(orig) = st.digit_at(cell) else {
+                continue;
+            };
+            let alts = st.strip(cell, orig);
+            givens -= 1;
+            let clue = givens;
+            // Fast paths: the cell stays stripped with no gate posed — a keep that a
+            // deferred batch absorbs.
+            if alts == 0 || (fast && st.reforced(cell, orig) != 0) {
+                st.keep_trivial();
+                s.fastpath[clue] += 1;
+                run += 1;
+                continue;
+            }
+            // Posed uniqueness probe — measure its nodes and total band-passes.
+            s.posed[clue] += 1;
+            pctr_reset();
+            band_ctr_reset();
+            let nonunique = st.scalar_nonunique(cell, orig);
+            let nodes = pctr_snapshot()[2];
+            let total_passes = band_ctr_snapshot()[1];
+            if nonunique {
+                // Non-unique: revert, and the run breaks here.
+                s.reverts[clue] += 1;
+                s.nodes_revert[clue] += nodes;
+                st.revert_gate(cell, orig);
+                givens += 1;
+                end_run!();
+                continue;
+            }
+            // Unique (keep by the prober's verdict) — continues the run.
+            s.keeps[clue] += 1;
+            s.nodes_keep[clue] += nodes;
+            run += 1;
+
+            // M3 part 1: the prober's root drain — replay the first propagation on a
+            // clone of the just-stripped probe board (orig forbidden), the exact drain
+            // the prober does before its first branch; band-passes vs the probe total.
+            band_ctr_reset();
+            let mut root = st.state.row().clone();
+            root.forbid(cell, orig);
+            <RM as Propagate>::propagate(&mut root);
+            s.probe_root_passes += band_ctr_snapshot()[1];
+            s.probe_total_passes += total_passes;
+            s.probe_drain_gates += 1;
+
+            // M3 part 2: the baseline solve's closure-drain to first fixpoint (cheap-only
+            // solve) vs the full solve's total, in sieve-recomputes. The full solve is the
+            // real baseline gate; its trace drives the keep/revert decision below.
+            fstat_reset();
+            let _ = FusedLogicSolver::solve_tracked(&st.state, cheap);
+            let drain_passes = fstat_snapshot()[7];
+            fstat_reset();
+            let trace = FusedLogicSolver::solve_tracked(&st.state, baseline);
+            let solve_total = fstat_snapshot()[7];
+            s.solve_drain_passes += drain_passes;
+            s.solve_total_passes += solve_total;
+            s.solve_drain_gates += 1;
+
+            // Apply the real baseline gate (faithful to resolve_gate's fast path).
+            if !trace.solved {
+                st.revert_gate(cell, orig);
+                givens += 1;
+                s.baseline_revert[clue] += 1;
+            } else {
+                st.req_met = spec.requirement_met(&trace.counts);
+                if st.req_met {
+                    st.best = Some(st.digits.clone());
+                }
+            }
+        }
+        // Trailing run (no reset needed — `run` is re-initialized next attempt).
+        if run > 0 {
+            s.run_hist[run.min(81)] += 1;
+        }
+    }
+    s
+}
+
+/// Wall-time split of one fixed-work scalar run between the cold [`verify`] (the
+/// `min_target_uses` avoid walk) and the rest of the attempt — the M2 measurement. NO
+/// counters: timing only, so it must be built WITHOUT `feature = "count"` (counters
+/// perturb the very times this measures). Times are nanoseconds; `total_nanos` is the
+/// whole run (fill + strip + verify), `verify_nanos` the verify subset.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct VerifyShare {
+    pub attempts: usize,
+    /// Attempts whose strip produced a requirement-meeting `best` (so verify ran).
+    pub reached_verify: usize,
+    /// Of those, verify rejected (the target was substitutable) — `NotForced`.
+    pub not_forced: usize,
+    pub successes: usize,
+    pub total_nanos: u64,
+    pub verify_nanos: u64,
+}
+
+/// Walk `attempts` faithful scalar strip attempts from `base_seed`, timing the cold
+/// [`verify`] call against the whole attempt. The strip loop is exactly [`attempt`]'s
+/// (same gate sequence, same produced `best`), so the (successes, not_forced,
+/// never_fired) split matches [`run_attempts`] for the seed — only the timing split is
+/// added. Diagnostic only; keep it out of `feature = "count"` builds.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn verify_share(base_seed: u64, spec: &Spec, attempts: usize) -> VerifyShare {
+    use std::time::Instant;
+
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+    let mut rng = Rng::from_seed(base_seed);
+    let mut vs = VerifyShare::default();
+
+    for _ in 0..attempts {
+        vs.attempts += 1;
+        let t_att = Instant::now();
+        let solution = random_solution(&mut rng);
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        let mut st: StripState = StripState::new(&solution);
+        for cell in positions {
+            let Some(orig) = st.digit_at(cell) else {
+                continue;
+            };
+            let alts = st.strip(cell, orig);
+            if alts == 0 || (fast && st.reforced(cell, orig) != 0) {
+                st.keep_trivial();
+                continue;
+            }
+            let nonunique = st.scalar_nonunique(cell, orig);
+            st.resolve_gate(cell, orig, nonunique, spec, baseline, fast);
+        }
+        if let Some(snap) = st.best.take() {
+            vs.reached_verify += 1;
+            let tv = Instant::now();
+            let ok = verify(&snap, spec);
+            vs.verify_nanos += tv.elapsed().as_nanos() as u64;
+            if ok {
+                vs.successes += 1;
+            } else {
+                vs.not_forced += 1;
+            }
+        }
+        vs.total_nanos += t_att.elapsed().as_nanos() as u64;
+    }
+    vs
+}
+
 /// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG stream.
 /// Unlike [`run_attempts`]'s fp (which only folds *successful* puzzles, so it is blind to
 /// the grids when nothing succeeds), this folds the full solution grid AND the shuffled

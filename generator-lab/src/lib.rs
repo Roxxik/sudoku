@@ -62,7 +62,7 @@ pub mod solve;
 pub mod spec;
 
 use spec::Spec;
-use spec::kinds::HIDDEN_QUAD;
+use spec::kinds::{DIFFICULTY, HIDDEN_QUAD, NUM, Tier, branch_of, tier_of};
 
 /// Build the **Subset-branch** bench spec for a `mode`: 0 = train(HiddenQuad), else
 /// drill(HiddenQuad). The HiddenQuad ladder is the lab's standard Subset benchmark
@@ -82,6 +82,124 @@ pub fn subset_spec_for_mode(mode: u32) -> Spec {
 /// targets are out of scope for the lab (they generate trivially in core).
 pub fn expert_spec(target: usize, drill: bool) -> Spec {
     if drill { Spec::drill(target) } else { Spec::train(target) }
+}
+
+/// Train-mode spec for a **set** of forced targets — the multi-force generalization of
+/// [`Spec::train`]. A kind is Allowed iff it is in SOME target's train scope (Trunk up to
+/// that target's tier, plus simpler-or-equal same-branch peers); each target is then
+/// Forced (count 1). Combining requirements keeps the per-attempt baseline cost high (no
+/// Forced kind can fast-path) while making the puzzle rarer — the "require a W-Wing AND a
+/// jellyfish" specs the combo benches sweep. `train_union(&[t])` reduces to
+/// `Spec::train(t)` (same masks); callers needing a count > 1 re-`force` after.
+pub fn train_union(forces: &[usize]) -> Spec {
+    let mut allowed = [false; NUM];
+    for &target in forces {
+        let target_tier = tier_of(target);
+        let target_branch = branch_of(target);
+        let target_diff = DIFFICULTY[target];
+        for idx in 0..NUM {
+            let tt = tier_of(idx);
+            if tt > target_tier {
+                continue;
+            }
+            let ok = if tt <= Tier::Intermediate {
+                true
+            } else {
+                branch_of(idx) == target_branch && DIFFICULTY[idx] <= target_diff
+            };
+            allowed[idx] |= ok;
+        }
+    }
+    let mut spec = Spec::explicit();
+    for (idx, &a) in allowed.iter().enumerate() {
+        if a {
+            spec = spec.allow(idx);
+        }
+    }
+    for &target in forces {
+        spec = spec.force(target, 1);
+    }
+    spec
+}
+
+/// Drill-mode spec for a **set** of forced targets — the multi-force generalization of
+/// [`Spec::drill`]. The union, with Allowed taking precedence over Conceded: a kind is
+/// **Allowed** iff it is below SOME target's tier (the union of the easier tiers);
+/// otherwise **Conceded** iff SOME target concedes it at its own tier (the same per-tier
+/// rule `Spec::drill` uses: flat-Intermediate concedes every same-tier peer; an
+/// Expert/Master target concedes its simpler same-branch peers); each target is then
+/// Forced. So the baseline (Allowed | Forced) is the Trunk-up-to-tier plus the targets
+/// only — the simpler substitutes are conceded (verify's avoid-walk may use them, the
+/// baseline solver may not), which is what makes each forced target fire in the baseline
+/// trace rather than being fast-pathed by a simpler peer.
+///
+/// With both targets in scope, verify's avoid-walk for one target may use the other as a
+/// substitute — the correct reading of "requires **both**" (a puzzle solvable with `t2`
+/// instead of `t1` does not require `t1`). `drill_union(&[t])` reduces to
+/// `Spec::drill(t)` (same masks); callers needing a count > 1 re-`force` after.
+pub fn drill_union(forces: &[usize]) -> Spec {
+    let mut allowed = [false; NUM];
+    let mut conceded = [false; NUM];
+    for &t in forces {
+        let t_tier = tier_of(t);
+        let t_branch = branch_of(t);
+        let t_diff = DIFFICULTY[t];
+        for idx in 0..NUM {
+            if forces.contains(&idx) {
+                continue; // forced targets are forced below, never allowed/conceded
+            }
+            let tt = tier_of(idx);
+            if tt < t_tier {
+                allowed[idx] = true; // easier tier for this target
+            } else if tt == t_tier {
+                let concede = match t_tier {
+                    Tier::Beginner => false,
+                    Tier::Intermediate => true, // flat tier: concede every same-tier peer
+                    Tier::Expert | Tier::Master => {
+                        branch_of(idx) == t_branch && DIFFICULTY[idx] < t_diff
+                    }
+                };
+                conceded[idx] |= concede;
+            }
+        }
+    }
+    let mut spec = Spec::explicit();
+    for idx in 0..NUM {
+        if allowed[idx] {
+            spec = spec.allow(idx); // Allowed precedence over Conceded
+        } else if conceded[idx] {
+            spec = spec.concede(idx);
+        }
+    }
+    for &t in forces {
+        spec = spec.force(t, 1);
+    }
+    spec
+}
+
+#[cfg(test)]
+mod union_tests {
+    use super::{drill_union, train_union};
+    use crate::spec::Spec;
+    use crate::spec::kinds::NUM;
+
+    /// The union builders must reduce to the single-target `Spec::train`/`Spec::drill`
+    /// for any one kind — same baseline / in-scope / forced masks. This is the contract
+    /// the combo benches lean on (a single `--force` must behave exactly like the
+    /// single-target spec).
+    #[test]
+    fn single_target_reduces_to_train_and_drill() {
+        for t in 0..NUM {
+            let (tu, st) = (train_union(&[t]), Spec::train(t));
+            assert_eq!(tu.baseline_mask(), st.baseline_mask(), "train baseline [{t}]");
+            assert_eq!(tu.in_scope_mask(), st.in_scope_mask(), "train in_scope [{t}]");
+            assert_eq!(tu.forced_mask(), st.forced_mask(), "train forced [{t}]");
+            let (du, sd) = (drill_union(&[t]), Spec::drill(t));
+            assert_eq!(du.baseline_mask(), sd.baseline_mask(), "drill baseline [{t}]");
+            assert_eq!(du.in_scope_mask(), sd.in_scope_mask(), "drill in_scope [{t}]");
+            assert_eq!(du.forced_mask(), sd.forced_mask(), "drill forced [{t}]");
+        }
+    }
 }
 
 /// JS-callable bench entry points, exported from the wasm32 cdylib build, timed
