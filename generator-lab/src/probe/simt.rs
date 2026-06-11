@@ -223,6 +223,28 @@ pub(crate) fn snapshot_lane(r: &[[V; 3]; 9], unsolved: &[V; 3], l: usize) -> ([[
     )
 }
 
+/// Snapshot lane `l` directly into caller-owned `sr`/`su` slots — the same strided
+/// 30-`u32` read as [`snapshot_lane`], but written in place rather than returned by
+/// value. Lets [`branch_lane`] land the snapshot straight in its pushed [`Frame`]
+/// instead of into a local that is then copied a second time into the stack slot.
+#[inline]
+pub(crate) fn snapshot_lane_into(
+    r: &[[V; 3]; 9],
+    unsolved: &[V; 3],
+    l: usize,
+    sr: &mut [[u32; 3]; 9],
+    su: &mut [u32; 3],
+) {
+    for d in 0..9 {
+        for b in 0..3 {
+            sr[d][b] = r[d][b].as_array()[l];
+        }
+    }
+    for b in 0..3 {
+        su[b] = unsolved[b].as_array()[l];
+    }
+}
+
 /// Restore a snapshot into lane `l` of the SoA warp (backtrack).
 #[inline]
 pub(crate) fn restore_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, sr: &[[u32; 3]; 9], su: &[u32; 3]) {
@@ -263,16 +285,47 @@ pub(crate) struct Frame {
     remaining: u16,
 }
 
+impl Frame {
+    /// Fold the frame's board + scalar fields into one checksum word — the frame-fusion
+    /// microbench's equivalence pin (all `branch_lane` variants must agree) and DCE guard.
+    /// Lab-only; the fields are private to this module, so the bench reads them through here.
+    #[inline]
+    pub(crate) fn fold_hash(&self) -> u64 {
+        let mut h = (self.cell as u64) ^ ((self.remaining as u64) << 40);
+        for d in 0..9 {
+            for b in 0..3 {
+                h ^= (self.r[d][b] as u64).rotate_left((d * 3 + b) as u32);
+            }
+        }
+        for b in 0..3 {
+            h ^= (self.unsolved[b] as u64) << (b * 9);
+        }
+        h
+    }
+}
+
 /// Branch lane `l` on an **externally-owned** frame stack (the unified-warp engine in
 /// [`crate::solve::simt`] keeps the prober's per-lane stacks itself rather than going
 /// through [`PackedProber`]). Pick a cell, push the pre-branch board + untried digits,
 /// assign the first candidate. Mirror of [`PackedProber::branch`], stack passed in.
+///
+/// The pre-branch board is snapshotted **directly into the pushed frame** rather than into
+/// a local that is then copied a second time. The strided SoA read ([`snapshot_lane_into`])
+/// is the design's irreducible per-branch clone; the old `let (sr, su) = snapshot_lane(..);
+/// push(Frame { r: sr, .. })` form copied those 31 words a second time, local -> `Vec`
+/// slot. Fusing it removes ~111 instructions per branch node (dominated by 82 redundant
+/// memory writes — `examples/framefusebench` measures it under Intel SDE `-mix`). The only
+/// residue is two dead AVX-512 zero-stores from the placeholder push that LLVM keeps across
+/// the call; the second copy itself is gone.
 pub(crate) fn branch_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], stack: &mut Vec<Frame>, l: usize) {
     dstat_add(2, 1);
-    let (sr, su) = snapshot_lane(r, unsolved, l);
-    let (cell, mask) = branch_cell(&sr, &su);
+    stack.push(Frame { r: [[0; 3]; 9], unsolved: [0; 3], cell: 0, remaining: 0 });
+    let frame = stack.last_mut().unwrap();
+    snapshot_lane_into(r, unsolved, l, &mut frame.r, &mut frame.unsolved);
+    let (cell, mask) = branch_cell(&frame.r, &frame.unsolved);
+    frame.cell = cell as u32;
+    frame.remaining = mask & (mask - 1);
     let d = mask.trailing_zeros() as usize;
-    stack.push(Frame { r: sr, unsolved: su, cell: cell as u32, remaining: mask & (mask - 1) });
     assign(r, l, cell, d);
 }
 

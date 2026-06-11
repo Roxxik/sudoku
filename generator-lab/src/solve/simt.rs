@@ -881,3 +881,84 @@ pub enum GateResult {
     /// A baseline lane finished: the logic solver's trace (`solved` + subset-kind counts).
     Baseline(SolveTrace),
 }
+
+// ===========================================================================
+// branch_lane frame-fusion criterion microbench (lab-only)
+// ===========================================================================
+//
+// `branch_lane` snapshots a stalled lane's board straight into its pushed [`Frame`]
+// (the frame-fusion win — it used to copy the 31-word board a second time, local ->
+// `Vec` slot). This harness is the standing criterion for that per-branch-node cost:
+// it harvests realistic pre-branch boards from a probe corpus, then replays one branch
+// op per iteration over them. The board load (`restore_lane`) and the read-back
+// checksum are fixed overhead, so the headline number is the SDE `-mix` per-call
+// `branch_lane` instruction count; the checksum is a DCE guard. To A/B a future change,
+// keep the prior `branch_lane` body alongside and drive both (see git history for the
+// original three-way harness that proved the fusion).
+
+/// A captured pre-branch lane board (a [`snapshot_lane`] result): the exact stalled
+/// state at which `branch_lane` fires.
+pub type BranchInput = ([[u32; 3]; 9], [u32; 3]);
+
+/// Harvest realistic `branch_lane` inputs from `probes`: load each probe into a lane,
+/// run the cheap warp closure to its first stall, and snapshot the stalled board (the
+/// exact state `branch_lane` would see). Probes that solve or die before stalling
+/// contribute nothing.
+pub fn collect_branch_inputs(probes: &[Probe]) -> Vec<BranchInput> {
+    let mut out = Vec::new();
+    let mut r = [[ZERO; 3]; 9];
+    let mut unsolved = [ZERO; 3];
+    let only0 = {
+        let mut a = [false; LANES];
+        a[0] = true;
+        M::from_array(a)
+    };
+    for p in probes {
+        load_lane(&mut r, &mut unsolved, 0, p);
+        // Drive lane 0 alone to its first stall (bounded against pathological inputs).
+        for _ in 0..256 {
+            let (changed, dead, solved) = warp_pass_full(&mut r, &mut unsolved, only0);
+            let bit = 1u64;
+            if (solved.to_bitmask() & bit) != 0 || (dead.to_bitmask() & bit) != 0 {
+                break; // terminated before branching — no input here
+            }
+            if (changed.to_bitmask() & bit) == 0 {
+                out.push(snapshot_lane(&r, &unsolved, 0)); // stalled: a real branch point
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Replay `iters` [`branch_lane`] ops over `inputs` (cycled). Each iteration loads an
+/// input into lane 0 via [`restore_lane`], branches, then folds the pushed frame and the
+/// post-assign lane into a checksum. Returns the checksum — stable run-to-run (a DCE
+/// guard, not a result to interpret). The load + fold are fixed overhead; the headline
+/// number is the SDE `-mix` per-call `branch_lane` instruction count.
+pub fn run_branch_bench(inputs: &[BranchInput], iters: usize) -> u64 {
+    assert!(!inputs.is_empty(), "run_branch_bench needs a non-empty corpus");
+    let mut r = [[ZERO; 3]; 9];
+    let mut unsolved = [ZERO; 3];
+    let mut stack: Vec<Frame> = Vec::with_capacity(64);
+    let n = inputs.len();
+    let mut acc: u64 = 0;
+    for i in 0..iters {
+        let (sr, su) = &inputs[i % n];
+        restore_lane(&mut r, &mut unsolved, 0, sr, su);
+        stack.clear();
+        branch_lane(&mut r, &mut unsolved, &mut stack, 0);
+        // Read back the pushed frame + the post-assign lane 0 into the checksum word.
+        let mut h = stack.last().unwrap().fold_hash();
+        for d in 0..9 {
+            for b in 0..3 {
+                h ^= (r[d][b].as_array()[0] as u64).rotate_left((d + b + 1) as u32);
+            }
+        }
+        for b in 0..3 {
+            h ^= (unsolved[b].as_array()[0] as u64).rotate_left((b + 5) as u32);
+        }
+        acc ^= h.rotate_left((i & 63) as u32);
+    }
+    acc
+}
