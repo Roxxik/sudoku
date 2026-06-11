@@ -864,6 +864,264 @@ pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
     s
 }
 
+/// A board's 2-digit unavoidable-set library: every minimal UA built from a single
+/// digit pair, as a cell list, plus the cell -> containing-UA index. For a complete
+/// grid and a pair `{a, b}`, a swap of `a <-> b` on a cell set is another valid grid iff
+/// in EVERY unit the set holds the `a`-cell iff it holds the `b`-cell — so the minimal
+/// such sets are the connected components of the graph that joins, per unit (row, column,
+/// AND box), that unit's `a`-cell to its `b`-cell. Components have even size 4..=18; the
+/// size-4 ones are the deadly rectangles (UA4s). This is the *exact* minimal library a
+/// probe-skip filter would carry; unlike a prober witness it never overshoots.
+#[cfg(feature = "count")]
+struct UaLib {
+    /// `(cells, size)` per UA.
+    uas: Vec<(Vec<usize>, usize)>,
+    /// `cell -> UA indices containing it` (length [`CELLS`]).
+    cell_uas: Vec<Vec<usize>>,
+}
+
+/// Enumerate the 2-digit UA library of a complete solution (see [`UaLib`]). Union-find
+/// over the cells of each of the 36 digit pairs, joining each unit's two pair-cells; the
+/// resulting components are the minimal 2-digit UAs.
+#[cfg(feature = "count")]
+fn enumerate_2digit_uas(sol: &DigitGrid) -> UaLib {
+    fn find(p: &mut [usize], x: usize) -> usize {
+        let mut r = x;
+        while p[r] != r {
+            r = p[r];
+        }
+        let mut c = x;
+        while p[c] != r {
+            let n = p[c];
+            p[c] = r;
+            c = n;
+        }
+        r
+    }
+    let digit = |cell: usize| sol.get(cell).map(|d| d.index());
+    // The `k`-th cell of unit `u` of kind 0=row / 1=column / 2=box.
+    let unit_cell = |kind: usize, u: usize, k: usize| -> usize {
+        match kind {
+            0 => u * 9 + k,
+            1 => k * 9 + u,
+            _ => ((u / 3) * 3 + k / 3) * 9 + ((u % 3) * 3 + k % 3),
+        }
+    };
+    let mut uas: Vec<(Vec<usize>, usize)> = Vec::new();
+    let mut cell_uas: Vec<Vec<usize>> = (0..CELLS).map(|_| Vec::new()).collect();
+    for a in 0..9usize {
+        for b in (a + 1)..9usize {
+            let mut parent: Vec<usize> = (0..CELLS).collect();
+            for kind in 0..3 {
+                for u in 0..9 {
+                    // Each unit holds exactly one `a`-cell and one `b`-cell; join them.
+                    let mut found = [usize::MAX; 2];
+                    let mut n = 0;
+                    for k in 0..9 {
+                        let cell = unit_cell(kind, u, k);
+                        if matches!(digit(cell), Some(di) if di == a || di == b) {
+                            if n < 2 {
+                                found[n] = cell;
+                            }
+                            n += 1;
+                        }
+                    }
+                    if n == 2 {
+                        let (ra, rb) = (find(&mut parent, found[0]), find(&mut parent, found[1]));
+                        if ra != rb {
+                            parent[ra] = rb;
+                        }
+                    }
+                }
+            }
+            // Group this pair's cells into components -> UAs.
+            let mut roots: Vec<(usize, usize)> = Vec::new(); // (root, ua index)
+            for cell in 0..CELLS {
+                if !matches!(digit(cell), Some(di) if di == a || di == b) {
+                    continue;
+                }
+                let r = find(&mut parent, cell);
+                let idx = match roots.iter().find(|&&(rr, _)| rr == r) {
+                    Some(&(_, i)) => i,
+                    None => {
+                        let i = uas.len();
+                        uas.push((Vec::new(), 0));
+                        roots.push((r, i));
+                        i
+                    }
+                };
+                uas[idx].0.push(cell);
+                cell_uas[cell].push(idx);
+            }
+            for &(_, i) in &roots {
+                uas[i].1 = uas[i].0.len();
+            }
+        }
+    }
+    UaLib { uas, cell_uas }
+}
+
+/// True 2-digit-UA probe-skip catch rate (M-UA-LIB) — the decisive counter to the
+/// witness histogram, which over-credits large orbits. Per board, enumerate the exact
+/// 2-digit UA library ([`enumerate_2digit_uas`]); along the faithful strip walk, keep a
+/// per-UA given count (monotone, decremented on each committed keep). A revert at cell
+/// `c` is *caught* by the library iff some library UA containing `c` is down to its last
+/// given (`c`) — stripping it provably empties that UA. Records catch by count and by the
+/// revert's prober node cost, for the UA4-only and the full 2-digit tier, split by clue
+/// group; plus the locked-cell census (sole givens of a UA — permanently unstrippable)
+/// per clue count. `false_positive` (a unique gate the filter wrongly flagged) is a
+/// soundness tripwire and must stay zero.
+#[cfg(feature = "count")]
+#[derive(Clone)]
+pub struct UaCatchStat {
+    pub attempts: usize,
+    pub boards: u64,
+    pub lib_uas: u64,
+    pub lib_ua4: u64,
+    /// `[group]` 0 = clue >= 33, 1 = clue <= 32.
+    pub reverts: [u64; 2],
+    pub revert_nodes: [u64; 2],
+    pub caught_ua4_ct: [u64; 2],
+    pub caught_ua4_nd: [u64; 2],
+    pub caught_all_ct: [u64; 2],
+    pub caught_all_nd: [u64; 2],
+    /// Locked-cell census by clue count: sum and sample-count of the locked-cell tally
+    /// (sole givens of some library UA) observed at each clue level.
+    pub locked_sum: [u64; 82],
+    pub locked_n: [u64; 82],
+    /// Soundness tripwire: a unique (kept or baseline-reverted) gate the filter flagged.
+    pub false_positive: u64,
+}
+
+#[cfg(feature = "count")]
+pub fn ua_catch_stat(base_seed: u64, spec: &Spec, attempts: usize) -> UaCatchStat {
+    use crate::probe::{pctr_reset, pctr_snapshot};
+
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+    assert!(fast, "ua_catch_stat assumes the fused fast-path baseline");
+    let mut rng = Rng::from_seed(base_seed);
+    let mut s = UaCatchStat {
+        attempts: 0,
+        boards: 0,
+        lib_uas: 0,
+        lib_ua4: 0,
+        reverts: [0; 2],
+        revert_nodes: [0; 2],
+        caught_ua4_ct: [0; 2],
+        caught_ua4_nd: [0; 2],
+        caught_all_ct: [0; 2],
+        caught_all_nd: [0; 2],
+        locked_sum: [0; 82],
+        locked_n: [0; 82],
+        false_positive: 0,
+    };
+
+    for _ in 0..attempts {
+        s.attempts += 1;
+        let solution = random_solution(&mut rng);
+        let lib = enumerate_2digit_uas(&solution.0);
+        s.boards += 1;
+        s.lib_uas += lib.uas.len() as u64;
+        s.lib_ua4 += lib.uas.iter().filter(|u| u.1 == 4).count() as u64;
+
+        // Per-UA given count (full board: every cell a given), and the locked census.
+        let mut gc: Vec<u32> = lib.uas.iter().map(|u| u.1 as u32).collect();
+        let mut is_given = [true; CELLS];
+        let mut locked = [false; CELLS];
+        let mut n_locked = 0u64;
+
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        let mut st: StripState = StripState::new(&solution);
+        let mut givens = CELLS;
+
+        for cell in positions {
+            let Some(orig) = st.digit_at(cell) else {
+                continue;
+            };
+            // Census at this gate (board still has `givens` clues).
+            s.locked_sum[givens.min(81)] += n_locked;
+            s.locked_n[givens.min(81)] += 1;
+            // Filter verdict: would stripping `cell` empty a library UA? (`cell` is still
+            // a committed given here, so a count of 1 means it is that UA's sole given.)
+            let mut caught_ua4 = false;
+            let mut caught_all = false;
+            for &u in &lib.cell_uas[cell] {
+                if gc[u] == 1 {
+                    caught_all = true;
+                    caught_ua4 |= lib.uas[u].1 == 4;
+                }
+            }
+
+            let alts = st.strip(cell, orig);
+            givens -= 1;
+            let clue = givens;
+            let group = if clue >= 33 { 0 } else { 1 };
+            let mut nonuniq = false;
+            let mut keep = false;
+            if alts == 0 || (fast && st.reforced(cell, orig) != 0) {
+                st.keep_trivial();
+                keep = true;
+            } else {
+                pctr_reset();
+                let nonunique = st.scalar_nonunique(cell, orig);
+                let nodes = pctr_snapshot()[2];
+                if nonunique {
+                    nonuniq = true;
+                    s.reverts[group] += 1;
+                    s.revert_nodes[group] += nodes;
+                    if caught_ua4 {
+                        s.caught_ua4_ct[group] += 1;
+                        s.caught_ua4_nd[group] += nodes;
+                    }
+                    if caught_all {
+                        s.caught_all_ct[group] += 1;
+                        s.caught_all_nd[group] += nodes;
+                    }
+                    st.revert_gate(cell, orig);
+                    givens += 1;
+                } else {
+                    let trace = FusedLogicSolver::solve_tracked(&st.state, baseline);
+                    if !trace.solved {
+                        st.revert_gate(cell, orig);
+                        givens += 1;
+                    } else {
+                        st.req_met = spec.requirement_met(&trace.counts);
+                        if st.req_met {
+                            st.best = Some(st.digits.clone());
+                        }
+                        keep = true;
+                    }
+                }
+            }
+            // Soundness: a unique gate (fast keep, kept, or baseline-revert) emptied no UA.
+            if !nonuniq && caught_all {
+                s.false_positive += 1;
+            }
+            // Commit a keep: decrement the UA given counts, and lock any UA's last given.
+            if keep {
+                is_given[cell] = false;
+                for &u in &lib.cell_uas[cell] {
+                    gc[u] -= 1;
+                    if gc[u] == 1 {
+                        for &cc in &lib.uas[u].0 {
+                            if is_given[cc] {
+                                if !locked[cc] {
+                                    locked[cc] = true;
+                                    n_locked += 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
 /// Wall-time split of one fixed-work scalar run between the cold [`verify`] (the
 /// `min_target_uses` avoid walk) and the rest of the attempt — the M2 measurement. NO
 /// counters: timing only, so it must be built WITHOUT `feature = "count"` (counters
@@ -974,4 +1232,67 @@ pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
         }
     }
     fp
+}
+
+#[cfg(all(test, feature = "count"))]
+mod ua_tests {
+    use super::enumerate_2digit_uas;
+    use crate::fill::random_solution;
+    use crate::repr::{Digit, DigitGrid};
+    use crate::rng::Rng;
+
+    fn is_valid_complete(g: &DigitGrid) -> bool {
+        let unit_cell = |kind: usize, u: usize, k: usize| -> usize {
+            match kind {
+                0 => u * 9 + k,
+                1 => k * 9 + u,
+                _ => ((u / 3) * 3 + k / 3) * 9 + ((u % 3) * 3 + k % 3),
+            }
+        };
+        for kind in 0..3 {
+            for u in 0..9 {
+                let mut seen = [false; 9];
+                for k in 0..9 {
+                    let Some(d) = g.get(unit_cell(kind, u, k)) else {
+                        return false;
+                    };
+                    if seen[d.index()] {
+                        return false;
+                    }
+                    seen[d.index()] = true;
+                }
+            }
+        }
+        true
+    }
+
+    /// Every enumerated 2-digit UA must be a genuine unavoidable set: it spans exactly two
+    /// digits, has even size >= 4, and swapping those two digits over its cells yields a
+    /// *different, still valid* complete grid (the second completion that makes the set
+    /// unavoidable). This is the contract the catch measurement relies on.
+    #[test]
+    fn enumerated_uas_are_genuine_unavoidable_sets() {
+        for seed in 0..40 {
+            let mut rng = Rng::from_seed(seed);
+            let sol = random_solution(&mut rng).0;
+            let lib = enumerate_2digit_uas(&sol);
+            assert!(!lib.uas.is_empty(), "seed {seed}: empty library");
+            for (cells, size) in &lib.uas {
+                assert_eq!(*size, cells.len());
+                assert!(*size >= 4 && *size % 2 == 0, "seed {seed}: odd/small UA size {size}");
+                let mut digs: Vec<usize> = cells.iter().map(|&c| sol.get(c).unwrap().index()).collect();
+                digs.sort_unstable();
+                digs.dedup();
+                assert_eq!(digs.len(), 2, "seed {seed}: UA spans {} digits", digs.len());
+                let (a, b) = (digs[0], digs[1]);
+                let mut swapped = sol.clone();
+                for &c in cells {
+                    let nd = if sol.get(c).unwrap().index() == a { b } else { a };
+                    swapped.set(c, Digit::from_index(nd));
+                }
+                assert!(is_valid_complete(&swapped), "seed {seed}: UA swap is not a valid grid");
+                assert_ne!(swapped.to_line(), sol.to_line(), "seed {seed}: UA swap is the identity");
+            }
+        }
+    }
 }

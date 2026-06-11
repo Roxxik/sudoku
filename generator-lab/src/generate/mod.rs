@@ -26,6 +26,9 @@ pub use random::{
 // Deferred-strip (M1) + common-snapshot (M3) instrumentation — counter-gated.
 #[cfg(feature = "count")]
 pub use random::{DeferStat, defer_stat};
+// True 2-digit-UA probe-skip catch measurement (M-UA-LIB) — counter-gated.
+#[cfg(feature = "count")]
+pub use random::{UaCatchStat, ua_catch_stat};
 // Verify-share (M2) wall-time split — native, no counters.
 #[cfg(not(target_arch = "wasm32"))]
 pub use random::{VerifyShare, verify_share};

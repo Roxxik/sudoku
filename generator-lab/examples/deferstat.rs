@@ -63,7 +63,7 @@ fn parse_args() -> (usize, u64) {
 // ====================================================================================
 #[cfg(feature = "count")]
 fn main() {
-    use generator_lab::generate::defer_stat;
+    use generator_lab::generate::{defer_stat, ua_catch_stat};
 
     let (attempts, seed) = parse_args();
     println!("# deferstat M1+M3 (counter run): {attempts} attempts, base seed {seed}\n");
@@ -72,6 +72,69 @@ fn main() {
         let s = defer_stat(seed, &spec, attempts);
         report_m1_m3(&label, &s);
     }
+
+    // M-UA-LIB: true 2-digit-UA catch — spec-invariant (reverts are spec-independent), so
+    // the two production hidden-quad specs suffice.
+    println!("\n################ M-UA-LIB: true 2-digit unavoidable-set catch ################\n");
+    for (label, spec) in [
+        ("train(hidden-quad)", Spec::train(HIDDEN_QUAD)),
+        ("drill(hidden-quad)", Spec::drill(HIDDEN_QUAD)),
+    ] {
+        let u = ua_catch_stat(seed, &spec, attempts);
+        report_ua(label, &u);
+    }
+}
+
+#[cfg(feature = "count")]
+fn report_ua(label: &str, u: &generator_lab::generate::UaCatchStat) {
+    println!("==== {label}: {} attempts ====", u.attempts);
+    println!(
+        "  library: {} boards, {:.1} UAs/board ({:.1} UA4s/board)   soundness false_positive (must be 0): {}",
+        u.boards,
+        u.lib_uas as f64 / u.boards.max(1) as f64,
+        u.lib_ua4 as f64 / u.boards.max(1) as f64,
+        u.false_positive,
+    );
+    let rev_all = u.reverts[0] + u.reverts[1];
+    let rnd_all = u.revert_nodes[0] + u.revert_nodes[1];
+    let att = u.attempts.max(1) as f64;
+    println!(
+        "  reverts {} ({:.1}/att): clue>=33 {} / clue<=32 {};  revert-nodes {} ({:.1}/att)",
+        rev_all, rev_all as f64 / att, u.reverts[0], u.reverts[1], rnd_all, rnd_all as f64 / att,
+    );
+    let pc = |n: u64, d: u64| 100.0 * n as f64 / d.max(1) as f64;
+    println!("  CATCH RATE (caught / reverts):           BY COUNT                 |          BY NODES (cost)");
+    println!(
+        "    {:<12} {:>10} {:>10} {:>8}  | {:>10} {:>10} {:>8}",
+        "tier", "clue>=33", "clue<=32", "ALL", "clue>=33", "clue<=32", "ALL"
+    );
+    let row = |name: &str, ct: &[u64; 2], nd: &[u64; 2]| {
+        println!(
+            "    {:<12} {:>9.1}% {:>9.1}% {:>7.1}% | {:>9.1}% {:>9.1}% {:>7.1}%",
+            name,
+            pc(ct[0], u.reverts[0]),
+            pc(ct[1], u.reverts[1]),
+            pc(ct[0] + ct[1], rev_all),
+            pc(nd[0], u.revert_nodes[0]),
+            pc(nd[1], u.revert_nodes[1]),
+            pc(nd[0] + nd[1], rnd_all),
+        );
+    };
+    row("UA4-only", &u.caught_ua4_ct, &u.caught_ua4_nd);
+    row("UA4+2digit", &u.caught_all_ct, &u.caught_all_nd);
+    print!("  locked-cell census (avg sole-given cells at clue=K):");
+    for k in [70usize, 60, 50, 40, 33, 32, 28, 26, 24, 22] {
+        if u.locked_n[k] > 0 {
+            print!(" {k}:{:.1}", u.locked_sum[k] as f64 / u.locked_n[k] as f64);
+        }
+    }
+    println!("\n  RAWUALIB census clue:avg");
+    for k in (17..=80).rev() {
+        if u.locked_n[k] > 0 {
+            print!(" {k}:{:.2}", u.locked_sum[k] as f64 / u.locked_n[k] as f64);
+        }
+    }
+    println!("\n");
 }
 
 /// 8 clue-count buckets from 81 down: bucket 0 = clues 73-80, ..., bucket 7 = clues <= 24.
