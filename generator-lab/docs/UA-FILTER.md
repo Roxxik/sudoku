@@ -1,7 +1,9 @@
 # UA strip pre-filter — implementation plan
 
-Status: planned (GO decision 2026-06-11, measurement M-UA-LIB). Two stages: UA4-only
-first, then the full 2-digit library. Land and benchmark each stage in isolation.
+Status: LANDED, tier-split. Stage 1 = UA4-only on both engines; stage 2 = the full
+2-digit library on the scalar/wasm path (it wins there) but NOT on SIMT (UA4-only
+stays). Production: `UaTier::SCALAR = Full`, `UaTier::SIMT = Ua4`. Section 7 has the
+measured outcome; the original plan is below.
 
 ## 1. Idea and why it pays
 
@@ -150,3 +152,50 @@ Locked-cell census (avg cells that are sole given of some library UA, at clue K)
 
 SIMT cycle split (320k att): prober 43.1% (train) / 46.0% (drill) of warp us/att;
 revert-side = x0.855 => 36.8% / 39.4%. SIMT baseline us/att: 39.60 train / 37.11 drill.
+
+## 7. Results (measured 2026-06-11)
+
+All numbers: 40000 att (scalar) / 160000 att (SIMT, 8 lanes), seed 1, hidden-quad,
+pinned core, boost off; `examples/bench` (scalar) and `examples/combobench --ua`
+(SIMT). The run_attempts fingerprint is bit-identical across off/ua4/full
+(0x98233825), and the full test suite + tests/ua_filter (per-engine, per-tier
+trajectory identity) are green — the soundness/trajectory-identity claims all held.
+
+Outcome: TIER-SPLIT, as section 4 anticipated. Scalar/wasm carry the full library;
+SIMT carries UA4-only.
+
+  scalar us/att:  off 98.3   ua4 86.5 (-12.0%)   full 84.2 (-14.3%)   <- full wins
+  SIMT   us/att:  off 36.9   ua4 34.5 ( -6.5%)   full 36.7 (+6.4% vs ua4)  <- ua4 wins
+
+Build cost (isolated enumeration, ns/board):
+  UA4   ~0.49 us (signature scan, 162 cell visits)
+  Full  ~4.0 us  (cycle decomposition; see below)
+
+The build is what decides the split, and it is NOT the ~1-2 us section-1/4 assumed
+for a naive port. The minimal 2-digit UAs are connected components of the per-unit
+a/b join graph; the instrumentation counter found them with a per-cell union-find,
+which costs ~8 us/board (the ~2,600 per-board `find` walks dominate — dependent-load
+loops). The production enumeration instead exploits the structure: row+column joins
+form a degree-2 graph, so the components are the cycles of the row permutation
+pi(r) = row-of-b-in(column-of-a-in(r)) (a 9-step walk over precomputed coordinate
+tables, zero finds), and box joins merge at most nine cycle ids via a tiny <=9-elt
+union-find. That lands at ~4 us (all the divisions hoisted into a one-time
+per-board precompute), under the scalar break-even.
+
+At ~4 us build:
+- scalar (~95 us attempt): full's extra catch (36% vs 24% of the revert pool by
+  nodes) clears the +3.5 us build delta over UA4 -> full nets ~-14% vs ~-12%.
+- SIMT (~35 us attempt): full's ~1.8 us extra catch does NOT clear the +3.5 us
+  build delta -> full is ~+2 us WORSE than UA4. UA4-only stays (the <=1 us SIMT
+  build bar is met only by the rectangle scan).
+
+The UA4 catch matches the by-nodes prediction: count instrumentation showed revert
+probe retirements drop 26.5% with ua4 (= the M-UA-LIB by-count UA4 catch) and keep
+retirements unchanged. Scalar UA4 (~12%) exceeds the ~11% projection; SIMT UA4
+(~6-7% net, ~8% gross) lands just under the ~8-9% projection, the gap being the
+~0.5 us build on the small ~35 us SIMT attempt plus node-share vs wall-time slack.
+
+Lesson worth keeping: "N comparisons is effectively free" is a trap — even the 162
+UA4 visits cost ~0.5 us, enough to matter on the small SIMT attempt; and the full
+build's algorithm (cycle decomposition, not union-find) was the whole ballgame, a
+~2x swing that moved full from a loss to a win on scalar.

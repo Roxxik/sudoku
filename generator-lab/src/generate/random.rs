@@ -171,9 +171,15 @@ pub enum UaTier {
 }
 
 impl UaTier {
-    /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]).
-    pub const SCALAR: UaTier = UaTier::Ua4;
-    /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]).
+    /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]). The
+    /// full 2-digit library wins here: its ~4 us/board cycle-decomposition build is small
+    /// against the ~95 us scalar attempt, so the extra revert catch (full 36% vs UA4 24% of
+    /// the revert pool by nodes) nets out ahead (~-14% vs off, vs UA4's ~-12%).
+    pub const SCALAR: UaTier = UaTier::Full;
+    /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]). UA4-only: on
+    /// the ~35 us warp attempt the full library's ~4 us build outweighs its ~1.8 us extra
+    /// catch, so the cheap UA4 rectangle scan (~0.5 us) is the win. Tiers may differ per
+    /// engine because the strip trajectory is identical regardless of tier.
     pub const SIMT: UaTier = UaTier::Ua4;
 }
 
@@ -337,83 +343,87 @@ impl UaFilter {
         }
     }
 
-    /// Enumerate the full 2-digit UA library of the complete solution `sol` (sizes 4..=18,
-    /// superseding [`enumerate_ua4`](Self::enumerate_ua4)). Ported from the M-UA-LIB counter
-    /// `enumerate_2digit_uas`: for each of the 36 digit pairs `{a, b}`, union-find over the
-    /// 18 cells holding `a` or `b`, joining each unit's (row/column/box) two pair-cells; the
-    /// connected components are the minimal UAs (an `a<->b` swap on any one is another valid
-    /// grid). ~55 UAs/board. Fixed-capacity scratch — no per-board heap allocation.
+    /// Enumerate the full 2-digit UA library of the complete solution `g` (sizes 4..=18,
+    /// superseding [`enumerate_ua4`](Self::enumerate_ua4)). The minimal 2-digit UAs of a pair
+    /// `{a, b}` are the connected components of the graph joining, per unit (row/column/box),
+    /// that unit's `a`-cell to its `b`-cell. Rather than a union-find over the 18 cells (whose
+    /// per-pair `find` walks dominated the cost), exploit the structure: row + column joins
+    /// form a degree-2 graph, so each row's two cells are co-component and the components are
+    /// exactly the *cycles* of the row permutation
+    /// `pi(r) = row-of-b-in(column-of-a-in(r))` — a 9-step walk over the precomputed maps,
+    /// zero finds. Box joins then merge at most nine cycle ids (one edge per box, between the
+    /// rows of its `a`- and `b`-cell) via a tiny `<=9`-element union-find. Each final
+    /// component's cells are, for each of its rows `r`, the `a`-cell and `b`-cell of row `r`,
+    /// so its size is `2 x rows`. ~55 UAs/board, ~4 us (vs ~8 us for a per-cell union-find,
+    /// whose `find` walks dominated). Fixed-capacity scratch — no heap. Correctness is pinned
+    /// by `ua4_equals_full_size4` (size-4 components = the rectangle scan) and
+    /// `full_uas_are_genuine` (every component's digit-swap is a distinct valid grid).
     fn enumerate_2digit(&mut self, g: &[u8; CELLS]) {
-        fn find(p: &mut [usize; CELLS], x: usize) -> usize {
-            let mut r = x;
-            while p[r] != r {
-                r = p[r];
+        // Root of a `<=9`-element union-find with path halving (over cycle ids).
+        fn root(p: &mut [u8; 9], mut x: usize) -> usize {
+            while p[x] as usize != x {
+                let gp = p[p[x] as usize];
+                p[x] = gp;
+                x = gp as usize;
             }
-            let mut c = x;
-            while p[c] != r {
-                let n = p[c];
-                p[c] = r;
-                c = n;
-            }
-            r
+            x
         }
-        // The `k`-th cell of unit `u` of kind 0=row / 1=column / 2=box.
-        let unit_cell = |kind: usize, u: usize, k: usize| -> usize {
-            match kind {
-                0 => u * 9 + k,
-                1 => k * 9 + u,
-                _ => ((u / 3) * 3 + k / 3) * 9 + ((u % 3) * 3 + k % 3),
+        // Precompute, once per board, each digit's coordinate within each line — the only
+        // divisions in the whole enumeration live here, hoisted out of the per-pair loops.
+        // A complete grid has exactly one cell per (unit, digit), so every entry is set.
+        let mut col_of = [[0u8; 9]; 9]; // [row][digit]    = column of the digit in that row
+        let mut row_in_col = [[0u8; 9]; 9]; // [column][digit] = row of the digit in that column
+        let mut row_in_box = [[0u8; 9]; 9]; // [box][digit]    = row of the digit in that box
+        for row in 0..9 {
+            for col in 0..9 {
+                let d = g[row * 9 + col] as usize;
+                let bx = (row / 3) * 3 + col / 3;
+                col_of[row][d] = col as u8;
+                row_in_col[col][d] = row as u8;
+                row_in_box[bx][d] = row as u8;
             }
-        };
-        let mut parent = [0usize; CELLS];
-        let mut cells = [0usize; 18];
-        let mut roots: [(usize, u8); 18] = [(usize::MAX, 0); 18];
-        for a in 0..9u8 {
-            for b in (a + 1)..9u8 {
-                for (c, p) in parent.iter_mut().enumerate() {
-                    *p = c;
+        }
+        let mut cid = [0u8; 9]; // row -> row+column cycle id
+        let mut comp = [0u8; 9]; // cycle id -> merged-component id (box-join union-find)
+        let mut comp_ua = [0u8; 9]; // merged-component id -> UA id (per pair)
+        for a in 0..9usize {
+            for b in (a + 1)..9usize {
+                // Cycles of `pi` = the row+column components, as row sets.
+                let mut visited = [false; 9];
+                let mut ncyc = 0u8;
+                for start in 0..9 {
+                    if visited[start] {
+                        continue;
+                    }
+                    let mut r = start;
+                    while !visited[r] {
+                        visited[r] = true;
+                        cid[r] = ncyc;
+                        // pi(r): the row of b in the column where a sits in row r.
+                        r = row_in_col[col_of[r][a] as usize][b] as usize;
+                    }
+                    ncyc += 1;
                 }
-                for kind in 0..3 {
-                    for u in 0..9 {
-                        // Each unit holds exactly one `a`-cell and one `b`-cell; join them.
-                        let mut found = [usize::MAX; 2];
-                        let mut n = 0;
-                        for k in 0..9 {
-                            let cell = unit_cell(kind, u, k);
-                            if g[cell] == a || g[cell] == b {
-                                if n < 2 {
-                                    found[n] = cell;
-                                }
-                                n += 1;
-                            }
-                        }
-                        if n == 2 {
-                            let (ra, rb) = (find(&mut parent, found[0]), find(&mut parent, found[1]));
-                            if ra != rb {
-                                parent[ra] = rb;
-                            }
-                        }
+                // Box joins merge cycle ids: one edge per box, between the rows of its a/b
+                // cells (each box's a-cell IS its row's a-cell, so it sits in that row's cycle).
+                for (i, c) in comp[..ncyc as usize].iter_mut().enumerate() {
+                    *c = i as u8;
+                }
+                for bx in 0..9 {
+                    let ra = row_in_box[bx][a] as usize;
+                    let rb = row_in_box[bx][b] as usize;
+                    let (x, y) = (root(&mut comp, cid[ra] as usize), root(&mut comp, cid[rb] as usize));
+                    if x != y {
+                        comp[x] = y as u8;
                     }
                 }
-                // This pair's cells, then grouped by root into one UA per component.
-                let mut ncells = 0;
-                for cell in 0..CELLS {
-                    if g[cell] == a || g[cell] == b {
-                        cells[ncells] = cell;
-                        ncells += 1;
-                    }
+                // Allocate one UA per merged component and emit each row's two cells.
+                for u in comp_ua[..ncyc as usize].iter_mut() {
+                    *u = u8::MAX;
                 }
-                let mut nroots = 0;
-                for i in 0..ncells {
-                    let cell = cells[i];
-                    let r = find(&mut parent, cell);
-                    let mut id = u8::MAX;
-                    for &(rr, ri) in &roots[..nroots] {
-                        if rr == r {
-                            id = ri;
-                            break;
-                        }
-                    }
+                for r in 0..9 {
+                    let fin = root(&mut comp, cid[r] as usize);
+                    let mut id = comp_ua[fin];
                     if id == u8::MAX {
                         if self.nua >= UA_CAP {
                             continue; // truncation-safe (never reached: <=144 UAs/board)
@@ -421,14 +431,15 @@ impl UaFilter {
                         id = self.nua as u8;
                         self.counts[self.nua] = 0;
                         self.nua += 1;
-                        roots[nroots] = (r, id);
-                        nroots += 1;
+                        comp_ua[fin] = id;
                     }
-                    self.counts[id as usize] += 1;
-                    let ln = self.lens[cell] as usize;
-                    if ln < UA_PER_CELL {
-                        self.cell_uas[cell][ln] = id;
-                        self.lens[cell] = (ln + 1) as u8;
+                    self.counts[id as usize] += 2;
+                    for cell in [r * 9 + col_of[r][a] as usize, r * 9 + col_of[r][b] as usize] {
+                        let ln = self.lens[cell] as usize;
+                        if ln < UA_PER_CELL {
+                            self.cell_uas[cell][ln] = id;
+                            self.lens[cell] = (ln + 1) as u8;
+                        }
                     }
                 }
             }
