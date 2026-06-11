@@ -37,6 +37,7 @@
 //! path.
 
 use super::random::{GeneratedPuzzle, Stats, StripState, baseline_fast_applicable, verify};
+use crate::counters::counter_block;
 use crate::fill::random_solution;
 use crate::probe::simt::{Frame, LANES, M, Probe, V, ZERO, load_lane};
 use crate::repr::banded::{Bands, RowMajor};
@@ -53,6 +54,49 @@ use std::collections::VecDeque;
 use std::ops::{Coroutine, CoroutineState};
 use std::pin::Pin;
 use std::rc::Rc;
+
+// --- warp-phase split metrics (feature = "count") -----------------------------------
+// Where does the warp's wall time go — the prober (probe phase) vs the rest (baseline
+// solve + host)? The kernel `warp_pass_full` advances every active lane in ONE shared
+// SIMD pass at a phase-independent per-lane cost, so the prober's share of kernel work is
+// its share of lane-passes. Cycle counters (rdtsc) split the scalar tail into the engine
+// (per phase) and the strip/fill/verify coroutine, so the prober's total share is
+// `kernel x probe-pass% + probe-engine`, and the host (which SIMT does not vectorize) is
+// isolated as the coroutine slice:
+//   [0] probe-phase lane-passes        [1] baseline-phase lane-passes
+//   [2] kernel cycles (warp_pass_full)
+//   [3] probe-engine-service cycles    [4] baseline-engine-service cycles
+//   [5] coroutine (resume) cycles — the host: strip bookkeeping + fill + verify
+//   [6] unique (keep) probe retirements  [7] non-unique (revert) probe retirements
+// `ph_add(i, v)` tallies (no-op without the feature). Read by `combobench`.
+counter_block!(PHSTAT: 8, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
+
+/// rdtsc timestamp for the kernel/service split (0 off-x86 or without the feature, so the
+/// cycle counters stay zero there while the lane-pass counters — exact — still work).
+#[cfg(all(feature = "count", target_arch = "x86_64"))]
+#[inline]
+fn rdtsc() -> u64 {
+    // SAFETY: _rdtsc is always available on x86_64; reads the timestamp counter.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+#[cfg(not(all(feature = "count", target_arch = "x86_64")))]
+#[inline]
+fn rdtsc() -> u64 {
+    0
+}
+
+/// Encode a lane's phase for [`PHSTAT`]: 0 = idle, 1 = probe, 2 = baseline.
+#[cfg(feature = "count")]
+#[inline]
+fn lane_phase(active: bool, baseline: bool) -> u8 {
+    if !active {
+        0
+    } else if baseline {
+        2
+    } else {
+        1
+    }
+}
 
 /// The strip state the warp's lanes carry: a **single row-major view**. The warp
 /// consumes only row bands ([`StripState::export_r`]), the gate tests are row-only,
@@ -111,6 +155,11 @@ pub trait Engine {
     /// state. `None` = still running (rejoin the warp); `Some` = retired.
     fn service(&mut self, b: &mut WarpBoards, l: usize, solved: bool, dead: bool)
     -> Option<Self::Verdict>;
+
+    /// Whether the lane is in its baseline phase (vs the uniqueness-probe phase) — read by
+    /// the host's warp-phase split metrics to attribute each lane-pass. A non-probe engine
+    /// can report `true` (no probe phase); the production [`GateEngine`] reports its flip.
+    fn baseline_phase(&self) -> bool;
 }
 
 /// The production engine: one uniqueness gate, probe phase first, flipping to the
@@ -184,7 +233,10 @@ impl Engine for GateEngine {
     #[inline]
     fn service(&mut self, b: &mut WarpBoards, l: usize, solved: bool, dead: bool)
     -> Option<GateResult> {
-        if self.baseline {
+        // Time the scalar engine work, attributed to the phase it entered in.
+        let was_baseline = self.baseline;
+        let t0 = rdtsc();
+        let out = if self.baseline {
             if solved {
                 Some(self.trace(true))
             } else if dead {
@@ -202,14 +254,25 @@ impl Engine for GateEngine {
         } else {
             // Probe phase: the shared prober service decides the uniqueness verdict.
             match prober_service(&mut b.r, &mut b.unsolved, &mut self.stack, l, solved, dead) {
-                Some(true) => Some(GateResult::ProbeNonUnique), // a completion exists
+                Some(true) => {
+                    ph_add(7, 1); // non-unique (revert) probe retirement
+                    Some(GateResult::ProbeNonUnique) // a completion exists
+                }
                 Some(false) => {
+                    ph_add(6, 1); // unique (keep) probe retirement
                     self.flip_to_baseline(b, l); // tree exhausted: unique
                     None
                 }
                 None => None, // branched / backtracked: keep searching
             }
-        }
+        };
+        ph_add(if was_baseline { 4 } else { 3 }, rdtsc().wrapping_sub(t0));
+        out
+    }
+
+    #[inline]
+    fn baseline_phase(&self) -> bool {
+        self.baseline
     }
 }
 
@@ -338,6 +401,10 @@ pub trait Occupant {
     /// retires, resume the attempt with the verdict and load its next request.
     /// Returns the lane's new active state.
     fn service(&mut self, b: &mut WarpBoards, l: usize, solved: bool, dead: bool) -> bool;
+
+    /// Whether the occupant's engine is in its baseline phase — the host's phase-split
+    /// metrics query it after each prime/service to attribute the coming lane-passes.
+    fn baseline_phase(&self) -> bool;
 }
 
 /// One ticket: an [`Engine`] (the warp-side machine) paired with its [`Attempt`] (the
@@ -360,7 +427,12 @@ where
     /// stays idle and is never serviced again). Returns the lane's new active state.
     #[inline]
     fn advance(&mut self, b: &mut WarpBoards, l: usize, verdict: E::Verdict) -> bool {
-        match Pin::new(&mut self.attempt).resume(verdict) {
+        // Time the coroutine resume — the host work (strip bookkeeping, fill, verify) that
+        // SIMT does not vectorize, isolated from the engine scalar and the kernel.
+        let t0 = rdtsc();
+        let r = Pin::new(&mut self.attempt).resume(verdict);
+        ph_add(5, rdtsc().wrapping_sub(t0));
+        match r {
             CoroutineState::Yielded(req) => {
                 self.engine.load(b, l, &req);
                 true
@@ -389,6 +461,11 @@ where
             None => true,                     // still running: rejoin the warp
             Some(v) => self.advance(b, l, v), // retired: drive the attempt onward
         }
+    }
+
+    #[inline]
+    fn baseline_phase(&self) -> bool {
+        self.engine.baseline_phase()
     }
 }
 
@@ -423,6 +500,10 @@ where
     active: [bool; LANES],
     occupants: [O; LANES],
     shared: SharedRef<I>,
+    /// Per-lane phase for the warp-phase split metrics: 0 = idle, 1 = probe, 2 = baseline.
+    /// Maintained at prime/service points and read each tick to attribute lane-passes.
+    #[cfg(feature = "count")]
+    phase: [u8; LANES],
 }
 
 /// The production instantiation: a [`GateEngine`] driven by the gate-per-strip
@@ -453,9 +534,15 @@ where
             active: [false; LANES],
             occupants: core::array::from_fn(|_| mk_occupant(&shared)),
             shared,
+            #[cfg(feature = "count")]
+            phase: [0; LANES],
         };
         for l in 0..LANES {
             s.active[l] = s.occupants[l].prime(&mut s.boards, l);
+            #[cfg(feature = "count")]
+            {
+                s.phase[l] = lane_phase(s.active[l], s.occupants[l].baseline_phase());
+            }
         }
         s
     }
@@ -498,8 +585,21 @@ where
         let active_b = active_mask.to_bitmask();
         uwstat_add(0, 1);
         uwstat_add(1, active_b.count_ones() as u64);
+        // Attribute this tick's lane-passes to phase: the kernel advances every active
+        // lane at a phase-independent per-lane cost, so the prober's share of kernel work
+        // is its share of lane-passes. `phase` (idle/probe/baseline) tracks active lanes.
+        #[cfg(feature = "count")]
+        for &p in &self.phase {
+            match p {
+                1 => ph_add(0, 1),
+                2 => ph_add(1, 1),
+                _ => {}
+            }
+        }
+        let k0 = rdtsc();
         let (changed, dead, solved) =
             warp_pass_full(&mut self.boards.r, &mut self.boards.unsolved, active_mask);
+        ph_add(2, rdtsc().wrapping_sub(k0)); // kernel cycles (the engine/coroutine slices self-time)
 
         let solved_b = solved.to_bitmask();
         let dead_b = dead.to_bitmask();
@@ -515,6 +615,10 @@ where
                 solved_b & bit != 0,
                 dead_b & bit != 0,
             );
+            #[cfg(feature = "count")]
+            {
+                self.phase[l] = lane_phase(self.active[l], self.occupants[l].baseline_phase());
+            }
         }
     }
 

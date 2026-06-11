@@ -125,6 +125,7 @@ fn main() {
     {
         generator_lab::repr::banded::psg_reset();
         generator_lab::solve::uwstat_reset();
+        generator_lab::generate::warp_host::phstat_reset();
     }
     // Fixed work, capped from the OUTSIDE: pump the production stream until `total`
     // attempts have started (the counter climbs on every attempt incl. retries, so this
@@ -163,6 +164,47 @@ fn main() {
             util,
             uw[1] as f64 / uw[0].max(1) as f64,
             uw[0] as f64 / (lanes * per_lane) as f64,
+        );
+        // Warp-phase split (the SIMT prober-vs-rest decomposition). The kernel advances
+        // every active lane at a phase-independent per-lane cost, so its cycles split by
+        // lane-pass phase; the scalar tail is timed directly (engine per phase + host
+        // coroutine). prober = probe-kernel + probe-engine; host = coroutine (the part
+        // SIMT does not vectorize).
+        let ph = generator_lab::generate::warp_host::phstat_snapshot();
+        let (probe_p, base_p) = (ph[0], ph[1]);
+        let lane_passes = (probe_p + base_p).max(1) as f64;
+        let probe_pass_share = probe_p as f64 / lane_passes;
+        let (kcyc, pe_cyc, be_cyc, co_cyc) =
+            (ph[2] as f64, ph[3] as f64, ph[4] as f64, ph[5] as f64);
+        let tcyc = (kcyc + pe_cyc + be_cyc + co_cyc).max(1.0);
+        let probe_kernel = kcyc * probe_pass_share;
+        let base_kernel = kcyc * (1.0 - probe_pass_share);
+        let prober = probe_kernel + pe_cyc;
+        let baseline = base_kernel + be_cyc;
+        let pct = |c: f64| 100.0 * c / tcyc;
+        println!(
+            "  warp lane-passes: probe {:.1}% / baseline {:.1}%   ({} / {})",
+            100.0 * probe_pass_share,
+            100.0 * base_p as f64 / lane_passes,
+            probe_p,
+            base_p,
+        );
+        println!(
+            "  warp cycles: kernel {:.1}% (probe {:.1}/base {:.1}) | engine probe {:.1}/base {:.1} | host-coroutine {:.1}%",
+            pct(kcyc), pct(probe_kernel), pct(base_kernel), pct(pe_cyc), pct(be_cyc), pct(co_cyc),
+        );
+        println!(
+            "  => PROBER {:.1}% | baseline {:.1}% | host {:.1}% of warp tick time",
+            pct(prober), pct(baseline), pct(co_cyc),
+        );
+        println!(
+            "  => revert-side prober ~= x0.855 (backend-invariant revert cost frac) = {:.1}% of warp us/att",
+            0.855 * pct(prober),
+        );
+        println!(
+            "  probe retirements: unique(keep) {} / non-unique(revert) {}  ({:.1}% revert by count)",
+            ph[6], ph[7],
+            100.0 * ph[7] as f64 / (ph[6] + ph[7]).max(1) as f64,
         );
     }
 
