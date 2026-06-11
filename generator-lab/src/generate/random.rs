@@ -668,6 +668,19 @@ pub struct DeferStat {
     /// (`k` in `1..=81`; fast-path skips and unique probes are keeps, non-unique
     /// probes break a run).
     pub run_hist: [u64; 82],
+    /// UA-witness size histogram for the probe-skip idea: at each non-unique (revert)
+    /// gate, the cell-diff between the known solution and the alternate completion the
+    /// prober constructed — itself an emptied unavoidable set, so its popcount is the
+    /// witness size. Indexed `[clue group][size]`, group 0 = clue >= 33, group 1 =
+    /// clue <= 32; `size` in `0..=81` (UAs are even and >= 4). The cumulative tail
+    /// `<= k` is a lower bound on a complete size-`k` UA library's revert catch-rate.
+    pub witness_size: [[u64; 82]; 2],
+    /// The same reverts as [`witness_size`](Self::witness_size) but each weighted by the
+    /// revert probe's DFS node count — so the cumulative tail `<= k` is the *cost* a
+    /// size-`k` library reclaims, not just the count fraction. Small-UA reverts cluster at
+    /// high clue where probes are ~1 node, so the node-weighted catch runs well below the
+    /// count-weighted one — the number the e2e economics actually turn on.
+    pub witness_nodes: [[u64; 82]; 2],
     /// M3 prober root-drain band-passes summed over keep (unique) gates.
     pub probe_root_passes: u64,
     /// M3 prober total band-passes summed over the same gates.
@@ -692,6 +705,7 @@ pub struct DeferStat {
 /// not be mixed with a wall-time A/B (the counters perturb timing). Diagnostic only.
 #[cfg(feature = "count")]
 pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
+    use crate::probe::search::first_completion;
     use crate::probe::{
         Propagate, band_ctr_reset, band_ctr_snapshot, pctr_reset, pctr_snapshot,
     };
@@ -720,6 +734,8 @@ pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
         nodes_revert: [0; 82],
         baseline_revert: [0; 82],
         run_hist: [0; 82],
+        witness_size: [[0; 82]; 2],
+        witness_nodes: [[0; 82]; 2],
         probe_root_passes: 0,
         probe_total_passes: 0,
         probe_drain_gates: 0,
@@ -734,6 +750,8 @@ pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
         let mut st: StripState = StripState::new(&solution);
+        // Per-digit cells of the full solution (row-major) — the witness diff's reference.
+        let sol_cells = SolverState::<RM>::clue_map(&solution.0);
         // Clue count at the current gate = givens on the board after the speculative
         // strip; starts at 81 (full grid), -1 per strip, +1 per revert.
         let mut givens = CELLS;
@@ -774,6 +792,24 @@ pub fn defer_stat(base_seed: u64, spec: &Spec, attempts: usize) -> DeferStat {
                 // Non-unique: revert, and the run breaks here.
                 s.reverts[clue] += 1;
                 s.nodes_revert[clue] += nodes;
+                // UA witness — reconstruct the alternate completion this revert proves
+                // exists and diff it against the solution over the empty cells (givens
+                // agree, so the diff lies wholly in the empties): the emptied UA, whose
+                // popcount a size-capped library would have to cover to skip this probe.
+                let mut probe = st.state.row().clone();
+                probe.forbid(cell, orig);
+                let empty = probe.unsolved();
+                if let Some(alt) = first_completion::<RM, Bivalue>(probe) {
+                    let mut diff = 0u32;
+                    for d in 0..9 {
+                        let m = (sol_cells.each()[d] & empty & !alt.candidates().each()[d]).to_lanes();
+                        diff += m[0].count_ones() + m[1].count_ones() + m[2].count_ones();
+                    }
+                    let group = if clue >= 33 { 0 } else { 1 };
+                    let bin = (diff as usize).min(81);
+                    s.witness_size[group][bin] += 1;
+                    s.witness_nodes[group][bin] += nodes;
+                }
                 st.revert_gate(cell, orig);
                 givens += 1;
                 end_run!();
@@ -844,6 +880,16 @@ pub struct VerifyShare {
     pub successes: usize,
     pub total_nanos: u64,
     pub verify_nanos: u64,
+    /// Posed probes whose verdict was unique (keep), and the wall time in them.
+    pub keep_probes: usize,
+    pub keep_probe_nanos: u64,
+    /// Posed probes whose verdict was non-unique (revert), and the wall time in them —
+    /// the revert-side prober cost a probe-skip library would reclaim. The per-probe
+    /// `Instant` adds a small (~75 ns/probe) overhead; the keep/revert wall-time split it
+    /// yields cross-checks the (clean) revert-node share, and the verify share it shares
+    /// the walk with is a ratio, so the drift cancels.
+    pub revert_probes: usize,
+    pub revert_probe_nanos: u64,
 }
 
 /// Walk `attempts` faithful scalar strip attempts from `base_seed`, timing the cold
@@ -876,7 +922,16 @@ pub fn verify_share(base_seed: u64, spec: &Spec, attempts: usize) -> VerifyShare
                 st.keep_trivial();
                 continue;
             }
+            let tp = Instant::now();
             let nonunique = st.scalar_nonunique(cell, orig);
+            let pe = tp.elapsed().as_nanos() as u64;
+            if nonunique {
+                vs.revert_probes += 1;
+                vs.revert_probe_nanos += pe;
+            } else {
+                vs.keep_probes += 1;
+                vs.keep_probe_nanos += pe;
+            }
             st.resolve_gate(cell, orig, nonunique, spec, baseline, fast);
         }
         if let Some(snap) = st.best.take() {

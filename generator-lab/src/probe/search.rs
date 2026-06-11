@@ -79,6 +79,57 @@ where
     }
 }
 
+/// The first completion of `state` the search reaches (DFS order), or `None` if the
+/// board has none — the **witness** twin of [`count_completions`] at `cap = 1`: the same
+/// `scan -> branch -> recurse` spine and node order, but it returns the solved
+/// [`SolverState`] instead of only tallying. At a complete grid every cell is decided and
+/// — because each cell's non-placed digits were cleared by their unit-mates — the
+/// per-digit candidate boards are stale-free, so `candidates()[d]` is exactly the cells
+/// holding `d`. The UA-witness diagnostic reads that out to recover the alternate
+/// completion a non-unique strip admits (its cell-diff against the known solution is an
+/// emptied unavoidable set). Counts nodes into `PCTR` identically to [`count`].
+pub fn first_completion<M, S>(state: SolverState<M>) -> Option<SolverState<M>>
+where
+    M: Propagate,
+    S: BranchStrategy,
+{
+    let mut state = state;
+    first::<M, S>(&mut state)
+}
+
+fn first<M, S>(state: &mut SolverState<M>) -> Option<SolverState<M>>
+where
+    M: Propagate,
+    S: BranchStrategy,
+{
+    super::pbump(2); // node tally, same as `count`
+    loop {
+        match M::propagate(state) {
+            Fixpoint::Solved => return Some(state.clone()),
+            Fixpoint::Dead => return None,
+            Fixpoint::Stuck => {}
+        }
+        let Scan::Branch { cell, candidates } = S::scan(state.candidates(), state.unsolved())
+        else {
+            return None;
+        };
+        let mut m = candidates;
+        loop {
+            let d = Digit::from_index(m.trailing_zeros() as usize);
+            m &= m - 1;
+            if m == 0 {
+                state.place(cell, d);
+                break;
+            }
+            let mut child = state.clone();
+            child.place(cell, d);
+            if let Some(sol) = first::<M, S>(&mut child) {
+                return Some(sol);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::count_completions;
@@ -130,6 +181,44 @@ mod tests {
             assert_eq!(count_completions::<Bands<RowMajor>, Bivalue>(state(s), 2), baseline);
             assert_eq!(count_completions::<Bands<RowMajor>, Mrv<2>>(state(s), 2), baseline);
             assert_eq!(count_completions::<Bands<RowMajor>, Mrv<9>>(state(s), 2), baseline);
+        }
+    }
+
+    /// [`first_completion`](super::first_completion) must (1) agree with the cap-1 count
+    /// on existence and (2) return a completion whose *filled* cells reconstruct to a
+    /// valid grid: each empty cell lands in exactly one digit board (the stale-free
+    /// property the witness diff relies on — givens are in no board, which is why the diff
+    /// is taken over the empty mask), and the full grid has no peer conflict.
+    #[test]
+    fn first_completion_reconstructs_a_valid_solution() {
+        use crate::repr::{CELLS, GridMask, PEERS};
+        type M = Bands<RowMajor>;
+        for s in [PUZZLE, &".".repeat(81)] {
+            let puz = DigitGrid::parse(s).unwrap();
+            let exists = count_completions::<M, Bivalue>(SolverState::<M>::from_digits(&puz), 1) >= 1;
+            let comp = super::first_completion::<M, Bivalue>(SolverState::<M>::from_digits(&puz));
+            assert_eq!(comp.is_some(), exists, "verdict mismatch");
+            let Some(alt) = comp else { continue };
+            assert!(!alt.unsolved().any(), "completion not fully solved");
+            let mut grid = [usize::MAX; CELLS];
+            for c in 0..CELLS {
+                if let Some(d) = puz.get(c) {
+                    grid[c] = d.index(); // given: in no candidate board, read from the puzzle
+                    continue;
+                }
+                for d in 0..9 {
+                    if (alt.candidates().each()[d] & M::cell(c)).any() {
+                        assert_eq!(grid[c], usize::MAX, "empty cell {c} in two digit boards (stale)");
+                        grid[c] = d;
+                    }
+                }
+                assert_ne!(grid[c], usize::MAX, "empty cell {c} in no digit board");
+            }
+            for c in 0..CELLS {
+                for &p in &PEERS[c] {
+                    assert_ne!(grid[c], grid[p], "peer conflict at {c}");
+                }
+            }
         }
     }
 }

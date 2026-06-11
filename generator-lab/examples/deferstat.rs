@@ -196,6 +196,89 @@ fn report_m1_m3(label: &str, s: &generator_lab::generate::DeferStat) {
         s.solve_drain_gates,
     );
 
+    // --- M-UA: probe-skip-by-unavoidable-set sizing ---
+    let att = s.attempts.max(1) as f64;
+    let tot_nodes_all = tot_nk + tot_nr;
+    println!("M-UA  probe-skip-by-unavoidable-set sizing:");
+    println!(
+        "    prize pool: {:.2} reverts/att  {:.1} revert-nodes/att  ({:.1} total nodes/att; revert-node share {:.1}%)",
+        tot_revert as f64 / att,
+        tot_nr as f64 / att,
+        tot_nodes_all as f64 / att,
+        100.0 * tot_nr as f64 / tot_nodes_all.max(1) as f64,
+    );
+    // Witness-size buckets {<=4,<=6,<=8,<=10,<=12,<=14,<=16,>16}.
+    let bucket_w = |size: usize| -> usize {
+        match size {
+            0..=4 => 0,
+            5..=6 => 1,
+            7..=8 => 2,
+            9..=10 => 3,
+            11..=12 => 4,
+            13..=14 => 5,
+            15..=16 => 6,
+            _ => 7,
+        }
+    };
+    let bucketize = |gi: usize| -> ([u64; 8], u64) {
+        let mut bk = [0u64; 8];
+        let mut tot = 0u64;
+        for size in 0..82 {
+            let c = if gi == 2 { s.witness_size[0][size] + s.witness_size[1][size] } else { s.witness_size[gi][size] };
+            bk[bucket_w(size)] += c;
+            tot += c;
+        }
+        (bk, tot)
+    };
+    let (_, w_all) = bucketize(2);
+    println!(
+        "    witnesses {w_all} (= reverts {tot_revert}? {})   UA = solution-vs-alternate cell diff",
+        if w_all == tot_revert { "yes" } else { "MISMATCH" }
+    );
+    println!(
+        "      {:<14} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "group(n)", "<=4", "<=6", "<=8", "<=10", "<=12", "<=14", "<=16", ">16"
+    );
+    for (gname, gi) in [("clue>=33", 0usize), ("clue<=32", 1usize), ("all", 2usize)] {
+        let (bk, tot) = bucketize(gi);
+        println!(
+            "      {:<14} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+            format!("{gname}({tot})"),
+            bk[0], bk[1], bk[2], bk[3], bk[4], bk[5], bk[6], bk[7]
+        );
+    }
+    // Cumulative catch-rate of a complete size-<=k UA library, all reverts (the decider).
+    let (bk_all, tot_all) = bucketize(2);
+    let ub = [4usize, 6, 8, 10, 12, 14, 16];
+    let mut run = 0u64;
+    let mut cum = String::new();
+    for b in 0..7 {
+        run += bk_all[b];
+        cum.push_str(&format!(" <={}:{:.1}%", ub[b], 100.0 * run as f64 / tot_all.max(1) as f64));
+    }
+    println!(
+        "      ALL cumulative catch (by count):{cum}   (>16 uncaught: {:.1}%)",
+        100.0 * bk_all[7] as f64 / tot_all.max(1) as f64
+    );
+    // Node-weighted: the prober cost a complete size-<=k library actually reclaims.
+    let mut nbk = [0u64; 8];
+    let mut ntot = 0u64;
+    for size in 0..82 {
+        let c = s.witness_nodes[0][size] + s.witness_nodes[1][size];
+        nbk[bucket_w(size)] += c;
+        ntot += c;
+    }
+    let mut nrun = 0u64;
+    let mut ncum = String::new();
+    for b in 0..7 {
+        nrun += nbk[b];
+        ncum.push_str(&format!(" <={}:{:.1}%", ub[b], 100.0 * nrun as f64 / ntot.max(1) as f64));
+    }
+    println!(
+        "      ALL cumulative catch (by NODES):{ncum}   (>16 uncaught: {:.1}% of revert cost)",
+        100.0 * nbk[7] as f64 / ntot.max(1) as f64
+    );
+
     // --- raw, parseable ---
     dump_raw(label, s);
     println!();
@@ -223,6 +306,15 @@ fn dump_raw(label: &str, s: &generator_lab::generate::DeferStat) {
         "  RAWM3 probe_root_passes={} probe_total_passes={} probe_gates={} solve_drain_passes={} solve_total_passes={} solve_gates={}",
         s.probe_root_passes, s.probe_total_passes, s.probe_drain_gates, s.solve_drain_passes, s.solve_total_passes, s.solve_drain_gates
     );
+    for (gi, gname) in [(0usize, "clue_ge33"), (1usize, "clue_le32")] {
+        print!("  RAWUA {gname} size:count:nodes");
+        for size in 0..82 {
+            if s.witness_size[gi][size] > 0 {
+                print!(" {size}:{}:{}", s.witness_size[gi][size], s.witness_nodes[gi][size]);
+            }
+        }
+        println!();
+    }
 }
 
 // ====================================================================================
@@ -235,9 +327,11 @@ fn main() {
 
     let (attempts, seed) = parse_args();
     println!("# deferstat M2 (wall-time run, no counters): {attempts} attempts, base seed {seed}\n");
+    // tot/vfy us/att drift with machine thermal state; verify% and the keep/revert probe
+    // SPLIT are ratios within one walk, so they are the stable, comparable numbers.
     println!(
-        "  {:<40} {:>10} {:>9} {:>9} {:>9} {:>11} {:>10} {:>11}",
-        "spec", "tot us/att", "vfy%", "vfy/1k", "vfy-fail%", "us/vfy-call", "vfy us/att", "succ/notF"
+        "  {:<33} {:>9} {:>6} {:>7} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9}",
+        "spec", "tot us/at", "vfy%", "vfy/1k", "vfyfail", "us/vfy", "vfy us/at", "revprb/at", "keepprb/at", "succ/notF"
     );
 
     for (label, spec) in workload() {
@@ -258,8 +352,10 @@ fn main() {
         let vfy_fail = 100.0 * vs.not_forced as f64 / vs.reached_verify.max(1) as f64;
         let us_per_vfy = verify_us / vs.reached_verify.max(1) as f64;
         let vfy_us_per_att = verify_us / vs.attempts.max(1) as f64;
+        let revprb_us_per_att = vs.revert_probe_nanos as f64 / 1000.0 / vs.attempts.max(1) as f64;
+        let keepprb_us_per_att = vs.keep_probe_nanos as f64 / 1000.0 / vs.attempts.max(1) as f64;
         println!(
-            "  {:<40} {:>10.3} {:>8.2}% {:>9.1} {:>8.1}% {:>11.3} {:>10.4} {:>5}/{:<5}",
+            "  {:<33} {:>9.2} {:>5.2}% {:>7.1} {:>7.1}% {:>8.2} {:>9.4} {:>9.3} {:>9.4} {:>4}/{:<4}",
             label,
             us_per_att,
             verify_share_pct,
@@ -267,6 +363,8 @@ fn main() {
             vfy_fail,
             us_per_vfy,
             vfy_us_per_att,
+            revprb_us_per_att,
+            keepprb_us_per_att,
             vs.successes,
             vs.not_forced,
         );
