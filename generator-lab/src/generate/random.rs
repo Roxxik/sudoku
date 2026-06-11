@@ -172,10 +172,12 @@ pub enum UaTier {
 
 impl UaTier {
     /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]). The
-    /// full 2-digit library wins here: its ~3.2 us/board cycle-decomposition build (size-18
-    /// single-component pairs dropped — see [`enumerate_2digit`](UaFilter::enumerate_2digit))
-    /// is small against the ~95 us scalar attempt, so the extra revert catch (full 36% vs UA4
-    /// 24% of the revert pool by nodes) nets out ahead (~-15% vs off, vs UA4's ~-12%).
+    /// full 2-digit library wins here: its build (the packed `pshufb`
+    /// [`enumerate_2digit_packed`](UaFilter::enumerate_2digit_packed) on x86_64, ~2.4 us/board,
+    /// or the scalar [`enumerate_2digit`](UaFilter::enumerate_2digit) elsewhere; size-18
+    /// single-component pairs dropped) is small against the ~95 us scalar attempt, so the extra
+    /// revert catch (full 36% vs UA4 24% of the revert pool by nodes) nets out ahead (~-15% vs
+    /// off, vs UA4's ~-12%).
     pub const SCALAR: UaTier = UaTier::Full;
     /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]). UA4-only: on
     /// the ~35 us warp attempt the full library's ~3.2 us build still outweighs its ~1.5 us
@@ -234,6 +236,13 @@ impl UaFilter {
         match tier {
             UaTier::Off => {}
             UaTier::Ua4 => f.enumerate_ua4(&Self::dense(sol)),
+            // x86_64 (the perf target) runs the packed `pshufb`/`swizzle_dyn` build; the scalar
+            // cycle-decomposition build stays as the oracle/fallback (it ships in the wasm
+            // cdylib and is the differential-test reference). Both produce a bit-identical
+            // `UaFilter` — see `enumerate_2digit_packed` and `docs/UA-PACKED-BUILD.md`.
+            #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+            UaTier::Full => f.enumerate_2digit_packed(&Self::dense(sol)),
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
             UaTier::Full => f.enumerate_2digit(&Self::dense(sol)),
         }
         f
@@ -372,6 +381,12 @@ impl UaFilter {
     /// whose `find` walks dominated). Fixed-capacity scratch — no heap. Correctness is pinned
     /// by `ua4_equals_full_size4` (size-4 components = the rectangle scan) and
     /// `full_uas_are_genuine` (every component's digit-swap is a distinct valid grid).
+    ///
+    /// On x86_64 the production [`build`](Self::build) routes [`UaTier::Full`] to the packed
+    /// [`enumerate_2digit_packed`](Self::enumerate_2digit_packed) instead; this scalar build
+    /// stays as the wasm/other-arch path and the `packed_equals_scalar` differential oracle, so
+    /// it is unused (but compiled) in a non-test x86_64+ssse3 build.
+    #[cfg_attr(all(target_arch = "x86_64", target_feature = "ssse3", not(test)), allow(dead_code))]
     fn enumerate_2digit(&mut self, g: &[u8; CELLS]) {
         // Root of a `<=9`-element union-find with path halving (over cycle ids).
         fn root(p: &mut [u8; 9], mut x: usize) -> usize {
@@ -475,6 +490,165 @@ impl UaFilter {
                         if ln < UA_PER_CELL {
                             self.cell_uas[cell][ln] = id;
                             self.lens[cell] = (ln + 1) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Packed-permutation port of [`enumerate_2digit`](Self::enumerate_2digit): the same full
+    /// 2-digit library and the same cap-14 single-component drop, producing a **bit-identical**
+    /// [`UaFilter`] — but the per-pair row+column cycle decomposition runs as `pshufb`
+    /// (`_mm_shuffle_epi8`) shuffles over 9-element byte maps instead of the serial,
+    /// dependent-load 9-step walk and a per-cell union-find. The whole rewrite is a build-cost
+    /// win on the same fixed output (see `docs/UA-PACKED-BUILD.md`); it carries no trajectory
+    /// change, so the production fingerprint is unchanged.
+    ///
+    /// For digit pair `{a, b}`, the row+column components are the cycles of the row permutation
+    /// `pi(r) = C_b[R_a[r]]` (one swizzle: the row of `b` in the column where `a` sits in row
+    /// `r`). Four rounds of min-label doubling — `L = min(L, L[P]); P = P[P]`, `2^4 = 16 >= 9` —
+    /// collapse each cycle to its minimum row index: a canonical, union-direction-free label.
+    /// Box joins then merge those labels (a tiny `<= 9`-element min-keeping union-find over the
+    /// nine box edges), and a merged label is again the component's minimum row. Emission
+    /// allocates one UA id per distinct final label in ascending order; because a component is
+    /// first reached, scanning rows `0..9`, at the row equal to its minimum (its label), this is
+    /// exactly the scalar build's first-row cycle-id allocation order — so `counts`, `cell_uas`,
+    /// and `lens` come out byte-for-byte identical (pinned by `packed_equals_scalar`).
+    ///
+    /// Lane hygiene: the byte maps fill lanes 9..15 with `0x80`, and every swizzle index that
+    /// feeds lanes 0..8 is itself in 0..8, so high-lane garbage never propagates into a low
+    /// lane; the single-component test masks to the low nine lanes (`& 0x1FF`). `L[0]` is always
+    /// `0` (row 0 lies in the cycle/component whose minimum row is 0), so "all lanes 0..8 zero"
+    /// is exactly "one 18-cell component", the cap-14 drop.
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    fn enumerate_2digit_packed(&mut self, g: &[u8; CELLS]) {
+        use core::arch::x86_64::*;
+
+        const HI: u8 = 0x80; // don't-care fill for lanes 9..15
+
+        // Root of a `<= 9`-element min-keeping union-find (over cycle min-row labels). Keeping
+        // the smaller label as the root makes the resolved label each component's minimum row,
+        // matching the scalar build's canonical first-row ordering.
+        fn root(p: &mut [u8; 9], mut x: usize) -> usize {
+            while p[x] as usize != x {
+                let gp = p[p[x] as usize];
+                p[x] = gp;
+                x = gp as usize;
+            }
+            x
+        }
+
+        // Precompute, once per board, each digit's coordinate within each line — the only
+        // divisions in the enumeration, hoisted out of the per-pair loops (as in the scalar
+        // build). A complete grid sets every (unit, digit) entry exactly once. `r_map`/`c_map`
+        // are the 16-byte permutation maps the per-pair vector ops consume (`R_d[row] = col`,
+        // `C_d[col] = row`, `C_d` the inverse of `R_d`); `col_of`/`row_in_box` stay scalar for
+        // the box merge and emission, which read individual entries.
+        let mut col_of = [[0u8; 9]; 9]; // [row][digit] = column of the digit in that row
+        let mut row_in_box = [[0u8; 9]; 9]; // [box][digit] = row of the digit in that box
+        let mut r_map = [[HI; 16]; 9];
+        let mut c_map = [[HI; 16]; 9];
+        for row in 0..9 {
+            for col in 0..9 {
+                let d = g[row * 9 + col] as usize;
+                let bx = (row / 3) * 3 + col / 3;
+                col_of[row][d] = col as u8;
+                row_in_box[bx][d] = row as u8;
+                r_map[d][row] = col as u8;
+                c_map[d][col] = row as u8;
+            }
+        }
+
+        // SAFETY: every `_mm_*` below is SSE2/SSSE3, statically available under
+        // `cfg(target_feature = "ssse3")` (the crate builds with `-C target-cpu=native`). All
+        // loads/stores are unaligned (`loadu`/`storeu`) over 16-byte `[u8; 16]` buffers, so
+        // there is no alignment precondition. We use raw `pshufb` rather than portable
+        // `Simd::swizzle_dyn`: the latter's "index >= 16 -> 0" contract scalarizes into long
+        // masked blends on AVX-512 targets (Zen4), whereas `pshufb` zeroes on the index's high
+        // bit — which the `0x80` high-lane fill matches exactly — so each shuffle stays one
+        // instruction.
+        unsafe {
+            let ident =
+                _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, -128, -128, -128, -128, -128, -128, -128);
+            let zero = _mm_setzero_si128();
+            let mut r_vec = [zero; 9];
+            let mut c_vec = [zero; 9];
+            for d in 0..9 {
+                r_vec[d] = _mm_loadu_si128(r_map[d].as_ptr() as *const __m128i);
+                c_vec[d] = _mm_loadu_si128(c_map[d].as_ptr() as *const __m128i);
+            }
+
+            for a in 0..9usize {
+                for b in (a + 1)..9usize {
+                    // pi(r) = C_b[R_a[r]] — the row+column permutation whose cycles are the
+                    // row+column components.
+                    let pi = _mm_shuffle_epi8(c_vec[b], r_vec[a]);
+                    // Min-label doubling: after 4 rounds (2^4 = 16 >= 9), `lab[r]` = the minimum
+                    // row index in r's cycle (its canonical label).
+                    let mut lab = ident;
+                    let mut pp = pi;
+                    for _ in 0..4 {
+                        lab = _mm_min_epu8(lab, _mm_shuffle_epi8(lab, pp));
+                        pp = _mm_shuffle_epi8(pp, pp);
+                    }
+                    // Single 9-cycle (lab all-zero over lanes 0..8) => the whole 18-cell pair,
+                    // which the cap-14 policy drops. `pi` is fixed-point-free, so one cycle
+                    // already spans all nine rows and no box join can split it — drop directly.
+                    if (_mm_movemask_epi8(_mm_cmpeq_epi8(lab, zero)) & 0x1FF) == 0x1FF {
+                        continue;
+                    }
+                    let mut l = [0u8; 16];
+                    _mm_storeu_si128(l.as_mut_ptr() as *mut __m128i, lab);
+                    // Box joins: one edge per box, between the labels of its a-cell and b-cell
+                    // rows (each box's a-cell is its row's a-cell, hence in that row's cycle).
+                    // Self-loops (a and b in one row) union a label with itself — a no-op.
+                    let mut parent: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+                    for bx in 0..9 {
+                        let la = l[row_in_box[bx][a] as usize] as usize;
+                        let lb = l[row_in_box[bx][b] as usize] as usize;
+                        let (x, y) = (root(&mut parent, la), root(&mut parent, lb));
+                        if x != y {
+                            let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+                            parent[hi] = lo as u8;
+                        }
+                    }
+                    // Final label per row = its merged component's minimum row. One lone label is
+                    // again the whole 18-cell pair (cap-14), so drop it as above.
+                    let mut fin = [0u8; 9];
+                    let mut single = true;
+                    for r in 0..9 {
+                        fin[r] = root(&mut parent, l[r] as usize) as u8;
+                        single &= fin[r] == 0;
+                    }
+                    if single {
+                        continue;
+                    }
+                    // One UA id per distinct final label, allocated in ascending-label order. The
+                    // first row carrying label `m`, scanning `0..9`, is row `m` itself (a
+                    // component's minimum row), so ids land in the scalar build's first-row order
+                    // — keeping the emitted library bit-identical. Each emitted row contributes
+                    // its a-cell and b-cell and `+2` to the UA's given count (`|U| = 2 x rows`).
+                    let mut label_ua = [u8::MAX; 9];
+                    for r in 0..9 {
+                        let m = fin[r] as usize;
+                        let id = if label_ua[m] == u8::MAX {
+                            let id = self.alloc_ua();
+                            label_ua[m] = id;
+                            id
+                        } else {
+                            label_ua[m]
+                        };
+                        if id == u8::MAX {
+                            continue; // truncated UA (never reached: <=144 UAs/board)
+                        }
+                        self.counts[id as usize] += 2;
+                        for cell in [r * 9 + col_of[r][a] as usize, r * 9 + col_of[r][b] as usize] {
+                            let ln = self.lens[cell] as usize;
+                            if ln < UA_PER_CELL {
+                                self.cell_uas[cell][ln] = id;
+                                self.lens[cell] = (ln + 1) as u8;
+                            }
                         }
                     }
                 }
@@ -1768,6 +1942,30 @@ mod ua_filter_tests {
                 assert!(is_valid_complete(&swapped), "seed {seed}: UA swap is not a valid grid");
                 assert_ne!(swapped.to_line(), sol.to_line(), "seed {seed}: UA swap is the identity");
             }
+        }
+    }
+
+    /// The packed `swizzle_dyn` build must produce a **bit-identical** [`UaFilter`] to the
+    /// scalar cycle-decomposition oracle — same `nua`, `counts`, `cell_uas`, and `lens`, not
+    /// merely the same UA *set*. That id-for-id identity is what lets the production x86_64 build
+    /// swap in the packed engine with the `run_attempts` fingerprint provably unchanged (the
+    /// emission allocates UA ids in the same first-row order). Gated to the arch+feature the
+    /// packed build is gated to (x86_64 + ssse3).
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    #[test]
+    fn packed_equals_scalar() {
+        for seed in 0..200 {
+            let mut rng = Rng::from_seed(seed);
+            let sol = random_solution(&mut rng).0;
+            let g = UaFilter::dense(&sol);
+            let mut packed = UaFilter::empty();
+            packed.enumerate_2digit_packed(&g);
+            let mut scalar = UaFilter::empty();
+            scalar.enumerate_2digit(&g);
+            assert_eq!(packed.nua, scalar.nua, "seed {seed}: nua differs");
+            assert_eq!(packed.lens, scalar.lens, "seed {seed}: lens differ");
+            assert_eq!(packed.counts, scalar.counts, "seed {seed}: counts differ");
+            assert!(packed.cell_uas == scalar.cell_uas, "seed {seed}: cell_uas differ");
         }
     }
 

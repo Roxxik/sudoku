@@ -1,8 +1,10 @@
 # UA-PACKED-BUILD — packed-permutation engine for the full 2-digit UA enumeration
 
-Status: design, not implemented. Successor to the scalar cycle-decomposition build in
-`UaFilter::enumerate_2digit` (see docs/UA-FILTER.md for the filter itself). Written
-intent-first: the implementing agent grounds the details in the current code.
+Status: LANDED (x86_64). `UaFilter::enumerate_2digit_packed` is the production
+`UaTier::Full` build on x86_64 + SSSE3; the scalar `enumerate_2digit` stays as the
+other-arch/wasm path and the differential-test oracle. Section 11 has the measured outcome;
+the original intent-first design is below. Successor to the scalar cycle-decomposition build
+in `UaFilter::enumerate_2digit` (see docs/UA-FILTER.md for the filter itself).
 
 ## 1. Why
 
@@ -159,3 +161,87 @@ before/after `ua_build_cost` + bench run.
 - No trajectory changes of any kind: this is a build-cost rewrite of an enumeration whose
   output (post-cap) is fixed.
 - 3-digit UAs stay dead (subset solves per board, wrong cost class).
+
+## 10. Measured baseline (post-cap) — profiling the shipped scalar build
+
+Added after the fact: section 1's `3683 ns` is the **pre-cap** Full build. This doc was
+written before the cap-14 skip landed (commit `6f64da3`, which reports `3.68 -> 3.15
+us/board`); the diagnosis in section 1 still holds, but the numbers a future
+implementer benchmarks against are the post-cap ones below. Zen4, single core pinned,
+build isolated from `run_attempts` (pre-gen the solutions, rebuild `UaTier::Full` in a
+tight loop so `random_solution` stays out of the timed/profiled region — `ua_build_cost`
+already does the timed half; the perf half needs a rebuild loop).
+
+Reproduced build cost (5 seeds, best-of): UA4 ~482-503 ns/board (section 1's 502 holds);
+**Full ~3.06-3.10 us/board** at 34.2 UAs/board (the cap-14 library). `perf stat` over the
+Full hot loop, per board: **~11.2k cycles, ~21.4k instructions, IPC 1.92**, L1-dcache
+load-miss **0.06%** (no cache misses — purely latency/throughput bound, exactly as section
+1 assumes), frontend-stall ~14.7% of cycles, branch-miss **126/board (~2.3%)**.
+
+What the premise gets right:
+- It IS stall-bound, not memory-bound (IPC 1.92 against Zen4's ~6-wide retire, zero cache
+  misses). "Roughly half is stalls" is fair against a ~4-IPC throughput model.
+- The per-pair cycle walk (`random.rs:408-419`) is the #1 hot region by cycles, **~21%**,
+  and `r = row_in_col[col_of[r][a]][b]` (line 417) is two genuinely dependent serial loads
+  per step, as claimed. Box-join `root()` union-find adds ~11%. Precompute and emission are
+  throughput-diffuse (their instructions land in inlined core helpers — bounds checks, slice
+  indexing — no single hot instruction), not stall-concentrated.
+
+Two corrections to the section-1 mechanism list:
+- **Branch mispredicts are a stall source section 1 omits**, comparable to the dependent
+  loads: ~126 misses/board ~= ~17% of all cycles. Sampling `branch-misses` and attributing
+  to source, the walk's variable trip count dominates — `random.rs:413` (`while !visited[r]`)
+  alone is **9.5% of all misses** (the single largest), the walk region ~19%, `root()`
+  (`378`) ~5%, emission's alloc/capacity branches (`462`/`474`) ~8%. The pshufb engine is
+  branchless, so it removes this incidentally — the conclusion survives, the diagnosis was
+  just half the stall story.
+- The **emission store-to-load-forwarding claim is not borne out.** Emission is not a
+  concentrated cycles hotspot; its cost is diffuse instruction count plus the unpredictable
+  branches above, not a visible `lens`/`cell_uas` forwarding chain. Down-weight it.
+
+Implication for the ~1 us target: at ~21.4k instructions/board, even a *stall-free* build at
+~3 IPC lands near ~1.9 us. Hitting <= ~1 us therefore requires cutting **instruction count**
+(the 9-step scalar walk -> ~12 vector ops), not merely removing stalls — which is exactly
+what the packed engine does, so section 6's estimate stands. The flip-bar math in section 2
+is unaffected: it constrains the *future* packed build (`build_cappedfull`), not the scalar
+status quo, so the stale 3683 never enters it.
+
+## 11. Measured outcome (landed 2026-06-11, x86_64/Zen4)
+
+`enumerate_2digit_packed` is live for `UaTier::Full` on x86_64 + SSSE3
+(`cfg(all(target_arch = "x86_64", target_feature = "ssse3"))`, met by the crate's
+`-C target-cpu=native`). Scalar `enumerate_2digit` is the wasm/other-arch path and the
+`packed_equals_scalar` differential oracle. Output is **bit-identical** to the scalar build
+(`packed_equals_scalar` asserts equal `nua`/`counts`/`cell_uas`/`lens` over 200 seeds), so the
+`run_attempts` fingerprint is unchanged (`0x4621f425` across off/ua4/full, both modes; the
+`tests/ua_filter` per-engine/per-tier trajectory-identity pins stay green).
+
+Build cost (`examples/bench`, seed 1, 8000 att, pinned core; isolated pooled loop in
+parentheses): scalar Full **~3.36 us/board (~3.06)** -> packed Full **~2.44 us/board (~2.33)**,
+**~27%** off at the same 34.3 UAs/board. Scalar e2e `full` improves ~83.1 -> ~82.0 us/att
+(train), ~79.1 -> ~78.3 (drill).
+
+An implementation note worth keeping: portable `Simd::<u8, 16>::swizzle_dyn` does **not** lower
+to a single `pshufb` on this AVX-512 target — its "index >= 16 -> 0" contract scalarizes into
+long masked `vpor`/`vpand`/`vpternlogd` blends, and a first cut using it measured **~5.37
+us/board (worse than scalar)**. Switching to the raw `_mm_shuffle_epi8` intrinsic (which zeroes
+on the index high bit, matching the `0x80` high-lane fill) restored the win — 9 `pshufb`/pair,
+one instruction each. Use the intrinsic, not `swizzle_dyn`, for any port of this.
+
+Where the remaining ~2.4 us goes (perf-annotated, fill amortized out so build is ~99% of the
+process): the hot instructions are **all in the scalar tail** — the box-join `root()`
+union-find and the emission (`alloc_ua` cap check, `counts += 2`, the `cell_uas` byte stores).
+The vector min-doubling is essentially free. This confirms the mechanism: the packed engine
+removed *only* the 9-step cycle walk (section 10's #1 hot region, ~21% of cycles + ~19% of
+branch-misses), which is exactly the ~27% it delivered. The box-merge and emission are
+**unchanged from the scalar build** — so the residue is the *shared* tail, not the new vector
+code.
+
+This lands **above** the section-2 SIMT flip bar (~1.5-1.8 us), so SIMT stays `UaTier::Ua4`
+(unchanged) and no tier unification happens yet; the win is the scalar/wasm production build.
+Section 10's ~1 us target was optimistic about emission: the scalar build floors near ~2 us
+once the walk is gone (emission is irreducible output work — ~273 membership writes — shared
+with scalar). Closing the rest is the section-6 follow-up, and a **separate** change
+(one-change-at-a-time): vectorize the box-merge (`M = pshufb(M, M)` propagation over the edge
+list) and/or restructure emission (buffer-and-flush, drop bounds/cap checks via the known
+`<=144`/`<=8` invariants). Measure each on its own `ua_build_cost` before/after.
