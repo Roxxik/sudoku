@@ -205,16 +205,25 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
             }
         }
         // Column hidden singles via the column fold + broadcast (see fn docs).
-        let mut cones = ZERO;
-        let mut ctwos = ZERO;
+        // Balanced two-level tree instead of a 9-deep serial fold: collapse each
+        // band's 3 row-slices into a saturating (ones>=1, twos>=2) pair, then merge
+        // the 3 bands with the same identity (twos = ta|tb|(oa&ob); ones = oa|ob).
+        // Critical-path depth drops ~9 -> ~4; col_single stays bit-identical.
+        let mut bones = [ZERO; 3];
+        let mut btwos = [ZERO; 3];
         for b in 0..3 {
             let live = r[d][b] & unsolved[b];
-            for rr in 0..3u32 {
-                let slice = (live >> Simd::splat(9 * rr)) & m9;
-                ctwos |= cones & slice;
-                cones |= slice;
-            }
+            let s0 = live & m9;
+            let s1 = (live >> nine) & m9;
+            let s2 = (live >> eighteen) & m9;
+            let o01 = s0 | s1;
+            bones[b] = o01 | s2;
+            btwos[b] = (s0 & s1) | (o01 & s2);
         }
+        let o01 = bones[0] | bones[1];
+        let t01 = btwos[0] | btwos[1] | (bones[0] & bones[1]);
+        let cones = o01 | bones[2];
+        let ctwos = t01 | btwos[2] | (o01 & bones[2]);
         let col_single = cones & !ctwos;
         let col_bc = col_single | (col_single << nine) | (col_single << eighteen);
         for b in 0..3 {
