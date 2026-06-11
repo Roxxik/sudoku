@@ -1,7 +1,7 @@
-//! Interleaved A/B of the WarpJob factoring: variant A = the merged host
+//! Interleaved A/B of the Engine factoring: variant A = the merged host
 //! ([`random_simt_merged::PuzzleStream`], slot lifecycle hardcoded in `tick`),
 //! variant B = the factored host ([`warp_host::GateStream`], same lifecycle behind
-//! the monomorphized [`WarpJob`] seam). Same lane coroutines, same kernels, same
+//! the monomorphized [`Engine`] seam). Same lane coroutines, same kernels, same
 //! seeds, alternating order-swapped chunks in one binary; the per-seed puzzle
 //! comparison is the soundness guard, the time ratio the verdict (expected: exact
 //! parity — the dispatch is static).
@@ -173,7 +173,7 @@ fn main() {
     }
 
     let mut a = MergedStream::new(base_seed.., &spec); // A: merged (hardcoded tick)
-    let mut b = GateStream::new(base_seed.., &spec); // B: factored (WarpJob seam)
+    let mut b = GateStream::new(base_seed.., &spec); // B: factored (Engine seam)
     let (mut found_a, mut found_b) = (Vec::new(), Vec::new());
     let (mut t_a, mut t_b) = (0.0f64, 0.0f64);
     let (mut att_a, mut att_b) = (0usize, 0usize);

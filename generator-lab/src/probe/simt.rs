@@ -72,7 +72,7 @@ pub(crate) fn rm_cell(lane: usize, bit: u32) -> usize {
 /// was a wash: Zen 4 double-pumps it, so no raw-throughput gain.)
 pub const LANES: usize = 8;
 
-// `pub` (not crate): they appear in the [`crate::generate::warp_host::WarpJob`]
+// `pub` (not crate): they appear in the [`crate::generate::warp_host::Engine`]
 // trait's method signatures (the boards a job's scalar service mutates).
 pub type V = Simd<u32, LANES>;
 pub type M = Mask<i32, LANES>;

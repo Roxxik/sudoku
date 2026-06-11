@@ -46,7 +46,7 @@
 #![feature(portable_simd)]
 #![feature(const_trait_impl)]
 // The SIMT warp host's per-lane resumable strip attempts are compiler-generated
-// coroutines (`generate::warp_host::lane_co`); the TAIT names the unnameable coroutine
+// coroutines (`generate::warp_host::attempt`); the TAIT names the unnameable coroutine
 // type so the stream can hold its lanes inline (no boxing, no dyn dispatch).
 #![feature(coroutines, coroutine_trait, type_alias_impl_trait)]
 

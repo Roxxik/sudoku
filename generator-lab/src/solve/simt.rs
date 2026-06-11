@@ -766,7 +766,7 @@ fn scalar_col_assign(r: &mut [[V; 3]; 9], unsolved: &[V; 3], l: usize) -> bool {
 /// `Some(false)` = the search tree is exhausted -> unique), or `None` if it keeps searching
 /// (descended into a branch, or backtracked to an untried alternative). `solved`/`dead` are
 /// this lane's bits from the pass. Shared by the host's
-/// [`GateJob`](crate::generate::warp_host::GateJob) (which flips a unique lane to baseline
+/// [`GateEngine`](crate::generate::warp_host::GateEngine) (which flips a unique lane to baseline
 /// in place) and [`resolve_probes`] (which just reports the verdict), so the production
 /// prober and the test/bench prober can't drift.
 #[inline]
@@ -863,7 +863,7 @@ pub fn resolve_probes(probes: &[Probe]) -> Vec<bool> {
 /// A freed warp lane's verdict — the resume value the host hands back to its lane
 /// coroutine. The unique-probe case never appears here: on a unique verdict the warp
 /// flips the lane to its baseline phase *in place* (see
-/// [`GateJob`](crate::generate::warp_host::GateJob)), so the host only ever sees a
+/// [`GateEngine`](crate::generate::warp_host::GateEngine)), so the host only ever sees a
 /// non-unique probe or a finished baseline.
 #[derive(Clone, Copy)]
 pub enum GateResult {

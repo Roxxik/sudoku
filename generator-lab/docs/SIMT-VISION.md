@@ -511,3 +511,10 @@ For later chunking only; the vision above does not depend on this table.
 | ticket | implicit (lane index) |
 | corpus harvester | `collect_probes` |
 | `Tallies` / `Ledger` | `Stats` (aggregate only; the ledger does not exist yet) |
+
+## Note (2026-06-11): partial landing
+
+A first slice of this vocab is in `warp_host.rs`: `WarpJob`->`Engine`,
+`GateJob`->`GateEngine`, `lane_co`/`LaneCo`->`attempt`/`Attempt`, and the `Slot`
+band-aid -> `Ticket<E, A>` behind an `Occupant` trait the host is generic over.
+Only the engine+attempt unit moved; stations, rigs, and the rim are still fused.

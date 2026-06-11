@@ -7,23 +7,27 @@
 //!     primitives — free functions in [`solve::simt`](crate::solve::simt) /
 //!     [`probe::simt`](crate::probe::simt). "Advance all lanes, return masks"; it
 //!     does not care what the lanes hold.
-//!   - **Job** ([`WarpJob`]): what occupies a warp lane — the per-slot scalar phase
+//!   - **Engine** ([`Engine`]): what occupies a warp lane — the per-lane scalar phase
 //!     machine. What to do at load, what to do when the pass leaves the lane
 //!     solved/dead/stalled (the warp-vs-scalar split lives HERE), and what verdict
-//!     it retires with. [`GateJob`] is the production job: the probe -> in-place
+//!     it retires with. [`GateEngine`] is the production engine: the probe -> in-place
 //!     baseline flip -> trace lifecycle, owning its branch stack, subset counts,
 //!     cached flip query, ladder memo, and spec-derived config.
-//!   - **Lane policy** (the strip driver): WHEN to request warp work — the
-//!     coroutine yielding [`WarpJob::Request`]s, resumed with [`WarpJob::Verdict`]s
-//!     ([`lane_co`], gate-per-strip; an alternative policy is just another
-//!     coroutine fn).
-//!   - **Host** ([`PuzzleStream`]): pure plumbing, generic over job and lane —
+//!   - **Attempt** (the strip driver): WHEN to request warp work — the coroutine
+//!     yielding [`Engine::Request`]s, resumed with [`Engine::Verdict`]s ([`attempt`],
+//!     gate-per-strip; an alternative policy is just another coroutine fn).
+//!   - **Occupant** ([`Occupant`]): the per-lane binding of an engine to its attempt.
+//!     It owns the request/verdict shuttle between them — engine retires a verdict,
+//!     attempt resumes and yields the next request, engine loads it — and exposes only
+//!     prime/service to the host. [`Ticket`] is the production occupant: one engine,
+//!     one attempt, ticket = lane. This is the single seam the host is generic over.
+//!   - **Host** ([`PuzzleStream`]): pure plumbing, generic over the occupant —
 //!     seeds/ready/stats, the pump budget, pass + service-mask + resume loop. It
 //!     knows nothing about probing or baselines.
 //!
 //! The service-eligibility mask (`active & (solved | dead | !changed)`) stays
-//! host-side: "this lane did not advance vectorially" is a kernel fact, not job
-//! semantics. Everything else lives in [`GateJob`].
+//! host-side: "this lane did not advance vectorially" is a kernel fact, not engine
+//! semantics. Everything else lives in [`GateEngine`].
 //!
 //! Logical lanes are independent, so the 8-slot interleave can't change any lane's
 //! outcome: the dispatch is monomorphized and the seed -> puzzle map is byte-identical
@@ -70,7 +74,7 @@ pub enum Pumped {
 }
 
 /// The warp's resident SoA boards: nine per-digit candidate bands plus the empty
-/// mask, eight lanes wide. The kernel advances them in lockstep; a job's scalar
+/// mask, eight lanes wide. The kernel advances them in lockstep; an engine's scalar
 /// service mutates one lane's columns.
 pub struct WarpBoards {
     pub r: [[V; 3]; 9],
@@ -83,38 +87,38 @@ impl WarpBoards {
     }
 }
 
-/// What occupies a warp lane: the per-slot scalar phase machine between the lane
+/// What occupies a warp lane: the per-lane scalar phase machine between the attempt
 /// coroutine's request and its verdict. The host loads a request, runs the shared
 /// vector pass, and calls [`service`](Self::service) whenever the pass leaves the
-/// lane solved/dead/unchanged; the job advances its phases in place (branch,
+/// lane solved/dead/unchanged; the engine advances its phases in place (branch,
 /// backtrack, flip, ladder step, ...) until it retires with a verdict, which the
-/// host resumes the lane with.
+/// host resumes the attempt with.
 ///
-/// A job is a data machine on purpose: it is serviced ~every tick (hot) and needs
+/// An engine is a data machine on purpose: it is serviced ~every tick (hot) and needs
 /// the shared boards, so it cannot be a coroutine (the lending problem) — this
 /// trait is the named, swappable form of that machine.
-pub trait WarpJob {
-    /// What a lane asks for (the yield type of its coroutine).
+pub trait Engine {
+    /// What a lane asks for (the yield type of its attempt coroutine).
     type Request;
-    /// What a finished job hands back (the resume type of the lane coroutine).
+    /// What a finished engine hands back (the resume type of the attempt coroutine).
     type Verdict;
     /// The dummy verdict for a lane's very first resume — it has not yielded a
     /// request yet, so the value is never read. A protocol artifact of priming.
     const PRIME: Self::Verdict;
-    /// Begin a new job on lane `l` for `req` (the slot was just freed or primed).
+    /// Begin a new query on lane `l` for `req` (the lane was just freed or primed).
     fn load(&mut self, b: &mut WarpBoards, l: usize, req: &Self::Request);
-    /// The pass left lane `l` solved/dead/unchanged: advance the job's scalar
+    /// The pass left lane `l` solved/dead/unchanged: advance the engine's scalar
     /// state. `None` = still running (rejoin the warp); `Some` = retired.
     fn service(&mut self, b: &mut WarpBoards, l: usize, solved: bool, dead: bool)
     -> Option<Self::Verdict>;
 }
 
-/// The production job: one uniqueness gate, probe phase first, flipping to the
+/// The production engine: one uniqueness gate, probe phase first, flipping to the
 /// baseline phase in place on a unique verdict (reusing the cached raw query — a
 /// [`Probe`]'s board IS the baseline query, the strip is unchanged between probe
 /// and verdict), so the whole gate costs the lane a single suspension. Owns the
 /// per-slot search state plus the spec-derived config.
-pub struct GateJob {
+pub struct GateEngine {
     /// `true` = baseline phase, `false` = probe phase.
     baseline: bool,
     /// Probe-phase branch stack (unused in the baseline phase).
@@ -131,9 +135,9 @@ pub struct GateJob {
     ladder_memo: bool,
 }
 
-impl GateJob {
+impl GateEngine {
     pub fn new(spec: &Spec, ladder_memo: bool) -> Self {
-        GateJob {
+        GateEngine {
             baseline: false,
             stack: Vec::with_capacity(64),
             counts: [0; NUM],
@@ -160,7 +164,7 @@ impl GateJob {
     }
 }
 
-impl WarpJob for GateJob {
+impl Engine for GateEngine {
     type Request = Probe;
     type Verdict = GateResult;
     const PRIME: GateResult = GateResult::ProbeNonUnique;
@@ -223,24 +227,25 @@ pub(in crate::generate) struct Shared<I> {
 
 pub(in crate::generate) type SharedRef<I> = Rc<RefCell<Shared<I>>>;
 
-/// One slot's lane: the whole resumable strip attempt — seeds loop, retry loop,
-/// strip walk, finalize — as a coroutine. Suspends only at uniqueness gates,
-/// yielding the gate's [`Probe`] and resuming with its [`GateResult`]. The TAIT
-/// names the closure's unnameable type so [`PuzzleStream`] holds its lanes inline
-/// (the coroutine is non-`static`, hence `Unpin`: no boxing, `Pin::new` suffices).
-pub type LaneCo<I: Iterator<Item = u64>> = impl Coroutine<GateResult, Yield = Probe, Return = ()>;
+/// The resumable strip attempt one lane runs — seeds loop, retry loop, strip walk,
+/// finalize — as a coroutine. Suspends only at uniqueness gates, yielding the gate's
+/// [`Probe`] and resuming with its [`GateResult`]. The TAIT names the closure's
+/// unnameable type so [`PuzzleStream`] holds its occupants inline (the coroutine is
+/// non-`static`, hence `Unpin`: no boxing, `Pin::new` suffices).
+pub type Attempt<I: Iterator<Item = u64>> = impl Coroutine<GateResult, Yield = Probe, Return = ()>;
 
-/// Build one lane coroutine. The body is [`attempt`](super::random::attempt) made
-/// literal: compare gate for gate — the `alts == 0` and re-force fast paths, the
-/// probe restriction, and the `best`/verify finalize are the shared [`StripState`]
-/// logic, so the sequential and SIMT drivers still cannot drift. The first resume's
-/// argument is a dummy (the lane has not yielded a gate yet); every later resume
-/// carries the verdict of the gate the lane is suspended at.
-#[define_opaque(LaneCo)]
-pub(in crate::generate) fn lane_co<I: Iterator<Item = u64>>(
+/// Build one [`Attempt`] coroutine. The body is the scalar
+/// [`attempt`](super::random::attempt) made literal: compare gate for gate — the
+/// `alts == 0` and re-force fast paths, the probe restriction, and the `best`/verify
+/// finalize are the shared [`StripState`] logic, so the sequential and SIMT drivers
+/// still cannot drift. The first resume's argument is a dummy (the lane has not
+/// yielded a gate yet); every later resume carries the verdict of the gate the lane
+/// is suspended at.
+#[define_opaque(Attempt)]
+pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
     shared: SharedRef<I>,
     spec: Spec,
-) -> LaneCo<I> {
+) -> Attempt<I> {
     // The hidden-single re-force fast path is sound only when the fused baseline fast
     // path applies (a forced cheap kind reads exact cheap counts the skipped
     // re-derivation would shift by one); the gate matches scalar [`attempt`]. Computed
@@ -319,50 +324,124 @@ pub(in crate::generate) fn lane_co<I: Iterator<Item = u64>>(
     }
 }
 
-/// One slot: its job (the warp-side machine) and its lane (the strip driver
-/// coroutine). The pair fixes the request/verdict protocol by type.
-struct Slot<J, C> {
-    job: J,
-    lane: C,
+/// The per-lane occupant the host drives. It owns the request/verdict shuttle
+/// between an [`Engine`] and its [`Attempt`] and exposes only `prime`/`service`, so
+/// the host (and every rig) is generic over this one seam rather than over the engine
+/// and the attempt separately. The only occupant today is one [`Ticket`] per lane
+/// (ticket = lane); a batch rig's occupant would hold many.
+pub trait Occupant {
+    /// First resume: kick the attempt from its priming verdict and load its first
+    /// request. Returns whether the lane is now active (the attempt yielded a gate
+    /// rather than completing on an empty seed feed).
+    fn prime(&mut self, b: &mut WarpBoards, l: usize) -> bool;
+    /// The pass left lane `l` solved/dead/unchanged: service the engine, and if it
+    /// retires, resume the attempt with the verdict and load its next request.
+    /// Returns the lane's new active state.
+    fn service(&mut self, b: &mut WarpBoards, l: usize, solved: bool, dead: bool) -> bool;
 }
 
-/// The streaming generator: generic plumbing over a [`WarpJob`] and a lane coroutine
-/// speaking its protocol. Owns the boards, the active mask, the eight slots, and the
-/// attempt-boundary [`Shared`] channel; `pump`/`stats` are the public face.
+/// One ticket: an [`Engine`] (the warp-side machine) paired with its [`Attempt`] (the
+/// strip-driver coroutine). The two are intertwined-but-separate by necessity — a
+/// data machine and a coroutine, joined only by their request/verdict protocol — and
+/// this struct is the thing that owns that join. In this rig ticket = lane, so the
+/// host holds one per lane.
+pub struct Ticket<E, A> {
+    engine: E,
+    attempt: A,
+}
+
+impl<E, A> Ticket<E, A>
+where
+    E: Engine,
+    A: Coroutine<E::Verdict, Yield = E::Request, Return = ()> + Unpin,
+{
+    /// Resume the attempt with a verdict: it runs to its next request (the engine
+    /// loads it, the lane reactivates) or completes (seed supply drained — the lane
+    /// stays idle and is never serviced again). Returns the lane's new active state.
+    #[inline]
+    fn advance(&mut self, b: &mut WarpBoards, l: usize, verdict: E::Verdict) -> bool {
+        match Pin::new(&mut self.attempt).resume(verdict) {
+            CoroutineState::Yielded(req) => {
+                self.engine.load(b, l, &req);
+                true
+            }
+            CoroutineState::Complete(()) => false,
+        }
+    }
+}
+
+impl<E, A> Occupant for Ticket<E, A>
+where
+    E: Engine,
+    A: Coroutine<E::Verdict, Yield = E::Request, Return = ()> + Unpin,
+{
+    #[inline]
+    fn prime(&mut self, b: &mut WarpBoards, l: usize) -> bool {
+        self.advance(b, l, E::PRIME)
+    }
+
+    // Inline so the per-tick service collapses into the host's loop: the engine's fat
+    // `Option<Verdict>` is consumed here and never travels through the host's memory
+    // (outlined, that return on every serviced lane measured ~2% e2e).
+    #[inline]
+    fn service(&mut self, b: &mut WarpBoards, l: usize, solved: bool, dead: bool) -> bool {
+        match self.engine.service(b, l, solved, dead) {
+            None => true,                     // still running: rejoin the warp
+            Some(v) => self.advance(b, l, v), // retired: drive the attempt onward
+        }
+    }
+}
+
+/// The production occupant: pair the [`GateEngine`] with its [`attempt`] coroutine —
+/// both derived from the same `spec` — as one [`Ticket`]. The matched construction the
+/// old two-factory `assemble` left implicit. A free fn, not an inherent constructor,
+/// because the opaque [`Attempt`] does not constrain an `impl`'s `I` (E0207).
+fn gate_ticket<I: Iterator<Item = u64>>(
+    shared: &SharedRef<I>,
+    spec: &Spec,
+    ladder_memo: bool,
+) -> Ticket<GateEngine, Attempt<I>> {
+    Ticket {
+        engine: GateEngine::new(spec, ladder_memo),
+        attempt: attempt(shared.clone(), spec.clone()),
+    }
+}
+
+/// The streaming generator: generic plumbing over an [`Occupant`] (one lane's
+/// engine+attempt pair). Owns the boards, the active mask, the eight occupants, and
+/// the attempt-boundary [`Shared`] channel; `pump`/`stats` are the public face.
 ///
 /// There is no attempt budget here: a bench that wants fixed work caps it from the
 /// outside on [`stats`](Self::stats)`.attempts` (the counter climbs on every attempt,
 /// including retries, so it terminates even on a spec that never yields).
-pub struct PuzzleStream<I, J, C>
+pub struct PuzzleStream<I, O>
 where
     I: Iterator<Item = u64>,
-    J: WarpJob,
-    C: Coroutine<J::Verdict, Yield = J::Request, Return = ()> + Unpin,
+    O: Occupant,
 {
     boards: WarpBoards,
     active: [bool; LANES],
-    slots: [Slot<J, C>; LANES],
+    occupants: [O; LANES],
     shared: SharedRef<I>,
 }
 
-/// The production instantiation: [`GateJob`] driven by the gate-per-strip lane
-/// ([`lane_co`]) on the row-major [`RowStrip`].
-pub type GateStream<I> = PuzzleStream<I, GateJob, LaneCo<I>>;
+/// The production instantiation: a [`GateEngine`] driven by the gate-per-strip
+/// [`attempt`] coroutine, paired as a [`Ticket`] per lane, on the row-major
+/// [`RowStrip`].
+pub type GateStream<I> = PuzzleStream<I, Ticket<GateEngine, Attempt<I>>>;
 
-impl<I, J, C> PuzzleStream<I, J, C>
+impl<I, O> PuzzleStream<I, O>
 where
     I: Iterator<Item = u64>,
-    J: WarpJob,
-    C: Coroutine<J::Verdict, Yield = J::Request, Return = ()> + Unpin,
+    O: Occupant,
 {
-    /// Assemble a stream from its parts: per-slot jobs and lanes from the
-    /// factories, lanes primed in slot order (which fixes the seed-pull order).
-    /// Generate-internal: experiments pair a job with a lane here; the public
-    /// entries pin production pairs (e.g. [`GateStream`]'s `new`).
+    /// Assemble a stream from its parts: one occupant per lane from the factory,
+    /// primed in lane order (which fixes the seed-pull order). Generate-internal:
+    /// experiments supply their own occupant factory; the public entries pin
+    /// production pairs (e.g. [`GateStream`]'s `new`).
     pub(in crate::generate) fn assemble(
         seeds: I,
-        mut mk_job: impl FnMut() -> J,
-        mut mk_lane: impl FnMut(&SharedRef<I>) -> C,
+        mut mk_occupant: impl FnMut(&SharedRef<I>) -> O,
     ) -> Self {
         let shared: SharedRef<I> = Rc::new(RefCell::new(Shared {
             seeds,
@@ -372,11 +451,11 @@ where
         let mut s = PuzzleStream {
             boards: WarpBoards::new(),
             active: [false; LANES],
-            slots: core::array::from_fn(|_| Slot { job: mk_job(), lane: mk_lane(&shared) }),
+            occupants: core::array::from_fn(|_| mk_occupant(&shared)),
             shared,
         };
-        for slot in 0..LANES {
-            s.advance(slot, J::PRIME);
+        for l in 0..LANES {
+            s.active[l] = s.occupants[l].prime(&mut s.boards, l);
         }
         s
     }
@@ -409,8 +488,8 @@ where
 
     /// One warp tick: a single kernel pass over the active lanes, then service
     /// each lane the pass left solved/dead/unchanged. The `service` bitmask is a
-    /// snapshot, so a job whose phase flips mid-tick is not re-serviced until the
-    /// next pass.
+    /// snapshot, so an occupant whose phase flips mid-tick is not re-serviced until
+    /// the next pass.
     fn tick(&mut self) {
         let active_mask = M::from_array(self.active);
         if !active_mask.any() {
@@ -430,29 +509,12 @@ where
             let l = service.trailing_zeros() as usize;
             service &= service - 1;
             let bit = 1u64 << l;
-            let verdict = self.slots[l].job.service(
+            self.active[l] = self.occupants[l].service(
                 &mut self.boards,
                 l,
                 solved_b & bit != 0,
                 dead_b & bit != 0,
             );
-            if let Some(v) = verdict {
-                self.active[l] = false;
-                self.advance(l, v);
-            }
-        }
-    }
-
-    /// Resume the slot's lane coroutine with a verdict: it runs to its next
-    /// request (a fresh job is loaded, the slot reactivates) or completes (seed
-    /// supply drained — the slot stays idle and is never serviced again).
-    fn advance(&mut self, l: usize, verdict: J::Verdict) {
-        match Pin::new(&mut self.slots[l].lane).resume(verdict) {
-            CoroutineState::Yielded(req) => {
-                self.slots[l].job.load(&mut self.boards, l, &req);
-                self.active[l] = true;
-            }
-            CoroutineState::Complete(()) => {}
         }
     }
 
@@ -473,11 +535,7 @@ impl<I: Iterator<Item = u64>> GateStream<I> {
     /// (exact/first-fire-preserving, so both settings produce identical puzzles; only
     /// the cost differs).
     pub fn new_opts(seeds: I, spec: &Spec, ladder_memo: bool) -> Self {
-        PuzzleStream::assemble(
-            seeds,
-            || GateJob::new(spec, ladder_memo),
-            |shared| lane_co(shared.clone(), spec.clone()),
-        )
+        PuzzleStream::assemble(seeds, |shared| gate_ticket(shared, spec, ladder_memo))
     }
 }
 
