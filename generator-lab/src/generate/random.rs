@@ -516,7 +516,10 @@ impl UaFilter {
     /// Emission allocates one UA id per distinct final label in ascending order; because a component is
     /// first reached, scanning rows `0..9`, at the row equal to its minimum (its label), this is
     /// exactly the scalar build's first-row cycle-id allocation order — so `counts`, `cell_uas`,
-    /// and `lens` come out byte-for-byte identical (pinned by `packed_equals_scalar`).
+    /// and `lens` come out byte-for-byte identical (pinned by `packed_equals_scalar`). Membership
+    /// slots come from per-digit counters rather than per-cell `lens` reads (an emitting pair
+    /// fills one slot in each of its two digits' nine cells), and `lens` itself is rebuilt from
+    /// those counters in one trailing `pshufb` pass over the grid bytes.
     ///
     /// Lane hygiene: the byte maps fill lanes 9..15 with `0x80`, and every swizzle index that
     /// feeds lanes 0..8 is itself in 0..8, so high-lane garbage never propagates into a low
@@ -568,6 +571,18 @@ impl UaFilter {
                 r_vec[d] = _mm_loadu_si128(r_map[d].as_ptr() as *const __m128i);
                 c_vec[d] = _mm_loadu_si128(c_map[d].as_ptr() as *const __m128i);
             }
+            // Per-digit membership counters, standing in for the per-cell `lens` during the
+            // build (the emission-restructure follow-up, `docs/UA-PACKED-BUILD.md` section 14).
+            // An emitting pair emits ALL nine rows (post-cap, every final component is kept),
+            // so it appends exactly one membership to each of its two digits' nine cells — the
+            // next free slot is therefore the same for a digit's whole cell set: the number of
+            // emitting pairs so far containing that digit. Tracking that single byte per digit
+            // replaces the 18 per-pair `lens` read-modify-writes (whose store-to-load forwarding
+            // chained across the consecutive pairs sharing a digit — the build's hottest line);
+            // `lens` itself is reconstructed in one pshufb pass after the pair loops. 16 lanes so
+            // the array loads straight into the flush's xmm; lanes 9..15 stay 0 (never indexed:
+            // grid digits are 0..8).
+            let mut cnt = [0u8; 16];
 
             for a in 0..9usize {
                 for b in (a + 1)..9usize {
@@ -660,13 +675,18 @@ impl UaFilter {
                     // provably dead for a 2-digit library, so the branches and their bounds
                     // checks are dropped. A board emits <= 144 UAs (<= 4 even components per pair
                     // x 36 pairs), so `nua` never reaches `UA_CAP` (192) and the id is never
-                    // `u8::MAX`; a cell of digit `d` joins one UA per partner digit (the 8 pairs
-                    // containing `d`, once each), so `lens[cell] <= 8 = UA_PER_CELL` and the slot
-                    // is always in range. The `<= 144` bound is pinned by
-                    // `library_sizes_match_anchors`; `packed_equals_scalar` carries `lens`
-                    // bit-identical to the checked scalar build. These are the two scalar-tail
-                    // hot spots section 11 names (`alloc_ua` cap check, the `cell_uas` byte
-                    // stores).
+                    // `u8::MAX` (pinned by `library_sizes_match_anchors`).
+                    //
+                    // The membership slot is the per-digit counter, not a per-cell `lens` read:
+                    // every earlier emitting pair containing `a` filled one slot in each of `a`'s
+                    // nine cells (all-rows emission), so each a-cell's next free slot IS `cnt[a]`
+                    // — the same value the dropped `lens[cell]` load would have produced, keeping
+                    // the slot assignment (and so the whole struct, via `packed_equals_scalar`)
+                    // bit-identical to the checked scalar build.
+                    let ka = cnt[a] as usize;
+                    let kb = cnt[b] as usize;
+                    cnt[a] += 1;
+                    cnt[b] += 1;
                     let mut label_ua = [u8::MAX; 9];
                     for r in 0..9 {
                         let m = fin[r] as usize;
@@ -683,17 +703,27 @@ impl UaFilter {
                         };
                         // SAFETY: id <= 143 < UA_CAP = counts.len().
                         *self.counts.get_unchecked_mut(id as usize) += 2;
-                        for cell in [r * 9 + col_of[r][a] as usize, r * 9 + col_of[r][b] as usize] {
-                            // SAFETY: cell < CELLS (= cell_uas.len()), and lens[cell] < 8 =
-                            // UA_PER_CELL before this push (a cell joins <= 8 UAs total), so the
-                            // membership slot index is in range.
-                            let ln = *self.lens.get_unchecked(cell) as usize;
-                            *self.cell_uas.get_unchecked_mut(cell).get_unchecked_mut(ln) = id;
-                            *self.lens.get_unchecked_mut(cell) = (ln + 1) as u8;
-                        }
+                        let ca = r * 9 + col_of[r][a] as usize;
+                        let cb = r * 9 + col_of[r][b] as usize;
+                        // SAFETY: ca/cb < CELLS (= cell_uas.len()); ka/kb < 8 = UA_PER_CELL,
+                        // because a digit joins at most its 8 pairs, so its counter is <= 7
+                        // before this pair's increment.
+                        *self.cell_uas.get_unchecked_mut(ca).get_unchecked_mut(ka) = id;
+                        *self.cell_uas.get_unchecked_mut(cb).get_unchecked_mut(kb) = id;
                     }
                 }
             }
+            // Reconstruct `lens` from the per-digit counters: a cell's membership count is
+            // exactly the number of emitting pairs containing its digit, i.e. `cnt[g[cell]]`.
+            // Grid digits are 0..8 (high bit clear), so `pshufb(cnt, g-bytes)` is that lookup,
+            // 16 cells per shuffle; five chunks cover cells 0..80, the last cell goes scalar.
+            let cnt_v = _mm_loadu_si128(cnt.as_ptr() as *const __m128i);
+            for chunk in 0..5 {
+                let gv = _mm_loadu_si128(g.as_ptr().add(chunk * 16) as *const __m128i);
+                let lv = _mm_shuffle_epi8(cnt_v, gv);
+                _mm_storeu_si128(self.lens.as_mut_ptr().add(chunk * 16) as *mut __m128i, lv);
+            }
+            self.lens[CELLS - 1] = cnt[g[CELLS - 1] as usize];
         }
     }
 }

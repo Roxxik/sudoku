@@ -315,3 +315,51 @@ Methodology note for the next fixed-iteration-bound decision: when a loop count 
 AND the relevant structure factors through a small enumerable configuration space, *exhaust the
 space* (here: all disjoint placement pairs) instead of sampling boards. It turns "proven 7,
 observed 4 over 36M boards" into "exactly 4" — no headroom guesswork, no rare-grid risk.
+
+## 14. Follow-up landed (2026-06-12): emission restructure (per-digit slot counters)
+
+Last of the section-6/11 follow-ups (the "buffer memberships per pair and flush" item), landed
+in a cheaper form than buffering: the per-cell `lens` read-modify-write is deleted from emission
+outright. The enabling structural fact: post-cap, **an emitting pair emits all nine rows** (every
+surviving component is kept), so each emitting pair containing digit `d` appends exactly one
+membership to *each* of `d`'s nine cells. The next free slot is therefore identical across a
+digit's whole cell set — a single per-digit counter `cnt[d]` (number of emitting pairs so far
+containing `d`), bumped twice per emitting pair. Emission's inner loop keeps only the two
+`cell_uas` byte stores (slot = `cnt[a]`/`cnt[b]`, hoisted out of the row loop), and `lens` is
+reconstructed after the pair loops in one trailing pass: `lens[cell] = cnt[g[cell]]`, i.e. five
+`pshufb`s of the counter vector by the grid bytes plus one scalar tail cell. Same slots, same
+values, same final `lens` — still bit-identical to scalar (`packed_equals_scalar`, 200 seeds),
+fingerprint still `0x4621f425`, `tests/ua_filter` per-engine/tier identity green.
+
+Measured (paired A/B by stashing the diff, one warm shell, pinned core): pooled
+(`uabuildprof`, 256 boards x 4000 rebuilds) **~815 -> ~785 ns/board, ~4%**; `perf stat` puts it
+entirely in instruction count — **-657 instructions/board (-6.2%), -140 cycles/board (-4.9%)**,
+IPC ~3.7 unchanged, branch count unchanged. One-shot `ua_build_cost` (fresh board per build,
+~1.35-1.42 us/board) and e2e are unchanged within noise.
+
+Two honest corrections this measurement forces:
+- Section 13's post-change profile put **23% of cycles on the `lens` load line**; removing the
+  whole RMW recovered only ~5%. Most of that attribution was sampling skid / latency the OoO
+  window already hid — the forwarding-chain story (section 6) was real but already absorbed.
+  Per-line cycle attribution overstates serial-chain lines; trust the paired A/B, not annotate.
+- The *full* buffer-and-flush variant (per-pair id-vector store, per-digit 8x16 transpose at
+  flush) was analyzed and is estimated a wash: it moves the ~277 membership byte stores out of
+  the pair loop but adds a comparable volume of transpose + scatter work at flush. Not attempted;
+  estimate, not measurement.
+
+Where the build stands (post-change profile, pooled): the vector core (min-doubling + relaxation
+shuffles) ~16%, the scalar `na`/`nb` box-map build ~15%, the precompute table fill ~11%, emission
+~irreducible byte stores + the small alloc loop. The named section-6 follow-up list is now
+exhausted; the two NEW candidates a future change could take, separately and A/B'd on
+`uabuildprof`: (a) vectorize `na`/`nb` — precompute per-digit `bx_d[r]` (box of `d`'s cell in row
+`r`) and `rbox_d[bx]` (row of `d` in box `bx`) maps once per board, then `na_v =
+pshufb(rbox_b, bx_a)` / `nb_v = pshufb(rbox_a, bx_b)`, two instructions replacing the 18-load
+scalar gather with its `/3` arithmetic; (b) shrink the precompute — `col_of` is `r_map`
+transposed (`col_of[r][d] == r_map[d][r]`), so one of the two is redundant store traffic.
+
+**Flip-bar status correction:** section 13 claimed the ~800 ns pooled build was "still above"
+the section-2 SIMT flip bar; the arithmetic says otherwise. With one-shot builds Full ~1.36 us
+and UA4 ~0.58 us, the section-2 condition reads `(1.36 - 0.58) + ~0.4 = ~1.18 us < 1.73 us` —
+the bar is **crossed** (and was already at section 13's numbers). Whether capped-full actually
+displaces UA4 on SIMT needs the SIMT-side measurement (the bar is a cost model, not a result);
+that is its own experiment, not part of this change.
