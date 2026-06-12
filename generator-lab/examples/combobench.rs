@@ -30,7 +30,6 @@
 //! simpler peer); `--toolbox full` allows the entire 16-kind ladder (more
 //! substitutes => rarer).
 
-use generator_lab::generate::UaTier;
 use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::{NAMES, NUM};
@@ -54,9 +53,6 @@ fn main() {
     let mut lanes = 8usize;
     let mut per_lane = 100_000usize;
     let mut base_seed = 1u64;
-    // UA pre-filter tier (docs/UA-FILTER.md); default = production SIMT tier. `--ua off`
-    // is the pre-filter baseline for the before/after us/att A/B.
-    let mut tier = UaTier::SIMT;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -83,14 +79,6 @@ fn main() {
             "--lanes" => lanes = it.next().and_then(|s| s.parse().ok()).unwrap_or(lanes),
             "--per-lane" => per_lane = it.next().and_then(|s| s.parse().ok()).unwrap_or(per_lane),
             "--seed" => base_seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(base_seed),
-            "--ua" => {
-                tier = match it.next().as_deref() {
-                    Some("off") => UaTier::Off,
-                    Some("ua4") => UaTier::Ua4,
-                    Some("full") => UaTier::Full,
-                    _ => tier,
-                }
-            }
             _ => {}
         }
     }
@@ -132,7 +120,7 @@ fn main() {
     };
     let total = lanes * per_lane;
     println!(
-        "combobench[{label}] toolbox={toolbox} ua={tier:?}: {lanes} lanes x {per_lane} = {total} attempts"
+        "combobench[{label}] toolbox={toolbox}: {lanes} lanes x {per_lane} = {total} attempts"
     );
 
     #[cfg(feature = "count")]
@@ -146,7 +134,7 @@ fn main() {
     // terminates even for a combo that never yields). Fold an order-independent fingerprint
     // over the produced puzzles so two builds match iff they produce the same puzzle set.
     let t0 = std::time::Instant::now();
-    let mut stream = GateStream::new_ua(base_seed.., &spec, true, tier);
+    let mut stream = GateStream::new(base_seed.., &spec);
     let mut combo_fp = 0u64; // XOR-fold of per-puzzle fps: order-independent
     // Pump ONE tick at a time so the outside cap overshoots `total` by at most a tick's
     // worth of attempts; a tick (a full 8-wide warp pass) dwarfs the per-call cost.

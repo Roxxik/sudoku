@@ -153,42 +153,6 @@ pub enum AttemptResult {
     NeverFired,
 }
 
-/// Which unavoidable-set (UA) pre-filter library the strip carries — the deadly-pattern
-/// filter of `docs/UA-FILTER.md`. Every UA of the solution grid must keep at least one
-/// given or the puzzle is non-unique, so a strip that would empty a library UA is provably
-/// a prober revert and can skip the probe entirely. Sound: it only ever fast-rejects gates
-/// the prober would revert, so the strip trajectory — and hence the produced puzzles and
-/// the `run_attempts` fingerprint — are bit-identical to [`UaTier::Off`]. The scalar and
-/// SIMT paths may carry different tiers safely, since the verdicts are unchanged either way.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum UaTier {
-    /// No pre-filter: every uniqueness gate poses a probe (the pre-filter baseline).
-    Off,
-    /// Size-4 UAs only (the deadly rectangles) — ~650 compares/board to build.
-    Ua4,
-    /// The full 2-digit-cycle UA library (sizes 4..=18).
-    Full,
-}
-
-impl UaTier {
-    /// Production tier for the scalar/wasm strip walk ([`attempt`], [`run_attempts`]). The
-    /// full 2-digit library wins here: its build (the packed `pshufb`
-    /// [`enumerate_2digit_packed`](UaFilter::enumerate_2digit_packed) on x86_64, ~1.4 us/board,
-    /// or the scalar [`enumerate_2digit`](UaFilter::enumerate_2digit) elsewhere; size-18
-    /// single-component pairs dropped) is small against the ~95 us scalar attempt, so the extra
-    /// revert catch (full 36% vs UA4 24% of the revert pool by nodes) nets out ahead (~-15% vs
-    /// off, vs UA4's ~-12%).
-    pub const SCALAR: UaTier = UaTier::Full;
-    /// Production tier for the SIMT warp host ([`crate::generate::warp_host`]). Full, since the
-    /// packed-build follow-ups: the original UA4-only verdict was set against the ~3.7 us scalar
-    /// Full build, which outweighed the extra catch on a ~35 us warp attempt. At the packed
-    /// build's ~1.4 us/board the extra catch wins (combobench, 160k att, hidden-quad: train
-    /// ~33.6 -> ~32.7, drill ~31.0 -> ~30.0 us/att vs UA4 — `docs/UA-PACKED-BUILD.md`
-    /// section 15). Tiers may differ per engine because the strip trajectory is identical
-    /// regardless of tier; UA4 stays as the cheap-build tier and test oracle.
-    pub const SIMT: UaTier = UaTier::Full;
-}
-
 /// Max UAs carried per board. The true maximum is 144 (36 digit pairs x <=4 components
 /// each); the headroom lets a miscount degrade by truncation (sound: a dropped UA is only
 /// a missed catch, never a wrong verdict) rather than panic. `u8` UA ids cap it at 255.
@@ -198,15 +162,22 @@ const UA_CAP: usize = 192;
 /// never truncated in practice.
 const UA_PER_CELL: usize = 8;
 
-/// The per-board UA pre-filter state ([`UaTier`]). Holds the library's `cell -> containing
-/// UA` index plus a per-UA *given count*, maintained along the strip walk: a UA's count is
-/// the number of its cells still given, starting at `|U|` (the walk begins from a full
-/// board) and dropping by one each time one of its cells is kept-stripped. Stripping a cell
-/// whose count is 1 would empty that UA — a provable non-unique — so the gate reverts
-/// without a probe (see [`caught`](Self::caught)). Reverted cells stay givens, so their
-/// count is untouched. All storage is fixed-capacity (no per-gate or per-attempt heap
-/// allocation); [`UaTier::Off`] leaves it empty, so [`caught`](Self::caught) is always
-/// `false` at zero cost.
+/// The per-board UA pre-filter state — the deadly-pattern filter of `docs/UA-FILTER.md`.
+/// Every UA of the solution grid must keep at least one given or the puzzle is non-unique,
+/// so a strip that would empty a library UA is provably a prober revert and can skip the
+/// probe entirely. Sound: it only ever fast-rejects gates the prober would revert, so the
+/// strip trajectory — and hence the produced puzzles and the `run_attempts` fingerprint —
+/// are bit-identical to a no-filter walk.
+///
+/// Holds the library's `cell -> containing UA` index plus a per-UA *given count*, maintained
+/// along the strip walk: a UA's count is the number of its cells still given, starting at
+/// `|U|` (the walk begins from a full board) and dropping by one each time one of its cells
+/// is kept-stripped. Stripping a cell whose count is 1 would empty that UA — a provable
+/// non-unique — so the gate reverts without a probe (see [`caught`](Self::caught)). Reverted
+/// cells stay givens, so their count is untouched. All storage is fixed-capacity (no per-gate
+/// or per-attempt heap allocation); the diagnostic no-filter walk ([`StripState::new`])
+/// leaves it [`empty`](Self::empty), so [`caught`](Self::caught) is always `false` at zero
+/// cost.
 struct UaFilter {
     /// Remaining given count per UA id (`0..nua`).
     counts: [u8; UA_CAP],
@@ -228,25 +199,32 @@ impl UaFilter {
         }
     }
 
-    /// Build the `tier`'s UA library for the complete solution grid `sol`, flattened once to
-    /// a dense `[u8; 81]` the enumerations index. ([`DigitGrid`] is already a cell-major
-    /// `[Option<Digit>; 81]`, so the flatten is ~81 cheap reads — it is not the cost; the
-    /// per-pair enumeration work is. It is kept because a tight `u8` array is the natural
-    /// input for the signature scan and the coordinate-table fill below.)
-    fn build(sol: &DigitGrid, tier: UaTier) -> Self {
+    /// Build the production (full 2-digit) UA library for the complete solution grid `sol`,
+    /// flattened once to a dense `[u8; 81]` the enumeration indexes. ([`DigitGrid`] is already
+    /// a cell-major `[Option<Digit>; 81]`, so the flatten is ~81 cheap reads — it is not the
+    /// cost; the per-pair enumeration work is. It is kept because a tight `u8` array is the
+    /// natural input for the coordinate-table fill below.)
+    ///
+    /// x86_64 (the perf target) runs the packed `pshufb` build; the scalar cycle-decomposition
+    /// build stays as the oracle/fallback (it ships in the wasm cdylib and is the
+    /// differential-test reference). Both produce a bit-identical `UaFilter` — see
+    /// [`enumerate_2digit_packed`](Self::enumerate_2digit_packed) and `docs/UA-PACKED-BUILD.md`.
+    fn build_full(sol: &DigitGrid) -> Self {
         let mut f = UaFilter::empty();
-        match tier {
-            UaTier::Off => {}
-            UaTier::Ua4 => f.enumerate_ua4(&Self::dense(sol)),
-            // x86_64 (the perf target) runs the packed `pshufb`/`swizzle_dyn` build; the scalar
-            // cycle-decomposition build stays as the oracle/fallback (it ships in the wasm
-            // cdylib and is the differential-test reference). Both produce a bit-identical
-            // `UaFilter` — see `enumerate_2digit_packed` and `docs/UA-PACKED-BUILD.md`.
-            #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
-            UaTier::Full => f.enumerate_2digit_packed(&Self::dense(sol)),
-            #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
-            UaTier::Full => f.enumerate_2digit(&Self::dense(sol)),
-        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+        f.enumerate_2digit_packed(&Self::dense(sol));
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+        f.enumerate_2digit(&Self::dense(sol));
+        f
+    }
+
+    /// Build the size-4-only (deadly-rectangle) UA library — the cheap UA4 codepath, kept
+    /// solely as the `ua4_equals_full_size4` differential oracle (production always uses the
+    /// full library via [`build_full`](Self::build_full)). Dead in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn build_ua4(sol: &DigitGrid) -> Self {
+        let mut f = UaFilter::empty();
+        f.enumerate_ua4(&Self::dense(sol));
         f
     }
 
@@ -326,6 +304,10 @@ impl UaFilter {
     /// ~10.7 UA4s/board (vs 648 for the brute-force rectangle scan; pinned equal by
     /// `ua4_equals_full_size4`). Note `x != y` always (two cells of one line differ), so a
     /// signature never collides with its own swap.
+    ///
+    /// Test-only: the cheap UA4 tier is no longer a production build (production runs the full
+    /// 2-digit library), kept as the `ua4_equals_full_size4` oracle. Dead in non-test builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn enumerate_ua4(&mut self, g: &[u8; CELLS]) {
         // `seen[sig]` = the cross line carrying signature `sig`, valid iff `stamp[sig]` is the
         // current line pair's generation. `sig = x * 9 + y` for digits `x` (first line) and
@@ -384,7 +366,7 @@ impl UaFilter {
     /// by `ua4_equals_full_size4` (size-4 components = the rectangle scan) and
     /// `full_uas_are_genuine` (every component's digit-swap is a distinct valid grid).
     ///
-    /// On x86_64 the production [`build`](Self::build) routes [`UaTier::Full`] to the packed
+    /// On x86_64 the production [`build_full`](Self::build_full) routes to the packed
     /// [`enumerate_2digit_packed`](Self::enumerate_2digit_packed) instead; this scalar build
     /// stays as the wasm/other-arch path and the `packed_equals_scalar` differential oracle, so
     /// it is unused (but compiled) in a non-test x86_64+ssse3 build.
@@ -441,8 +423,8 @@ impl UaFilter {
                 // single-component case costs 58% of all library memberships (avg `lens` drops
                 // 8.00 -> 3.36) yet adds only 0.06pp of revert-node catch (M-UA-LIB finding 5,
                 // a cap-14 emission filter), so it is dropped here. Sound: a missed catch only
-                // poses a probe the prober reverts anyway — trajectory unchanged (still pinned
-                // by the `tests/ua_filter` tier-invariants). `pi` is fixed-point-free, so a
+                // poses a probe the prober reverts anyway — trajectory unchanged by
+                // construction. `pi` is fixed-point-free, so a
                 // single 9-cycle (~1/3 of pairs) is already the whole pair (no box join can
                 // split it) and is dropped directly, without the box-merge union-find.
                 if ncyc == 1 {
@@ -798,13 +780,29 @@ pub(in crate::generate) struct StripState<S: StripView = DualSolverState> {
     /// The running requirement verdict of the current accepted board (carried across
     /// the `alts == 0` fast path). The full grid fires nothing, so it starts false.
     req_met: bool,
-    /// The unavoidable-set pre-filter (see [`UaFilter`]); empty for [`UaTier::Off`].
+    /// The unavoidable-set pre-filter (see [`UaFilter`]); empty for the diagnostic no-filter
+    /// walk ([`new`](Self::new)).
     ua: UaFilter,
 }
 
 impl<S: StripView> StripState<S> {
-    /// Fresh state stripping the full `solution` grid (nothing removed yet). The strip
-    /// mutates `state` in place thereafter.
+    /// Fresh state stripping the full `solution` grid (nothing removed yet), carrying no UA
+    /// pre-filter — the diagnostic walks use this so they pay nothing and measure the
+    /// unfiltered baseline. Production strips use [`new_ua`](Self::new_ua).
+    pub(in crate::generate) fn new(solution: &Solution) -> Self {
+        Self::build(solution, UaFilter::empty())
+    }
+
+    /// [`new`](Self::new) carrying the production (full 2-digit) UA pre-filter, built once
+    /// from the full solution grid. The filter is sound (only fast-rejects prober reverts),
+    /// so the strip trajectory is identical to the no-filter [`new`](Self::new) walk.
+    pub(in crate::generate) fn new_ua(solution: &Solution) -> Self {
+        Self::build(solution, UaFilter::build_full(&solution.0))
+    }
+
+    /// Shared constructor: a fresh state stripping the full `solution` (nothing removed yet)
+    /// with the prepared pre-filter `ua` (empty for [`new`](Self::new), the full library for
+    /// [`new_ua`](Self::new_ua)). The strip mutates `state` in place thereafter.
     ///
     /// `solution` is always a *complete* grid (the fill's output), and `from_digits` of a
     /// complete grid is the trivial solved state — every cell placed leaves no unsolved
@@ -813,18 +811,7 @@ impl<S: StripView> StripState<S> {
     /// (~4% of the fill's cost, all of it wasted). The strip then reopens cells one at a
     /// time via [`StripView::clear_clue`]. `clue_map` still walks the
     /// placements (the clue map is genuinely the full grid).
-    ///
-    /// Carries no UA pre-filter ([`UaTier::Off`]) — the diagnostic walks use this so they
-    /// pay nothing and measure the unfiltered baseline. Production strips use
-    /// [`new_ua`](Self::new_ua).
-    pub(in crate::generate) fn new(solution: &Solution) -> Self {
-        Self::new_ua(solution, UaTier::Off)
-    }
-
-    /// [`new`](Self::new) carrying the `tier`'s UA pre-filter, built once from the full
-    /// solution grid. The filter is sound (only fast-rejects prober reverts), so the strip
-    /// trajectory is identical to [`UaTier::Off`] regardless of `tier`.
-    pub(in crate::generate) fn new_ua(solution: &Solution, tier: UaTier) -> Self {
+    fn build(solution: &Solution, ua: UaFilter) -> Self {
         let digits = solution.0.clone();
         debug_assert!(digits.is_complete(), "strip must start from a complete solution");
         let state = S::solved();
@@ -833,7 +820,6 @@ impl<S: StripView> StripState<S> {
             "solved() must equal from_digits of a complete grid"
         );
         let clue = S::clue_map(&digits);
-        let ua = UaFilter::build(&digits, tier);
         StripState { digits, state, clue, best: None, req_met: false, ua }
     }
 
@@ -1041,11 +1027,11 @@ impl StripState<DualSolverState> {
     }
 }
 
-/// One full strip attempt for `spec` at UA pre-filter [`tier`](UaTier). Mirrors the old bb
-/// `generator`'s strip-attempt gate for gate, on the new prober/solver stack. The public
-/// [`run_attempts`] / [`generate`] use [`UaTier::SCALAR`]; the tier is a parameter so a
-/// bench/test can A/B it (the produced puzzles are tier-independent — the filter is sound).
-pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
+/// One full strip attempt for `spec`, carrying the production (full 2-digit) UA pre-filter.
+/// Mirrors the old bb `generator`'s strip-attempt gate for gate, on the new prober/solver
+/// stack. The filter is sound (it only fast-rejects gates the prober would revert), so the
+/// produced puzzles are bit-identical to a no-filter walk.
+pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     let baseline = spec.baseline_mask();
     let fast = baseline_fast_applicable(spec);
     let solution = random_solution(rng);
@@ -1056,7 +1042,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
 
     // The scalar attempt strips on the dual-banded state (the default `StripView`):
     // its baseline gate below runs the scalar engines, which read both views.
-    let mut st: StripState = StripState::new_ua(&solution, tier);
+    let mut st: StripState = StripState::new_ua(&solution);
     for cell in positions {
         let Some(orig) = st.digit_at(cell) else {
             continue;
@@ -1069,7 +1055,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec, tier: UaTier) -> AttemptResult {
         // exactly as a revert would leave it. A caught gate is provably non-unique, so it is
         // never an `alts == 0` or re-force keep (caught => non-unique, those => unique;
         // mutually exclusive, as the debug cross-check pins) — checking it first is
-        // trajectory-identical. No-op for `UaTier::Off`.
+        // trajectory-identical.
         if st.ua_caught_before_strip(cell, orig) {
             continue;
         }
@@ -1137,7 +1123,7 @@ pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<Gene
     let mut stats = Stats::default();
     for _ in 0..max_attempts {
         stats.attempts += 1;
-        match attempt(rng, spec, UaTier::SCALAR) {
+        match attempt(rng, spec) {
             AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
@@ -1153,20 +1139,14 @@ pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<Gene
 /// Run exactly `n` attempts (NOT "until found") for `spec` — a fixed-work, deterministic
 /// benchmark of the per-attempt cost mix. Returns the tallies plus a fingerprint over
 /// produced puzzles folded identically to the old bb `generator`'s `run_attempts`, so the two
-/// fps are directly comparable. Uses the production UA pre-filter tier ([`UaTier::SCALAR`]).
+/// fps are directly comparable. Carries the production (full 2-digit) UA pre-filter, whose
+/// soundness leaves the fingerprint identical to a no-filter walk.
 pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
-    run_attempts_ua(rng, spec, n, UaTier::SCALAR)
-}
-
-/// [`run_attempts`] at an explicit UA pre-filter [`tier`](UaTier) — the A/B entry the
-/// filter-on-vs-off fingerprint test and the scalar bench drive. The fingerprint is
-/// tier-independent (the filter is sound: it never changes a verdict), which that test pins.
-pub fn run_attempts_ua(rng: &mut Rng, spec: &Spec, n: usize, tier: UaTier) -> (Stats, u64) {
     let mut stats = Stats::default();
     let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {
         stats.attempts += 1;
-        match attempt(rng, spec, tier) {
+        match attempt(rng, spec) {
             AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
@@ -1881,13 +1861,12 @@ pub fn verify_share(base_seed: u64, spec: &Spec, attempts: usize) -> VerifyShare
     vs
 }
 
-/// Wall time to build the UA pre-filter `tier`'s library over `attempts` random solutions
-/// from `base_seed` — the per-board enumeration cost in isolation (the stage-2 decision
-/// gate: on SIMT the full library only beats UA4-only if its build stays ~<= 1 us/board).
+/// Wall time to build the production (full 2-digit) UA pre-filter library over `attempts`
+/// random solutions from `base_seed` — the per-board enumeration cost in isolation.
 /// Solutions are filled up front so only the enumeration is timed; returns `(total_nanos,
 /// total_uas)` for ns/board and avg library size. Diagnostic only (no `count` feature).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn ua_build_cost(base_seed: u64, attempts: usize, tier: UaTier) -> (u64, u64) {
+pub fn ua_build_cost(base_seed: u64, attempts: usize) -> (u64, u64) {
     use std::time::Instant;
     let mut rng = Rng::from_seed(base_seed);
     let sols: Vec<DigitGrid> = (0..attempts).map(|_| random_solution(&mut rng).0).collect();
@@ -1895,19 +1874,19 @@ pub fn ua_build_cost(base_seed: u64, attempts: usize, tier: UaTier) -> (u64, u64
     let t = Instant::now();
     for s in &sols {
         // `uas` accumulates the library size so the build cannot be optimized away.
-        uas += UaFilter::build(s, tier).nua as u64;
+        uas += UaFilter::build_full(s).nua as u64;
     }
     (t.elapsed().as_nanos() as u64, uas)
 }
 
 /// Like [`ua_build_cost`] but pre-fills `boards` solutions ONCE and rebuilds the whole pool
 /// `repeats` times, so [`random_solution`]'s fill cost amortizes to near-zero and the timed
-/// (and `perf`-sampled) region is ~entirely [`UaFilter::build`]. Returns `(total_nanos,
+/// (and `perf`-sampled) region is ~entirely [`UaFilter::build_full`]. Returns `(total_nanos,
 /// total_uas)` over `boards * repeats` builds; divide nanos by that product for ns/board.
 /// This is the "isolated pooled loop" the `docs/UA-PACKED-BUILD.md` measurements use to make
 /// the build the dominant process symbol for `perf annotate`. Diagnostic only.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn ua_build_cost_pooled(base_seed: u64, boards: usize, repeats: usize, tier: UaTier) -> (u64, u64) {
+pub fn ua_build_cost_pooled(base_seed: u64, boards: usize, repeats: usize) -> (u64, u64) {
     use std::time::Instant;
     let mut rng = Rng::from_seed(base_seed);
     let sols: Vec<DigitGrid> = (0..boards).map(|_| random_solution(&mut rng).0).collect();
@@ -1916,7 +1895,7 @@ pub fn ua_build_cost_pooled(base_seed: u64, boards: usize, repeats: usize, tier:
     for _ in 0..repeats {
         for s in &sols {
             // `uas` accumulates the library size so the build cannot be optimized away.
-            uas += UaFilter::build(s, tier).nua as u64;
+            uas += UaFilter::build_full(s).nua as u64;
         }
     }
     (t.elapsed().as_nanos() as u64, uas)
@@ -1950,7 +1929,7 @@ pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
 
 #[cfg(test)]
 mod ua_filter_tests {
-    use super::{CELLS, UaFilter, UaTier};
+    use super::{CELLS, UaFilter};
     use crate::fill::random_solution;
     use crate::repr::{Digit, DigitGrid};
     use crate::rng::Rng;
@@ -2009,8 +1988,8 @@ mod ua_filter_tests {
         for seed in 0..50 {
             let mut rng = Rng::from_seed(seed);
             let sol = random_solution(&mut rng).0;
-            let ua4 = sorted(cellsets(&UaFilter::build(&sol, UaTier::Ua4)));
-            let full = UaFilter::build(&sol, UaTier::Full);
+            let ua4 = sorted(cellsets(&UaFilter::build_ua4(&sol)));
+            let full = UaFilter::build_full(&sol);
             let full_s4 = sorted(cellsets(&full).into_iter().filter(|s| s.len() == 4).collect());
             assert!(ua4.iter().all(|s| s.len() == 4), "seed {seed}: non-size-4 UA in UA4 tier");
             assert_eq!(ua4, full_s4, "seed {seed}: UA4 rectangle set != full size-4 components");
@@ -2027,7 +2006,7 @@ mod ua_filter_tests {
         for seed in 0..30 {
             let mut rng = Rng::from_seed(seed);
             let sol = random_solution(&mut rng).0;
-            let f = UaFilter::build(&sol, UaTier::Full);
+            let f = UaFilter::build_full(&sol);
             assert!(f.nua > 0, "seed {seed}: empty full library");
             for cells in cellsets(&f) {
                 assert!(cells.len() >= 4 && cells.len() % 2 == 0, "seed {seed}: bad UA size");
@@ -2082,8 +2061,8 @@ mod ua_filter_tests {
         let n = 400;
         for _ in 0..n {
             let sol = random_solution(&mut rng).0;
-            ua4 += UaFilter::build(&sol, UaTier::Ua4).nua;
-            let f = UaFilter::build(&sol, UaTier::Full);
+            ua4 += UaFilter::build_ua4(&sol).nua;
+            let f = UaFilter::build_full(&sol);
             full += f.nua;
             max_nua = max_nua.max(f.nua);
         }

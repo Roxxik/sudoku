@@ -20,8 +20,8 @@ mod random;
 pub mod warp_host;
 
 pub use random::{
-    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, UaTier, attempt,
-    determinism_fp, generate, reforce_stat, run_attempts, run_attempts_ua, verify,
+    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt, determinism_fp,
+    generate, reforce_stat, run_attempts, verify,
 };
 // Deferred-strip (M1) + common-snapshot (M3) instrumentation — counter-gated.
 #[cfg(feature = "count")]

@@ -7,9 +7,14 @@ outweighed the extra catch on a ~35 us warp attempt (section 7). The packed-buil
 follow-ups (`docs/UA-PACKED-BUILD.md` sections 11-14) cut the Full build to ~1.4
 us/board, which crosses section 7's break-even: remeasured on the same combobench
 workload, Full beats UA4 on SIMT by ~0.9-1.0 us/att (train ~33.6 -> ~32.7, drill
-~31.0 -> ~30.0; UA-PACKED-BUILD section 15). Production is now `UaTier::SCALAR =
-Full` AND `UaTier::SIMT = Full`; UA4 stays as the cheap-build tier and test oracle.
-Section 7 below records the original (pre-packed-build) verdict.
+~31.0 -> ~30.0; UA-PACKED-BUILD section 15). Production is now the full 2-digit library
+on **both** engines. The `UaTier` machinery (enum, `SCALAR`/`SIMT` constants, the `tier`
+parameter threaded through `attempt`/`StripState`/the warp/`run_attempts`/`GateStream`)
+has since been **deleted** (UA-PACKED-BUILD section 18): production builds Full directly,
+and the UA4 codepath (`enumerate_ua4`) survives only as the `ua4_equals_full_size4`
+build-level differential oracle. Section 7 below records the original (pre-packed-build)
+verdict; references to `UaTier::*` and the strip-walk tier-invariance test
+(`tests/ua_filter.rs`, now deleted — soundness pinned at the build level) are historical.
 
 ## 1. Idea and why it pays
 

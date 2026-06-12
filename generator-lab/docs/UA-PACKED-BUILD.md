@@ -443,4 +443,99 @@ reps); e2e within noise — the one-shot is diluted by the fresh-board fill traf
 amortizes out, so the precompute slice shows smaller there.
 
 Still open: the section-14 candidate (a)/(b) precompute list is now exhausted; the remaining
-named follow-up is the section-15 tier-split deletion cleanup (one production tier everywhere).
+named follow-up is the section-15 tier-split deletion cleanup (one production tier everywhere) —
+landed in section 18.
+
+## 18. Tier-split deletion (2026-06-12): one production tier (Full) everywhere
+
+The section-15 follow-up. With Full now the production tier on *both* engines, the `UaTier`
+machinery threaded a now-constant choice through every layer of the strip walk; it is removed.
+**No behavior change** — this is a pure plumbing cleanup, the build engine and the produced
+puzzles are untouched.
+
+Removed:
+- The `UaTier` enum and its `SCALAR`/`SIMT` constants (both were `Full`).
+- The `tier` parameter from `attempt`, `StripState::new_ua`, the warp `attempt` coroutine +
+  `gate_ticket`, `ua_build_cost`/`ua_build_cost_pooled`. `attempt`/`new_ua` build the full
+  library directly (`UaFilter::build_full`); `StripState::new` (the diagnostic no-filter walk)
+  builds `UaFilter::empty()` directly. The two constructors now share a private `build(solution,
+  ua)`.
+- `run_attempts_ua` (folded into `run_attempts`) and `GateStream::new_ua` (folded into
+  `new_opts`); the `--ua` flag in `combobench`, the per-tier loop in `bench`. Benches run the
+  production Full path.
+- `UaFilter::build(sol, tier)` split into `build_full` (production, cfg-gated packed/scalar)
+  and `build_ua4` (test-only).
+
+Kept for tests (the "UA4 codepath"): `enumerate_ua4` + `build_ua4`, both
+`#[cfg_attr(not(test), allow(dead_code))]` (compiled, warning-free, dead in prod — the same
+convention `enumerate_2digit` uses as the x86 oracle). They survive solely as the
+`ua4_equals_full_size4` differential oracle.
+
+Soundness coverage after the cut (this is the chosen trade — see below): the strip-walk
+tier-invariance test (`tests/ua_filter.rs`, which drove scalar+SIMT at Off/Ua4/Full to pin
+"filter changes no verdict" live) is **deleted**. Soundness is now pinned at the build level —
+`packed_equals_scalar` (200 seeds, bit-identical packed vs scalar library), `ua4_equals_full_size4`
+(UA4 == full size-4 components), `full_uas_are_genuine` (every emitted UA is a genuine unavoidable
+set), `library_sizes_match_anchors` (sizes sane, under `UA_CAP`) — plus the cross-engine
+`tests/equiv_warp_repr` `stream_matches_scalar_per_seed` (SIMT == scalar per seed, now both at
+Full). The "a filter catch only fast-rejects a gate the prober would revert" property is thereby
+sound *by construction* (a caught gate is provably non-unique) rather than re-pinned by a live
+Off-vs-Full fingerprint each run; the build-level bit-identity to the scalar oracle is what now
+guards the library, and the cross-engine pin guards the walk.
+
+Full release suite green (`cargo test --release -p generator-lab --lib` 22/22, incl. the four
+UA oracles; `equiv_warp_repr`/`confluence` green). Build cost unchanged (`bench` ~1177 ns/board
+one-shot, `uabuildprof` ~559 ns/board pooled — section-17 figures).
+
+## 18. Parked micro-candidates (2026-06-12): what a further squeeze would try
+
+Surveyed after section 17 (~544 ns pooled, 5374 inst, 1946 cycles, IPC 2.76 per build), not
+pursued now. Sized by instruction arithmetic only — **estimates, not measurements** — and each
+would be its own paired stash-diff A/B on `uabuildprof` (sections 14/16: per-line attribution
+mis-weights both ways, only the A/B counts). Expectation-setting: the build is ~1.5% of scalar
+e2e (~80 us/att) and ~4% of SIMT e2e (~30 us/att), so even a further -20% of the build is
+~0.3% e2e at best; and the section-16 caveat stands — the residue is chain-bound, so
+instruction shaving buys < 1:1 in wall-clock. In descending estimated ROI-per-effort:
+
+(a) **Derive `bx_map` from `r_map` in the precompute** (small diff). `bx_map[d][row] =
+(row/3)*3 + r_map[d][row]/3`, and a divide-by-3 over values 0..8 is a `pshufb` lookup:
+`bx_vec[d] = paddb(pshufb(DIV3, r_vec[d]), ROWBASE)` with `DIV3 = [0,0,0,1,1,1,2,2,2, ...]`
+and `ROWBASE = [0,0,0,3,3,3,6,6,6, 0x80 x 7]` — the `0x80` high lanes restore the hygiene
+fill exactly (`r_vec`'s `0x80` lanes shuffle to 0, the add puts `0x80` back). Two vector ops
+per digit (18 total) delete 81 scalar stores plus `bx_map`'s 144-byte init. The in-loop `/3`
+box math stays: it feeds `rbox_map`, which remains a genuine scatter (`bx_map[d]` is a
+row->box *permutation* — one cell per row and per box — and `rbox_map[d]` is its inverse;
+inverting a permutation is the scatter). ~150-250 inst; by section 17's precedent
+(-156 inst -> -4.1% cycles), expect ~2-4% of the build.
+
+(b) **Per-label `counts` instead of nine RMWs in emission** (small diff). Post-cap an
+emitting pair keeps every component, so a label's row count is readable straight off `cur`:
+at each label's alloc site (<= 4 per pair), `rows = popcount(movemask(cmpeq(cur,
+broadcast(label))) & 0x1FF)` and `counts[id] = 2 * rows` as one store — dropping the
+alloc-time zeroing and the per-row `counts += 2` RMW. Same values, so bit-identity is free.
+~150-200 inst on paper, but discount per section 14's lesson (the forwarding chain it removes
+was already mostly absorbed by the OoO window): expect ~1-3%.
+
+(c) **ymm 2-pair batching of the vector core** (the only structural cut left; the largest
+diff by far). Pairs are independent until emission, and AVX2 `vpshufb` operates per 128-bit
+lane, so two pairs ride one ymm through compose, min-doubling, and relaxation at the same
+chain depth and half the shuffle count (Zen4 double-pumps 512-bit ops, so zmm 4-batching
+adds little over ymm). Batch consecutive pairs sharing `a` (broadcast the `a`-side tables
+once per `a`-group, one `vinserti128` per `b`-side operand), run the component tests
+per half (`& 0x1FF` low lane, `& 0x1FF0000` high), run the relaxation when *either* lane
+survives (~70% of batches vs ~45% of pairs — the dead lane rides free), and emit surviving
+lanes in pair order so the allocation order (and the struct) stays bit-identical. Odd
+`a`-group tails fall back to the existing xmm path. Net ~300 inst (~5-6%) after the
+insert/broadcast overhead; the < 1:1 discount puts the wall-clock win at maybe ~2-4% —
+comparable to (a) for several times the complexity.
+
+Analyzed and dropped as a wash: a label-free single-9-cycle early-out (a fixed-point-free
+9-permutation that is not a 9-cycle has a cycle of length 2, 3, or 4, so `pi^3` and `pi^4`
+both fixed-point-free iff single cycle — 3 shuffles + 2 compares, ~8 ops vs the doubling's
+~14) to spare the ~20 step-3 pairs the min-label doubling. But the ~16 survivors then run
+the doubling *on top of* the test, and the totals net out to ~zero.
+
+Emission's ~277 membership byte stores remain irreducible output work (the buffer-and-flush
+variant was already judged a wash, section 14). Beyond (a)-(c) the build is at its floor;
+the next named change is the section-15 tier-split deletion cleanup, sequenced after the
+squeeze is declared done.
