@@ -35,6 +35,24 @@ use generator_lab::spec::Spec;
 use generator_lab::spec::kinds::{NAMES, NUM};
 use generator_lab::{drill_union, train_union};
 
+/// Whole-run rdtsc envelope (same span as the wall clock) so the warp's per-phase cycle
+/// buckets can be expressed as a true fraction of total runtime — the leftover (host
+/// tick/pump plumbing + rdtsc/instrumentation overhead) surfaces as a measured
+/// `unaccounted` slice instead of a silently-shrunk denominator. 0 off the `count`+x86
+/// path (the per-phase counters are zero there too, so the breakdown is just skipped).
+#[cfg(all(feature = "count", target_arch = "x86_64"))]
+#[inline]
+fn rdtsc() -> u64 {
+    // SAFETY: _rdtsc is always available on x86_64.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+#[cfg(not(all(feature = "count", target_arch = "x86_64")))]
+#[inline]
+#[allow(dead_code)] // only called from the `count` reporting block
+fn rdtsc() -> u64 {
+    0
+}
+
 /// Which toolbox surrounds the forced kinds.
 #[derive(Clone, Copy, PartialEq)]
 enum Toolbox {
@@ -133,6 +151,8 @@ fn main() {
     // attempts have started (the counter climbs on every attempt incl. retries, so this
     // terminates even for a combo that never yields). Fold an order-independent fingerprint
     // over the produced puzzles so two builds match iff they produce the same puzzle set.
+    #[cfg(feature = "count")]
+    let env0 = rdtsc();
     let t0 = std::time::Instant::now();
     let mut stream = GateStream::new(base_seed.., &spec);
     let mut combo_fp = 0u64; // XOR-fold of per-puzzle fps: order-independent
@@ -146,6 +166,8 @@ fn main() {
         }
     }
     let dt = t0.elapsed();
+    #[cfg(feature = "count")]
+    let env_cycles = rdtsc().wrapping_sub(env0);
     let stats = stream.stats();
     #[cfg(feature = "count")]
     {
@@ -155,57 +177,90 @@ fn main() {
             h.iter().map(|&c| format!("{:.1}%", 100.0 * c as f64 / total.max(1) as f64)).collect();
         println!("  place_single_group group-size histogram (cells): {h:?}");
         println!("    share: {}", pct.join(" "));
-        // Honest unified-warp lane utilization for THIS workload: avg active lanes per
-        // pass / LANES (active = slot bound to live work). uw = [passes, active-lane-sum].
+        // --- profiler-style runtime attribution (us/att + % of total wall) -----------
+        // Read it the way perf would: one attempt start to finish, every slice of wall
+        // time named. The kernel `warp_pass_full` advances ALL active lanes in ONE shared
+        // SIMD pass, so probe and baseline are not separate passes — they ride the same
+        // pass — and the kernel's cost is split between them by LANE-PASS COUNT (each
+        // tick's active lanes tallied by phase). The scalar tail is timed directly: engine
+        // service per phase, host coroutine resume (fill/ua/strip/verify). The whole-run
+        // rdtsc envelope (`env_cyc`, same span as the wall clock) turns the leftover — host
+        // tick/pump plumbing + rdtsc/instrumentation overhead — into a measured
+        // `unaccounted` slice, so every row is a true fraction of total runtime.
         let uw = generator_lab::solve::uwstat_snapshot();
         let lanes_const = generator_lab::probe::simt::LANES;
-        let util = uw[1] as f64 / (lanes_const as f64 * uw[0].max(1) as f64);
-        println!(
-            "  warp LANES={lanes_const}  passes {}  util {:.3} ({:.2}/{lanes_const} lanes)  passes/att {:.2}",
-            uw[0],
-            util,
-            uw[1] as f64 / uw[0].max(1) as f64,
-            uw[0] as f64 / (lanes * per_lane) as f64,
-        );
-        // Warp-phase split (the SIMT prober-vs-rest decomposition). The kernel advances
-        // every active lane at a phase-independent per-lane cost, so its cycles split by
-        // lane-pass phase; the scalar tail is timed directly (engine per phase + host
-        // coroutine). prober = probe-kernel + probe-engine; host = coroutine (the part
-        // SIMT does not vectorize).
         let ph = generator_lab::generate::warp_host::phstat_snapshot();
-        let (probe_p, base_p) = (ph[0], ph[1]);
-        let lane_passes = (probe_p + base_p).max(1) as f64;
-        let probe_pass_share = probe_p as f64 / lane_passes;
-        let (kcyc, pe_cyc, be_cyc, co_cyc) =
-            (ph[2] as f64, ph[3] as f64, ph[4] as f64, ph[5] as f64);
-        let tcyc = (kcyc + pe_cyc + be_cyc + co_cyc).max(1.0);
-        let probe_kernel = kcyc * probe_pass_share;
-        let base_kernel = kcyc * (1.0 - probe_pass_share);
-        let prober = probe_kernel + pe_cyc;
-        let baseline = base_kernel + be_cyc;
-        let pct = |c: f64| 100.0 * c / tcyc;
+        let attempts = stats.attempts.max(1) as f64;
+
+        let (probe_lp, base_lp) = (ph[0] as f64, ph[1] as f64);
+        let lane_passes = (probe_lp + base_lp).max(1.0);
+        let probe_pass_share = probe_lp / lane_passes;
+
+        // Each named cycle bucket. probe/baseline each = warp_pass (kernel lane-pass share)
+        // + service (engine). fill/ua-build/verify are timed once per attempt inside the
+        // coroutine; strip is the coroutine residual (it absorbs the cheap per-cell UA
+        // pre-filter query — the UA cost is the build, not the query).
+        let kcyc = ph[2] as f64;
+        let (pe_cyc, be_cyc, co_cyc) = (ph[3] as f64, ph[4] as f64, ph[5] as f64);
+        let (fill_cyc, ua_cyc, verify_cyc) = (ph[8] as f64, ph[9] as f64, ph[10] as f64);
+        let strip_cyc = (co_cyc - fill_cyc - ua_cyc - verify_cyc).max(0.0);
+        let probe_warp = kcyc * probe_pass_share;
+        let base_warp = kcyc * (1.0 - probe_pass_share);
+        let tcyc = kcyc + pe_cyc + be_cyc + co_cyc; // everything attributed
+        let env_cyc = (env_cycles as f64).max(tcyc); // envelope >= accounted (guard)
+        let unacc = env_cyc - tcyc;
+
+        // Calibrate tsc->wall over the shared span (us_per_cyc = wall_us / env_cyc), so the
+        // rows sum exactly to the measured wall us/att. `us`/`pct` are of TOTAL runtime.
+        let wall_us = dt.as_secs_f64() * 1e6;
+        let us = |c: f64| wall_us * c / env_cyc / attempts;
+        let pct = |c: f64| 100.0 * c / env_cyc;
+
         println!(
-            "  warp lane-passes: probe {:.1}% / baseline {:.1}%   ({} / {})",
+            "  warp_pass calls/att {:.1}  (util {:.3}, {:.2}/{lanes_const} lanes active per call)",
+            uw[0] as f64 / attempts,
+            uw[1] as f64 / (lanes_const as f64 * uw[0].max(1) as f64),
+            uw[1] as f64 / uw[0].max(1) as f64,
+        );
+        println!(
+            "  lane-passes/att: total {:.1}  probe {:.1} ({:.1}%)  baseline {:.1} ({:.1}%)",
+            lane_passes / attempts,
+            probe_lp / attempts,
             100.0 * probe_pass_share,
-            100.0 * base_p as f64 / lane_passes,
-            probe_p,
-            base_p,
+            base_lp / attempts,
+            100.0 * (1.0 - probe_pass_share),
         );
         println!(
-            "  warp cycles: kernel {:.1}% (probe {:.1}/base {:.1}) | engine probe {:.1}/base {:.1} | host-coroutine {:.1}%",
-            pct(kcyc), pct(probe_kernel), pct(base_kernel), pct(pe_cyc), pct(be_cyc), pct(co_cyc),
+            "  warp_pass (kernel) timeshare {:.1}% of total  (probe {:.1}% / baseline {:.1}%)",
+            pct(kcyc),
+            pct(probe_warp),
+            pct(base_warp),
         );
+        println!("  phase breakdown (us/att, % of total wall):");
+        let row =
+            |name: &str, c: f64| println!("    {name:<19} {:>7.3} us  {:>5.1}%", us(c), pct(c));
+        row("fill", fill_cyc);
+        row("ua-build", ua_cyc);
+        row("strip", strip_cyc);
+        row("probe : warp_pass", probe_warp);
+        row("probe : service", pe_cyc);
+        row("baseline: warp_pass", base_warp);
+        row("baseline: service", be_cyc);
+        row("verify", verify_cyc);
+        row("unaccounted", unacc);
+        println!("    {:-<35}", "");
+        row("total", env_cyc);
         println!(
-            "  => PROBER {:.1}% | baseline {:.1}% | host {:.1}% of warp tick time",
-            pct(prober), pct(baseline), pct(co_cyc),
-        );
-        println!(
-            "  => revert-side prober ~= x0.855 (backend-invariant revert cost frac) = {:.1}% of warp us/att",
-            0.855 * pct(prober),
+            "    (probe  total {:>7.3} us  {:>5.1}%)   (baseline total {:>7.3} us  {:>5.1}%)",
+            us(probe_warp + pe_cyc),
+            pct(probe_warp + pe_cyc),
+            us(base_warp + be_cyc),
+            pct(base_warp + be_cyc),
         );
         println!(
             "  probe retirements: unique(keep) {} / non-unique(revert) {}  ({:.1}% revert by count)",
-            ph[6], ph[7],
+            ph[6],
+            ph[7],
             100.0 * ph[7] as f64 / (ph[6] + ph[7]).max(1) as f64,
         );
     }

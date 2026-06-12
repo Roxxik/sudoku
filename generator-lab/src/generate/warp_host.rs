@@ -68,8 +68,14 @@ use std::rc::Rc;
 //   [3] probe-engine-service cycles    [4] baseline-engine-service cycles
 //   [5] coroutine (resume) cycles — the host: strip bookkeeping + fill + verify
 //   [6] unique (keep) probe retirements  [7] non-unique (revert) probe retirements
+// Slots [8..11] decompose the coroutine slice [5] (which SIMT does not vectorize) into its
+// named host phases, each timed ONCE per attempt inside the coroutine body (the cheap
+// per-cell UA pre-filter is left in the residual rather than rdtsc-bracketed per cell):
+//   [8] fill cycles (random_solution)  [9] ua-build cycles (StripState::new_ua library)
+//   [10] verify cycles (final irreplaceability check)
+// so the strip-walk is the residual `[5] - [8] - [9] - [10]`.
 // `ph_add(i, v)` tallies (no-op without the feature). Read by `combobench`.
-counter_block!(PHSTAT: 8, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
+counter_block!(PHSTAT: 11, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
 
 /// rdtsc timestamp for the kernel/service split (0 off-x86 or without the feature, so the
 /// cycle counters stay zero there while the lane-pass counters — exact — still work).
@@ -322,8 +328,16 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
             let mut rng = Rng::from_seed(seed);
             loop {
                 shared.borrow_mut().stats.attempts += 1;
+                // Fill + UA-build slices (subsets of this resume's coroutine cycles [5]):
+                // random_solution is the fill, new_ua is the per-board UA library build —
+                // the UA cost is the BUILD, not the cheap per-cell `caught` query, which
+                // stays in the strip residual. Timed once per attempt (low perturbation).
+                let tf = rdtsc();
                 let solution = random_solution(&mut rng);
+                let tu = rdtsc();
+                ph_add(8, tu.wrapping_sub(tf)); // fill: random_solution
                 let mut strip: StripState<RowStrip> = StripState::new_ua(&solution);
+                ph_add(9, rdtsc().wrapping_sub(tu)); // ua-build: new_ua library
                 let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
                 rng.shuffle(&mut positions);
                 for idx in 0..CELLS {
@@ -369,7 +383,10 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                 // Finalize — byte-identical bookkeeping to `run_attempts`.
                 let success = match strip.best.take() {
                     Some(snap) => {
-                        if verify(&snap, &spec) {
+                        let tv = rdtsc();
+                        let ok = verify(&snap, &spec);
+                        ph_add(10, rdtsc().wrapping_sub(tv)); // verify: final irreplaceability check
+                        if ok {
                             let givens = snap.digit_count();
                             let mut sh = shared.borrow_mut();
                             sh.stats.successes += 1;
