@@ -536,22 +536,26 @@ impl UaFilter {
 
         // Precompute, once per board, each digit's coordinate within each line — the only
         // divisions in the enumeration, hoisted out of the per-pair loops (as in the scalar
-        // build). A complete grid sets every (unit, digit) entry exactly once. `r_map`/`c_map`
-        // are the 16-byte permutation maps the per-pair vector ops consume (`R_d[row] = col`,
-        // `C_d[col] = row`, `C_d` the inverse of `R_d`); `col_of`/`row_in_box` stay scalar for
-        // the box merge and emission, which read individual entries.
+        // build). A complete grid sets every (unit, digit) entry exactly once. The 16-byte
+        // permutation maps the per-pair vector ops consume: `r_map`/`c_map` over lines
+        // (`R_d[row] = col`, `C_d[col] = row`, `C_d` the inverse of `R_d`) and
+        // `bx_map`/`rbox_map` over boxes (`B_d[row] = box`, `X_d[box] = row`, composing to the
+        // box-edge neighbor maps below). `col_of` stays scalar for emission, which reads
+        // individual entries.
         let mut col_of = [[0u8; 9]; 9]; // [row][digit] = column of the digit in that row
-        let mut row_in_box = [[0u8; 9]; 9]; // [box][digit] = row of the digit in that box
         let mut r_map = [[HI; 16]; 9];
         let mut c_map = [[HI; 16]; 9];
+        let mut bx_map = [[HI; 16]; 9]; // B_d[row] = box of d's cell in that row
+        let mut rbox_map = [[HI; 16]; 9]; // X_d[box] = row of d's cell in that box
         for row in 0..9 {
             for col in 0..9 {
                 let d = g[row * 9 + col] as usize;
                 let bx = (row / 3) * 3 + col / 3;
                 col_of[row][d] = col as u8;
-                row_in_box[bx][d] = row as u8;
                 r_map[d][row] = col as u8;
                 c_map[d][col] = row as u8;
+                bx_map[d][row] = bx as u8;
+                rbox_map[d][bx] = row as u8;
             }
         }
 
@@ -569,9 +573,13 @@ impl UaFilter {
             let zero = _mm_setzero_si128();
             let mut r_vec = [zero; 9];
             let mut c_vec = [zero; 9];
+            let mut bx_vec = [zero; 9];
+            let mut rbox_vec = [zero; 9];
             for d in 0..9 {
                 r_vec[d] = _mm_loadu_si128(r_map[d].as_ptr() as *const __m128i);
                 c_vec[d] = _mm_loadu_si128(c_map[d].as_ptr() as *const __m128i);
+                bx_vec[d] = _mm_loadu_si128(bx_map[d].as_ptr() as *const __m128i);
+                rbox_vec[d] = _mm_loadu_si128(rbox_map[d].as_ptr() as *const __m128i);
             }
             // Per-digit membership counters, standing in for the per-cell `lens` during the
             // build (the emission-restructure follow-up, `docs/UA-PACKED-BUILD.md` section 14).
@@ -634,15 +642,13 @@ impl UaFilter {
                     // never realizes the 2-2-2-3 cactus chain that would need it.)
                     // `packed_equals_scalar` pins the bit-identical output.
                     const ROUNDS: usize = 4;
-                    let mut na = [HI; 16];
-                    let mut nb = [HI; 16];
-                    for r in 0..9 {
-                        let band = (r / 3) * 3;
-                        na[r] = row_in_box[band + col_of[r][a] as usize / 3][b];
-                        nb[r] = row_in_box[band + col_of[r][b] as usize / 3][a];
-                    }
-                    let na_v = _mm_loadu_si128(na.as_ptr() as *const __m128i);
-                    let nb_v = _mm_loadu_si128(nb.as_ptr() as *const __m128i);
+                    // na[r] = X_b[B_a[r]], nb[r] = X_a[B_b[r]]: one shuffle each through the
+                    // per-digit box maps, replacing an 18-load scalar gather (and its /3 box
+                    // arithmetic) per surviving pair. Index lanes 0..8 are boxes 0..8, so the
+                    // low-lane hygiene invariant holds; lanes 9..15 zero out (0x80 fill), which
+                    // the masked component tests never read.
+                    let na_v = _mm_shuffle_epi8(rbox_vec[b], bx_vec[a]);
+                    let nb_v = _mm_shuffle_epi8(rbox_vec[a], bx_vec[b]);
                     // pii(r) = C_a[R_b[r]] — the inverse of `pi`, i.e. the other cycle direction,
                     // so the min spreads both ways around each cycle.
                     let pii = _mm_shuffle_epi8(c_vec[a], r_vec[b]);

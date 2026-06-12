@@ -384,3 +384,37 @@ reproduces the full-tier numbers (32.7 / 30.1 us/att). UA4 stays as the cheap-bu
 the `ua4_equals_full_size4` oracle; the section-2 idea of *deleting* the tier split entirely
 (one production tier everywhere) is now plausible but is its own cleanup, not part of this
 change.
+
+## 16. Follow-up landed (2026-06-12): vectorized `na`/`nb` box maps
+
+Section-14 candidate (a). The precompute pass gains two per-digit 16-byte box maps —
+`bx_map` (`B_d[row]` = box of `d`'s cell in that row) and `rbox_map` (`X_d[box]` = row of `d`
+in that box; the scalar `row_in_box` array they subsume is deleted) — and the per-pair
+`na`/`nb` build collapses to two shuffles:
+
+    na_v = pshufb(rbox_b, bx_a)    // na[r] = row of b in the box holding r's a-cell
+    nb_v = pshufb(rbox_a, bx_b)    // nb[r] = row of a in the box holding r's b-cell
+
+replacing the per-surviving-pair 18-load scalar gather with its `/3` box arithmetic, bounds
+checks, and `na`/`nb` stack buffers. Lane hygiene holds: index lanes 0..8 are boxes 0..8, so
+the low-lane invariant is untouched; lanes 9..15 of `na_v`/`nb_v` zero out (the `0x80` fill),
+which only the masked tests could observe and never read. Output unchanged — bit-identical to
+scalar (`packed_equals_scalar`, 200 seeds), fingerprint still `0x4621f425`, `tests/ua_filter`
+per-engine/tier identity green.
+
+Measured (paired A/B by stashing the diff, one warm shell, pinned core): pooled
+(`uabuildprof`, 256 boards x 4000 rebuilds, interleaved best-of-5) **~800 -> ~604 ns/board,
+~-24%**; one-shot `ua_build_cost` (`examples/bench`, 8000 att) **~1354-1373 -> ~1193-1232
+ns/board, ~-12%**, same 34.3 UAs/board; e2e within noise (the build is a small slice of the
+strip). `perf stat` over the pooled run, per build: instructions **9.89k -> 5.53k (-44%)**,
+cycles **2674 -> 2014 (-25%)**, branches 979 -> 511, branch-misses flat (~0.3/build) — the
+win is pure instruction-count removal (the gather plus its bounds-check branches), the
+inverse of the section-14 skid lesson: per-line cycle attribution gave this region ~15%, and
+removing it bought ~25%. Attribution mis-weights in both directions; only the paired A/B
+counts. IPC drops 3.70 -> 2.75, i.e. the residue is now more chain-bound (the serial shuffle
+ladders), so further pure instruction shaving should be expected to buy less than 1:1 in
+wall-clock.
+
+Still open, each its own A/B'd change: section-14 candidate (b) (drop the `col_of`/`r_map`
+transpose redundancy in the precompute, now ~a larger share of the smaller build) and the
+section-15 tier-split deletion cleanup.
