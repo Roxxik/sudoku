@@ -74,7 +74,7 @@ use std::rc::Rc;
 //   [8] fill cycles (random_solution)  [9] ua-build cycles (StripState::new_ua library)
 //   [10] verify cycles (final irreplaceability check)
 // so the strip-walk is the residual `[5] - [8] - [9] - [10]`.
-// `ph_add(i, v)` tallies (no-op without the feature). Read by `combobench`.
+// `ph_add(i, v)` tallies (no-op without the feature). Read by `findpar-bench`.
 counter_block!(PHSTAT: 11, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
 
 /// rdtsc timestamp for the kernel/service split (0 off-x86 or without the feature, so the

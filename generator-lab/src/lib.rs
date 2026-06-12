@@ -52,6 +52,7 @@
 #![feature(stmt_expr_attributes)]
 
 pub mod repr;
+pub mod cli;
 pub(crate) mod counters;
 pub mod fill;
 pub mod fingerprint;

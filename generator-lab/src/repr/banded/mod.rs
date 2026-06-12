@@ -22,7 +22,7 @@ mod dual_solver_state;
 
 pub use dual_solver_state::DualSolverState;
 
-// Naked-single group-size histogram (`feature = "count"`) — read by `combobench`.
+// Naked-single group-size histogram (`feature = "count"`) — read by `findpar-bench`.
 #[cfg(feature = "count")]
 pub use dual_solver_state::{psg_reset, psg_snapshot};
 

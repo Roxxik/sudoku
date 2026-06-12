@@ -17,7 +17,8 @@
 //!
 //! Workload (per the request): the production rare spec HiddenQuad in train and drill,
 //! a NakedPair-class cheap contrast, and three combined train-union specs that force two
-//! Expert kinds at once (combobench's builder) — spanning the branch pairings.
+//! Expert kinds at once (the shared `cli::build_spec` / findpar-bench builder) — spanning
+//! the branch pairings.
 //!
 //! Usage:
 //!   M1+M3:  cargo run --release --features count -p generator-lab --example deferstat -- [attempts=3000] [seed=1]
@@ -474,6 +475,6 @@ fn main() {
         );
     }
     println!(
-        "\n  projected SIMT verify share = (vfy us/att) / (SIMT us/att for the same spec).\n  SIMT us/att comes from the warp bench (combobench/simtbench); report the ratio there."
+        "\n  projected SIMT verify share = (vfy us/att) / (SIMT us/att for the same spec).\n  SIMT us/att comes from the warp bench (findpar-bench); report the ratio there."
     );
 }

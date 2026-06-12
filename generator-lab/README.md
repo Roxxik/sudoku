@@ -53,13 +53,18 @@ generator-lab/check.sh [attempts=2000] [seed=1]
 # Native only:
 cargo run --release -p generator-lab --example bench -- --attempts 4000 --seed 1
 
-# Print one actual puzzle (scalar, single seed; feed to core's CLI/verifier):
-cargo run --release -p generator-lab --example find -- --mode train --seed 1
-cargo run --release -p generator-lab --example find -- --mode drill --seed 1
+# Print actual puzzles (scalar, one per seed; feed to core's CLI/verifier). The spec is
+# --force NAME[:COUNT] (repeatable) + --toolbox train|drill|full:
+cargo run --release -p generator-lab --example find -- --force hidden-quad --seed 1
+cargo run --release -p generator-lab --example find -- --force hidden-quad --toolbox drill --seed 1
 
 # Harvest N puzzles via the packed SIMT prober (races W=8 seed streams in parallel
-# until N are found); puzzle lines on stdout, summary on stderr:
-cargo run --release -p generator-lab --example findpar -- --mode train --count 10
+# until N are found); puzzle lines on stdout, summary on stderr. Same args as find:
+cargo run --release -p generator-lab --example findpar -- --force hidden-quad --count 10
+
+# Fixed-budget SIMT bench (yield-independent us/att; combine --force kinds to surface
+# slow+rare codepaths):
+cargo run --release -p generator-lab --example findpar-bench -- --force hidden-quad --per-lane 20000
 
 # Real-device ARM numbers (desktop wasm is a POOR proxy): serve the page over the
 # LAN, open on a phone, tap Run train / Run drill — results POST back to the
@@ -88,8 +93,11 @@ generator-lab/web/serve.sh [port=8000]
   `SIMT-ROADMAP.md`.
 - `src/verify.rs` — spec verification reduced to a bool.
 - `src/generator.rs` — the random strip-generate pipeline (scalar, per-lane reference).
-- `examples/bench.rs` `examples/find.rs` — native bench / scalar single-puzzle.
-- `examples/findpar.rs` — harvest N puzzles via the packed SIMT prober (`simt::host::find_puzzles`, W=8 seed streams in parallel).
+- `examples/bench.rs` — native bench. `examples/find.rs` — scalar puzzles (one per seed).
+- `examples/findpar.rs` — same args as `find`, but harvests the puzzles via the packed
+  SIMT prober (W=8 seed streams in parallel). `examples/findpar-bench.rs` — the
+  fixed-budget, yield-independent bench variant (`--force`/`--toolbox`, `--lanes`/`--per-lane`).
+  All three read the spec via the shared `cli` module (`--force NAME[:COUNT]` + `--toolbox`).
 - `examples/probebench.rs` `examples/packbench.rs` — packed prober speedup (isolated
   / end-to-end) vs the scalar prober. The rest of `examples/` are the SIMT design
   microbenches indexed in `SIMT-ROADMAP.md`.

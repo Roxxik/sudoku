@@ -1,23 +1,20 @@
-//! Sweep COMBINED-requirement specs through the unified W=8 SIMT warp to find a
-//! generator codepath worth optimizing: one that is both slow per attempt AND
-//! rare (many attempts per puzzle), so the warp's average time to produce one
-//! puzzle is large (> 1s is the threshold of interest).
+//! `findpar-bench` -- the benchmarking sibling of `find`/`findpar`. Same `--force`/
+//! `--toolbox` spec interface, but instead of running each seed to a puzzle it runs a
+//! FIXED attempt budget (lanes x per_lane, capped from the outside on `stats().attempts`)
+//! through the unified W=8 SIMT warp. Fixed work makes the per-attempt cost
+//! yield-independent: it measures cleanly even at zero yield, where `findpar` would run
+//! forever, and the measured yield (successes/attempts) projects the average s/puzzle.
 //!
-//! A single `--target` (the `simtbench`/`findpar` interface) only ever Forces one
-//! kind. This example builds an EXPLICIT spec that Forces several kinds at once
-//! (and any kind with count > 1), e.g. "require a W-Wing AND a naked triple" or
-//! "require two X-Wings and a jellyfish". Combining requirements keeps the
-//! per-attempt solver cost high (the baseline ladder can't fast-path a Forced
-//! kind) while making the puzzle much rarer, which is exactly the slow+rare
-//! codepath we want to surface.
-//!
-//! Work is FIXED (lanes x per_lane attempts, capped from outside on `stats().attempts`)
-//! so a truly-rare combo is capped instead of running forever; us/att is yield-independent so it measures
-//! cleanly even at zero yield, and the yield (successes/attempts) gives the
-//! attempts/puzzle needed to project the average s/puzzle.
+//! Built for finding a generator codepath worth optimizing: one that is both slow per
+//! attempt AND rare (many attempts per puzzle), so the warp's average time to produce one
+//! puzzle is large (> 1s is the threshold of interest). Combining requirements with
+//! several `--force` kinds (and any kind at count > 1) keeps the per-attempt solver cost
+//! high (the baseline ladder can't fast-path a Forced kind) while making the puzzle much
+//! rarer -- exactly the slow+rare codepath we want to surface, e.g. "require a W-Wing AND
+//! a naked triple" or "require two X-Wings and a jellyfish".
 //!
 //! Usage:
-//!   cargo run --release -p generator-lab --example combobench -- \
+//!   cargo run --release -p generator-lab --example findpar-bench -- \
 //!       --force NAME[:COUNT] [--force NAME[:COUNT] ...] \
 //!       [--toolbox train|drill|full] [--lanes 8] [--per-lane 100000] [--seed 1]
 //!
@@ -30,10 +27,8 @@
 //! simpler peer); `--toolbox full` allows the entire 16-kind ladder (more
 //! substitutes => rarer).
 
+use generator_lab::cli::{Toolbox, build_spec, parse_force, spec_label};
 use generator_lab::generate::warp_host::{GateStream, Pumped};
-use generator_lab::spec::Spec;
-use generator_lab::spec::kinds::{NAMES, NUM};
-use generator_lab::{drill_union, train_union};
 
 /// Whole-run rdtsc envelope (same span as the wall clock) so the warp's per-phase cycle
 /// buckets can be expressed as a true fraction of total runtime — the leftover (host
@@ -53,18 +48,6 @@ fn rdtsc() -> u64 {
     0
 }
 
-/// Which toolbox surrounds the forced kinds.
-#[derive(Clone, Copy, PartialEq)]
-enum Toolbox {
-    /// Union of each target's train-scope (Trunk + simpler-or-equal same-branch peers).
-    Train,
-    /// Union of each target's drill-scope: Trunk allowed, simpler same-branch peers
-    /// CONCEDED (avoid-walk only) — so each forced kind fires in the baseline trace.
-    Drill,
-    /// The entire 16-kind ladder allowed (more substitutes => rarer).
-    Full,
-}
-
 fn main() {
     let mut forces: Vec<(usize, u16)> = Vec::new();
     let mut toolbox = Toolbox::Train;
@@ -75,25 +58,14 @@ fn main() {
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--force" => {
-                let spec = it.next().unwrap_or_default();
-                let (name, count) = match spec.split_once(':') {
-                    Some((n, c)) => (n.to_string(), c.parse().unwrap_or(1u16)),
-                    None => (spec, 1u16),
-                };
-                let idx = NAMES.iter().position(|&n| n == name).unwrap_or_else(|| {
-                    eprintln!("unknown kind {name:?}; known: {}", NAMES.join(", "));
+            "--force" => match parse_force(&it.next().unwrap_or_default()) {
+                Ok(f) => forces.push(f),
+                Err(msg) => {
+                    eprintln!("{msg}");
                     std::process::exit(2);
-                });
-                forces.push((idx, count));
-            }
-            "--toolbox" => {
-                toolbox = match it.next().as_deref() {
-                    Some("full") => Toolbox::Full,
-                    Some("drill") => Toolbox::Drill,
-                    _ => Toolbox::Train,
                 }
-            }
+            },
+            "--toolbox" => toolbox = Toolbox::parse(it.next().as_deref()),
             "--lanes" => lanes = it.next().and_then(|s| s.parse().ok()).unwrap_or(lanes),
             "--per-lane" => per_lane = it.next().and_then(|s| s.parse().ok()).unwrap_or(per_lane),
             "--seed" => base_seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(base_seed),
@@ -106,39 +78,14 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Build the toolbox around the forced kinds. train/drill use the library union
-    // builders (the multi-force generalizations of Spec::train/Spec::drill); full allows
-    // the entire ladder. The union builders force at count 1, so re-force afterwards to
-    // honor any requested COUNT > 1 (force overrides the slot).
-    let idxs: Vec<usize> = forces.iter().map(|&(i, _)| i).collect();
-    let mut spec = match toolbox {
-        Toolbox::Train => train_union(&idxs),
-        Toolbox::Drill => drill_union(&idxs),
-        Toolbox::Full => {
-            let mut s = Spec::explicit();
-            for idx in 0..NUM {
-                s = s.allow(idx);
-            }
-            s
-        }
-    };
-    for &(idx, count) in &forces {
-        spec = spec.force(idx, count);
-    }
-
-    let label = forces
-        .iter()
-        .map(|&(idx, c)| if c == 1 { NAMES[idx].to_string() } else { format!("{}x{c}", NAMES[idx]) })
-        .collect::<Vec<_>>()
-        .join(" + ");
-    let toolbox = match toolbox {
-        Toolbox::Train => "train-union",
-        Toolbox::Drill => "drill-union",
-        Toolbox::Full => "full",
-    };
+    // Build the toolbox spec around the forced kinds (the shared `cli` builder honors any
+    // requested COUNT > 1).
+    let spec = build_spec(&forces, toolbox);
+    let label = spec_label(&forces);
+    let toolbox = toolbox.label();
     let total = lanes * per_lane;
     println!(
-        "combobench[{label}] toolbox={toolbox}: {lanes} lanes x {per_lane} = {total} attempts"
+        "findpar-bench[{label}] toolbox={toolbox}: {lanes} lanes x {per_lane} = {total} attempts"
     );
 
     #[cfg(feature = "count")]

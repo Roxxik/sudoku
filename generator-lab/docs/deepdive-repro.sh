@@ -2,14 +2,14 @@
 #
 # deepdive-repro.sh — reproduce the QUANTITATIVE numbers in DEEPDIVE.md,
 # DEEPDIVE-LOG.md and DEEPDIVE-LANES16.md in one run, using the CURRENT code
-# (symbol/host names drift; the perf events and combobench interface do not).
+# (symbol/host names drift; the perf events and findpar-bench interface do not).
 #
 # WHAT THIS SCRIPT DOES (the deterministic, measurable half):
 #   topdown   §2 table + DEEPDIVE-LOG facts: us/att, cyc/att, instr/att, IPC,
 #             the five Zen-4 slot buckets (retiring/frontend/backend/bad-spec/smt),
 #             MPKI, taken%, mispredict-rate, op-cache hit% + %ops-from-opcache,
 #             L1d loads/att + miss%, vector-ops/att, divides/att.
-#   util      §3: unified-warp lane utilization + warp passes/att (combobench
+#   util      §3: unified-warp lane utilization + warp passes/att (findpar-bench
 #             --features count prints these directly).
 #   selftime  §4: per-symbol self-time for the named hot regions (perf record/report).
 #   lanes16   DEEPDIVE-LANES16: l8-vs-l16 top-down + double-pump (sse_avx_ops/att,
@@ -153,15 +153,15 @@ setup_env(){
 }
 
 # ───────────────────────── build helpers ─────────────────────────
-build_combobench(){ # features-or-empty  out-suffix
+build_findpar_bench(){ # features-or-empty  out-suffix
   local feats="$1" suff="$2" flags=()
   [[ -n "$feats" ]] && flags=(--features "$feats")
-  ( cd "$CRATE_DIR" && cargo build --release "${flags[@]}" --example combobench >/dev/null 2>&1 )
-  cp "$TARGET_DIR/combobench" "$TARGET_DIR/combobench-$suff"
-  echo "$TARGET_DIR/combobench-$suff"
+  ( cd "$CRATE_DIR" && cargo build --release "${flags[@]}" --example findpar-bench >/dev/null 2>&1 )
+  cp "$TARGET_DIR/findpar-bench" "$TARGET_DIR/findpar-bench-$suff"
+  echo "$TARGET_DIR/findpar-bench-$suff"
 }
 
-# Run combobench (prints to $WORK/out) under a perf-stat CSV group (-> $WORK/csv).
+# Run findpar-bench (prints to $WORK/out) under a perf-stat CSV group (-> $WORK/csv).
 # $1=binary $2=workload-forces $3=event-group $4=per_lane
 runperf(){
   local bin="$1" forces="$2" group="$3" pl="$4" args=() f
@@ -177,7 +177,7 @@ fnum(){ awk -v a="$1" -v b="$2" -v s="${3:-1}" 'BEGIN{printf (b==0?0:s*a/b)}'; }
 
 # ───────────────────────── section: TOPDOWN (§2 + LOG) ─────────────────────────
 sec_topdown(){
-  rule; say "§2 WHOLE-PROGRAM TOP-DOWN  (combobench, ${LANES}×${PER_LANE} att, pinned core $CORE)"
+  rule; say "§2 WHOLE-PROGRAM TOP-DOWN  (findpar-bench, ${LANES}×${PER_LANE} att, pinned core $CORE)"
   printf '%-4s %7s %7s %7s %5s | %5s %5s %5s %5s %4s | %4s %5s %6s %5s %6s %5s\n' \
     wl us/att cyc/att Kins/a IPC ret% fe% be% bad% smt% MPKI tkn% mispr% OC-h% L1ld/a L1m%
   local entry label forces
@@ -222,7 +222,7 @@ sec_topdown(){
 
 # ───────────────────────── section: UTIL (§3) ─────────────────────────
 sec_util(){
-  rule; say "§3 UNIFIED-WARP UTILIZATION  (combobench --features count)"
+  rule; say "§3 UNIFIED-WARP UTILIZATION  (findpar-bench --features count)"
   printf '%-4s %8s %10s %10s\n' wl LANES util passes/att
   local entry label forces f args
   for entry in "${WORKLOADS[@]}"; do
@@ -277,8 +277,8 @@ trap restore_lanes EXIT
 sec_lanes16(){
   rule; say "LANES16: 8-wide (ymm) vs 16-wide (zmm) unified warp — shape + double-pump"
   local b8 b16
-  set_lanes 8;  b8="$(build_combobench '' l8)"
-  set_lanes 16; b16="$(build_combobench '' l16)"; restore_lanes
+  set_lanes 8;  b8="$(build_findpar_bench '' l8)"
+  set_lanes 16; b16="$(build_findpar_bench '' l16)"; restore_lanes
   # objdump ymm/zmm/xmm operand counts inside warp_pass_full (any monomorph)
   say "  warp_pass_full operand-register-width counts (objdump, in-function):"
   local bn
@@ -328,8 +328,8 @@ sec_sde(){
   rule; say "SDE -mix: instruction shape (isa-set width partition + top opcodes), l8 vs l16"
   [[ -x "$SDE" ]] || { say "  SDE not found at '$SDE' (set \$SDE) — skipping."; return; }
   local att=$((LANES*PER_LANE_SDE)) b8 b16
-  set_lanes 8;  b8="$(build_combobench '' l8)"
-  set_lanes 16; b16="$(build_combobench '' l16)"; restore_lanes
+  set_lanes 8;  b8="$(build_findpar_bench '' l8)"
+  set_lanes 16; b16="$(build_findpar_bench '' l16)"; restore_lanes
   local entry label forces cfg
   for entry in "${WORKLOADS[@]}"; do
     label="${entry%%|*}"; forces="${entry#*|}"
@@ -371,8 +371,8 @@ say "crate=$CRATE_DIR  core=$CORE  per_lane=$PER_LANE  quick=$QUICK  sections=${
 have perf || { echo "perf not found" >&2; exit 1; }
 setup_env
 
-BIN_PROD="$(build_combobench '' prod)"
-BIN_COUNT="$(build_combobench count count)"
+BIN_PROD="$(build_findpar_bench '' prod)"
+BIN_COUNT="$(build_findpar_bench count count)"
 say "built: $(basename "$BIN_PROD"), $(basename "$BIN_COUNT")"
 
 for s in "${SECTIONS[@]}"; do
