@@ -416,5 +416,31 @@ ladders), so further pure instruction shaving should be expected to buy less tha
 wall-clock.
 
 Still open, each its own A/B'd change: section-14 candidate (b) (drop the `col_of`/`r_map`
-transpose redundancy in the precompute, now ~a larger share of the smaller build) and the
-section-15 tier-split deletion cleanup.
+transpose redundancy in the precompute, now ~a larger share of the smaller build — landed in
+section 17) and the section-15 tier-split deletion cleanup.
+
+## 17. Follow-up landed (2026-06-12): drop the `col_of`/`r_map` precompute redundancy
+
+Section-14 candidate (b). The scalar `col_of[row][digit]` array (the per-row column lookup
+emission reads) was exactly the transpose of the vector `r_map[digit][row]` map — both store
+`col` at the same `(row, digit)` placement of a complete grid, so `col_of[r][d] == r_map[d][r]`
+identically. It is deleted: emission reads the column from `r_map[a][r]` / `r_map[b][r]` directly
+(a contiguous walk along each digit's 9-byte row map, replacing the old 9-byte-stride
+`col_of[r][a]`), and the precompute loop drops its 81 `col_of` stores plus the array's zero-init.
+Output unchanged — bit-identical to scalar (`packed_equals_scalar`, 200 seeds), fingerprint still
+`0x4621f425`, `tests/ua_filter` per-engine/tier identity green, `library_sizes_match_anchors`
+green.
+
+Measured (paired A/B by building both binaries from the stashed diff, one warm shell, pinned
+core, interleaved both orders): pooled (`uabuildprof`, 256 boards x 4000 rebuilds, best-of-10)
+**~579 -> ~544 ns/board, ~-6%** at the same 34.7 UAs/board (every one of 20 interleaved reps had
+the changed build faster). `perf stat` over the pooled run, per build: instructions **5529 ->
+5374 (-156, -2.8%)**, cycles **2030 -> 1946 (-84, -4.1%)**, branches and branch-misses flat
+(~511 / ~0.22 per build) — a pure instruction-count win (the deleted stores + their address math
++ the array init), no branch change, exactly the section-16 shape. One-shot `ua_build_cost`
+(`examples/bench`, 8000 att) **~1187 -> ~1155 ns/board, ~-2.7%** (best-of, consistent across
+reps); e2e within noise — the one-shot is diluted by the fresh-board fill traffic the pooled loop
+amortizes out, so the precompute slice shows smaller there.
+
+Still open: the section-14 candidate (a)/(b) precompute list is now exhausted; the remaining
+named follow-up is the section-15 tier-split deletion cleanup (one production tier everywhere).

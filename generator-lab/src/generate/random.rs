@@ -540,9 +540,10 @@ impl UaFilter {
         // permutation maps the per-pair vector ops consume: `r_map`/`c_map` over lines
         // (`R_d[row] = col`, `C_d[col] = row`, `C_d` the inverse of `R_d`) and
         // `bx_map`/`rbox_map` over boxes (`B_d[row] = box`, `X_d[box] = row`, composing to the
-        // box-edge neighbor maps below). `col_of` stays scalar for emission, which reads
-        // individual entries.
-        let mut col_of = [[0u8; 9]; 9]; // [row][digit] = column of the digit in that row
+        // box-edge neighbor maps below). Emission's per-row column lookup reads `r_map[d][row]`
+        // directly: the old scalar `col_of[row][d]` was exactly `r_map`'s transpose (both store
+        // `col` at the same complete-grid `(row, d)` placement), so it was redundant store
+        // traffic — `docs/UA-PACKED-BUILD.md` section 14 candidate (b).
         let mut r_map = [[HI; 16]; 9];
         let mut c_map = [[HI; 16]; 9];
         let mut bx_map = [[HI; 16]; 9]; // B_d[row] = box of d's cell in that row
@@ -551,7 +552,6 @@ impl UaFilter {
             for col in 0..9 {
                 let d = g[row * 9 + col] as usize;
                 let bx = (row / 3) * 3 + col / 3;
-                col_of[row][d] = col as u8;
                 r_map[d][row] = col as u8;
                 c_map[d][col] = row as u8;
                 bx_map[d][row] = bx as u8;
@@ -711,8 +711,9 @@ impl UaFilter {
                         };
                         // SAFETY: id <= 143 < UA_CAP = counts.len().
                         *self.counts.get_unchecked_mut(id as usize) += 2;
-                        let ca = r * 9 + col_of[r][a] as usize;
-                        let cb = r * 9 + col_of[r][b] as usize;
+                        // Column of a/b in row r: `r_map[d][r]` (= the deleted `col_of[r][d]`).
+                        let ca = r * 9 + r_map[a][r] as usize;
+                        let cb = r * 9 + r_map[b][r] as usize;
                         // SAFETY: ca/cb < CELLS (= cell_uas.len()); ka/kb < 8 = UA_PER_CELL,
                         // because a digit joins at most its 8 pairs, so its counter is <= 7
                         // before this pair's increment.
