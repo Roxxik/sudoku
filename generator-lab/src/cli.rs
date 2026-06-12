@@ -94,20 +94,21 @@ pub fn spec_label(forces: &[(usize, u16)]) -> String {
 
 /// The shared `--force`/`--toolbox`/`--seed`/`--count`/`--max` argument set for the `find`
 /// (scalar) and `findpar` (SIMT) examples, so the two tools take identical arguments.
-/// Both run the seed range `seed..seed+count`, one puzzle per seed (each seed run to its
-/// first success — a pure function of the seed, identical across the scalar and SIMT
-/// paths). `max` is the scalar per-seed safety cap; `findpar` has no per-seed cap and
-/// ignores it (use `findpar-bench` for a bounded SIMT run).
+/// One seed = one attempt: both consume seeds from `base_seed` upward, a single strip walk
+/// each, until `count` puzzles have been produced (most seeds yield nothing, so far more
+/// than `count` seeds are tried — and which seeds yield is a pure function of the seed,
+/// identical across the scalar and SIMT paths). `max` caps the total attempts (= seeds
+/// tried) so a low- or zero-yield spec can't run forever; it defaults to unlimited.
 pub struct FindArgs {
     /// The forced kinds with their counts, in `--force` order.
     pub forces: Vec<(usize, u16)>,
     /// The toolbox surrounding the forced kinds.
     pub toolbox: Toolbox,
-    /// First seed of the `count`-wide range.
+    /// First seed tried; seeds are consumed `base_seed, base_seed + 1, ...`.
     pub base_seed: u64,
-    /// How many consecutive seeds to turn into puzzles.
+    /// How many puzzles to produce (seeds are consumed until this many succeed).
     pub count: u64,
-    /// Scalar per-seed attempt cap (ignored by `findpar`).
+    /// Safety cap on total attempts (= seeds tried) before giving up; default unlimited.
     pub max: usize,
 }
 
@@ -119,7 +120,7 @@ impl FindArgs {
         let mut toolbox = Toolbox::Train;
         let mut base_seed = 1u64;
         let mut count = 1u64;
-        let mut max = 1_000_000usize;
+        let mut max = usize::MAX; // unlimited by default; --max sets a finite attempt cap
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {

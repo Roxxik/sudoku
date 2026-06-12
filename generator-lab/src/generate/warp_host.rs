@@ -30,11 +30,12 @@
 //! semantics. Everything else lives in [`GateEngine`].
 //!
 //! Logical lanes are independent, so the 8-slot interleave can't change any lane's
-//! outcome: the dispatch is monomorphized and the seed -> puzzle map is byte-identical
-//! to the sequential scalar [`generate`](super::generate) (`tests/equiv_warp_repr`
-//! pins each lane lane-for-lane). An AVX native play, so it (and the `std::simd` warp
-//! it batches onto) stays out of the wasm cdylib, which ships the scalar `run_attempts`
-//! path.
+//! outcome: the dispatch is monomorphized and each seed's single attempt is byte-identical
+//! to the scalar [`attempt`](super::random::attempt) from the same seed (one seed = one
+//! attempt; most seeds yield nothing, so the seed -> puzzle map is partial — `tests/
+//! equiv_warp_repr` pins each lane lane-for-lane). An AVX native play, so it (and the
+//! `std::simd` warp it batches onto) stays out of the wasm cdylib, which ships the scalar
+//! `run_attempts` path.
 
 use super::random::{GeneratedPuzzle, Stats, StripState, baseline_fast_applicable, verify};
 use crate::counters::counter_block;
@@ -322,92 +323,88 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
     let fast = baseline_fast_applicable(&spec);
     let co = #[coroutine] move |_first: GateResult| {
         loop {
-            // New seed: one fresh RNG stream, retried until it yields a puzzle.
+            // One seed = one attempt. Pull the next seed and run a single strip walk; most
+            // seeds yield nothing, so the seed -> puzzle map is partial. When the feed
+            // drains, the lane finishes.
             let next = shared.borrow_mut().seeds.next();
             let Some(seed) = next else { return };
             let mut rng = Rng::from_seed(seed);
-            loop {
-                shared.borrow_mut().stats.attempts += 1;
-                // Fill + UA-build slices (subsets of this resume's coroutine cycles [5]):
-                // random_solution is the fill, new_ua is the per-board UA library build —
-                // the UA cost is the BUILD, not the cheap per-cell `caught` query, which
-                // stays in the strip residual. Timed once per attempt (low perturbation).
-                let tf = rdtsc();
-                let solution = random_solution(&mut rng);
-                let tu = rdtsc();
-                ph_add(8, tu.wrapping_sub(tf)); // fill: random_solution
-                let mut strip: StripState<RowStrip> = StripState::new_ua(&solution);
-                ph_add(9, rdtsc().wrapping_sub(tu)); // ua-build: new_ua library
-                let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
-                rng.shuffle(&mut positions);
-                for idx in 0..CELLS {
-                    let cell = positions[idx];
-                    let Some(orig) = strip.digit_at(cell) else {
-                        continue; // already stripped
-                    };
-                    // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
-                    // unavoidable set is a provable non-unique — revert without yielding a
-                    // probe to the warp (one fewer probe lane-pass). Posed BEFORE the strip:
-                    // `caught` reads only the library counts (nothing the strip mutates), so a
-                    // caught cell skips both the strip and the revert (it stays a given). A
-                    // caught gate is never an `alts == 0` or re-force keep (caught =>
-                    // non-unique, those => unique; mutually exclusive), so checking it first
-                    // is trajectory-identical.
-                    if strip.ua_caught_before_strip(cell, orig) {
-                        continue;
-                    }
-                    let alts = strip.strip(cell, orig);
-                    if alts == 0 {
-                        strip.keep_trivial(cell);
-                        continue;
-                    }
-                    // Hidden-single re-force fast path: both gates skippable,
-                    // verdict carried (see [`StripState::reforced`]).
-                    if fast && strip.reforced(cell, orig) != 0 {
-                        strip.keep_trivial(cell);
-                        continue;
-                    }
-                    // The uniqueness gate: suspend here; the warp decides. A unique
-                    // verdict comes back as the baseline trace directly (the warp
-                    // flips probe -> baseline in place), so one suspension covers
-                    // both gates.
-                    let (r, unsolved) = strip.export_r();
-                    let verdict = yield Probe { r, unsolved, cell, alts };
-                    match verdict {
-                        GateResult::ProbeNonUnique => strip.revert_gate(cell, orig),
-                        GateResult::Baseline(trace) => {
-                            strip.apply_baseline(cell, orig, &trace, &spec)
-                        }
+            shared.borrow_mut().stats.attempts += 1;
+            // Fill + UA-build slices (subsets of this resume's coroutine cycles [5]):
+            // random_solution is the fill, new_ua is the per-board UA library build —
+            // the UA cost is the BUILD, not the cheap per-cell `caught` query, which
+            // stays in the strip residual. Timed once per attempt (low perturbation).
+            let tf = rdtsc();
+            let solution = random_solution(&mut rng);
+            let tu = rdtsc();
+            ph_add(8, tu.wrapping_sub(tf)); // fill: random_solution
+            let mut strip: StripState<RowStrip> = StripState::new_ua(&solution);
+            ph_add(9, rdtsc().wrapping_sub(tu)); // ua-build: new_ua library
+            let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+            rng.shuffle(&mut positions);
+            for idx in 0..CELLS {
+                let cell = positions[idx];
+                let Some(orig) = strip.digit_at(cell) else {
+                    continue; // already stripped
+                };
+                // UA pre-filter (docs/UA-FILTER.md): a strip that would empty a library
+                // unavoidable set is a provable non-unique — revert without yielding a
+                // probe to the warp (one fewer probe lane-pass). Posed BEFORE the strip:
+                // `caught` reads only the library counts (nothing the strip mutates), so a
+                // caught cell skips both the strip and the revert (it stays a given). A
+                // caught gate is never an `alts == 0` or re-force keep (caught =>
+                // non-unique, those => unique; mutually exclusive), so checking it first
+                // is trajectory-identical.
+                if strip.ua_caught_before_strip(cell, orig) {
+                    continue;
+                }
+                let alts = strip.strip(cell, orig);
+                if alts == 0 {
+                    strip.keep_trivial(cell);
+                    continue;
+                }
+                // Hidden-single re-force fast path: both gates skippable,
+                // verdict carried (see [`StripState::reforced`]).
+                if fast && strip.reforced(cell, orig) != 0 {
+                    strip.keep_trivial(cell);
+                    continue;
+                }
+                // The uniqueness gate: suspend here; the warp decides. A unique
+                // verdict comes back as the baseline trace directly (the warp
+                // flips probe -> baseline in place), so one suspension covers
+                // both gates.
+                let (r, unsolved) = strip.export_r();
+                let verdict = yield Probe { r, unsolved, cell, alts };
+                match verdict {
+                    GateResult::ProbeNonUnique => strip.revert_gate(cell, orig),
+                    GateResult::Baseline(trace) => {
+                        strip.apply_baseline(cell, orig, &trace, &spec)
                     }
                 }
-                // Finalize — byte-identical bookkeeping to `run_attempts`.
-                let success = match strip.best.take() {
-                    Some(snap) => {
-                        let tv = rdtsc();
-                        let ok = verify(&snap, &spec);
-                        ph_add(10, rdtsc().wrapping_sub(tv)); // verify: final irreplaceability check
-                        if ok {
-                            let givens = snap.digit_count();
-                            let mut sh = shared.borrow_mut();
-                            sh.stats.successes += 1;
-                            sh.stats.total_givens += givens;
-                            sh.ready.push_back((
-                                seed,
-                                GeneratedPuzzle { puzzle: Puzzle(snap), solution, givens },
-                            ));
-                            true
-                        } else {
-                            shared.borrow_mut().stats.not_forced += 1;
-                            false
-                        }
+            }
+            // Finalize — byte-identical bookkeeping to `run_attempts`. One attempt per
+            // seed: tally the outcome and loop on to the next seed whether or not this
+            // one yielded a puzzle.
+            match strip.best.take() {
+                Some(snap) => {
+                    let tv = rdtsc();
+                    let ok = verify(&snap, &spec);
+                    ph_add(10, rdtsc().wrapping_sub(tv)); // verify: final irreplaceability check
+                    if ok {
+                        let givens = snap.digit_count();
+                        let mut sh = shared.borrow_mut();
+                        sh.stats.successes += 1;
+                        sh.stats.total_givens += givens;
+                        sh.ready.push_back((
+                            seed,
+                            GeneratedPuzzle { puzzle: Puzzle(snap), solution, givens },
+                        ));
+                    } else {
+                        shared.borrow_mut().stats.not_forced += 1;
                     }
-                    None => {
-                        shared.borrow_mut().stats.never_fired += 1;
-                        false
-                    }
-                };
-                if success {
-                    break; // this seed has its puzzle: pull the next
+                }
+                None => {
+                    shared.borrow_mut().stats.never_fired += 1;
                 }
             }
         }
@@ -516,9 +513,11 @@ fn gate_ticket<I: Iterator<Item = u64>>(
 /// engine+attempt pair). Owns the boards, the active mask, the eight occupants, and
 /// the attempt-boundary [`Shared`] channel; `pump`/`stats` are the public face.
 ///
-/// There is no attempt budget here: a bench that wants fixed work caps it from the
-/// outside on [`stats`](Self::stats)`.attempts` (the counter climbs on every attempt,
-/// including retries, so it terminates even on a spec that never yields).
+/// There is no attempt budget here: one seed = one attempt, so a finite seed iterator
+/// bounds the work directly (drain it for a fixed-attempt run), and a bench that wants a
+/// fixed budget over an unbounded feed caps it from the outside on
+/// [`stats`](Self::stats)`.attempts` (the counter climbs once per seed, so it terminates
+/// even on a spec that never yields).
 pub struct PuzzleStream<I, O>
 where
     I: Iterator<Item = u64>,
@@ -657,9 +656,10 @@ where
 }
 
 impl<I: Iterator<Item = u64>> GateStream<I> {
-    /// Race `seeds` through the warp, one puzzle per seed (each retried until it
-    /// yields). Carries the production (full 2-digit) UA pre-filter; its soundness keeps the
-    /// produced puzzles lane-for-lane identical to the scalar [`generate`](super::generate).
+    /// Race `seeds` through the warp, one attempt per seed (a seed yields a puzzle only
+    /// when its single strip walk succeeds — most don't). Carries the production (full
+    /// 2-digit) UA pre-filter; its soundness keeps each seed's attempt lane-for-lane
+    /// identical to the scalar [`attempt`](super::random::attempt) from the same seed.
     pub fn new(seeds: I, spec: &Spec) -> Self {
         Self::new_opts(seeds, spec, true)
     }

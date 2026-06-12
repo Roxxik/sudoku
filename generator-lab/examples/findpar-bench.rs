@@ -1,9 +1,9 @@
 //! `findpar-bench` -- the benchmarking sibling of `find`/`findpar`. Same `--force`/
-//! `--toolbox` spec interface, but instead of running each seed to a puzzle it runs a
-//! FIXED attempt budget (lanes x per_lane, capped from the outside on `stats().attempts`)
-//! through the unified W=8 SIMT warp. Fixed work makes the per-attempt cost
-//! yield-independent: it measures cleanly even at zero yield, where `findpar` would run
-//! forever, and the measured yield (successes/attempts) projects the average s/puzzle.
+//! `--toolbox` spec interface, but instead of stopping at a puzzle count it runs a FIXED
+//! attempt budget (lanes x per_lane seeds, one attempt each) through the unified W=8 SIMT
+//! warp. Fixed work makes the per-attempt cost yield-independent: it measures cleanly even
+//! at zero yield, where `findpar` would run forever, and the measured yield
+//! (successes/attempts) projects the average s/puzzle.
 //!
 //! Built for finding a generator codepath worth optimizing: one that is both slow per
 //! attempt AND rare (many attempts per puzzle), so the warp's average time to produce one
@@ -94,22 +94,21 @@ fn main() {
         generator_lab::solve::uwstat_reset();
         generator_lab::generate::warp_host::phstat_reset();
     }
-    // Fixed work, capped from the OUTSIDE: pump the production stream until `total`
-    // attempts have started (the counter climbs on every attempt incl. retries, so this
-    // terminates even for a combo that never yields). Fold an order-independent fingerprint
-    // over the produced puzzles so two builds match iff they produce the same puzzle set.
+    // Fixed work: one seed = one attempt, so a bounded seed range IS the attempt budget —
+    // feed exactly `total` seeds and drain (no outside per-tick cap, no overshoot; the feed
+    // bounds the work, and it terminates even for a combo that never yields). Fold an
+    // order-independent fingerprint over the produced puzzles so two builds match iff they
+    // produce the same puzzle set.
     #[cfg(feature = "count")]
     let env0 = rdtsc();
     let t0 = std::time::Instant::now();
-    let mut stream = GateStream::new(base_seed.., &spec);
+    let mut stream = GateStream::new(base_seed..base_seed + total as u64, &spec);
     let mut combo_fp = 0u64; // XOR-fold of per-puzzle fps: order-independent
-    // Pump ONE tick at a time so the outside cap overshoots `total` by at most a tick's
-    // worth of attempts; a tick (a full 8-wide warp pass) dwarfs the per-call cost.
-    while stream.stats().attempts < total {
-        match stream.pump(1) {
+    loop {
+        match stream.pump(4096) {
             Pumped::Found(_, p) => combo_fp ^= generator_lab::fingerprint::grid_fp(&p.puzzle.0),
             Pumped::StepCountReached => {}
-            Pumped::NoMorePuzzles => break, // unbounded seeds: unreachable
+            Pumped::NoMorePuzzles => break, // seed feed drained: all `total` attempts done
         }
     }
     let dt = t0.elapsed();

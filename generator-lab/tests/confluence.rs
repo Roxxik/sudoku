@@ -46,8 +46,11 @@ fn assert_confluent(spec: &Spec, count: u64) {
     let perms = permutations();
 
     let mut boards: Vec<(u64, Board)> = Vec::new();
-    let mut stream = GateStream::new(1..1 + count, spec);
-    loop {
+    // One seed = one attempt, so feed an unbounded seed range and stop once `count` puzzles
+    // have surfaced. A fixed `1..1+count` range would yield far fewer than `count` for a
+    // rare spec (Swordfish/W-Wing need many attempts each).
+    let mut stream = GateStream::new(1.., spec);
+    while (boards.len() as u64) < count {
         match stream.pump(4096) {
             Pumped::Found(seed, p) => boards.push((seed, Board::from_digits(&p.puzzle.0))),
             Pumped::StepCountReached => {}
