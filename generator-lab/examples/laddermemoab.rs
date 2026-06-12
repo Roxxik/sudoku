@@ -150,7 +150,7 @@ fn main() {
         let l = generator_lab::solve::lstat_snapshot();
         let share = |run: u64, skip: u64| 100.0 * skip as f64 / (run + skip).max(1) as f64;
         println!(
-            "  ladder: {} entries   subset-scans {} run / {} skipped ({:.1}% skip)   fish-scans {} run / {} skipped ({:.1}% skip)",
+            "  ladder: {} entries   subset-scans {} run / {} skipped ({:.1}% skip)   fish-scans {} run / {} skipped ({:.1}% skip)   fish-pos digit rebuilds {}",
             l[0],
             l[1],
             l[2],
@@ -158,6 +158,7 @@ fn main() {
             l[3],
             l[4],
             share(l[3], l[4]),
+            l[5],
         );
     }
 }

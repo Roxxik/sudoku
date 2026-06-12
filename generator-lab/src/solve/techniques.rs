@@ -231,6 +231,10 @@ pub(super) fn naked_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
     false
 }
 
+/// The basic-fish kinds, for the "does this toolbox have any fish at all" gate shared
+/// by [`fish_step`] and the SIMT ladder's cached-position rebuild.
+pub(super) const ANY_FISH: KindMask = (1 << X_WING) | (1 << SWORDFISH) | (1 << JELLYFISH);
+
 /// Per-`(orientation, digit, base-line)` candidate-position masks for the basic fish:
 /// bit `x` of `pos[o][d][b]` is set iff digit `d` is a candidate at base line `b`,
 /// cross position `x` (orientation `o`: `0` = rows as base lines, `1` = columns). What
@@ -238,11 +242,38 @@ pub(super) fn naked_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
 /// cover — the per-line masks themselves are size-independent, so [`fish_step`] scans
 /// the board once and the three sizes share it instead of each rebuilding it. The scan
 /// is the fish's read-heavy half (one [`get`] per cell — see [`FishPositions::scan`]).
-struct FishPositions {
+///
+/// A digit's whole search reads only that digit's two slices (`pos[*][d]`), so the
+/// masks also memoize per digit: the SIMT ladder caches a `FishPositions` across
+/// stalls in its [`crate::solve::simt::LadderMemo`] and refreshes only the digits its
+/// band diff proved changed ([`rebuild_digit`](Self::rebuild_digit)), handing the
+/// cache to [`fish_step`] in place of the scan.
+pub(super) struct FishPositions {
     pos: [[[u16; 9]; 9]; 2],
 }
 
 impl FishPositions {
+    /// All-empty masks — the placeholder behind a dead [`crate::solve::simt::LadderMemo`]
+    /// (every digit marked stale, so nothing ever reads these zeros).
+    pub(super) const EMPTY: FishPositions = FishPositions { pos: [[[0; 9]; 9]; 2] };
+
+    /// Refresh one digit's slices of both orientations from its nine 9-bit row slices
+    /// (`rows[r]` bit `c` = the digit is a candidate at cell `(r, c)`) — the cached
+    /// cross-stall rebuild for a digit the band diff found changed. Row orientation is
+    /// the row slices themselves; the column orientation is their 9x9 bit transpose,
+    /// built branchlessly (the scatter loop measurably raised branch-misses for the
+    /// analogous `SubsetCache` transpose, see [`crate::solve::simt`]).
+    pub(super) fn rebuild_digit(&mut self, di: usize, rows: [u16; 9]) {
+        self.pos[0][di] = rows;
+        let mut cols = [0u16; 9];
+        for (r, &row) in rows.iter().enumerate() {
+            for (c, col) in cols.iter_mut().enumerate() {
+                *col |= ((row >> c) & 1) << r;
+            }
+        }
+        self.pos[1][di] = cols;
+    }
+
     /// Read every cell's candidates once into the per-line masks. The only board-reading
     /// pass the fish ladder makes per stall.
     ///
@@ -273,26 +304,37 @@ impl FishPositions {
 }
 
 /// Try the three basic fishes in size-ascending order (X-Wing, then Swordfish, then
-/// Jellyfish), sharing a single [`FishPositions`] scan across all three. Honours
+/// Jellyfish), sharing a single [`FishPositions`] across all three. Honours
 /// `allowed` and preserves the exact first-applicable order of the three separate
 /// `fish(b, size)` ladder entries it replaces (size outer, then digit, then
 /// orientation), so the produced verdict and elimination set are byte-identical.
 /// Returns the fired kind index, or `None`.
+///
+/// `memo` is the SIMT ladder's per-digit cross-stall memo: the no-fire verdict bytes
+/// AND the cached positions, already refreshed for every changed digit (see
+/// [`FishPositions`]) — so the memoized path never re-reads the board here. `None`
+/// (the scalar solvers) scans the board fresh.
 pub(super) fn fish_step<V: LogicBoard>(
     v: &mut V,
     allowed: KindMask,
-    mut memo: Option<&mut [u8; 9]>,
+    memo: Option<(&mut [u8; 9], &FishPositions)>,
 ) -> Option<usize> {
-    const ANY_FISH: KindMask = (1 << X_WING) | (1 << SWORDFISH) | (1 << JELLYFISH);
     if allowed & ANY_FISH == 0 {
         return None;
     }
-    let fp = FishPositions::scan(v);
+    let scanned;
+    let (mut nf, fp) = match memo {
+        Some((nf, fp)) => (Some(nf), fp),
+        None => {
+            scanned = FishPositions::scan(v);
+            (None, &scanned)
+        }
+    };
     // `slot` is the per-digit memo bit for this size (X-Wing 0 / Swordfish 1 / Jellyfish
-    // 2), independent of the global kind index `bit`. `memo.as_deref_mut()` reborrows the
+    // 2), independent of the global kind index `bit`. `nf.as_deref_mut()` reborrows the
     // optional memo for each size's scan.
     for (bit, size, slot) in [(X_WING, 2usize, 0u8), (SWORDFISH, 3, 1), (JELLYFISH, 4, 2)] {
-        if allowed & (1 << bit) != 0 && fish_sized(v, size, &fp, slot, memo.as_deref_mut()) {
+        if allowed & (1 << bit) != 0 && fish_sized(v, size, fp, slot, nf.as_deref_mut()) {
             return Some(bit);
         }
     }
