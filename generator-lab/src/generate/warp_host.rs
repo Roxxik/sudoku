@@ -314,8 +314,7 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
     // re-derivation would shift by one); the gate matches scalar [`attempt`]. Computed
     // once per lane.
     let fast = baseline_fast_applicable(&spec);
-    #[coroutine]
-    move |_first: GateResult| {
+    let co = #[coroutine] move |_first: GateResult| {
         loop {
             // New seed: one fresh RNG stream, retried until it yields a puzzle.
             let next = shared.borrow_mut().seeds.next();
@@ -395,7 +394,8 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                 }
             }
         }
-    }
+    };
+    return co;
 }
 
 /// The per-lane occupant the host drives. It owns the request/verdict shuttle
