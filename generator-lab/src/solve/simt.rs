@@ -5,7 +5,7 @@
 //! [`FusedLogicSolver`](super::FusedLogicSolver) the strip runs per lane. The consumer is
 //! the SIMT warp host ([`crate::generate::warp_host`]), which runs the probe and baseline
 //! gates on one shared warp; this module provides the baseline closure ([`warp_pass_full`])
-//! and the scalar subset fallback ([`subset_step`]) it drives.
+//! and the scalar harder-ladder fallback ([`ladder_step`]) it drives.
 //!
 //! ## The cheap-closure / subset split (data-driven)
 //!
@@ -14,7 +14,7 @@
 //! singles, locked candidates) SOLVES ~97% of calls in ~1 fixpoint pass, and only ~2%
 //! ever reach the combinatorial **subset ladder** (naked/hidden pair..quad). So this
 //! solver **vectorizes the cheap closure** ([`warp_pass_full`], lane-uniform band ALU)
-//! and keeps the rare subset step **scalar per-lane** ([`subset_step`], reusing the
+//! and keeps the rare harder step **scalar per-lane** ([`ladder_step`], reusing the
 //! composable [`super::techniques`] on a snapshot) — exactly the way the prober keeps
 //! its branch-cell pick and frame snapshot scalar.
 //!
@@ -69,36 +69,70 @@ use std::simd::{Select, Simd};
 // exists, so no oversubscription is needed to fill it. Read by `simtutil`.
 counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_snapshot, reset = uwstat_reset);
 
-// --- subset-ladder memo effectiveness (feature = "count") ----------------------
-// [0] ladder entries (subset_step calls that reach the subset scans), [1] per-kind
-// unit scans run, [2] per-kind unit scans skipped by the cross-stall memo. The skip
-// share [2]/([1]+[2]) is the memo's bite. Read by `laddermemoab`.
-counter_block!(LSTAT: 3, inc = lstat_inc, add = lstat_add, snapshot = lstat_snapshot, reset = lstat_reset);
+// --- harder-ladder memo effectiveness (feature = "count") ----------------------
+// [0] ladder entries (ladder_step calls that reach the subset scans), [1] subset
+// per-kind unit scans run, [2] subset per-kind unit scans skipped by the cross-stall
+// memo, [3] fish per-kind digit scans run, [4] fish per-kind digit scans skipped by the
+// per-digit memo. The skip shares [2]/([1]+[2]) (subsets) and [4]/([3]+[4]) (fishes) are
+// the memo's bite per family. Read by `laddermemoab`.
+counter_block!(LSTAT: 5, inc = lstat_inc, add = lstat_add, snapshot = lstat_snapshot, reset = lstat_reset);
 
-/// Cross-stall memo for one lane's subset ladder (see [`subset_step`]): the
-/// unsolved-gated candidate bands as the ladder **last scanned them**, plus, per
-/// unit, which subset kinds have been verified no-fire on exactly that state. A
-/// subset fires or not as a function of its unit's marks alone, so a unit whose
-/// gated bands are unchanged since a kind scanned it clean cannot fire that kind —
-/// the rescan is skipped and first-fire order is preserved exactly. Diffing the
-/// fresh snapshot against `prev` on ladder entry catches every mutation source
-/// between stalls uniformly (the previous fire's eliminations, the closure's
-/// placements and peer clears, the off-warp LC prunes), so nothing on the closure
-/// spine needs to track changes.
+/// How much of the cross-stall ladder memo to apply. Production is [`Full`](Self::Full);
+/// the lesser modes exist only for the `laddermemoab` A/B. [`Subsets`](Self::Subsets) is
+/// the pre-fish baseline — subset unit-scans memoized, fishes fully rescanned every
+/// stall — so `Full` vs `Subsets` isolates exactly the per-digit fish memo's marginal
+/// effect, and `Off` is the no-memo floor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemoMode {
+    /// No memo: every stall rescans every unit and digit (the floor).
+    Off,
+    /// Subset unit-scans memoized; fishes rescanned (the pre-fish production behaviour).
+    Subsets,
+    /// Subset unit-scans AND per-digit fish scans memoized (production).
+    Full,
+}
+
+impl MemoMode {
+    /// Whether any memo state is carried (the subset memo is on iff so).
+    #[inline]
+    pub(crate) fn memo_on(self) -> bool {
+        !matches!(self, MemoMode::Off)
+    }
+    /// Whether the per-digit fish memo is applied on top of the subset memo.
+    #[inline]
+    pub(crate) fn fish(self) -> bool {
+        matches!(self, MemoMode::Full)
+    }
+}
+
+/// Cross-stall memo for one lane's harder ladder (see [`ladder_step`]): the
+/// unsolved-gated candidate bands as the ladder **last scanned them**, plus which
+/// per-unit subset kinds and per-digit fish kinds have been verified no-fire on exactly
+/// that state. A subset fires as a function of its unit's marks alone, and a basic fish
+/// as a function of one digit's candidate positions alone, so a unit (resp. digit) whose
+/// gated bands are unchanged since a kind scanned it clean cannot fire that kind — the
+/// rescan is skipped and first-fire order is preserved exactly. Diffing the fresh
+/// snapshot against `prev` on ladder entry catches every mutation source between stalls
+/// uniformly (the previous fire's eliminations, the closure's placements and peer clears,
+/// the off-warp LC prunes), so nothing on the closure spine needs to track changes.
 pub(crate) struct LadderMemo {
     /// `candidates & unsolved` per digit band as last scanned (the state the
-    /// `no_fire` verdicts are about).
+    /// `no_fire`/`fish_no_fire` verdicts are about).
     prev: [[u32; 3]; 9],
-    /// Bit `k` = ladder kind `k` (pair..quad in difficulty order, see
+    /// Bit `k` = subset ladder kind `k` (pair..quad in difficulty order, see
     /// [`cellmarks_step_harder`]) verified no-fire on unit `u` for `prev`.
     no_fire: [u8; 27],
-    /// False after a lane (re)load: `prev`/`no_fire` describe a dead board.
+    /// Bit `k` = basic-fish kind `k` (X-Wing 0 / Swordfish 1 / Jellyfish 2) verified
+    /// no-fire on digit `d` for `prev`. A fish is single-digit, so the memo is per
+    /// digit, not per unit — see [`crate::solve::techniques::fish_step`].
+    fish_no_fire: [u8; 9],
+    /// False after a lane (re)load: `prev`/`no_fire`/`fish_no_fire` describe a dead board.
     valid: bool,
 }
 
 impl LadderMemo {
     pub(crate) const INVALID: LadderMemo =
-        LadderMemo { prev: [[0; 3]; 9], no_fire: [0; 27], valid: false };
+        LadderMemo { prev: [[0; 3]; 9], no_fire: [0; 27], fish_no_fire: [0; 9], valid: false };
 
     /// Mark the memo as describing a dead board (call on every lane (re)load).
     #[inline]
@@ -162,7 +196,7 @@ pub(crate) fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q
 /// the live board picks the single forced cell, in whichever band/row it sits, with no
 /// transpose and no column-major view.
 ///
-/// Locked candidates run **off the warp** (a stalled lane's scalar [`subset_step`], via
+/// Locked candidates run **off the warp** (a stalled lane's scalar [`ladder_step`], via
 /// [`scalar_lc_fast`]), so this closure does singles only.
 #[cfg_attr(feature = "profiling", inline(never))]
 pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
@@ -261,8 +295,15 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
 /// transpose is paid once, not three times per kind); the rarer fish/wings — guarded
 /// out entirely for the subset-only HiddenQuad toolbox — fall back to the generic
 /// [`super::techniques`] bodies on the cell-major `cm` (every unit reachable via `get`,
-/// columns included).
-fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask, no_fire: &mut [u8; 27]) -> Option<usize> {
+/// columns included). `no_fire`/`fish_no_fire` are the caller's cross-stall memos (see
+/// [`LadderMemo`]): the per-unit subset memo and the per-digit fish memo; `fish_no_fire`
+/// is `None` when the fish memo is off (full fish rescan).
+fn cellmarks_step_harder(
+    cm: &mut CellMarks,
+    allowed: KindMask,
+    no_fire: &mut [u8; 27],
+    fish_no_fire: Option<&mut [u8; 9]>,
+) -> Option<usize> {
     const ANY_SUBSET: KindMask = (1 << NAKED_PAIR)
         | (1 << HIDDEN_PAIR)
         | (1 << NAKED_TRIPLE)
@@ -290,7 +331,7 @@ fn cellmarks_step_harder(cm: &mut CellMarks, allowed: KindMask, no_fire: &mut [u
         try_kind!(NAKED_QUAD, cached_naked_subset(cm, &cache, 4, 4, no_fire));
         try_kind!(HIDDEN_QUAD, cached_hidden_subset(cm, &cache, 4, 5, no_fire));
     }
-    if let Some(k) = techniques::fish_step(cm, allowed) {
+    if let Some(k) = techniques::fish_step(cm, allowed, fish_no_fire) {
         return Some(k);
     }
     if let Some(k) = techniques::wing_step(cm, allowed) {
@@ -477,15 +518,19 @@ fn cached_hidden_subset(
 /// is the rare ~2% tail, so paying it per-lane scalar is cheap.
 ///
 /// `memo` is the lane's cross-stall [`LadderMemo`] (`None` = memo off, full rescan —
-/// the A/B baseline): consecutive stalls of one baseline solve change only a few
-/// cells, so the subset ladder skips every (kind, unit) verified no-fire on a unit
-/// whose gated bands are unchanged since that scan — exact, first-fire preserved.
-pub(crate) fn subset_step(
+/// the A/B floor): consecutive stalls of one baseline solve change only a few cells, so
+/// the harder ladder skips every (kind, unit) subset and (kind, digit) fish verified
+/// no-fire on a unit/digit whose gated bands are unchanged since that scan — exact,
+/// first-fire preserved. `fish_memo` gates the per-digit fish skip on top of the subset
+/// memo (so the A/B can hold the subset memo fixed and toggle just the fish part); it is
+/// only consulted when `memo` is `Some`.
+pub(crate) fn ladder_step(
     r: &mut [[V; 3]; 9],
     unsolved: &mut [V; 3],
     l: usize,
     allowed: KindMask,
     memo: Option<&mut LadderMemo>,
+    fish_memo: bool,
 ) -> Option<usize> {
     // The off-warp LC pass is in scope iff the toolbox allows it (pointing/claiming run
     // together); derived from `allowed` rather than carried as a redundant flag.
@@ -508,20 +553,28 @@ pub(crate) fn subset_step(
     // same fast surface `verify` uses (`Board`). Subsets only prune (never place), so the
     // empty mask is unchanged and only the candidate bands are read back.
     let mut cm = CellMarks::from_bands(&sr, &su);
-    // Cross-stall memo: diff the gated bands against the last-scanned state; every
-    // changed cell dirties its three units (clears their no-fire bits). This catches
-    // the previous fire's eliminations, the closure's work, and LC prunes uniformly.
-    // `prev` then becomes the current state — the one the scans below run on.
+    // Cross-stall memo: diff the gated bands against the last-scanned state. Every
+    // changed cell dirties its three units (clears their subset no-fire bits) and every
+    // changed digit clears its fish no-fire byte — a fish is single-digit, so a digit
+    // whose positions are unchanged keeps its verdicts. This catches the previous fire's
+    // eliminations, the closure's work, and LC prunes uniformly. `prev` then becomes the
+    // current state — the one the scans below run on.
     let mut no_scratch = [0u8; 27];
-    let no_fire: &mut [u8; 27] = match memo {
+    let (no_fire, fish_nf): (&mut [u8; 27], Option<&mut [u8; 9]>) = match memo {
         Some(memo) => {
             if memo.valid {
                 let mut changed = [0u32; 3];
                 for d in 0..9 {
+                    let mut dd = 0u32; // digit d's effective-band change, OR'd over bands
                     for b in 0..3 {
                         let eff = sr[d][b] & su[b];
-                        changed[b] |= eff ^ memo.prev[d][b];
+                        let x = eff ^ memo.prev[d][b];
+                        changed[b] |= x;
+                        dd |= x;
                         memo.prev[d][b] = eff;
+                    }
+                    if fish_memo && dd != 0 {
+                        memo.fish_no_fire[d] = 0; // digit d moved -> all its fish verdicts stale
                     }
                 }
                 for (b, mut w) in changed.into_iter().enumerate() {
@@ -540,13 +593,15 @@ pub(crate) fn subset_step(
                     }
                 }
                 memo.no_fire = [0; 27];
+                memo.fish_no_fire = [0; 9];
                 memo.valid = true;
             }
-            &mut memo.no_fire
+            let fish_nf = fish_memo.then_some(&mut memo.fish_no_fire);
+            (&mut memo.no_fire, fish_nf)
         }
-        None => &mut no_scratch,
+        None => (&mut no_scratch, None),
     };
-    let k = cellmarks_step_harder(&mut cm, allowed, no_fire)?;
+    let k = cellmarks_step_harder(&mut cm, allowed, no_fire, fish_nf)?;
     // A fired subset removes only a handful of candidates, so write them straight into the
     // warp lane (one bit clear each) rather than rebuilding + scattering the whole board.
     // `r` is untouched since the snapshot (the LC fixpoint runs on the local copy `sr`), so
@@ -559,7 +614,7 @@ pub(crate) fn subset_step(
     Some(k)
 }
 
-/// Candidate-only **cell-major** board for the scalar subset step (see [`subset_step`]):
+/// Candidate-only **cell-major** board for the scalar harder step (see [`ladder_step`]):
 /// each cell's [`Mark`] stored directly, so a technique's per-unit scan reads it in O(1)
 /// rather than the digit-major snapshot's 9-board scan per `get`. The cell<->(band, bit)
 /// map is [`RowMajor`]'s (`band = cell / 27`, `bit = (cell / 9 % 3) * 9 + cell % 9`).
@@ -571,7 +626,7 @@ struct CellMarks {
     /// Row-major empty mask (the snapshot's `su`), the one fact candidates can't carry.
     unsolved: [u32; 3],
     /// Log of `(cell, digit-index)` candidates removed by [`eliminate`](CellMarks::eliminate),
-    /// so [`subset_step`] writes back only what the fired technique pruned (a targeted bit
+    /// so [`ladder_step`] writes back only what the fired technique pruned (a targeted bit
     /// clear per entry) instead of rebuilding + scattering the whole lane. One firing of any
     /// harder technique — a subset over one nine-cell unit, or a basic fish of `size` cover
     /// lines — removes at most `size * (9 - size) <= 20` candidates, so the fixed buffer never

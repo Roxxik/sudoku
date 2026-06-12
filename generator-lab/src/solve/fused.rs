@@ -334,7 +334,7 @@ fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut
 /// **once** into a cell-major [`CellBoard`] — `get` is then an O(1) [`Mark`] load —
 /// run the ladder there, and replay the handful of eliminations the fired technique
 /// logged back onto `b` (both views). This is the scalar analogue of the SIMT
-/// baseline's `subset_step` / `CellMarks` transpose, identical verdict and elimination
+/// baseline's `ladder_step` / `CellMarks` transpose, identical verdict and elimination
 /// set (the techniques are deterministic over the board contract; `forbid` is
 /// commutative, so the replay order is moot).
 #[cfg_attr(prof_solver, inline(never))]
@@ -363,7 +363,7 @@ fn ladder<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usize> {
     try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
     try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
     try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
-    if let Some(k) = techniques::fish_step(b, allowed) {
+    if let Some(k) = techniques::fish_step(b, allowed, None) {
         return Some(k);
     }
     if let Some(k) = techniques::wing_step(b, allowed) {

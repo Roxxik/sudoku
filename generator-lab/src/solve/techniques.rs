@@ -278,18 +278,35 @@ impl FishPositions {
 /// `fish(b, size)` ladder entries it replaces (size outer, then digit, then
 /// orientation), so the produced verdict and elimination set are byte-identical.
 /// Returns the fired kind index, or `None`.
-pub(super) fn fish_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<usize> {
+pub(super) fn fish_step<V: LogicBoard>(
+    v: &mut V,
+    allowed: KindMask,
+    mut memo: Option<&mut [u8; 9]>,
+) -> Option<usize> {
     const ANY_FISH: KindMask = (1 << X_WING) | (1 << SWORDFISH) | (1 << JELLYFISH);
     if allowed & ANY_FISH == 0 {
         return None;
     }
     let fp = FishPositions::scan(v);
-    for (bit, size) in [(X_WING, 2usize), (SWORDFISH, 3), (JELLYFISH, 4)] {
-        if allowed & (1 << bit) != 0 && fish_sized(v, size, &fp) {
+    // `slot` is the per-digit memo bit for this size (X-Wing 0 / Swordfish 1 / Jellyfish
+    // 2), independent of the global kind index `bit`. `memo.as_deref_mut()` reborrows the
+    // optional memo for each size's scan.
+    for (bit, size, slot) in [(X_WING, 2usize, 0u8), (SWORDFISH, 3, 1), (JELLYFISH, 4, 2)] {
+        if allowed & (1 << bit) != 0 && fish_sized(v, size, &fp, slot, memo.as_deref_mut()) {
             return Some(bit);
         }
     }
     None
+}
+
+/// Tally a fish per-digit scan into the SIMT harder-ladder memo counter (`run = false`
+/// means the per-digit memo skipped it) — a no-op off the `count`+native path. The fish
+/// memo is SIMT-only, so this reaches across to [`crate::solve::simt`]'s `LSTAT`; the
+/// reference is `cfg`-gated out on wasm, where that module does not exist.
+#[inline(always)]
+fn fish_tally(_run: bool) {
+    #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
+    crate::solve::simt::lstat_inc(if _run { 3 } else { 4 });
 }
 
 /// **Basic fish** of `size` (X-Wing 2, Swordfish 3, Jellyfish 4): for one digit,
@@ -304,8 +321,26 @@ pub(super) fn fish_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
 /// candidate cell (the [`Marks`] invariant), so its position mask is empty and it
 /// self-excludes — no separate "is it placed" check, the same trick the subset bodies
 /// use. A placed cross-cell likewise reads empty, so the elimination scan skips it.
-fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool {
+fn fish_sized<V: LogicBoard>(
+    v: &mut V,
+    size: usize,
+    fp: &FishPositions,
+    slot: u8,
+    mut memo: Option<&mut [u8; 9]>,
+) -> bool {
+    // Per-digit cross-stall memo (SIMT only): a basic fish reads one digit's positions
+    // alone, so a digit unchanged since this size scanned it clean cannot newly fire —
+    // skip it, first-fire order preserved (a skipped digit could only have returned
+    // false). `None` = no memo (scalar solvers, full scan).
+    let slot_bit = 1u8 << slot;
     for di in 0..9 {
+        if let Some(nf) = memo.as_deref_mut() {
+            if nf[di] & slot_bit != 0 {
+                fish_tally(false);
+                continue;
+            }
+            fish_tally(true);
+        }
         let d = Digit::from_index(di);
         for (o, row_base) in [true, false].into_iter().enumerate() {
             // Per base line, the 9-bit mask of cross-positions where `d` is a candidate.
@@ -406,6 +441,11 @@ fn fish_sized<V: LogicBoard>(v: &mut V, size: usize, fp: &FishPositions) -> bool
                     }
                 }
             }
+        }
+        // Both orientations scanned clean for digit di at this size: record it so a later
+        // stall that leaves di unchanged skips the rescan.
+        if let Some(nf) = memo.as_deref_mut() {
+            nf[di] |= slot_bit;
         }
     }
     false

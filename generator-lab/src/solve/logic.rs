@@ -99,7 +99,7 @@ fn step_once<V: LogicBoard>(b: &mut V, allowed: KindMask) -> Option<usize> {
     try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
     try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
     try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
-    if let Some(k) = techniques::fish_step(b, allowed) {
+    if let Some(k) = techniques::fish_step(b, allowed, None) {
         return Some(k);
     }
     if let Some(k) = techniques::wing_step(b, allowed) {
@@ -192,7 +192,7 @@ fn step_harder_ordered<V: LogicBoard>(
                 };
                 (allowed & (1 << bit) != 0 && techniques::hidden_subset(b, s as usize)).then_some(bit)
             }
-            HardStep::Fish => techniques::fish_step(b, allowed),
+            HardStep::Fish => techniques::fish_step(b, allowed, None),
             HardStep::Wings => techniques::wing_step(b, allowed),
         };
         if let Some(k) = fired {
