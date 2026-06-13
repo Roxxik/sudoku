@@ -28,6 +28,14 @@ crate-type = ["lib", "cdylib"]
 # generator's phase split is done with Instant in the bench example).
 count = []
 
+# Heavyweight, DATA-only kernel bookkeeping: per-digit / per-technique counters
+# inside the hot SIMD kernel (`warp_pass_full` + `smear_v`) — naked/row/box/col
+# singles, placements, candidate eliminations, and collisions. Perturbs timing
+# heavily (popcounts in the innermost loop), so it is SEPARATE from `count`: a build
+# you make to read the kernel's semantics, never to measure it (perf/IBS give the
+# instruction counts; this gives the data). Read by `findpar-bench`.
+kernel_count = []
+
 # Mark the per-position phase-boundary functions `#[inline(never)]` so a sampling
 # profiler (e.g. Chrome/Firefox DevTools on a real phone, via the name section)
 # attributes time to distinct frames — from_board / any_alt_solves / baseline /

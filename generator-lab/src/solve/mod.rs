@@ -58,6 +58,24 @@ pub use simt::{uwstat_reset, uwstat_snapshot};
 #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
 pub use simt::{lstat_reset, lstat_snapshot};
 
+/// Per-kind harder-technique check/fire census (`feature = "count"`) — `TCHK`/`TFIRE`,
+/// read by `findpar-bench`'s `--techstats` table (see `simt::TCHK`). `THIST` + `THIST_CAP`
+/// are the per-baseline-solve fire histogram behind `--techhist` (see `simt::THIST`).
+#[cfg(all(feature = "count", not(target_arch = "wasm32")))]
+pub use simt::{
+    THIST_CAP, tchk_reset, tchk_snapshot, tfire_reset, tfire_snapshot, thist_reset,
+    thist_snapshot,
+};
+
+/// Detailed kernel bookkeeping (`feature = "kernel_count"`): `KSTAT` (per-digit sums) and
+/// `KHIST` (per-lane-pass distributions) with the `kc` slot map, read by `findpar-bench`
+/// (see `simt::KSTAT` / `simt::KHIST` / `simt::kc`).
+#[cfg(all(feature = "kernel_count", not(target_arch = "wasm32")))]
+pub use simt::{
+    kc, khist_reset, khist_snapshot, krbtick_reset, krbtick_snapshot, kstat_reset,
+    kstat_snapshot,
+};
+
 use crate::spec::kinds::{KindMask, SolveTrace};
 
 /// A technique-driven solver over board `B` — the swap point between engines, so the

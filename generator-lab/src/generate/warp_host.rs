@@ -46,7 +46,7 @@ use crate::repr::{CELLS, Puzzle, SolverState};
 use crate::rng::Rng;
 use crate::solve::simt::{
     GateResult, LadderMemo, SolveQuery, ladder_step, load_query, prober_service,
-    uwstat_add, warp_pass_full,
+    tfire_inc, thist_record, uwstat_add, warp_pass_full,
 };
 use crate::spec::Spec;
 use crate::spec::kinds::{KindMask, NUM, SolveTrace};
@@ -90,6 +90,39 @@ use std::rc::Rc;
 //   [12] strip() core cycles
 // `ph_add(i, v)` tallies (no-op without the feature). Read by `findpar-bench`.
 counter_block!(PHSTAT: 13, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
+
+// --- per-pass lane-state distribution (feature = "count") ----------------------
+// After each warp_pass every active lane is in exactly one state; this partitions them
+// (priority solved > dead > advanced > stuck) and records, per pass, both the running
+// per-state lane totals and two lane-count histograms — how many lanes were STUCK, and how
+// many ADVANCED, at once:
+//   [0] solved lanes   [1] dead lanes   [2] advanced (placed something, rejoins the warp)
+//   [3] stuck lanes (active, no placement, not solved/dead -> drop to scalar service)
+//   [4 + n]               passes with exactly n STUCK lanes    (n in 0..=LANES)
+//   [4 + LSTATE_BINS + n] passes with exactly n ADVANCED lanes (n in 0..=LANES)
+// A "stuck" lane is one the shared kernel could not advance: a probe that must branch or a
+// baseline that must run the harder ladder -- i.e. the scalar-service pressure; an
+// "advanced" lane is one the kernel moved forward (placement) that rejoins the warp -- the
+// warp's per-pass throughput. [0..4] divided by the pass count give the per-pass means (they
+// sum to the active lanes/pass the `warp:` line reports); the two histograms are the
+// "how many at once" distributions. The four categories are exactly the kernel masks the
+// tick already extracts, so recording is a handful of popcounts. Read by `--techstats`.
+/// Bins per LSTATE lane-count histogram: a count 0..=LANES, so LANES+1 bins.
+pub const LSTATE_BINS: usize = LANES + 1;
+counter_block!(LSTATE: 4 + 2 * LSTATE_BINS, inc = lstate_inc, add = lstate_add, snapshot = lstate_snapshot, reset = lstate_reset);
+
+// --- per-lane service-gap histogram (feature = "count") ------------------------
+// How many consecutive warp passes a lane runs in the kernel WITHOUT being serviced -- the
+// run of "advanced" passes between two scalar service events (a probe branch, a baseline
+// ladder step, or a terminal solved/dead). Each service event closes the lane's current run
+// and bins its length: `SVCGAP[g]` counts runs of exactly `g` non-serviced passes, with
+// `g == SVC_CAP` an "or more" overflow bin. A run of 0 means the lane stalled (was serviced)
+// on its very first pass after a load/service. This is the per-LANE dual of LSTATE's per-PASS
+// stuck count: LSTATE asks "how many lanes are stuck this pass", this asks "how long does a
+// lane advance before it needs scalar help". The streak is held per lane in
+// `PuzzleStream::no_service`. Read by `--techstats`.
+pub const SVC_CAP: usize = 32;
+counter_block!(SVCGAP: SVC_CAP + 1, inc = svcgap_inc, add = svcgap_add, snapshot = svcgap_snapshot, reset = svcgap_reset);
 
 /// rdtsc timestamp for the kernel/service split (0 off-x86 or without the feature, so the
 /// cycle counters stay zero there while the lane-pass counters — exact — still work).
@@ -226,6 +259,9 @@ impl GateEngine {
     }
 
     fn trace(&self, solved: bool) -> GateResult {
+        // One retired baseline solve = one baseline-servicing episode: bin its per-kind
+        // fires into THIST (count-only no-op otherwise) before handing the trace back.
+        thist_record(&self.counts);
         GateResult::Baseline(SolveTrace { solved, counts: self.counts })
     }
 }
@@ -262,6 +298,7 @@ impl Engine for GateEngine {
                 match ladder_step(&mut b.r, &mut b.unsolved, l, self.allowed, &mut self.memo) {
                     Some(k) => {
                         self.counts[k] = self.counts[k].saturating_add(1);
+                        tfire_inc(k); // central per-kind fire census (paired with TCHK)
                         None
                     }
                     None => Some(self.trace(false)),
@@ -541,6 +578,11 @@ where
     /// Maintained at prime/service points and read each tick to attribute lane-passes.
     #[cfg(feature = "count")]
     phase: [u8; LANES],
+    /// Per-lane count of consecutive warp passes advanced without a scalar service, for the
+    /// `SVCGAP` service-gap histogram: bumped each non-serviced pass, binned + reset on the
+    /// pass that services the lane.
+    #[cfg(feature = "count")]
+    no_service: [u32; LANES],
 }
 
 /// The production instantiation: a [`GateEngine`] driven by the gate-per-strip
@@ -573,6 +615,8 @@ where
             shared,
             #[cfg(feature = "count")]
             phase: [0; LANES],
+            #[cfg(feature = "count")]
+            no_service: [0; LANES],
         };
         for l in 0..LANES {
             s.active[l] = s.occupants[l].prime(&mut s.boards, l);
@@ -649,6 +693,37 @@ where
         let changed_b = changed.to_bitmask();
         let mut service = active_b & (solved_b | dead_b | !changed_b);
         ph_add(11, rdtsc().wrapping_sub(k1)); // tick-driver: bitmask extraction + service-set (post-kernel)
+        // Lane-state census (count-only): partition this pass's active lanes (priority
+        // solved > dead > advanced > stuck) and bin the simultaneously-stuck count. Left out
+        // of the tick-driver bracket above so the popcounts land in `unaccounted`, not a
+        // named profile row.
+        #[cfg(feature = "count")]
+        {
+            let solved_n = (active_b & solved_b).count_ones();
+            let dead_n = (active_b & dead_b & !solved_b).count_ones();
+            let adv_n = (active_b & changed_b & !solved_b & !dead_b).count_ones();
+            let stuck_n = (active_b & !changed_b & !solved_b & !dead_b).count_ones();
+            lstate_add(0, solved_n as u64);
+            lstate_add(1, dead_n as u64);
+            lstate_add(2, adv_n as u64);
+            lstate_add(3, stuck_n as u64);
+            lstate_add(4 + stuck_n as usize, 1); // STUCK histogram: passes with `stuck_n` stuck
+            lstate_add(4 + LSTATE_BINS + adv_n as usize, 1); // ADVANCED histogram
+            // Per-lane service gap: a serviced lane closes its kernel-only run (bin + reset);
+            // an active-but-not-serviced lane advanced this pass, so extend its run.
+            for l in 0..LANES {
+                let bit = 1u64 << l;
+                if active_b & bit == 0 {
+                    continue;
+                }
+                if service & bit != 0 {
+                    svcgap_add((self.no_service[l] as usize).min(SVC_CAP), 1);
+                    self.no_service[l] = 0;
+                } else {
+                    self.no_service[l] += 1;
+                }
+            }
+        }
         while service != 0 {
             let l = service.trailing_zeros() as usize;
             service &= service - 1;

@@ -334,11 +334,26 @@ pub(super) fn fish_step<V: LogicBoard>(
     // 2), independent of the global kind index `bit`. `nf.as_deref_mut()` reborrows the
     // optional memo for each size's scan.
     for (bit, size, slot) in [(X_WING, 2usize, 0u8), (SWORDFISH, 3, 1), (JELLYFISH, 4, 2)] {
-        if allowed & (1 << bit) != 0 && fish_sized(v, size, fp, slot, nf.as_deref_mut()) {
-            return Some(bit);
+        if allowed & (1 << bit) != 0 {
+            tech_checked(bit);
+            if fish_sized(v, size, fp, slot, nf.as_deref_mut()) {
+                return Some(bit);
+            }
         }
     }
     None
+}
+
+/// Tally a harder technique getting its turn into [`crate::solve::simt`]'s per-kind
+/// `TCHK` census (`bit` = the kind index) — a no-op off the `count`+native path. The fish
+/// and wing bodies are shared between the SIMT ladder and the scalar solvers (verify's
+/// avoid-walk among them), so the tally is **gated**: `tchk_gated` only counts while the
+/// SIMT ladder is the driver, keeping the census a pure account of warp baseline servicing
+/// (see `crate::solve::simt::tchk_gated`). SIMT-only, so `cfg`-gated out on wasm.
+#[inline(always)]
+fn tech_checked(_bit: usize) {
+    #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
+    crate::solve::simt::tchk_gated(_bit);
 }
 
 /// Tally a fish per-digit scan into the SIMT harder-ladder memo counter (`run = false`
@@ -764,10 +779,14 @@ pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
     let nb = cells_with_n_candidates(v, 2, &mut bivbuf);
     let bivalues = &bivbuf[..nb];
     let buckets = (allowed & BUCKETED != 0).then(|| BivalueBuckets::build(bivalues));
-    if allowed & (1 << XY_WING) != 0 && xy_wing(v, bivalues, buckets.as_ref().expect("built")) {
-        return Some(XY_WING);
+    if allowed & (1 << XY_WING) != 0 {
+        tech_checked(XY_WING);
+        if xy_wing(v, bivalues, buckets.as_ref().expect("built")) {
+            return Some(XY_WING);
+        }
     }
     if allowed & (1 << XYZ_WING) != 0 {
+        tech_checked(XYZ_WING);
         let mut tribuf = [(0usize, Mark::EMPTY); CELLS];
         let nt = cells_with_n_candidates(v, 3, &mut tribuf);
         let trivalues = &tribuf[..nt];
@@ -775,8 +794,11 @@ pub(super) fn wing_step<V: LogicBoard>(v: &mut V, allowed: KindMask) -> Option<u
             return Some(XYZ_WING);
         }
     }
-    if allowed & (1 << W_WING) != 0 && w_wing(v, buckets.as_ref().expect("built")) {
-        return Some(W_WING);
+    if allowed & (1 << W_WING) != 0 {
+        tech_checked(W_WING);
+        if w_wing(v, buckets.as_ref().expect("built")) {
+            return Some(W_WING);
+        }
     }
     None
 }

@@ -55,7 +55,7 @@ use crate::repr::{CellIdx, Digit, DigitGrid, Mark, Marks, Occupancy, SolverState
 use crate::solve::Eliminate;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, KindMask, LC_POINTING, NAKED_PAIR,
-    NAKED_QUAD, NAKED_TRIPLE, SolveTrace,
+    NAKED_QUAD, NAKED_TRIPLE, NUM, SolveTrace,
 };
 use std::simd::cmp::SimdPartialEq;
 use std::simd::num::SimdUint;
@@ -77,6 +77,128 @@ counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_
 // 81-cell scan the cache replaces). The skip shares [2]/([1]+[2]) (subsets) and
 // [4]/([3]+[4]) (fishes) are the memo's bite per family.
 counter_block!(LSTAT: 6, inc = lstat_inc, add = lstat_add, snapshot = lstat_snapshot, reset = lstat_reset);
+
+// --- per-kind harder-technique check/fire census (feature = "count") -----------
+// Two `[u64; NUM]` blocks, indexed by kind (see `spec::kinds`), counting the harder
+// ladder's work the SIMT warp actually did across a whole run — the closure kernel
+// singles never enter the ladder, so they stay at zero and the census is exactly the
+// "harder techniques" the warp drops to scalar for. `TCHK[k]` = times kind `k`'s scan
+// got its turn in the ladder (allowed AND not short-circuited by an earlier fire — the
+// first-fire funnel, so an earlier kind is checked more often than a later one);
+// `TFIRE[k]` = times it actually changed the board (an elimination/placement). The fire
+// RATE is `TFIRE[k]/TCHK[k]`. Locked candidates run as one fused scalar pass that always
+// reports as `LC_POINTING`, so its row covers pointing+claiming and `LC_CLAIMING` stays
+// zero. Read by `findpar-bench`'s `--techstats` table; orthogonal to LSTAT's
+// per-unit/per-digit scan granularity. NOTE these are not solver-agnostic puzzle
+// properties — traces are deliberately unpinned (reorder-for-speed is sound), so this is
+// strictly an account of THIS warp's baseline servicing, not "the puzzle needs kind k".
+counter_block!(TCHK: NUM, inc = tchk_inc, add = tchk_add, snapshot = tchk_snapshot, reset = tchk_reset);
+counter_block!(TFIRE: NUM, inc = tfire_inc, add = tfire_add, snapshot = tfire_snapshot, reset = tfire_reset);
+
+// --- per-baseline-solve fire histogram (feature = "count") ---------------------
+// The distribution behind TFIRE's per-attempt average: for each retired baseline solve
+// (one per unique keep — the unit of baseline servicing in the warp), bin how many times
+// each kind fired in THAT solve. `THIST[k * (THIST_CAP + 1) + b]` counts baseline solves
+// in which kind `k` fired exactly `b` times, with `b == THIST_CAP` an "or more" overflow
+// bin. Every kind's bins sum to the total number of baseline solves (each retirement
+// records all NUM kinds, bin 0 included), so a kind's share of solves needing >= 1 fire
+// is `1 - THIST[k*..+0]/total`. Recorded in `GateEngine::trace` straight off the warp's
+// own `counts`, so — unlike a scalar re-solve — it is exactly what the SIMT path did.
+pub const THIST_CAP: usize = 16;
+counter_block!(THIST: NUM * (THIST_CAP + 1), inc = thist_inc, add = thist_add, snapshot = thist_snapshot, reset = thist_reset);
+
+/// Bin one retired baseline solve's per-kind fire `counts` into [`THIST`] (one row per
+/// kind, the count clamped to the `THIST_CAP` overflow bin). A no-op off the `count`
+/// path. Called once per baseline-solve retirement (see `GateEngine::trace`), reading the
+/// warp's own accumulated counts — the SIMT baseline servicing the bench measures.
+#[cfg(feature = "count")]
+pub(crate) fn thist_record(counts: &[u16; NUM]) {
+    for (k, &c) in counts.iter().enumerate() {
+        thist_add(k * (THIST_CAP + 1) + (c as usize).min(THIST_CAP), 1);
+    }
+}
+#[cfg(not(feature = "count"))]
+#[inline(always)]
+pub(crate) fn thist_record(_counts: &[u16; NUM]) {}
+
+// --- detailed kernel bookkeeping (feature = "kernel_count") --------------------
+// DATA-only census of what the SIMD kernel ([`warp_pass_full`] + [`smear_v`]) does, summed
+// over lanes/passes/the run. Heavyweight (popcounts in the innermost loop), so it rides its
+// own feature, NEVER `count`: a build to read the kernel's semantics, not to time it. The
+// kernel mostly works per digit, so the spine is per-digit (offset + digit `0..9`); the
+// row/box/col split is the per-unit-TYPE breakdown, and naked vs row+box+col is the
+// per-technique one. See [`kc`] for the slot map and [`warp_pass_full`] for where each is
+// tallied. Read by `findpar-bench` (built with `--features kernel_count`).
+#[cfg(feature = "kernel_count")]
+pub mod kc {
+    //! Slot offsets into the [`kstat_snapshot`](super::kstat_snapshot) array. The first seven
+    //! are per-digit (add the digit `0..9`); the last three are scalar run totals.
+    /// Naked singles placed for digit d (a sieve single whose lone candidate is d).
+    pub const NAKED: usize = 0;
+    /// Row hidden singles for d (a row with exactly one d-candidate).
+    pub const ROWH: usize = 9;
+    /// Box hidden singles for d.
+    pub const BOXH: usize = 18;
+    /// Column hidden singles for d.
+    pub const COLH: usize = 27;
+    /// Net cells placed for d this pass (`popcount(group)`); `<= NAKED+ROWH+BOXH+COLH`, the
+    /// gap being cells a cell is forced by more than one technique at once.
+    pub const PLACED: usize = 36;
+    /// Digit-d candidates the smear cleared (placed cells + their peers losing d).
+    pub const PEERELIM: usize = 45;
+    /// Lanes where the smear found a same-unit collision for d (two singles, one unit).
+    pub const CONFLICT: usize = 54;
+    /// Kernel passes (calls to `warp_pass_full`).
+    pub const CALLS: usize = 63;
+    /// Active lane-passes (active lanes summed over passes).
+    pub const LANEPASS: usize = 64;
+    /// Sieve contradiction cells (an unsolved cell with no candidate left).
+    pub const DEAD: usize = 65;
+    /// Lane-passes the full pass advances (placed >= 1) but a reduced `naked ∪ col` pass
+    /// would NOT (no naked single and no column hidden single fired) -- i.e. row/box hidden
+    /// singles were the sole driver. The load-bearing count for the kernel's row/box path.
+    pub const RBONLY: usize = 66;
+    /// Length of the [`KSTAT`](super::KSTAT) block: 7 per-digit metrics x 9 + 4 scalars.
+    pub const LEN: usize = 67;
+
+    // --- KHIST: per-lane-pass distributions (the "work in one board, one pass" view) ----
+    // A separate block: for each active lane on each pass, its across-digits total of a
+    // metric is binned (clamped to `KHIST_CAP`). Each metric owns `KHIST_CAP + 1` slots; a
+    // metric's bins sum to the active lane-passes ([`LANEPASS`]). The digit axis is collapsed
+    // here on purpose -- per-digit per-lane-pass values are ~0/1 (no shape); the spread is in
+    // the across-digit total. (A per-DIGIT histogram would be a kernel change: bin inside the
+    // digit loop into 9x the slots.) `hidden` = row+box+col single detections (with overlap).
+    /// Bins per KHIST metric: a per-lane-pass count `0..=KHIST_CAP` (last = "or more").
+    pub const KHIST_CAP: usize = 64;
+    /// Net cells placed by a lane in one pass (`+ min(count, KHIST_CAP)`).
+    pub const KH_PLACED: usize = 0;
+    /// Naked singles placed by a lane in one pass.
+    pub const KH_NAKED: usize = KHIST_CAP + 1;
+    /// Row + box hidden-single detections by a lane in one pass (the `one_bit` path,
+    /// aggregated -- the headline hidden metric).
+    pub const KH_ROWBOX: usize = 2 * (KHIST_CAP + 1);
+    /// Row hidden-single detections by a lane in one pass (the row half of `KH_ROWBOX`).
+    pub const KH_ROW: usize = 3 * (KHIST_CAP + 1);
+    /// Box hidden-single detections by a lane in one pass (the box half of `KH_ROWBOX`).
+    pub const KH_BOX: usize = 4 * (KHIST_CAP + 1);
+    /// Column hidden-single detections by a lane in one pass (the fold+broadcast path).
+    pub const KH_COL: usize = 5 * (KHIST_CAP + 1);
+    /// Candidate eliminations by a lane's smear in one pass.
+    pub const KH_ELIM: usize = 6 * (KHIST_CAP + 1);
+    /// Length of the [`KHIST`](super::KHIST) block: 7 metrics x (KHIST_CAP + 1) bins.
+    pub const KHIST_LEN: usize = 7 * (KHIST_CAP + 1);
+}
+// One invocation: the `kc::LEN`-sized static is `#[cfg(feature = "kernel_count")]`, so it
+// (and its `kc::LEN` reference) is stripped before name resolution when the feature is off,
+// leaving only the no-op `kstat_inc`/`kstat_add` the gated-out call sites would compile to.
+counter_block!(feature = "kernel_count", KSTAT: kc::LEN, inc = kstat_inc, add = kstat_add, snapshot = kstat_snapshot, reset = kstat_reset);
+counter_block!(feature = "kernel_count", KHIST: kc::KHIST_LEN, inc = khist_inc, add = khist_add, snapshot = khist_snapshot, reset = khist_reset);
+
+// Per-TICK distribution of the row/box load-bearing count (0..=LANES): in one shared pass,
+// how many lanes advanced via row/box only (`kc::RBONLY`'s condition). Unlike KHIST (binned
+// per lane-pass), this bins per pass, so its bins sum to the pass count (`kc::CALLS`) -- the
+// "over all lanes in a tick" view of the rate. Read by `findpar-bench`.
+counter_block!(feature = "kernel_count", KRBTICK: LANES + 1, inc = krbtick_inc, add = krbtick_add, snapshot = krbtick_snapshot, reset = krbtick_reset);
 
 /// Cross-stall memo for one lane's harder ladder (see [`ladder_step`]): the
 /// unsolved-gated candidate bands as the ladder **last scanned them**, plus which
@@ -208,29 +330,78 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
             ones[b] |= x;
         }
     }
+    #[cfg(feature = "kernel_count")]
+    {
+        kstat_add(kc::CALLS, 1);
+        kstat_add(kc::LANEPASS, active.to_bitmask().count_ones() as u64);
+    }
     let mut singles = [ZERO; 3];
     for b in 0..3 {
-        dead |= (unsolved[b] & !ones[b]).simd_ne(ZERO); // an unsolved cell with no candidate
+        let nocand = unsolved[b] & !ones[b]; // an unsolved cell with no candidate
+        dead |= nocand.simd_ne(ZERO);
+        #[cfg(feature = "kernel_count")]
+        kstat_add(kc::DEAD, active.select(nocand, ZERO).count_ones().reduce_sum() as u64);
         singles[b] = unsolved[b] & ones[b] & !twos[b];
     }
 
     let m9: V = Simd::splat(0x1FF);
     let nine: V = Simd::splat(9);
     let eighteen: V = Simd::splat(18);
+    // Per-lane across-digits accumulators for the KHIST per-lane-pass distributions; binned
+    // for the active lanes once the digit loop finishes (KSTAT keeps the per-digit sums).
+    #[cfg(feature = "kernel_count")]
+    let (mut naked_l, mut row_l, mut box_l, mut rowbox_l, mut col_l, mut placed_l, mut elim_l) =
+        (ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO);
+    // For the "row/box load-bearing" tally (kc::RBONLY): whether a lane has ANY naked single
+    // this pass (digit-agnostic, straight from the sieve) and ANY column hidden single (OR'd
+    // over digits in the col block below). A reduced `naked ∪ col` pass places nothing on a
+    // lane iff both are false.
+    #[cfg(feature = "kernel_count")]
+    let naked_any = (singles[0] | singles[1] | singles[2]).simd_ne(ZERO);
+    #[cfg(feature = "kernel_count")]
+    let mut col_any = M::splat(false);
     // PERFBLOCK: rowbox
     for d in 0..9 {
         let mut group = [singles[0] & r[d][0], singles[1] & r[d][1], singles[2] & r[d][2]];
+        // Naked singles for digit d: the group before any hidden-single ORs (active lanes).
+        #[cfg(feature = "kernel_count")]
+        {
+            let v = active.select(group[0], ZERO).count_ones()
+                + active.select(group[1], ZERO).count_ones()
+                + active.select(group[2], ZERO).count_ones();
+            kstat_add(kc::NAKED + d, v.reduce_sum() as u64);
+            naked_l += v;
+        }
         // Row + box hidden singles (each unit a contiguous / box-gathered 9-bit run, in
-        // lane in the row banding).
+        // lane in the row banding). `ob` is bound (vs inlined) only so kernel_count can tally
+        // the firing lanes; codegen is identical when the feature is off.
         for b in 0..3 {
             let live = r[d][b] & unsolved[b];
             for rr in 0..3 {
                 let rc = live & Simd::splat(ROW_MASK[rr]);
-                group[b] |= one_bit(rc).select(rc, ZERO);
+                let ob = one_bit(rc);
+                group[b] |= ob.select(rc, ZERO);
+                #[cfg(feature = "kernel_count")]
+                {
+                    let fired = active & ob;
+                    kstat_add(kc::ROWH + d, fired.to_bitmask().count_ones() as u64);
+                    let one = fired.select(Simd::splat(1), ZERO);
+                    row_l += one;
+                    rowbox_l += one;
+                }
             }
             for bx in 0..3 {
                 let bc = live & Simd::splat(BOX_CELLS[bx]);
-                group[b] |= one_bit(bc).select(bc, ZERO);
+                let ob = one_bit(bc);
+                group[b] |= ob.select(bc, ZERO);
+                #[cfg(feature = "kernel_count")]
+                {
+                    let fired = active & ob;
+                    kstat_add(kc::BOXH + d, fired.to_bitmask().count_ones() as u64);
+                    let one = fired.select(Simd::splat(1), ZERO);
+                    box_l += one;
+                    rowbox_l += one;
+                }
             }
         }
         // PERFBLOCK: col
@@ -255,6 +426,13 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
         let cones = o01 | bones[2];
         let ctwos = t01 | btwos[2] | (o01 & bones[2]);
         let col_single = cones & !ctwos;
+        #[cfg(feature = "kernel_count")]
+        {
+            let v = active.select(col_single, ZERO).count_ones();
+            kstat_add(kc::COLH + d, v.reduce_sum() as u64);
+            col_l += v;
+            col_any |= col_single.simd_ne(ZERO);
+        }
         let col_bc = col_single | (col_single << nine) | (col_single << eighteen);
         for b in 0..3 {
             group[b] |= (r[d][b] & unsolved[b]) & col_bc;
@@ -263,12 +441,64 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
         // PERFBLOCK: smear
         let (peers, conflict) = smear_v(group);
         dead |= conflict;
+        // Smear bookkeeping: net placements (post-dedup group), digit-d candidates the smear
+        // clears (read off r[d] BEFORE the AND below), and collisions. Active lanes only.
+        #[cfg(feature = "kernel_count")]
+        {
+            let mut pv = ZERO;
+            let mut ev = ZERO;
+            for b in 0..3 {
+                pv += active.select(group[b], ZERO).count_ones();
+                ev += (r[d][b] & active.select(peers[b], ZERO)).count_ones();
+            }
+            kstat_add(kc::PLACED + d, pv.reduce_sum() as u64);
+            kstat_add(kc::PEERELIM + d, ev.reduce_sum() as u64);
+            kstat_add(kc::CONFLICT + d, (active & conflict).to_bitmask().count_ones() as u64);
+            placed_l += pv;
+            elim_l += ev;
+        }
         for b in 0..3 {
             let gm = active.select(group[b], ZERO);
             unsolved[b] &= !gm;
             r[d][b] &= !active.select(peers[b], ZERO);
             changed |= gm.simd_ne(ZERO);
         }
+    }
+
+    // Per-lane-pass histograms (KHIST): bin each ACTIVE lane's across-digits totals for this
+    // pass. Inactive lanes accumulated 0 (every term went through `active.select`), so the
+    // mask excludes them rather than folding them into bin 0.
+    #[cfg(feature = "kernel_count")]
+    {
+        let act = active.to_bitmask();
+        let (nk, rw, bx, rb, cl, pl, el) = (
+            naked_l.to_array(),
+            row_l.to_array(),
+            box_l.to_array(),
+            rowbox_l.to_array(),
+            col_l.to_array(),
+            placed_l.to_array(),
+            elim_l.to_array(),
+        );
+        for l in 0..LANES {
+            if act & (1 << l) == 0 {
+                continue;
+            }
+            khist_add(kc::KH_PLACED + (pl[l] as usize).min(kc::KHIST_CAP), 1);
+            khist_add(kc::KH_NAKED + (nk[l] as usize).min(kc::KHIST_CAP), 1);
+            khist_add(kc::KH_ROWBOX + (rb[l] as usize).min(kc::KHIST_CAP), 1);
+            khist_add(kc::KH_ROW + (rw[l] as usize).min(kc::KHIST_CAP), 1);
+            khist_add(kc::KH_BOX + (bx[l] as usize).min(kc::KHIST_CAP), 1);
+            khist_add(kc::KH_COL + (cl[l] as usize).min(kc::KHIST_CAP), 1);
+            khist_add(kc::KH_ELIM + (el[l] as usize).min(kc::KHIST_CAP), 1);
+        }
+        // Row/box load-bearing: the full pass placed (`changed`, already active-only since
+        // every `group` went through `active.select`) but `naked ∪ col` would have placed
+        // nothing -- so only row/box hidden singles drove this lane-pass. RBONLY sums the
+        // lanes; KRBTICK bins this tick's count (0..=LANES) for the per-tick distribution.
+        let rb_n = (changed & !naked_any & !col_any).to_bitmask().count_ones();
+        kstat_add(kc::RBONLY, rb_n as u64);
+        krbtick_add(rb_n as usize, 1);
     }
 
     // PERFBLOCK: tail
@@ -326,10 +556,17 @@ fn cellmarks_step_harder(
         lstat_inc(0);
         let cache = SubsetCache::build(cm);
         let no_fire = &mut memo.no_fire;
+        // `tchk_inc($bit)` counts this kind getting its ladder turn (allowed and not
+        // short-circuited by an earlier subset fire); the scan then runs and a fire
+        // returns. Per-kind FIRES are tallied once, centrally, in the engine's service
+        // (see `GateEngine::service`), so the two stay a single source apart.
         macro_rules! try_kind {
             ($bit:expr, $call:expr) => {
-                if allowed & (1 << $bit) != 0 && $call {
-                    return Some($bit);
+                if allowed & (1 << $bit) != 0 {
+                    tchk_inc($bit);
+                    if $call {
+                        return Some($bit);
+                    }
                 }
             };
         }
@@ -360,13 +597,42 @@ fn cellmarks_step_harder(
     } else {
         None
     };
-    if let Some(k) = techniques::fish_step(cm, allowed, fish_arg) {
-        return Some(k);
+    // The fish/wing CHECKED tallies live in the shared `techniques` bodies, which verify's
+    // scalar avoid-walk also drives (host work, NOT baseline servicing). Flag the SIMT ladder
+    // active across just these two calls so `tchk_gated` counts here and nowhere else; cleared
+    // right after (no early return between, so it always resets). Subset/LC checked are
+    // tallied in this module directly and need no flag.
+    #[cfg(feature = "count")]
+    // SAFETY: single-threaded lab; plain static-mut write, same as the counter blocks.
+    unsafe {
+        SIMT_LADDER = true;
     }
-    if let Some(k) = techniques::wing_step(cm, allowed) {
-        return Some(k);
+    let fired = techniques::fish_step(cm, allowed, fish_arg)
+        .or_else(|| techniques::wing_step(cm, allowed));
+    #[cfg(feature = "count")]
+    // SAFETY: as above.
+    unsafe {
+        SIMT_LADDER = false;
     }
-    None
+    fired
+}
+
+// fish/wing CHECKED are tallied from inside the shared `techniques` bodies (`tech_checked`),
+// which verify's scalar avoid-walk also calls — host work, not baseline servicing. Count
+// those tallies only while the SIMT ladder is the driver, flagged by `cellmarks_step_harder`
+// around its fish/wing calls, so TCHK stays a pure account of the warp's baseline servicing.
+#[cfg(feature = "count")]
+static mut SIMT_LADDER: bool = false;
+
+/// Count a fish/wing CHECK into [`TCHK`] iff the SIMT ladder (not verify's scalar avoid-walk)
+/// is the caller. Called by `techniques::tech_checked` (itself count-only), so it has no
+/// non-`count` form — the only caller is gated out with the feature.
+#[cfg(feature = "count")]
+pub(crate) fn tchk_gated(bit: usize) {
+    // SAFETY: single-threaded lab; plain by-value read of the flag.
+    if unsafe { SIMT_LADDER } {
+        tchk_inc(bit);
+    }
 }
 
 /// Per-unit candidate cache for the subset ladder, built ONCE per stall and shared by
@@ -560,6 +826,9 @@ pub(crate) fn ladder_step(
     // The off-warp LC pass is in scope iff the toolbox allows it (pointing/claiming run
     // together); derived from `allowed` rather than carried as a redundant flag.
     let try_lc = allowed & (1 << LC_POINTING) != 0;
+    if try_lc {
+        tchk_inc(LC_POINTING); // the fused pointing+claiming pass gets its ladder turn
+    }
     let (mut sr, su) = snapshot_lane(r, unsolved, l);
     // LC-off-warp: run the FAST (table-driven) scalar LC fixpoint on the snapshot before
     // the subsets; if it pruned anything, rejoin the warp so the vectorized singles
