@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Dependency / critical-path bottleneck view for a kernel (llvm-mca, znver4).
+
+The companion to warp-mca: where warp-mca shows the RESOURCE (port) axis, this
+shows the DEPENDENCY axis -- the other half of a backend-bound kernel's stall.
+Three views, all folded through the same inline-chain PERFBLOCK map:
+
+  1. bottleneck split   -- % cycles backend-bound, resource% vs data-dependency%
+                           (register vs memory), from -bottleneck-analysis.
+  2. per-block stall     -- from the timeline wait-times: dep-stall = queue-wait -
+                           ready-wait (operand latency), res-stall = ready-wait
+                           (port contention), summed per block. Shows which blocks
+                           are dependency-bound vs resource-bound.
+  3. critical sequence  -- llvm-mca's actual throughput-limiting chain, each edge
+                           tagged REGISTER dep (which reg) or RESOURCE (which port),
+                           annotated with each instruction's block + source line.
+
+Region: loop (default, widest backward branch) | whole | 0xSTART:0xSTOP
+usage: warp-deps BIN SYMBOL [REGION] [SRC] [SRC_TAG] [FUNC_TAG]
+"""
+import subprocess, re, sys, collections, tempfile, os
+
+BIN      = sys.argv[1]
+SYM      = sys.argv[2]
+REGION   = sys.argv[3] if len(sys.argv) > 3 else "loop"
+SRC      = sys.argv[4] if len(sys.argv) > 4 else "generator-lab/src/solve/simt.rs"
+SRC_TAG  = sys.argv[5] if len(sys.argv) > 5 else "solve/simt.rs"
+FUNC_TAG = sys.argv[6] if len(sys.argv) > 6 else "warp_pass_full"
+MCPU     = os.environ.get("MCPU", "znver4")
+ITERS    = os.environ.get("TIMELINE_ITERS", "10")
+
+MARK = re.compile(r'PERFBLOCK:\s*(\S+)')
+markers = sorted((i, m.group(1)) for i, l in enumerate(open(SRC), 1)
+                 for m in [MARK.search(l)] if m)
+
+# symbol range
+start = size = None
+for ln in subprocess.run(["nm", "-S", BIN], capture_output=True, text=True).stdout.splitlines():
+    p = ln.split()
+    if len(p) >= 4 and p[3].endswith(FUNC_TAG):
+        start, size = int(p[0], 16), int(p[1], 16); break
+if start is None:
+    sys.exit("symbol ending in %s not found" % FUNC_TAG)
+stop = start + size
+
+# disassemble whole symbol
+dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn",
+                      "--start-address=%#x" % start, "--stop-address=%#x" % stop, BIN],
+                     capture_output=True, text=True).stdout
+CTRL = re.compile(r'^(j\w+|call|ret|loop|nop|data16|cs\b|xchg\b)')
+rows = []
+for ln in dis.splitlines():
+    f = ln.split("\t")
+    m = re.match(r'\s*([0-9a-f]+):$', f[0]) if f else None
+    if not (m and len(f) >= 2): continue
+    addr = int(m.group(1), 16)
+    asm = re.sub(r'\s+#.*$', '', f[1]).strip()
+    tgt = None
+    bm = re.match(r'j\w+\s+([0-9a-f]+)\b', asm)
+    if bm: tgt = int(bm.group(1), 16)
+    rows.append((addr, asm, bool(CTRL.match(asm)), tgt))
+
+# region
+if REGION == "whole":
+    lo_a, hi_a = start, stop
+elif ":" in REGION:
+    a, b = REGION.split(":"); lo_a, hi_a = int(a, 16), int(b, 16)
+else:
+    back = [(a, t) for a, asm, c, t in rows if t is not None and start <= t < a]
+    if not back: sys.exit("no backward branch; pass 'whole' or 0xA:0xB")
+    a, t = max(back, key=lambda x: x[0] - x[1]); lo_a, hi_a = t, a
+
+fed = [(a, asm) for a, asm, c, t in rows if lo_a <= a < hi_a and not c]
+if not fed: sys.exit("no instructions in region")
+
+# block + source line per fed instruction
+chunks = subprocess.run(["llvm-symbolizer", "--inlines", "--obj=" + BIN],
+                        input="\n".join(hex(a) for a, _ in fed),
+                        capture_output=True, text=True).stdout.split("\n\n")
+locre = re.compile(re.escape(SRC_TAG) + r':(\d+)')
+def own_line(chunk):
+    ls = [l for l in chunk.splitlines() if l.strip()]
+    found = None
+    for i in range(0, len(ls) - 1, 2):
+        if FUNC_TAG in ls[i] and SRC_TAG in ls[i + 1]:
+            mm = locre.search(ls[i + 1])
+            if mm: found = int(mm.group(1))
+    return found
+flines = [own_line(c) for c in chunks]
+seen = [l for l in flines if l]
+lo, hi = min(seen), max(seen)
+scoped = [m for m in markers if m[0] <= hi]
+si = max((i for i, m in enumerate(scoped) if m[0] <= lo), default=0)
+scoped = scoped[si:]
+def block_of(line):
+    if line is None: return "?"
+    name = scoped[0][1]
+    for mln, mname in scoped:
+        if line >= mln: name = mname
+        else: break
+    return name
+fblk = [block_of(l) for l in flines]
+order = {n: i for i, (_, n) in enumerate(scoped)}; order["?"] = 999
+
+with tempfile.NamedTemporaryFile("w", suffix=".s", delete=False) as tf:
+    tf.write("\n".join(a for _, a in fed) + "\n"); spath = tf.name
+def mca(extra):
+    return subprocess.run(["llvm-mca", "-mcpu=" + MCPU] + extra + [spath],
+                          capture_output=True, text=True).stdout
+bo = mca(["-bottleneck-analysis"])
+tl = mca(["-timeline", "-timeline-max-iterations=" + ITERS])
+os.unlink(spath)
+
+# (1) bottleneck split
+def pct(pat, s):
+    m = re.search(pat, s); return m.group(1) if m else "?"
+print("# %s  region=%s  [%#x,%#x)  mcpu=%s" % (SYM, REGION, lo_a, hi_a, MCPU))
+print("# BACKEND PRESSURE %s%%   RESOURCE %s%%   DATA-DEP %s%% (reg %s%% / mem %s%%)" % (
+    pct(r'Cycles with backend pressure increase\s*\[\s*([\d.]+)%', bo),
+    pct(r'Resource Pressure\s*\[\s*([\d.]+)%', bo),
+    pct(r'Data Dependencies:\s*\[\s*([\d.]+)%', bo),
+    pct(r'Register Dependencies\s*\[\s*([\d.]+)%', bo),
+    pct(r'Memory Dependencies\s*\[\s*([\d.]+)%', bo)))
+tops = re.findall(r'-\s+(Zn4\S+)\s*\[\s*([\d.]+)%', bo)
+if tops:
+    print("#   top resources: " + ", ".join("%s %s%%" % (n, p) for n, p in tops[:6]))
+
+# (2) per-block stall from timeline wait-times: dep = w1-w2, res = w2
+wre = re.compile(r'^\s*(\d+)\.\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s')
+depb = collections.defaultdict(float); resb = collections.defaultdict(float); nb = collections.Counter()
+for ln in tl.splitlines():
+    m = wre.match(ln)
+    if not m: continue
+    i = int(m.group(1)); w1 = float(m.group(3)); w2 = float(m.group(4))
+    if i >= len(fblk): continue
+    b = fblk[i]; nb[b] += 1
+    depb[b] += max(0.0, w1 - w2); resb[b] += w2
+print("\n# per-block stall (sum avg cyc/iter; dep=operand-latency, res=port-contention):")
+print("#   %-8s %5s %10s %10s   bound" % ("BLOCK", "#ins", "dep-stall", "res-stall"))
+for b in sorted(nb, key=lambda x: order.get(x, 998)):
+    d, r = depb[b], resb[b]
+    print("    %-8s %5d %10.1f %10.1f   %s" % (b, nb[b], d, r, "DEP" if d > r else "res"))
+
+# (3) critical sequence with block/line + reason
+print("\n# critical sequence (llvm-mca throughput-limiting chain):")
+creg = collections.Counter(); cres = collections.Counter(); chain = []
+in_cs = False
+for ln in bo.splitlines():
+    if "Critical sequence based on" in ln: in_cs = True; continue
+    if not in_cs: continue
+    m = re.match(r'^[\s|+<>-]*(\d+)\.\s+(.*)$', ln)
+    if not m: continue
+    idx = int(m.group(1)); rest = m.group(2)
+    reason = ""
+    rm = re.search(r'##\s*(REGISTER dependency:\s*(\S+)|RESOURCE interference:\s*(\S+))', rest)
+    insn = rest.split("##")[0].strip()
+    if rm:
+        if rm.group(2): reason = "REG " + rm.group(2); creg[rm.group(2)] += 1
+        elif rm.group(3): reason = "RES " + rm.group(3); cres[rm.group(3)] += 1
+    blk = fblk[idx] if idx < len(fblk) else "?"
+    line = flines[idx] if idx < len(flines) else None
+    chain.append((blk, line, reason, insn))
+if creg:
+    print("#   register-dep edges: " + ", ".join("%s x%d" % (r, c) for r, c in creg.most_common(6)))
+if cres:
+    print("#   resource edges:     " + ", ".join("%s x%d" % (r, c) for r, c in cres.most_common(6)))
+print("#   %-8s %-6s %-14s %s" % ("BLOCK", "LINE", "REASON", "INSN"))
+for blk, line, reason, insn in chain:
+    print("    %-8s %-6s %-14s %s" % (blk, (SRC_TAG.split('/')[-1] + ":" + str(line)) if line else "-", reason or ".", insn))

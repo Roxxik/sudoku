@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Deterministic per-kernel dynamic instruction profile (Intel SDE -mix).
+
+The A/B validator for kernel micro-opts: SDE counts dynamic instructions exactly
+(no sampling noise), so a source change's effect on op count is provable -- a real
+codegen delta shows as a nonzero opcode delta, a no-op (LLVM already did it) shows
+as zero. Reports the analyzed function's icount/call plus its per-opcode histogram,
+normalized per call so two runs with different attempt counts stay comparable.
+
+  one build : warp-icount BIN -- ARGS...
+  A/B       : warp-icount BIN -- ARGS... > before.txt
+              (edit kernel, rebuild)
+              warp-icount BIN -- ARGS... > after.txt
+              diff before.txt after.txt        # exact op-count delta, by opcode
+
+env: SDE=/path/to/sde64 (default ~/opt/sde-external-*/sde64), FUNC=warp_pass_full
+"""
+import subprocess, re, sys, os, glob, tempfile
+
+if "--" in sys.argv:
+    k = sys.argv.index("--")
+    BIN, ARGS = sys.argv[1], sys.argv[k + 1:]
+else:
+    BIN, ARGS = sys.argv[1], sys.argv[2:]
+FUNC = os.environ.get("FUNC", "warp_pass_full")
+SDE = os.environ.get("SDE") or next(iter(sorted(
+    glob.glob(os.path.expanduser("~/opt/sde-external-*/sde64")))), None)
+if not SDE or not os.path.exists(SDE):
+    sys.exit("SDE not found; set SDE=/path/to/sde64")
+
+mixf = tempfile.NamedTemporaryFile(suffix=".mix", delete=False).name
+rc = subprocess.run([SDE, "-chip-check-disable", "-mix", "-omix", mixf, "--", BIN] + ARGS,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+txt = open(mixf).read()
+os.unlink(mixf)
+if rc != 0:
+    sys.exit("SDE run failed (rc=%d)" % rc)
+
+# FUNCTION TOTALS row for the target function -> icount, calls
+icount = calls = None
+for ln in txt.splitlines():
+    if "#FUNCTION TOTALS" in ln:
+        intotals = True
+    if FUNC in ln and re.match(r'\s*\d+:\s+\d+', ln):
+        f = ln.split()
+        # idx:  icount  %  cumltv%  calls  addr  name...
+        icount = int(f[1]); calls = int(f[4]); break
+if icount is None:
+    sys.exit("function %s not found in FUNCTION TOTALS" % FUNC)
+
+# per-function opcode histogram block
+lines = txt.splitlines()
+bi = next((i for i, l in enumerate(lines)
+           if l.startswith("# $dynamic-counts-for-function") and FUNC in l), None)
+opc = {}        # bare opcodes (e.g. VPANDD)
+agg = {}        # *aggregates (e.g. *category-LOGICAL)
+if bi is not None:
+    for l in lines[bi + 1:]:
+        if l.startswith("# $dynamic-counts-for-function") or l.startswith("# EMIT"):
+            break
+        m = re.match(r'(\*?[\w.-]+)\s+(\d+)\s*$', l)
+        if not m:
+            continue
+        name, cnt = m.group(1), int(m.group(2))
+        (agg if name.startswith("*") else opc)[name] = cnt
+
+c = calls or 1
+print("# func   : %s" % FUNC)
+print("# args   : %s" % " ".join(ARGS))
+print("# icount : %d   calls: %d   icount/call: %.2f" % (icount, calls, icount / c))
+KEY = ["*category-LOGICAL", "*isa-set-AVX512_VPOPCNTDQ_256", "*category-SHIFT",
+       "*category-DATAXFER", "*mem-read-32", "*mem-write-32", "*category-COND_BR"]
+print("# --- key categories (count/call) ---")
+for k in KEY:
+    if k in agg:
+        print("#   %-32s %10d  %8.2f/call" % (k, agg[k], agg[k] / c))
+print("# --- opcodes (count/call), sorted by name for diff-stability ---")
+for name in sorted(opc):
+    print("%-22s %12d  %8.2f" % (name, opc[name], opc[name] / c))

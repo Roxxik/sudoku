@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Per-block execution-port pressure for a backend-bound kernel (llvm-mca, znver4).
+
+Reconstructs a region's real machine code from the binary, runs it through the
+znver4 scheduler model, and folds llvm-mca's per-instruction resource table
+through the SAME inline-chain PERFBLOCK map used by warp-attrib -- so you see
+which execution ports each source block saturates, not just a global number.
+This is the "why is it slow" view for a port/ALU-bound kernel: it tells you
+whether to cut ops off a hot port, rebalance across pipes, or shorten a chain.
+
+Region selection:
+  loop  (default) auto-detect the widest backward branch = the hot loop body
+  whole           the entire symbol
+  0xSTART:0xSTOP  explicit
+
+usage: warp-mca BIN SYMBOL [REGION] [SRC] [SRC_TAG] [FUNC_TAG]
+"""
+import subprocess, re, sys, collections, tempfile, os
+
+BIN      = sys.argv[1]
+SYM      = sys.argv[2]
+REGION   = sys.argv[3] if len(sys.argv) > 3 else "loop"
+SRC      = sys.argv[4] if len(sys.argv) > 4 else "generator-lab/src/solve/simt.rs"
+SRC_TAG  = sys.argv[5] if len(sys.argv) > 5 else "solve/simt.rs"
+FUNC_TAG = sys.argv[6] if len(sys.argv) > 6 else "warp_pass_full"
+MCPU     = os.environ.get("MCPU", "znver4")
+
+# markers from current source
+MARK = re.compile(r'PERFBLOCK:\s*(\S+)')
+markers = sorted((i, m.group(1)) for i, l in enumerate(open(SRC), 1)
+                 for m in [MARK.search(l)] if m)
+
+# symbol range
+start = size = None
+for ln in subprocess.run(["nm", "-S", BIN], capture_output=True, text=True).stdout.splitlines():
+    p = ln.split()
+    if len(p) >= 4 and p[3].endswith(FUNC_TAG):
+        start, size = int(p[0], 16), int(p[1], 16); break
+if start is None:
+    sys.exit("symbol ending in %s not found" % FUNC_TAG)
+stop = start + size
+
+# disassemble whole symbol -> ordered (addr, asm, is_ctrl)
+dis = subprocess.run(["objdump", "-d", "--no-show-raw-insn",
+                      "--start-address=%#x" % start, "--stop-address=%#x" % stop, BIN],
+                     capture_output=True, text=True).stdout
+CTRL = re.compile(r'^(j\w+|call|ret|loop|nop|data16|cs\b|xchg\b)')
+rows = []   # (addr, asm, is_ctrl, branch_target_or_None)
+for ln in dis.splitlines():
+    f = ln.split("\t")
+    m = re.match(r'\s*([0-9a-f]+):$', f[0]) if f else None
+    if not (m and len(f) >= 2):
+        continue
+    addr = int(m.group(1), 16)
+    asm = re.sub(r'\s+#.*$', '', f[1]).strip()
+    isc = bool(CTRL.match(asm))
+    tgt = None
+    bm = re.match(r'j\w+\s+([0-9a-f]+)\b', asm)
+    if bm:
+        tgt = int(bm.group(1), 16)
+    rows.append((addr, asm, isc, tgt))
+
+# resolve region
+if REGION == "whole":
+    lo_a, hi_a = start, stop
+elif ":" in REGION:
+    a, b = REGION.split(":"); lo_a, hi_a = int(a, 16), int(b, 16)
+else:  # loop: widest backward branch
+    back = [(addr, tgt) for addr, asm, isc, tgt in rows if tgt is not None and start <= tgt < addr]
+    if not back:
+        sys.exit("no backward branch found; pass 'whole' or an explicit 0xA:0xB region")
+    addr, tgt = max(back, key=lambda x: x[0] - x[1])
+    lo_a, hi_a = tgt, addr     # [header, back-edge) -- the loop body, branch excluded
+
+# instructions actually fed to mca (drop control flow / padding), keep parallel addrs
+fed = [(addr, asm) for addr, asm, isc, _ in rows if lo_a <= addr < hi_a and not isc]
+if not fed:
+    sys.exit("no instructions in region")
+asm_text = "\n".join(a for _, a in fed) + "\n"
+
+# inline-chain block per fed instruction
+chunks = subprocess.run(["llvm-symbolizer", "--inlines", "--obj=" + BIN],
+                        input="\n".join(hex(a) for a, _ in fed),
+                        capture_output=True, text=True).stdout.split("\n\n")
+locre = re.compile(re.escape(SRC_TAG) + r':(\d+)')
+def own_line(chunk):
+    ls = [l for l in chunk.splitlines() if l.strip()]
+    found = None
+    for i in range(0, len(ls) - 1, 2):
+        if FUNC_TAG in ls[i] and SRC_TAG in ls[i + 1]:
+            mm = locre.search(ls[i + 1])
+            if mm: found = int(mm.group(1))
+    return found
+flines = [own_line(c) for c in chunks]
+seen = [l for l in flines if l]
+lo, hi = min(seen), max(seen)
+scoped = [m for m in markers if m[0] <= hi]
+si = max((i for i, m in enumerate(scoped) if m[0] <= lo), default=0)
+scoped = scoped[si:]
+def block_of(line):
+    if line is None: return "?"
+    name = scoped[0][1]
+    for mln, mname in scoped:
+        if line >= mln: name = mname
+        else: break
+    return name
+fblocks = [block_of(l) for l in flines]
+
+# run llvm-mca
+with tempfile.NamedTemporaryFile("w", suffix=".s", delete=False) as tf:
+    tf.write(asm_text); spath = tf.name
+mca = subprocess.run(["llvm-mca", "-mcpu=" + MCPU, spath],
+                     capture_output=True, text=True).stdout
+os.unlink(spath)
+
+def grab(pat):
+    m = re.search(pat, mca)
+    return m.group(1) if m else "?"
+iters = grab(r'Iterations:\s+(\d+)')
+cycles = grab(r'Total Cycles:\s+(\d+)')
+ipc = grab(r'IPC:\s+([\d.]+)')
+rthr = grab(r'Block RThroughput:\s+([\d.]+)')
+disp = grab(r'Dispatch Width:\s+(\d+)')
+
+# legend: column token -> resource name
+legend = {}
+for m in re.finditer(r'^(\[[\d.]+\])\s+-\s+(\S+)', mca, re.M):
+    legend[m.group(1)] = m.group(2)
+
+# parse "Resource pressure by instruction" table
+lines = mca.splitlines()
+ti = next((i for i, l in enumerate(lines) if l.startswith("Resource pressure by instruction")), None)
+if ti is None:
+    sys.exit("no per-instruction resource table in mca output")
+hdr = lines[ti + 1]
+cols = re.findall(r'\[[\d.]+\]', hdr)         # column tokens, in order
+N = len(cols)
+def cell(tok): return 0.0 if tok == "-" else float(tok)
+
+perblock = collections.defaultdict(lambda: collections.defaultdict(float))  # block -> resname -> press
+restotal = collections.defaultdict(float)
+binstr = collections.Counter()
+r = ti + 2
+fed_i = 0
+for l in lines[r:]:
+    if not l.strip(): break
+    parts = l.split()
+    if len(parts) < N + 1: continue
+    press = parts[:N]
+    blk = fblocks[fed_i] if fed_i < len(fblocks) else "?"
+    binstr[blk] += 1
+    for tok, val in zip(cols, press):
+        name = legend.get(tok, tok)
+        v = cell(val)
+        perblock[blk][name] += v
+        restotal[name] += v
+    fed_i += 1
+
+order = {name: i for i, (_, name) in enumerate(scoped)}
+order["?"] = 999
+top = [n for n, _ in sorted(restotal.items(), key=lambda kv: -kv[1])][:8]
+
+print("# %s  region=%s  [%#x,%#x)  mcpu=%s" % (SYM, REGION, lo_a, hi_a, MCPU))
+print("# fed %d instr (ctrl/pad dropped); markers: %s"
+      % (len(fed), ", ".join("%s@%d" % (n, l) for l, n in scoped)))
+print("# sim: RThroughput=%s cyc/iter  TotalCyc/iter=%.1f  IPC=%s  DispatchW=%s"
+      % (rthr, (float(cycles) / float(iters)) if iters.isdigit() else 0, ipc, disp))
+print("\n# bottleneck ports (total pressure/iter, all blocks):")
+for n in top:
+    print("  %-10s %8.2f" % (n, restotal[n]))
+print("\n# per-block port pressure (pressure/iter on the hot ports):")
+print("  %-8s %5s  " % ("BLOCK", "#ins") + " ".join("%9s" % n for n in top))
+for blk in sorted(perblock, key=lambda b: order.get(b, 998)):
+    cells = " ".join("%9.2f" % perblock[blk].get(n, 0.0) for n in top)
+    print("  %-8s %5d  %s" % (blk, binstr[blk], cells))

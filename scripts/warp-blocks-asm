@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Annotate a kernel's real disassembly with PERFBLOCK labels (recovered per
+instruction from the inline chain) and report whether each block occupies a
+CONTIGUOUS run of addresses or is interleaved by the scheduler.
+
+  contiguous  -> a start/end address per block would suffice
+  interleaved -> per-line (inline-chain) attribution is mandatory
+
+Per-instruction overlays:
+  PORT  -- modeled execution port (llvm-mca znver4 by-instruction resource table):
+           F0..F3 = vector ALU pipes (multiple digits = splittable across them),
+           ld/st = load/store. Static (model-derived); shown when llvm-mca is present.
+  %IBS  -- measured sample share, shown only if a perf.data is given (arg 3).
+           Noisy per-instruction; trust the RUN SUMMARY / warp-attrib aggregates.
+
+usage: warp-blocks-asm BIN SYMBOL [PERF.data|-] [SRC] [SRC_TAG] [FUNC_TAG]
+"""
+import subprocess, re, sys, collections, tempfile, os
+
+BIN      = sys.argv[1]
+SYM      = sys.argv[2]
+PERF     = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] != "-" else None
+SRC      = sys.argv[4] if len(sys.argv) > 4 else "generator-lab/src/solve/simt.rs"
+SRC_TAG  = sys.argv[5] if len(sys.argv) > 5 else "solve/simt.rs"
+FUNC_TAG = sys.argv[6] if len(sys.argv) > 6 else "warp_pass_full"
+MCPU     = os.environ.get("MCPU", "znver4")
+
+MARK = re.compile(r'PERFBLOCK:\s*(\S+)')
+markers = sorted((i, m.group(1)) for i, l in enumerate(open(SRC), 1)
+                 for m in [MARK.search(l)] if m)
+
+# symbol range via nm -S
+start = size = None
+for ln in subprocess.run(["nm", "-S", BIN], capture_output=True, text=True).stdout.splitlines():
+    p = ln.split()
+    if len(p) >= 4 and p[3].endswith(FUNC_TAG):
+        start, size = int(p[0], 16), int(p[1], 16); break
+if start is None:
+    sys.exit("symbol ending in %s not found via nm" % FUNC_TAG)
+stop = start + size
+
+# disassemble -> ordered (addr, full_text, clean_asm, is_ctrl)
+dis = subprocess.run(["objdump", "-d", "--start-address=%#x" % start,
+                      "--stop-address=%#x" % stop, BIN], capture_output=True, text=True).stdout
+CTRL = re.compile(r'^(j\w+|call|ret|loop|nop|data16|cs\b|xchg\b)')
+insns = []
+for ln in dis.splitlines():
+    f = ln.split("\t")
+    m = re.match(r'\s*([0-9a-f]+):$', f[0]) if f else None
+    if m and len(f) >= 3:
+        full = re.sub(r'\s+', ' ', f[2].strip())
+        clean = re.sub(r'\s+#.*$', '', full)
+        insns.append((int(m.group(1), 16), full, clean, bool(CTRL.match(clean))))
+if not insns:
+    sys.exit("no instructions disassembled in range")
+
+# inline chain -> own source line per instruction
+chunks = subprocess.run(["llvm-symbolizer", "--inlines", "--obj=" + BIN],
+                        input="\n".join(hex(a) for a, _, _, _ in insns),
+                        capture_output=True, text=True).stdout.split("\n\n")
+locre = re.compile(re.escape(SRC_TAG) + r':(\d+)')
+def own_line(chunk):
+    ls = [l for l in chunk.splitlines() if l.strip()]
+    found = None
+    for i in range(0, len(ls) - 1, 2):
+        if FUNC_TAG in ls[i] and SRC_TAG in ls[i + 1]:
+            mm = locre.search(ls[i + 1])
+            if mm: found = int(mm.group(1))
+    return found
+lines = [own_line(c) for c in chunks]
+
+seen = [l for l in lines if l]
+lo, hi = min(seen), max(seen)
+scoped = [m for m in markers if m[0] <= hi]
+si = max((i for i, m in enumerate(scoped) if m[0] <= lo), default=0)
+scoped = scoped[si:]
+def block_of(line):
+    if line is None: return "?"
+    name = scoped[0][1]
+    for mln, mname in scoped:
+        if line >= mln: name = mname
+        else: break
+    return name
+
+# modeled port per instruction via llvm-mca (whole symbol, ctrl/pad dropped)
+port = {}
+fed = [(a, clean) for a, full, clean, isc in insns if not isc]
+try:
+    with tempfile.NamedTemporaryFile("w", suffix=".s", delete=False) as tf:
+        tf.write("\n".join(c for _, c in fed) + "\n"); spath = tf.name
+    mca = subprocess.run(["llvm-mca", "-mcpu=" + MCPU, spath], capture_output=True, text=True).stdout
+    os.unlink(spath)
+    legend = {m.group(1): m.group(2)
+              for m in re.finditer(r'^(\[[\d.]+\])\s+-\s+(\S+)', mca, re.M)}
+    mlines = mca.splitlines()
+    ti = next((i for i, l in enumerate(mlines) if l.startswith("Resource pressure by instruction")), None)
+    if ti is not None:
+        cols = re.findall(r'\[[\d.]+\]', mlines[ti + 1]); N = len(cols)
+        def label(press):
+            agg = collections.defaultdict(float)
+            for tok, v in zip(cols, press):
+                agg[legend.get(tok, tok)] += (0.0 if v == "-" else float(v))
+            if agg.get("Zn4Load", 0) >= 0.5: return "ld"
+            if agg.get("Zn4Store", 0) >= 0.5: return "st"
+            fp = {i: agg.get("Zn4FP%d" % i, 0) for i in range(4)}
+            mx = max(fp.values())
+            if mx >= 0.2:
+                return "F" + "".join(str(i) for i in range(4) if fp[i] >= 0.5 * mx)
+            if agg:
+                top = max(agg, key=agg.get)
+                return top.replace("Zn4", "").lower()[:3] if agg[top] > 0.05 else "."
+            return "."
+        fi = 0
+        for l in mlines[ti + 2:]:
+            if not l.strip(): break
+            parts = l.split()
+            if len(parts) < N + 1: continue
+            if fi < len(fed):
+                port[fed[fi][0]] = label(parts[:N])
+            fi += 1
+except Exception as e:
+    sys.stderr.write("warn: llvm-mca port overlay unavailable (%s)\n" % e)
+
+# measured IBS % per instruction (optional)
+pct = {}
+if PERF:
+    ann = subprocess.run(["perf", "annotate", "-i", PERF, "--stdio",
+                          "--show-total-period", SYM], capture_output=True, text=True).stdout
+    raw = {}; tot = 0
+    for ln in ann.splitlines():
+        m = re.match(r'\s*([\d]+)\s+:\s+([0-9a-fA-F]+):\s', ln)
+        if m:
+            v = int(m.group(1)); raw[int(m.group(2), 16)] = v; tot += v
+    pct = {a: 100 * v / tot for a, v in raw.items()} if tot else {}
+
+# listing
+rows = [(a, lines[i], block_of(lines[i]), full) for i, (a, full, _, _) in enumerate(insns)]
+print("# %s   markers: %s" % (SYM, ", ".join("%s@%d" % (n, l) for l, n in scoped)))
+print("# mca=%s   %s" % (MCPU, ("IBS overlay: " + PERF) if PERF else "static (no perf.data)"))
+print("# ADDR     BLOCK    LINE  PORT  %IBS  INSN")
+prev = None
+for a, line, blk, full in rows:
+    if blk != prev:
+        print("  ----- %s -----" % blk); prev = blk
+    pt = port.get(a, ".")
+    pc = ("%5.1f" % pct[a]) if a in pct else "    ."
+    print("  %06x  %-7s %4s  %-4s %s  %s" % (a, blk, line if line else "-", pt, pc, full))
+
+# contiguity / runs
+runs = []
+for a, line, blk, full in rows:
+    if runs and runs[-1][0] == blk:
+        runs[-1][2] = a; runs[-1][3] += 1
+    else:
+        runs.append([blk, a, a, 1])
+nblocks = len(set(b for b, *_ in runs))
+print("\n# RUN SUMMARY (%d runs across %d distinct blocks)" % (len(runs), nblocks))
+for blk, s, e, n in runs:
+    pp = sum(pct.get(a, 0) for a, l, b, f in rows if s <= a <= e and b == blk)
+    print("  %-7s %06x-%06x  %3d instr  %5.1f%%" % (blk, s, e, n, pp))
+frag = {b: c for b, c in collections.Counter(r[0] for r in runs).items() if c > 1}
+print("\n# VERDICT: " + ("CONTIGUOUS (each block = 1 run -> start/end ranges OK)"
+      if not frag else "INTERLEAVED -> per-line attribution required. fragmented: "
+      + ", ".join("%s x%d" % (b, c) for b, c in sorted(frag.items()))))

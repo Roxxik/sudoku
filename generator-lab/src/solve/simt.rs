@@ -193,6 +193,7 @@ pub(crate) fn load_query(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], l: usize, q
 /// [`scalar_lc_fast`]), so this closure does singles only.
 #[cfg_attr(feature = "profiling", inline(never))]
 pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active: M) -> (M, M, M) {
+    // PERFBLOCK: sieve
     let mut changed = M::splat(false);
     let mut dead = M::splat(false);
 
@@ -216,6 +217,7 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
     let m9: V = Simd::splat(0x1FF);
     let nine: V = Simd::splat(9);
     let eighteen: V = Simd::splat(18);
+    // PERFBLOCK: rowbox
     for d in 0..9 {
         let mut group = [singles[0] & r[d][0], singles[1] & r[d][1], singles[2] & r[d][2]];
         // Row + box hidden singles (each unit a contiguous / box-gathered 9-bit run, in
@@ -231,6 +233,7 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
                 group[b] |= one_bit(bc).select(bc, ZERO);
             }
         }
+        // PERFBLOCK: col
         // Column hidden singles via the column fold + broadcast (see fn docs).
         // Balanced two-level tree instead of a 9-deep serial fold: collapse each
         // band's 3 row-slices into a saturating (ones>=1, twos>=2) pair, then merge
@@ -257,6 +260,7 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
             group[b] |= (r[d][b] & unsolved[b]) & col_bc;
         }
 
+        // PERFBLOCK: smear
         let (peers, conflict) = smear_v(group);
         dead |= conflict;
         for b in 0..3 {
@@ -267,10 +271,12 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
         }
     }
 
+    // PERFBLOCK: tail
     dead &= active;
     changed &= active;
     let empties = unsolved[0].count_ones() + unsolved[1].count_ones() + unsolved[2].count_ones();
     let solved = active & empties.simd_eq(ZERO) & !dead;
+    // PERFBLOCK: end
     (changed, dead, solved)
 }
 

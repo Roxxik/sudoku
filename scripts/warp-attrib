@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Source-marker block attribution for any out-of-line kernel (reusable).
+
+Instrumentation = comment markers `PERFBLOCK: <name>` placed in the analyzed
+function. Pure comments -> ZERO codegen impact; only .debug_line line numbers
+shift, the .text bytes are identical (provable). Block ranges are recomputed
+from the CURRENT source on every run, so source edits never desync them; move a
+marker comment and the boundary moves with it -- no Rust parser, no hardcoded
+line numbers.
+
+Each IBS-sampled instruction is bucketed by the analyzed function's OWN source
+line, recovered from the full inline chain (llvm-symbolizer --inlines) -- not the
+deepest portable_simd frame, not a guessed byte range. Fractions are intra-kernel
+(of the symbol's own samples), so they don't move with spec-dependent surrounding
+cost. The analyzer is parameterized by symbol + source file + tags; nothing is
+kernel-specific.
+
+usage: warp_attrib.py BIN PERF.data SYMBOL [SRC_FILE] [SRC_TAG] [FUNC_TAG]
+"""
+import subprocess, re, sys, collections
+
+BIN      = sys.argv[1]
+PERF     = sys.argv[2]
+SYM      = sys.argv[3]
+SRC      = sys.argv[4] if len(sys.argv) > 4 else "generator-lab/src/solve/simt.rs"
+SRC_TAG  = sys.argv[5] if len(sys.argv) > 5 else "solve/simt.rs"   # match in inline frame loc
+FUNC_TAG = sys.argv[6] if len(sys.argv) > 6 else "warp_pass_full"  # match in inline frame func
+
+MARK = re.compile(r'PERFBLOCK:\s*(\S+)')
+
+# 1. markers from the CURRENT source (line number -> block name), file order
+markers = []
+for i, line in enumerate(open(SRC), 1):
+    m = MARK.search(line)
+    if m:
+        markers.append((i, m.group(1)))
+markers.sort()
+if not markers:
+    sys.exit("no PERFBLOCK markers found in " + SRC)
+
+# 2. per-instruction IBS sample period from perf annotate (raw period)
+ann = subprocess.run(["perf", "annotate", "-i", PERF, "--stdio",
+                      "--show-total-period", SYM],
+                     capture_output=True, text=True).stdout
+rows = []  # (addr, period)
+for ln in ann.splitlines():
+    m = re.match(r'\s*([\d]+)\s+:\s+([0-9a-fA-F]+):\s', ln)
+    if m:
+        rows.append((int(m.group(2), 16), int(m.group(1))))
+if not rows:
+    sys.exit("no instruction rows parsed from perf annotate; head:\n"
+             + "\n".join(ann.splitlines()[:12]))
+
+# 3. full inline chain per address -> the analyzed function's OWN source line
+addr_in = "\n".join(hex(a) for a, _ in rows)
+out = subprocess.run(["llvm-symbolizer", "--inlines", "--obj=" + BIN],
+                     input=addr_in, capture_output=True, text=True).stdout
+chunks = out.split("\n\n")
+locre = re.compile(re.escape(SRC_TAG) + r':(\d+)')
+
+def own_line(chunk):
+    ls = [l for l in chunk.splitlines() if l.strip()]
+    found = None
+    for i in range(0, len(ls) - 1, 2):       # frames: func, loc, func, loc, ...
+        func, loc = ls[i], ls[i + 1]
+        if FUNC_TAG in func and SRC_TAG in loc:
+            mm = locre.search(loc)
+            if mm:
+                found = int(mm.group(1))      # keep outermost matching frame
+    return found
+
+inst = [(period, own_line(chunk)) for (addr, period), chunk in zip(rows, chunks)]
+seen = [l for _, l in inst if l is not None]
+if not seen:
+    sys.exit("no instruction mapped to a %s frame in %s" % (FUNC_TAG, SRC_TAG))
+lo, hi = min(seen), max(seen)
+
+# 4. auto-scope markers to THIS function: the block covering `lo`, through `hi`.
+#    (lets the same marker convention serve multiple instrumented kernels.)
+scoped = [m for m in markers if m[0] <= hi]
+start = max((idx for idx, m in enumerate(scoped) if m[0] <= lo), default=0)
+scoped = scoped[start:]
+
+def block_of(line):
+    name = scoped[0][1]
+    for mln, mname in scoped:
+        if line >= mln:
+            name = mname
+        else:
+            break
+    return name
+
+byblock = collections.Counter()
+byline = collections.Counter()
+total = nomatch = 0
+for period, line in inst:
+    total += period
+    if line is None:
+        nomatch += period
+        byblock["? no " + FUNC_TAG + " frame"] += period
+        continue
+    byblock[block_of(line)] += period
+    byline[line] += period
+
+order = {name: i for i, (_, name) in enumerate(scoped)}
+print("# symbol : " + SYM)
+print("# markers: " + ", ".join("%s@%d" % (n, l) for l, n in scoped)
+      + "  (scoped to lines %d-%d)" % (lo, hi))
+print("# instrs : %d   total period: %d   unmatched: %.2f%%"
+      % (len(rows), total, 100 * nomatch / total))
+print("# %-26s %9s  %14s" % ("BLOCK", "% kernel", "period"))
+for blk in sorted(byblock, key=lambda b: order.get(b, 999)):
+    p = byblock[blk]
+    print("  %-26s %8.1f%%  %14d" % (blk, 100 * p / total, p))
+print("\n# per-line (top 25 by period):")
+for line, p in byline.most_common(25):
+    print("  %s:%-4d %6.1f%%   %s" % (SRC_TAG, line, 100 * p / total, block_of(line)))
