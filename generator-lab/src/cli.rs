@@ -43,6 +43,17 @@ impl Toolbox {
             Toolbox::Full => "full",
         }
     }
+
+    /// The short `--toolbox` token, the exact inverse of [`parse`](Self::parse): round-trips
+    /// through the CLI (unlike [`label`](Self::label), whose `*-union` suffix `parse` would
+    /// silently read back as `Train`). Used when a tool re-emits a spec it can re-ingest.
+    pub fn label_short(self) -> &'static str {
+        match self {
+            Toolbox::Train => "train",
+            Toolbox::Drill => "drill",
+            Toolbox::Full => "full",
+        }
+    }
 }
 
 /// Parse one `NAME[:COUNT]` force token into a `(kind index, count)` pair. `COUNT`

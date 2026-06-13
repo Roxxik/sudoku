@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Sweep every Expert forced spec (single / double / triple) through the `harvest` example to
+quantify how rare each is, and capture a few seed -> puzzle samples per yielding spec as test
+fixtures.
+
+The enumeration and the resume bookkeeping live here; `harvest` itself only scans one CLI-given
+spec over one CLI-given seed window and reports `hits`/`next`. Each strip attempt is an
+independent 1/X chance of yielding, so rarity is just hits/attempts; rarity.csv reports
+`one_in = attempts // hits` (= X). A common spec pins X in a few thousand attempts; a rare one
+reads as 0 hits over the budget (X then only known to exceed it).
+
+Pick a spec-list (all / single / double / triple) and one --attempts budget; per-tier budgets
+are just separate runs. Resumable: rarity.csv stores cumulative `attempts` per spec, so a rerun
+continues at seed = base + attempts and never rescans the same (usually empty) range. Start
+cheap, then deepen only the low/no-yield rows:
+
+    scripts/rarity                                  # cheap sweep of everything (default attempts)
+    scripts/rarity triple --attempts 5000           # just the triples, cheaper
+    scripts/rarity --min-hits 5 --attempts 1000000  # deepen every row still under 5 hits
+    scripts/rarity --update-tests                   # ...and refresh the committed test fixtures
+
+What touches your tests: ONLY --update-tests. By default the run writes the rarity table
+(rarity.csv) and a throwaway copy of the captured sample fixtures under target/, and leaves the
+committed test fixtures alone -- so you can poke at it freely. rarity.csv is never a test input.
+Add --update-tests to (re)write generator-lab/tests/fixtures/harvest, which the reconstruction
+test replays.
+
+Combinations over the 12 Expert kinds (multisets, so X:2 / X:3 are included):
+12 singles, 78 doubles, 364 triples = 454 specs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import itertools
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# The 12 Expert kinds, in taxonomy order (naked-pair .. w-wing).
+KINDS = [
+    "naked-pair", "hidden-pair", "naked-triple", "hidden-triple", "naked-quad", "hidden-quad",
+    "x-wing", "swordfish", "jellyfish", "xy-wing", "xyz-wing", "w-wing",
+]
+TIER_NAME = {1: "single", 2: "double", 3: "triple"}
+
+
+def group(multiset):
+    """A sorted multiset of kind names -> (key, force_args). `key` is '+'-joined NAME[:COUNT]
+    (the CSV key and fixture force tokens); `force_args` is the matching --force argv."""
+    toks, fargs = [], []
+    for name, grp in itertools.groupby(multiset):
+        c = sum(1 for _ in grp)
+        tok = name if c == 1 else f"{name}:{c}"
+        toks.append(tok)
+        fargs += ["--force", tok]
+    return "+".join(toks), fargs
+
+
+def size_of_key(key):
+    """Multiset size (sum of counts) of a spec key, e.g. `x-wing:2+swordfish` -> 3."""
+    return sum(int(t.split(":")[1]) if ":" in t else 1 for t in key.split("+"))
+
+
+def enumerate_specs(tier):
+    """(key, force_args) for every spec in the requested tier(s), singles then doubles then triples."""
+    jobs = []
+    if tier in ("all", "single"):
+        jobs += [group((k,)) for k in KINDS]
+    if tier in ("all", "double"):
+        jobs += [group(c) for c in itertools.combinations_with_replacement(KINDS, 2)]
+    if tier in ("all", "triple"):
+        jobs += [group(c) for c in itertools.combinations_with_replacement(KINDS, 3)]
+    return jobs
+
+
+def load_csv(path):
+    """rarity.csv -> {key: [attempts, hits]} (the resume state)."""
+    state = {}
+    if path.exists():
+        for line in path.read_text().splitlines()[1:]:  # skip header
+            f = line.split(",")
+            if len(f) >= 4 and f[1]:
+                state[f[1]] = [int(f[2]), int(f[3])]
+    return state
+
+
+def parse_fixture(text):
+    """A fixture file -> [{key, toolbox, pairs}], one per blank-line-separated record."""
+    recs = []
+    for block in re.split(r"\n\s*\n", text):
+        forces, toolbox, pairs = [], "train", []
+        for line in block.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            head, _, rest = line.partition(" ")
+            if head == "force":
+                forces.append(rest.strip())
+            elif head == "toolbox":
+                toolbox = rest.strip()
+            elif head == "sample":
+                seed, _, puz = rest.strip().partition(" ")
+                pairs.append((seed, puz))
+        if forces:
+            recs.append({"key": "+".join(forces), "toolbox": toolbox, "pairs": pairs})
+    return recs
+
+
+def load_samples(fixdir):
+    """The committed scan fixtures are the persistent sample store; read them back so an
+    iterate pass keeps the samples it already captured. -> {key: {toolbox, pairs}}."""
+    samples = {}
+    for tier in TIER_NAME.values():
+        p = fixdir / f"scan-{tier}s.txt"
+        if p.exists():
+            for rec in parse_fixture(p.read_text()):
+                samples[rec["key"]] = {"toolbox": rec["toolbox"], "pairs": rec["pairs"]}
+    return samples
+
+
+def write_csv(path, state):
+    """rarity.csv, sorted by tier, then commonest first (smallest one_in), 0-hit specs last."""
+    rows = []
+    for key, (att, hit) in state.items():
+        size = size_of_key(key)
+        one_in = att // hit if hit else None
+        rank = one_in if hit else 1 << 60  # X unknown -> last within its tier
+        rows.append((size, rank, key, att, hit, one_in))
+    rows.sort()
+    lines = ["tier,spec,attempts,hits,one_in"]
+    for size, _rank, key, att, hit, one_in in rows:
+        lines.append(f"{TIER_NAME[size]},{key},{att},{hit},{'' if one_in is None else one_in}")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def write_fixtures(fixdir, samples):
+    """Regenerate the per-tier sample fixtures from the (merged) sample store."""
+    fixdir.mkdir(parents=True, exist_ok=True)
+    for size, tier in TIER_NAME.items():
+        items = sorted((k, r) for k, r in samples.items() if size_of_key(k) == size)
+        if not items:
+            continue
+        out = [
+            f"# generator-lab rarity-scan sample fixtures ({tier} specs). Regenerate via",
+            "# scripts/rarity. Positive-only: each 'sample' seed must still reconstruct its",
+            "# puzzle (no window => no negative claim). See tests/harvest_reconstructs.rs.",
+        ]
+        for key, rec in items:
+            out.append("")
+            out += [f"force {t}" for t in key.split("+")]
+            out.append(f"toolbox {rec['toolbox']}")
+            out += [f"sample {seed} {puz}" for seed, puz in rec["pairs"]]
+        (fixdir / f"scan-{tier}s.txt").write_text("\n".join(out) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("tier", nargs="?", default="all", choices=["all", "single", "double", "triple"],
+                    help="which spec-list to scan (default all)")
+    ap.add_argument("--attempts", type=int, default=10_000, help="attempts to add per spec this run")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="parallel harvest processes; mining goes ~Nx faster (default 1, sequential)")
+    ap.add_argument("--min-hits", type=int, default=None,
+                    help="only (re)scan specs currently below this many hits -- deepen the rare ones")
+    ap.add_argument("--toolbox", default="train", choices=["train", "drill", "full"])
+    ap.add_argument("--seed", type=int, default=1, help="seed base; resume continues at base+attempts")
+    ap.add_argument("--samples", type=int, default=4,
+                    help="seed -> puzzle pairs to capture per yielding spec, written as 'sample' lines "
+                         "into the fixture files -- which land in the scratch dir by default, or the "
+                         "committed test dir under --update-tests (where the reconstruction test "
+                         "replays them). Applies either way; more = stronger check, bigger files")
+    ap.add_argument("--update-tests", action="store_true",
+                    help="write the sample fixtures into the COMMITTED test dir "
+                         "(generator-lab/tests/fixtures/harvest) -- the ONLY option here that touches "
+                         "your tests. Without it they go to a scratch dir under target/")
+    ap.add_argument("--csv", default=None,
+                    help="rarity table + resume state (default generator-lab/rarity.csv); never a "
+                         "test input, so writing it cannot affect tests")
+    a = ap.parse_args()
+
+    root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, check=True).stdout.strip())
+    os.chdir(root)
+    csv_path = Path(a.csv) if a.csv else root / "generator-lab/rarity.csv"
+    # --update-tests is the only path that touches the committed fixtures the test reads;
+    # otherwise samples go to a gitignored scratch dir under target/ and tests are untouched.
+    fixdir = root / "generator-lab/tests/fixtures/harvest" if a.update_tests else root / "target/rarity-scan"
+
+    print("rarity: building harvest...", file=sys.stderr)
+    subprocess.run(["cargo", "build", "--release", "-q", "-p", "generator-lab", "--example", "harvest"], check=True)
+    harvest = str(root / "target/release/examples/harvest")
+
+    state = load_csv(csv_path)
+    samples = load_samples(fixdir)
+
+    # The specs to scan this run (after the tier + min-hits filters).
+    todo = []
+    for key, fargs in enumerate_specs(a.tier):
+        att, hit = state.get(key, [0, 0])
+        if a.min_hits is not None and hit >= a.min_hits:
+            continue  # already common enough; don't spend more attempts on it
+        todo.append((key, fargs, size_of_key(key), att, hit))
+
+    def run_one(job):
+        key, fargs, size, att, hit = job
+        p = subprocess.run([harvest, *fargs, "--toolbox", a.toolbox, "--seed", str(a.seed + att),
+                            "--attempts", str(a.attempts)], capture_output=True, text=True)
+        m = re.search(r"hits=(\d+)", p.stderr)
+        h = int(m.group(1)) if m else 0
+        pairs = [ln.split(" ", 1) for ln in p.stdout.splitlines() if ln.strip()][: a.samples]
+        return job, h, pairs
+
+    # Each spec's scan is independent (own seed range, own warp) -- fan them across --jobs
+    # processes and merge as each FINISHES (as_completed, so a slow spec can't stall the
+    # progress line). State is updated only here in the main thread.
+    total = len(todo)
+    print(f"rarity: scanning {total} spec(s) x {a.attempts} attempts on {a.jobs} job(s)...", file=sys.stderr)
+    done = new_yields = 0
+    t_start = last_beat = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        futures = [ex.submit(run_one, job) for job in todo]
+        for fut in concurrent.futures.as_completed(futures):
+            (key, fargs, size, att, hit), h, pairs = fut.result()
+            state[key] = [att + a.attempts, hit + h]
+            if h > 0 and key not in samples:  # capture lowest-seed samples the first time it yields
+                samples[key] = {"toolbox": a.toolbox, "pairs": [(s, puz) for s, puz in pairs]}
+            done += 1
+            if hit == 0 and h > 0:  # a spec we'd never seen yield -- the interesting discovery
+                new_yields += 1
+                print(f"  NEW  {TIER_NAME[size]} {key}: {h} hit(s) in {att + a.attempts} -> ~1 in {(att + a.attempts) // h}",
+                      file=sys.stderr)
+            now = time.monotonic()
+            if now - last_beat >= 3 or done == total:  # throttled heartbeat with ETA
+                last_beat = now
+                el = now - t_start
+                eta = el / done * (total - done)
+                print(f"[{done}/{total}] {100 * done // total:>3}%  {el:5.0f}s elapsed  ETA {eta:4.0f}s"
+                      f"  ({new_yields} new yields)", file=sys.stderr)
+
+    write_csv(csv_path, state)
+    write_fixtures(fixdir, samples)
+    yielded = sum(1 for _, hit in state.values() if hit > 0)
+    dest = "COMMITTED test fixtures" if a.update_tests else f"scratch {fixdir} (tests untouched)"
+    print(f"rarity: {len(state)} spec(s), {yielded} with yield -> {csv_path}; samples -> {dest}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

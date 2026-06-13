@@ -57,6 +57,7 @@ pub(crate) mod counters;
 pub mod fill;
 pub mod fingerprint;
 pub mod generate;
+pub mod harvest;
 pub mod probe;
 pub mod rng;
 pub mod scan;
