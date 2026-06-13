@@ -72,8 +72,9 @@ counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_
 // [0] ladder entries (ladder_step calls that reach the subset scans), [1] subset
 // per-kind unit scans run, [2] subset per-kind unit scans skipped by the cross-stall
 // memo, [3] fish per-kind digit scans run, [4] fish per-kind digit scans skipped by the
-// per-digit memo, [5] cached fish-position digit slices rebuilt (the dirty share of the
-// 81-cell scan the cache replaces). The skip shares [2]/([1]+[2]) (subsets) and
+// per-digit memo, [5] shared cached-position digit slices rebuilt (the dirty share of the
+// 81-cell scan / cm transpose the cache replaces — Step 2b: one rebuild feeds both the
+// fish and hidden-subset layouts). The skip shares [2]/([1]+[2]) (subsets) and
 // [4]/([3]+[4]) (fishes) are the memo's bite per family.
 counter_block!(LSTAT: 6, inc = lstat_inc, add = lstat_add, snapshot = lstat_snapshot, reset = lstat_reset);
 
@@ -211,13 +212,15 @@ counter_block!(feature = "kernel_count", KRBTICK: LANES + 1, inc = krbtick_inc, 
 /// the off-warp LC prunes), so nothing on the closure spine needs to track changes.
 ///
 /// The same per-digit granularity carries each technique's position *input*, not just its
-/// verdicts: both the fish step's per-orientation masks (`fish_pos`) and the hidden
-/// subsets' per-unit masks (`subset_pos`) are cached across stalls and only the
-/// diff-dirtied digits' slices are rebuilt, straight from the digit-major `prev` bands —
-/// so the fish's 81-cell `FishPositions::scan` and the hidden subsets' old `cm` position
-/// transpose both drop out of the memoized path. The two caches are kept SEPARATE — each
-/// rebuilt only when its consumer is in scope, each with its own staleness mask; a perf
-/// A/B decides shared-vs-separate (see `generator-lab/docs/LADDER-REDO.md`).
+/// verdicts: both the fish step's per-orientation masks and the hidden subsets' per-unit
+/// masks are cached across stalls and only the diff-dirtied digits' slices are rebuilt,
+/// straight from the digit-major `prev` bands — so the fish's 81-cell `FishPositions::scan`
+/// and the hidden subsets' old `cm` position transpose both drop out of the memoized path.
+/// **Step 2b SHARED:** the two layouts live in ONE [`techniques::UnitPositions`] cache
+/// behind ONE staleness mask (`pos_stale`); a stale digit's column transpose — needed by
+/// both layouts — is computed once and scattered into both (see [`cellmarks_step_harder`]).
+/// A perf A/B decides shared (this) vs the 2a separate caches (see
+/// `generator-lab/docs/LADDER-REDO.md`).
 pub(crate) struct LadderMemo {
     /// `candidates & unsolved` per digit band as last scanned (the state the
     /// `no_fire`/`fish_no_fire` verdicts are about).
@@ -229,30 +232,20 @@ pub(crate) struct LadderMemo {
     /// no-fire on digit `d` for `prev`. A fish is single-digit, so the memo is per
     /// digit, not per unit — see [`crate::solve::techniques::fish_step`].
     fish_no_fire: [u8; 9],
-    /// The fish ladder's per-digit candidate-position masks, cached across stalls so
-    /// the fish step's 81-cell board scan is not re-paid for digits the diff proved
-    /// unchanged. Digits flagged in `fish_stale` are refreshed **lazily** from `prev`
-    /// right before the fish scans run (so an entry that fires at LC or a subset pays
-    /// nothing) — see [`cellmarks_step_harder`].
-    fish_pos: techniques::FishPositions,
-    /// Bit `d` = `fish_pos`'s digit-`d` slices do not reflect `prev` and must be
-    /// rebuilt before the next fish scan reads them.
-    fish_stale: u16,
-    /// The hidden subsets' per-unit candidate-position cache (rows `u` 0..9, columns
-    /// 9..18, boxes 18..27): `subset_pos[u][d]` bit `i` = digit `d` is a candidate at unit
-    /// `u`'s `i`-th cell (`UNITS[u][i]`). Built incrementally from the digit-major `prev`
-    /// bands (NOT a `cm` round-trip), per dirty digit, only when a hidden subset is in
-    /// scope — see [`cellmarks_step_harder`] / [`rebuild_subset_digit`]. Its row/col halves
-    /// duplicate `fish_pos` (SEPARATE recomputes them; the perf A/B decides
-    /// shared-vs-separate); only the box masks are unique to it. Replaces the cm-derived
-    /// `SubsetCache.positions` transpose — the double transpose `sr -> cm -> positions`.
-    subset_pos: [[u16; 9]; 27],
-    /// Bit `d` = `subset_pos`'s digit-`d` slices do not reflect `prev` and must be rebuilt
-    /// before the next hidden-subset scan reads them. Twin of `fish_stale`, kept separate
-    /// on purpose: a subset fire returns before the fish rebuild, and a fishless toolbox
-    /// never reaches it, so one shared mask could not be cleared correctly for both
-    /// consumers — each cache clears its own right after its rebuild loop.
-    subset_stale: u16,
+    /// The SHARED per-digit candidate-position cache (Step 2b): the fish ladder's
+    /// per-orientation masks AND the hidden subsets' per-unit masks (rows 0..9, columns
+    /// 9..18, boxes 18..27), built incrementally from the digit-major `prev` bands (NOT a
+    /// `cm` round-trip) so neither the fish's 81-cell scan nor the old `sr -> cm ->
+    /// positions` transpose is re-paid. The column transpose the two layouts share is
+    /// computed once per dirty digit — see [`techniques::UnitPositions::rebuild_digit`].
+    /// Digits flagged in `pos_stale` are refreshed **lazily** right before their consumer's
+    /// scans (so an entry that fires earlier pays nothing) — see [`cellmarks_step_harder`].
+    pos: techniques::UnitPositions,
+    /// Bit `d` = `pos`'s digit-`d` slices do not reflect `prev` and must be rebuilt before
+    /// the next subset/fish scan reads them. ONE mask for the shared cache: every consumer
+    /// rebuilds (and clears) it at the first scan it reaches, so whichever of the hidden
+    /// subsets / fishes runs first refreshes the stale digits for both.
+    pos_stale: u16,
     /// False after a lane (re)load: `prev`/`no_fire`/`fish_no_fire` describe a dead board.
     valid: bool,
 }
@@ -262,10 +255,8 @@ impl LadderMemo {
         prev: [[0; 3]; 9],
         no_fire: [0; 27],
         fish_no_fire: [0; 9],
-        fish_pos: techniques::FishPositions::EMPTY,
-        fish_stale: 0x1FF,
-        subset_pos: [[0; 9]; 27],
-        subset_stale: 0x1FF,
+        pos: techniques::UnitPositions::EMPTY,
+        pos_stale: 0x1FF,
         valid: false,
     };
 
@@ -541,60 +532,35 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
 /// production.
 ///
 /// The nine 9-bit row slices of one digit's row-major bands (band `b` holds rows
-/// `3b..3b+3` at bit offsets 0/9/18) — the per-digit input shared by both position
-/// rebuilds ([`FishPositions::rebuild_digit`](techniques::FishPositions::rebuild_digit)
-/// and [`rebuild_subset_digit`]), extracted here so the band packing stays this module's
-/// knowledge.
+/// `3b..3b+3` at bit offsets 0/9/18) — the per-digit input to the shared position rebuild
+/// ([`techniques::UnitPositions::rebuild_digit`]), extracted here so the band packing
+/// stays this module's knowledge.
 #[inline]
 fn band_rows(bands: &[u32; 3]) -> [u16; 9] {
     core::array::from_fn(|r| ((bands[r / 3] >> (9 * (r % 3))) & 0x1FF) as u16)
 }
 
-/// Refresh digit `di`'s per-unit candidate-position masks across all 27 units from its
-/// nine 9-bit row slices (`rows[r]` bit `c` = `di` is a candidate at cell `(r, c)`) — the
-/// hidden-subset twin of
-/// [`FishPositions::rebuild_digit`](techniques::FishPositions::rebuild_digit), built
-/// straight from the digit-major bands (no `cm` transpose). `pos[u][di]` bit `i` is set
-/// iff `di` is a candidate at `UNITS[u][i]`: rows (`u` 0..9) ARE the row slices; columns
-/// (9..18) are their 9x9 bit transpose (built branchlessly, like the fish columns);
-/// boxes (18..27) gather each box row's three-column segment at the box's stack offset
-/// into the slot triplet — box slot `3*lr + lc` is cell `(3*(b/3)+lr, 3*(b%3)+lc)`, the
-/// row-major box order of [`crate::repr::UNITS`]. Byte-identical to the old
-/// `SubsetCache.positions` (which read the same bits via `cm`), since `prev` and `cm`
-/// carry the same per-cell candidacy.
-#[inline]
-fn rebuild_subset_digit(pos: &mut [[u16; 9]; 27], di: usize, rows: [u16; 9]) {
-    for r in 0..9 {
-        pos[r][di] = rows[r]; // row unit r: slot c = column c
-    }
-    for c in 0..9 {
-        let mut col = 0u16;
-        for (r, &row) in rows.iter().enumerate() {
-            col |= ((row >> c) & 1) << r; // column unit c: slot r = row r
-        }
-        pos[9 + c][di] = col;
-    }
-    for b in 0..9 {
-        let br = 3 * (b / 3);
-        let bc = 3 * (b % 3);
-        pos[18 + b][di] = ((rows[br] >> bc) & 7)
-            | (((rows[br + 1] >> bc) & 7) << 3)
-            | (((rows[br + 2] >> bc) & 7) << 6);
-    }
-}
-
 /// Every technique runs through the generic [`super::techniques`] bodies on the
 /// cell-major `cm` (every unit reachable via `get`, columns included). The six subsets
 /// share a single [`SubsetCache`] of per-unit marks built up front and passed in (so the
-/// marks gather is paid once, not three times per kind); the hidden subsets additionally
-/// read the per-unit digit-position masks from the memo's `subset_pos`, rebuilt here
-/// lazily (per dirty digit, straight from the diffed `prev` bands — NOT the old `sr -> cm
-/// -> positions` transpose) and only when a hidden subset is in scope. The rarer
-/// fish/wings — guarded out entirely for the subset-only HiddenQuad toolbox — take the
-/// cache-free path. `memo` is the lane's cross-stall [`LadderMemo`], already diffed by
-/// [`ladder_step`]: the per-unit subset verdicts gate the subset scans, the per-digit fish
-/// verdicts gate the fish scans, and the stale cached positions (subset + fish) are rebuilt
-/// here, lazily, from the diffed `prev` bands.
+/// marks gather is paid once, not three times per kind); the hidden subsets and the basic
+/// fish additionally read their cached digit-position masks from the memo's shared
+/// [`techniques::UnitPositions`], rebuilt here lazily (per dirty digit, straight from the
+/// diffed `prev` bands — NOT the old `sr -> cm -> positions` transpose). The rarer wings
+/// take the cache-free path. `memo` is the lane's cross-stall [`LadderMemo`], already
+/// diffed by [`ladder_step`]: the per-unit subset verdicts gate the subset scans, the
+/// per-digit fish verdicts gate the fish scans, and the stale shared positions are rebuilt
+/// here, lazily.
+///
+/// **Step 2b SHARED rebuild.** The hidden subsets' per-unit masks and the fishes'
+/// per-orientation masks need the *same* per-digit column transpose, so a stale digit is
+/// refreshed exactly ONCE per stall — at whichever consumer's scan runs first — and that
+/// rebuild scatters into both layouts (gated on each consumer being in scope). When a
+/// hidden subset is in scope the rebuild happens up front (it must precede the subset
+/// scans) and also fills the fish layout, so the fish block below finds nothing stale; a
+/// fish-without-hidden toolbox instead rebuilds *lazily* right before the fishes, so a
+/// subset fire returns first and the transpose is never paid on that entry. Either way the
+/// transpose is computed once, and one staleness mask (`pos_stale`) serves both.
 fn cellmarks_step_harder(
     cm: &mut CellMarks,
     allowed: KindMask,
@@ -607,6 +573,8 @@ fn cellmarks_step_harder(
         | (1 << NAKED_QUAD)
         | (1 << HIDDEN_QUAD);
     const ANY_HIDDEN: KindMask = (1 << HIDDEN_PAIR) | (1 << HIDDEN_TRIPLE) | (1 << HIDDEN_QUAD);
+    let want_hidden = allowed & ANY_HIDDEN != 0;
+    let want_fish = allowed & techniques::ANY_FISH != 0;
     // The marks cache only feeds the subset ladder; a subset-free toolbox (e.g. drill,
     // whose baseline is singles-only) skips the build entirely and falls straight through.
     // `no_fire` is the cross-stall memo (all-zero = scan everything); the ladder-order
@@ -614,20 +582,22 @@ fn cellmarks_step_harder(
     if allowed & ANY_SUBSET != 0 {
         lstat_inc(0);
         let cache = SubsetCache::build(cm);
-        // Hidden subsets read per-unit digit positions: refresh `subset_pos` for exactly
-        // the digits the entry diff flagged stale, straight off the diffed `prev` bands (no
-        // `cm` round-trip), and ONLY when a hidden subset is actually in scope — a
-        // naked-only toolbox builds none of it (so it pays nothing for the box masks). Its
-        // own stale mask, cleared right here, so a subset fire below or a fishless toolbox
-        // leaves the fish cache's separate staleness untouched.
-        if allowed & ANY_HIDDEN != 0 {
-            let mut w = memo.subset_stale;
+        // Shared rebuild, up-front arm: a hidden subset reads its per-unit positions before
+        // the scans below, and the column transpose those need is exactly the fish layout's
+        // — so refresh every stale digit ONCE here, scattering into the per-unit layout AND
+        // (when a fish is also in scope) the fish per-orientation layout, the transpose paid
+        // a single time. Skip it for a naked-only toolbox (`want_hidden` false): no per-unit
+        // positions are read, so none — and no box masks — are built. Clearing `pos_stale`
+        // here leaves the fish block below with nothing to rebuild.
+        if want_hidden {
+            let mut w = memo.pos_stale;
             while w != 0 {
                 let di = w.trailing_zeros() as usize;
                 w &= w - 1;
-                rebuild_subset_digit(&mut memo.subset_pos, di, band_rows(&memo.prev[di]));
+                lstat_inc(5);
+                memo.pos.rebuild_digit(di, band_rows(&memo.prev[di]), want_fish, true);
             }
-            memo.subset_stale = 0;
+            memo.pos_stale = 0;
         }
         let no_fire = &mut memo.no_fire;
         // `tchk_inc($bit)` counts this kind getting its ladder turn (allowed and not
@@ -645,7 +615,7 @@ fn cellmarks_step_harder(
             };
         }
         let m = Some(&cache.marks);
-        let p = Some(&memo.subset_pos);
+        let p = Some(&memo.pos.subset);
         try_kind!(NAKED_PAIR, techniques::naked_subset(cm, 2, m, Some((&mut *no_fire, 0))));
         try_kind!(HIDDEN_PAIR, techniques::hidden_subset(cm, 2, p, m, Some((&mut *no_fire, 1))));
         try_kind!(NAKED_TRIPLE, techniques::naked_subset(cm, 3, m, Some((&mut *no_fire, 2))));
@@ -653,23 +623,23 @@ fn cellmarks_step_harder(
         try_kind!(NAKED_QUAD, techniques::naked_subset(cm, 4, m, Some((&mut *no_fire, 4))));
         try_kind!(HIDDEN_QUAD, techniques::hidden_subset(cm, 4, p, m, Some((&mut *no_fire, 5))));
     }
-    // Fish memo: refresh the cached positions for exactly the digits the entry diff
-    // flagged stale, straight off the diffed bands (pure bit ops — no board re-read).
-    // This sits AFTER the subsets on purpose: a subset fire returns above, so its entry
-    // pays no fish maintenance and the staleness simply carries to a later entry; a
-    // fishless toolbox (the `ANY_FISH` gate) never pays it at all. A stale digit always
-    // has a cleared `no_fire` byte (same diff clears both), so no rebuild is wasted on
-    // a digit the scans would skip.
-    let fish_arg = if allowed & techniques::ANY_FISH != 0 {
-        let mut w = memo.fish_stale;
+    // Shared rebuild, lazy arm: only reached with work to do when NO hidden subset rebuilt
+    // above (so `pos_stale` is still set — a fish-without-hidden toolbox). Refresh the stale
+    // digits' fish layout here, after the subsets, so a subset fire returns first and this
+    // transpose is paid only on entries that actually reach the fishes (2a's laziness). When
+    // a hidden subset did rebuild above, `pos_stale` is 0 and this loop is empty. A stale
+    // digit always has a cleared `fish_no_fire` byte (same diff clears both), so no rebuild
+    // is wasted on a digit the scans would skip.
+    let fish_arg = if want_fish {
+        let mut w = memo.pos_stale;
         while w != 0 {
             let di = w.trailing_zeros() as usize;
             w &= w - 1;
             lstat_inc(5);
-            memo.fish_pos.rebuild_digit(di, band_rows(&memo.prev[di]));
+            memo.pos.rebuild_digit(di, band_rows(&memo.prev[di]), true, false);
         }
-        memo.fish_stale = 0;
-        Some((&mut memo.fish_no_fire, &memo.fish_pos))
+        memo.pos_stale = 0;
+        Some((&mut memo.fish_no_fire, &memo.pos.fish))
     } else {
         None
     };
@@ -723,9 +693,9 @@ pub(crate) fn tchk_gated(bit: usize) {
 /// for every later size.
 ///
 /// The hidden subsets' per-unit *digit-position* masks are NOT here: they live in the
-/// memo's `subset_pos`, built incrementally from the digit-major `prev` bands
-/// ([`rebuild_subset_digit`]) rather than transposed out of `cm` — that fold killed the
-/// old `sr -> cm -> positions` double transpose (see [`LadderMemo`]).
+/// memo's shared [`techniques::UnitPositions`], built incrementally from the digit-major
+/// `prev` bands rather than transposed out of `cm` — that fold killed the old `sr -> cm ->
+/// positions` double transpose (see [`LadderMemo`]).
 struct SubsetCache {
     /// `marks[u][i]` = the candidate set of unit `u`'s `i`-th cell (`UNITS[u][i]`).
     marks: [[Mark; 9]; 27],
@@ -788,13 +758,12 @@ pub(crate) fn ladder_step(
     let mut cm = CellMarks::from_bands(&sr, &su);
     // Cross-stall memo: diff the gated bands against the last-scanned state. Every changed
     // cell dirties its three units (clears their subset no-fire bits) and every changed
-    // digit clears its fish no-fire byte AND marks BOTH cached position caches (fish
-    // per-orientation `fish_pos`, hidden-subset per-unit `subset_pos`) stale for that digit
-    // — a fish is single-digit and a hidden subset reads one digit's per-unit masks, so a
-    // digit whose bands are unchanged keeps its verdicts and both its cached position
-    // slices. This catches the previous fire's eliminations, the closure's work, and LC
-    // prunes uniformly. `prev` then becomes the current state — the one the scans below run
-    // on (and the source the stale position slices are lazily rebuilt from, see
+    // digit clears its fish no-fire byte AND marks the shared cached positions (`pos`) stale
+    // for that digit — a fish is single-digit and a hidden subset reads one digit's per-unit
+    // masks, so a digit whose bands are unchanged keeps its verdicts and both its cached
+    // position layouts. This catches the previous fire's eliminations, the closure's work,
+    // and LC prunes uniformly. `prev` then becomes the current state — the one the scans
+    // below run on (and the source the stale position slices are lazily rebuilt from, see
     // `cellmarks_step_harder`).
     if memo.valid {
         let mut changed = [0u32; 3];
@@ -809,8 +778,7 @@ pub(crate) fn ladder_step(
             }
             if dd != 0 {
                 memo.fish_no_fire[d] = 0; // digit d moved -> all its fish verdicts stale
-                memo.fish_stale |= 1 << d; // and its cached fish positions need a rebuild
-                memo.subset_stale |= 1 << d; // ditto its cached hidden-subset positions
+                memo.pos_stale |= 1 << d; // and its shared cached positions need a rebuild
             }
         }
         for (b, mut w) in changed.into_iter().enumerate() {
@@ -830,8 +798,7 @@ pub(crate) fn ladder_step(
         }
         memo.no_fire = [0; 27];
         memo.fish_no_fire = [0; 9];
-        memo.fish_stale = 0x1FF;
-        memo.subset_stale = 0x1FF;
+        memo.pos_stale = 0x1FF;
         memo.valid = true;
     }
     let k = cellmarks_step_harder(&mut cm, allowed, memo)?;

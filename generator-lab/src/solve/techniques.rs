@@ -301,25 +301,10 @@ pub(super) struct FishPositions {
 
 impl FishPositions {
     /// All-empty masks — the placeholder behind a dead [`crate::solve::simt::LadderMemo`]
-    /// (every digit marked stale, so nothing ever reads these zeros).
+    /// (every digit marked stale, so nothing ever reads these zeros). The cross-stall
+    /// per-digit rebuild now lives on [`UnitPositions`] (Step 2b: shared with the hidden
+    /// subsets' per-unit masks so the column transpose is computed once, not twice).
     pub(super) const EMPTY: FishPositions = FishPositions { pos: [[[0; 9]; 9]; 2] };
-
-    /// Refresh one digit's slices of both orientations from its nine 9-bit row slices
-    /// (`rows[r]` bit `c` = the digit is a candidate at cell `(r, c)`) — the cached
-    /// cross-stall rebuild for a digit the band diff found changed. Row orientation is
-    /// the row slices themselves; the column orientation is their 9x9 bit transpose,
-    /// built branchlessly (the scatter loop measurably raised branch-misses for the
-    /// analogous `SubsetCache` transpose, see [`crate::solve::simt`]).
-    pub(super) fn rebuild_digit(&mut self, di: usize, rows: [u16; 9]) {
-        self.pos[0][di] = rows;
-        let mut cols = [0u16; 9];
-        for (r, &row) in rows.iter().enumerate() {
-            for (c, col) in cols.iter_mut().enumerate() {
-                *col |= ((row >> c) & 1) << r;
-            }
-        }
-        self.pos[1][di] = cols;
-    }
 
     /// Read every cell's candidates once into the per-line masks. The only board-reading
     /// pass the fish ladder makes per stall.
@@ -347,6 +332,86 @@ impl FishPositions {
             }
         }
         Self { pos }
+    }
+}
+
+/// The SIMT ladder's SHARED cross-stall position cache (Step 2b): ONE struct holding BOTH
+/// the basic fish's per-orientation masks ([`FishPositions`]) and the hidden subsets'
+/// per-unit masks, refreshed by a single [`rebuild_digit`](Self::rebuild_digit) whose
+/// column 9x9 transpose — the costly half, needed by both layouts — is computed ONCE per
+/// dirty digit and scattered into both. Replaces 2a's two independent caches (each with
+/// its own transpose + its own staleness mask); a perf A/B decides shared (this) vs
+/// separate (see `generator-lab/docs/LADDER-REDO.md`).
+///
+/// The fish per-orientation masks ARE the hidden layout's row units (`fish.pos[0]`) and
+/// column units (`fish.pos[1]`); only the box units (`subset[18..27]`) are unique to the
+/// per-unit layout. The row/col data is held in BOTH shapes anyway so each consumer reads
+/// contiguously — [`fish_step`] wants `fish.pos[o][di]` (per base line for a fixed digit),
+/// [`hidden_subset`] wants `subset[u][di]` (per digit for a fixed unit); reading either out
+/// of the other's layout would stride (the regression the bundled attempt hit — see the doc).
+pub(super) struct UnitPositions {
+    /// Fish per-orientation masks (also the hidden layout's row units 0..9 / column units
+    /// 9..18). Refreshed only when a basic fish is in scope.
+    pub(super) fish: FishPositions,
+    /// Hidden subsets' per-unit masks: rows `u` 0..9, columns 9..18, boxes 18..27;
+    /// `subset[u][di]` bit `i` = digit `di` is a candidate at unit `u`'s `i`-th cell
+    /// (`UNITS[u][i]`). The row/col halves duplicate `fish`; only the boxes are unique.
+    /// Refreshed only when a hidden subset is in scope.
+    pub(super) subset: [[u16; 9]; 27],
+}
+
+impl UnitPositions {
+    /// All-empty — the placeholder behind a dead [`crate::solve::simt::LadderMemo`] (every
+    /// digit marked stale, so nothing ever reads these zeros).
+    pub(super) const EMPTY: UnitPositions =
+        UnitPositions { fish: FishPositions::EMPTY, subset: [[0; 9]; 27] };
+
+    /// Refresh one digit's slices from its nine 9-bit row slices (`rows[r]` bit `c` = the
+    /// digit is a candidate at cell `(r, c)`), scattering the SHARED row/col derivation into
+    /// whichever consumer layouts are in scope. The column 9x9 bit transpose — the costly
+    /// half — is computed ONCE here (built branchlessly: the scatter loop measurably raised
+    /// branch-misses for the analogous transpose, see [`crate::solve::simt`]) and written to
+    /// both layouts, instead of 2a's two separate rebuilds each recomputing it:
+    /// - `want_fish`: the fish per-orientation masks (`fish.pos[0]` = rows, `[1]` = cols).
+    /// - `want_hidden`: the per-unit masks — row units 0..9 ARE the row slices, column units
+    ///   9..18 the transpose, box units 18..27 gather each box row's three-column segment at
+    ///   the box's stack offset into the slot triplet (box slot `3*lr + lc` is cell
+    ///   `(3*(b/3)+lr, 3*(b%3)+lc)`, the row-major box order of [`crate::repr::UNITS`]).
+    ///
+    /// Byte-identical to 2a's `FishPositions::rebuild_digit` + `simt::rebuild_subset_digit`
+    /// (same bits, same slot order); only the transpose is now shared, not computed twice.
+    pub(super) fn rebuild_digit(
+        &mut self,
+        di: usize,
+        rows: [u16; 9],
+        want_fish: bool,
+        want_hidden: bool,
+    ) {
+        let mut cols = [0u16; 9];
+        for (r, &row) in rows.iter().enumerate() {
+            for (c, col) in cols.iter_mut().enumerate() {
+                *col |= ((row >> c) & 1) << r;
+            }
+        }
+        if want_fish {
+            self.fish.pos[0][di] = rows;
+            self.fish.pos[1][di] = cols;
+        }
+        if want_hidden {
+            for r in 0..9 {
+                self.subset[r][di] = rows[r];
+            }
+            for c in 0..9 {
+                self.subset[9 + c][di] = cols[c];
+            }
+            for b in 0..9 {
+                let br = 3 * (b / 3);
+                let bc = 3 * (b % 3);
+                self.subset[18 + b][di] = ((rows[br] >> bc) & 7)
+                    | (((rows[br + 1] >> bc) & 7) << 3)
+                    | (((rows[br + 2] >> bc) & 7) << 6);
+            }
+        }
     }
 }
 

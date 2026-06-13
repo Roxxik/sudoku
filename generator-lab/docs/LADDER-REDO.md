@@ -5,11 +5,14 @@ measured neutral on both paths; see Step 1 below for numbers and the implementat
 The branch is now **rebased on `master`** (which brought the `harvest` seed->puzzle
 fixtures), and the yield gate has switched from the slow full-range `findpar` diff to the
 fast **both-paths `harvest_reconstructs` test** (scalar + SIMT) — see Verification
-methodology. **Step 2a (SEPARATE) is now landed** — neutral-to-slightly-faster, fp-matched
-(see the Step 2 Outcome); **2b SHARED and the 2a-vs-2b A/B remain.** A first *bundled* attempt (Step 2's shared layout, NOT the
-fold) was once built, verified output-identical, measured to regress slightly, then
-accidentally discarded with `git restore` (recoverable only from the session transcript —
-see Reconstruction notes). This doc captures everything so the work resumes cleanly at Step 2.
+methodology. **Step 2 is DONE: 2a SEPARATE landed, then 2b SHARED built + A/B'd, and the
+A/B picked 2b SHARED** (output-identical; flat where the shared transpose can't fire,
+~0.4% faster on the cross-branch hidden+fish specs where it does — see the 2b Outcome /
+A/B verdict). The remaining open item is the optional Step 3 (lazy-`cm` reorder). A first
+*bundled* attempt (Step 2's shared layout, NOT the fold) was once built, verified
+output-identical, measured to regress slightly, then accidentally discarded with `git
+restore` (recoverable only from the session transcript — see Reconstruction notes). This
+doc captures everything; the 2b adopted here is the "shared, done right" the bundle wasn't.
 
 ## Goal
 
@@ -163,10 +166,19 @@ Then A/B two efficient variants (perf decides):
   clear before fish read it. `subset_stale` + `fish_stale`, each set by the entry diff and
   cleared right after its own rebuild loop, is the faithful SEPARATE design and preserves
   Step 1's lazy properties (subset fire skips fish maintenance; fishless skips fish entirely).
-- **2b SHARED** (NOT YET BUILT): one struct holding BOTH layouts (per-orientation for fish +
-  per-unit for hidden); one `rebuild_digit` computes rows/cols(/boxes) once and scatters into
-  both; the per-unit layout is only populated when `ANY_HIDDEN` is in scope. Derivation
-  shared, reads contiguous for both, storage slightly larger.
+- **2b SHARED  ✅ BUILT + MEASURED** (see 2b Outcome below): one `techniques::UnitPositions`
+  struct holding BOTH layouts (per-orientation `FishPositions` for fish + per-unit `subset:
+  [[u16;9];27]` for hidden); one `rebuild_digit(di, rows, want_fish, want_hidden)` computes the
+  column transpose ONCE and scatters into whichever layouts are in scope; one shared
+  `pos_stale` mask. **Deviation from the sketch (the dual-arm rebuild placement).** A single
+  rebuild point cannot serve both consumers naively: hidden needs its positions *before* the
+  subset scans, fish *after*; and the 2a lesson (mistake #2) is that paying the fish transpose
+  on an entry that fires at a naked subset is wasted. The faithful SHARED design therefore
+  invokes the *one* `rebuild_digit` (and clears the *one* mask) at whichever consumer runs
+  first: up-front in the subset block when `ANY_HIDDEN` (where the transpose is needed anyway,
+  so it also fills the fish layout for free — the genuine share), else *lazily* right before
+  the fishes when fish-without-hidden (so a subset fire returns first and the transpose is
+  never paid — 2a's laziness preserved). Net: the transpose is computed once, never wasted.
 
 `findpar-bench` (the 4 specs, interleaved) picks 2a vs 2b; the both-paths harvest yield gate
 (`cargo test --release`, scalar + SIMT) must stay green for each.
@@ -191,6 +203,50 @@ matched OLD==NEW every spec):
 
 Net: neutral-to-slightly-faster everywhere, no regression — matching the expectation. **Next:
 2b SHARED, then the 2a-vs-2b A/B decision.**
+
+**2b Outcome.** Built on the worktree (uncommitted at the time of the A/B): `UnitPositions`
+folds 2a's `fish_pos` + `subset_pos` into one cache behind one `pos_stale` mask;
+`FishPositions::rebuild_digit` and `simt::rebuild_subset_digit` collapse into one
+`UnitPositions::rebuild_digit` that computes the col transpose once and scatters into both
+layouts (dual-arm placement above). Output-identical to 2a — full `cargo test --release -p
+generator-lab` green incl. BOTH harvest paths + `equiv_warp_repr`; `findpar-bench` `fp` matched
+2a==2b on all 5 specs. Perf (interleaved 2a vs 2b, **5 rounds**, `--attempts 400000`, median
+us/att; `fp` matched every spec, every round):
+
+The result keys cleanly off whether the spec's `allowed` mask co-activates `ANY_HIDDEN`
+**and** `ANY_FISH` (the only case where 2b shares the transpose 2a computes twice). NB the
+toolbox is the train-union of the forced targets, so a target pulls in its simpler same-branch
+peers: `swordfish + naked-triple` is NOT "fish + naked" — naked-triple's Subset-branch scope
+(difficulty <= 50) includes **hidden-pair** (44), so it co-activates hidden + fish just like
+`hidden-triple + swordfish`.
+
+| spec                          | `allowed` co-scope        | 2a med | 2b med | delta   |
+|-------------------------------|---------------------------|--------|--------|---------|
+| hidden-quad                   | Subset only (no fish)     | 31.71  | 31.69  | -0.06%  |
+| xy-wing                       | Bivalue only              | 30.63  | 30.63  |  0.00%  |
+| w-wing + jellyfish            | Fish + Bivalue (no hidden)| 37.29  | 37.26  | -0.08%  |
+| **swordfish + naked-triple**  | **hidden-pair + fish**    | 30.20  | 30.07  | **-0.43%** |
+| **hidden-triple + swordfish** | **hidden + fish**         | 31.39  | 31.26  | **-0.41%** |
+
+**Both** hidden+fish co-scope specs show ~-0.4%; the three non-co-scope specs are flat. That is
+2b's shared transpose firing — a real, repeatable signal, NOT noise (the consistent ~0.4% on
+exactly the two specs where the share is reachable, and only those, is the tell). 2b is
+output-identical and never slower elsewhere.
+
+**A/B verdict — ADOPT 2b SHARED.** Perf is neutral-or-better: flat where the share can't fire,
+~0.4% faster where it can. The win fires whenever a hidden subset and a basic fish are in scope
+on the same stall — i.e. on any cross-branch combination spec, which is a class the generator is
+growing toward (more multi-`--force` combinations planned). It is therefore NOT dormant; the
+"share only if no cost" gate is passed (no cost — a small win), and 2b additionally consolidates
+2a's two caches / two masks / two rebuild methods into one of each. The cost is the dual-arm
+rebuild placement (up-front under `ANY_HIDDEN`, else lazy before the fishes), documented at the
+2b bullet and in `cellmarks_step_harder`. Reproduce: `perf-ab/ab.sh <perf-ab-dir> 400000 5` (the
+2a/2b binaries + raw results lived under the worktree's `perf-ab/`, gitignored; deleted after).
+
+*Possible follow-up (separate, measured):* the `ANY_HIDDEN` arm rebuilds at the subset-block top
+(before naked-pair), matching 2a. It could be deferred to just before the first hidden scan
+(hidden-pair) to also skip the transpose when a naked subset fires first — a narrow extra
+laziness, equally applicable to 2a, left out here to keep the dual-arm logic readable.
 
 ### Step 3 — OPTIONAL, separate, measured: lazy-`cm` reorder
 Order is free, so try digit-major techniques first (LC -> hidden subsets -> fishes ->
@@ -266,4 +322,6 @@ follow Step 1/Step 2, not this):
 ## Open / pending
 
 - User has an idea for the found puzzles, to share after the work is finished.
-- Final shared-vs-separate (2a vs 2b) decision pending the Step 2 perf comp.
+- Shared-vs-separate (2a vs 2b) decision: **RESOLVED — 2b SHARED adopted** (see the A/B verdict).
+- Step 3 (lazy-`cm` reorder) remains optional/unstarted; plus the noted micro-opt of making the
+  `ANY_HIDDEN` rebuild lazy past naked-pair (separate, measured).
