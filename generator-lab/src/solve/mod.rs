@@ -53,8 +53,8 @@ pub use fused::{fstat_reset, fstat_snapshot};
 #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
 pub use simt::{uwstat_reset, uwstat_snapshot};
 
-/// Subset-ladder memo counters (`feature = "count"`) — read by the `laddermemoab`
-/// example.
+/// Harder-ladder memo counters (`feature = "count"`) — the cross-stall memo's
+/// scan-skip and rebuild diagnostics (see `simt::LSTAT`).
 #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
 pub use simt::{lstat_reset, lstat_snapshot};
 

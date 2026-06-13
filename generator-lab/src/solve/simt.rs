@@ -75,36 +75,8 @@ counter_block!(UWSTAT: 2, inc = uwstat_inc, add = uwstat_add, snapshot = uwstat_
 // memo, [3] fish per-kind digit scans run, [4] fish per-kind digit scans skipped by the
 // per-digit memo, [5] cached fish-position digit slices rebuilt (the dirty share of the
 // 81-cell scan the cache replaces). The skip shares [2]/([1]+[2]) (subsets) and
-// [4]/([3]+[4]) (fishes) are the memo's bite per family. Read by `laddermemoab`.
+// [4]/([3]+[4]) (fishes) are the memo's bite per family.
 counter_block!(LSTAT: 6, inc = lstat_inc, add = lstat_add, snapshot = lstat_snapshot, reset = lstat_reset);
-
-/// How much of the cross-stall ladder memo to apply. Production is [`Full`](Self::Full);
-/// the lesser modes exist only for the `laddermemoab` A/B. [`Subsets`](Self::Subsets) is
-/// the pre-fish baseline — subset unit-scans memoized, fishes fully rescanned every
-/// stall — so `Full` vs `Subsets` isolates exactly the per-digit fish memo's marginal
-/// effect, and `Off` is the no-memo floor.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum MemoMode {
-    /// No memo: every stall rescans every unit and digit (the floor).
-    Off,
-    /// Subset unit-scans memoized; fishes rescanned (the pre-fish production behaviour).
-    Subsets,
-    /// Subset unit-scans AND per-digit fish scans memoized (production).
-    Full,
-}
-
-impl MemoMode {
-    /// Whether any memo state is carried (the subset memo is on iff so).
-    #[inline]
-    pub(crate) fn memo_on(self) -> bool {
-        !matches!(self, MemoMode::Off)
-    }
-    /// Whether the per-digit fish memo is applied on top of the subset memo.
-    #[inline]
-    pub(crate) fn fish(self) -> bool {
-        matches!(self, MemoMode::Full)
-    }
-}
 
 /// Cross-stall memo for one lane's harder ladder (see [`ladder_step`]): the
 /// unsolved-gated candidate bands as the ladder **last scanned them**, plus which
@@ -312,18 +284,6 @@ pub(crate) fn warp_pass_full(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], active:
 /// have two Expert branches in scope together, so their relative order is moot in
 /// production.
 ///
-/// The fish slice of the cross-stall [`LadderMemo`], split-borrowed for
-/// [`cellmarks_step_harder`]: the per-digit no-fire verdicts, the cached
-/// [`FishPositions`](techniques::FishPositions) with its stale-digit mask, and the
-/// diffed bands (`prev`) the stale slices are rebuilt from. `None` = fish memo off
-/// (full board scan inside [`techniques::fish_step`]).
-struct FishMemo<'a> {
-    no_fire: &'a mut [u8; 9],
-    pos: &'a mut techniques::FishPositions,
-    stale: &'a mut u16,
-    prev: &'a [[u32; 3]; 9],
-}
-
 /// The nine 9-bit row slices of one digit's row-major bands (band `b` holds rows
 /// `3b..3b+3` at bit offsets 0/9/18) — the [`FishPositions::rebuild_digit`]
 /// (techniques::FishPositions::rebuild_digit) input, extracted here so the band
@@ -337,14 +297,14 @@ fn band_rows(bands: &[u32; 3]) -> [u16; 9] {
 /// transpose is paid once, not three times per kind); the rarer fish/wings — guarded
 /// out entirely for the subset-only HiddenQuad toolbox — fall back to the generic
 /// [`super::techniques`] bodies on the cell-major `cm` (every unit reachable via `get`,
-/// columns included). `no_fire`/`fish` are the caller's cross-stall memos (see
-/// [`LadderMemo`]): the per-unit subset memo and the per-digit fish memo; `fish`
-/// is `None` when the fish memo is off (full fish rescan).
+/// columns included). `memo` is the lane's cross-stall [`LadderMemo`], already diffed
+/// by [`ladder_step`]: the per-unit subset verdicts gate the subset scans, the
+/// per-digit fish verdicts gate the fish scans, and the stale cached fish positions
+/// are rebuilt here, lazily, from the diffed `prev` bands.
 fn cellmarks_step_harder(
     cm: &mut CellMarks,
     allowed: KindMask,
-    no_fire: &mut [u8; 27],
-    fish: Option<FishMemo<'_>>,
+    memo: &mut LadderMemo,
 ) -> Option<usize> {
     const ANY_SUBSET: KindMask = (1 << NAKED_PAIR)
         | (1 << HIDDEN_PAIR)
@@ -354,11 +314,12 @@ fn cellmarks_step_harder(
         | (1 << HIDDEN_QUAD);
     // The cache only feeds the subset ladder; a subset-free toolbox (e.g. drill, whose
     // baseline is singles-only) skips the build entirely and falls straight through.
-    // `no_fire` is the caller's cross-stall memo (all-zero = scan everything); the
-    // ladder-order bit per kind below indexes it.
+    // `no_fire` is the cross-stall memo (all-zero = scan everything); the ladder-order
+    // bit per kind below indexes it.
     if allowed & ANY_SUBSET != 0 {
         lstat_inc(0);
         let cache = SubsetCache::build(cm);
+        let no_fire = &mut memo.no_fire;
         macro_rules! try_kind {
             ($bit:expr, $call:expr) => {
                 if allowed & (1 << $bit) != 0 && $call {
@@ -380,19 +341,18 @@ fn cellmarks_step_harder(
     // fishless toolbox (the `ANY_FISH` gate) never pays it at all. A stale digit always
     // has a cleared `no_fire` byte (same diff clears both), so no rebuild is wasted on
     // a digit the scans would skip.
-    let fish_arg = match fish {
-        Some(fm) if allowed & techniques::ANY_FISH != 0 => {
-            let mut w = *fm.stale;
-            while w != 0 {
-                let di = w.trailing_zeros() as usize;
-                w &= w - 1;
-                lstat_inc(5);
-                fm.pos.rebuild_digit(di, band_rows(&fm.prev[di]));
-            }
-            *fm.stale = 0;
-            Some((fm.no_fire, &*fm.pos))
+    let fish_arg = if allowed & techniques::ANY_FISH != 0 {
+        let mut w = memo.fish_stale;
+        while w != 0 {
+            let di = w.trailing_zeros() as usize;
+            w &= w - 1;
+            lstat_inc(5);
+            memo.fish_pos.rebuild_digit(di, band_rows(&memo.prev[di]));
         }
-        _ => None,
+        memo.fish_stale = 0;
+        Some((&mut memo.fish_no_fire, &memo.fish_pos))
+    } else {
+        None
     };
     if let Some(k) = techniques::fish_step(cm, allowed, fish_arg) {
         return Some(k);
@@ -580,20 +540,16 @@ fn cached_hidden_subset(
 /// toolbox). Snapshot/restore is the prober's per-branch clone path; the harder search
 /// is the rare ~2% tail, so paying it per-lane scalar is cheap.
 ///
-/// `memo` is the lane's cross-stall [`LadderMemo`] (`None` = memo off, full rescan —
-/// the A/B floor): consecutive stalls of one baseline solve change only a few cells, so
-/// the harder ladder skips every (kind, unit) subset and (kind, digit) fish verified
-/// no-fire on a unit/digit whose gated bands are unchanged since that scan — exact,
-/// first-fire preserved. `fish_memo` gates the per-digit fish skip on top of the subset
-/// memo (so the A/B can hold the subset memo fixed and toggle just the fish part); it is
-/// only consulted when `memo` is `Some`.
+/// `memo` is the lane's cross-stall [`LadderMemo`]: consecutive stalls of one baseline
+/// solve change only a few cells, so the harder ladder skips every (kind, unit) subset
+/// and (kind, digit) fish verified no-fire on a unit/digit whose gated bands are
+/// unchanged since that scan — exact, first-fire preserved.
 pub(crate) fn ladder_step(
     r: &mut [[V; 3]; 9],
     unsolved: &mut [V; 3],
     l: usize,
     allowed: KindMask,
-    memo: Option<&mut LadderMemo>,
-    fish_memo: bool,
+    memo: &mut LadderMemo,
 ) -> Option<usize> {
     // The off-warp LC pass is in scope iff the toolbox allows it (pointing/claiming run
     // together); derived from `allowed` rather than carried as a redundant flag.
@@ -624,60 +580,43 @@ pub(crate) fn ladder_step(
     // eliminations, the closure's work, and LC prunes uniformly. `prev` then becomes the
     // current state — the one the scans below run on (and the source the stale fish
     // slices are lazily rebuilt from, see `cellmarks_step_harder`).
-    let mut no_scratch = [0u8; 27];
-    let (no_fire, fish): (&mut [u8; 27], Option<FishMemo<'_>>) = match memo {
-        Some(memo) => {
-            if memo.valid {
-                let mut changed = [0u32; 3];
-                for d in 0..9 {
-                    let mut dd = 0u32; // digit d's effective-band change, OR'd over bands
-                    for b in 0..3 {
-                        let eff = sr[d][b] & su[b];
-                        let x = eff ^ memo.prev[d][b];
-                        changed[b] |= x;
-                        dd |= x;
-                        memo.prev[d][b] = eff;
-                    }
-                    if fish_memo && dd != 0 {
-                        memo.fish_no_fire[d] = 0; // digit d moved -> all its fish verdicts stale
-                        memo.fish_stale |= 1 << d; // and its cached positions need a rebuild
-                    }
-                }
-                for (b, mut w) in changed.into_iter().enumerate() {
-                    while w != 0 {
-                        let cell = rm_cell(b, w.trailing_zeros());
-                        w &= w - 1;
-                        memo.no_fire[cell / 9] = 0;
-                        memo.no_fire[9 + cell % 9] = 0;
-                        memo.no_fire[18 + 3 * (cell / 27) + (cell % 9) / 3] = 0;
-                    }
-                }
-            } else {
-                for d in 0..9 {
-                    for b in 0..3 {
-                        memo.prev[d][b] = sr[d][b] & su[b];
-                    }
-                }
-                memo.no_fire = [0; 27];
-                memo.fish_no_fire = [0; 9];
-                memo.fish_stale = 0x1FF;
-                memo.valid = true;
+    if memo.valid {
+        let mut changed = [0u32; 3];
+        for d in 0..9 {
+            let mut dd = 0u32; // digit d's effective-band change, OR'd over bands
+            for b in 0..3 {
+                let eff = sr[d][b] & su[b];
+                let x = eff ^ memo.prev[d][b];
+                changed[b] |= x;
+                dd |= x;
+                memo.prev[d][b] = eff;
             }
-            let fish = if fish_memo {
-                Some(FishMemo {
-                    no_fire: &mut memo.fish_no_fire,
-                    pos: &mut memo.fish_pos,
-                    stale: &mut memo.fish_stale,
-                    prev: &memo.prev,
-                })
-            } else {
-                None
-            };
-            (&mut memo.no_fire, fish)
+            if dd != 0 {
+                memo.fish_no_fire[d] = 0; // digit d moved -> all its fish verdicts stale
+                memo.fish_stale |= 1 << d; // and its cached positions need a rebuild
+            }
         }
-        None => (&mut no_scratch, None),
-    };
-    let k = cellmarks_step_harder(&mut cm, allowed, no_fire, fish)?;
+        for (b, mut w) in changed.into_iter().enumerate() {
+            while w != 0 {
+                let cell = rm_cell(b, w.trailing_zeros());
+                w &= w - 1;
+                memo.no_fire[cell / 9] = 0;
+                memo.no_fire[9 + cell % 9] = 0;
+                memo.no_fire[18 + 3 * (cell / 27) + (cell % 9) / 3] = 0;
+            }
+        }
+    } else {
+        for d in 0..9 {
+            for b in 0..3 {
+                memo.prev[d][b] = sr[d][b] & su[b];
+            }
+        }
+        memo.no_fire = [0; 27];
+        memo.fish_no_fire = [0; 9];
+        memo.fish_stale = 0x1FF;
+        memo.valid = true;
+    }
+    let k = cellmarks_step_harder(&mut cm, allowed, memo)?;
     // A fired subset removes only a handful of candidates, so write them straight into the
     // warp lane (one bit clear each) rather than rebuilding + scattering the whole board.
     // `r` is untouched since the snapshot (the LC fixpoint runs on the local copy `sr`), so

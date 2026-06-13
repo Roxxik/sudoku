@@ -45,7 +45,7 @@ use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{CELLS, Puzzle, SolverState};
 use crate::rng::Rng;
 use crate::solve::simt::{
-    GateResult, LadderMemo, MemoMode, SolveQuery, ladder_step, load_query, prober_service,
+    GateResult, LadderMemo, SolveQuery, ladder_step, load_query, prober_service,
     uwstat_add, warp_pass_full,
 };
 use crate::spec::Spec;
@@ -187,13 +187,10 @@ pub struct GateEngine {
     memo: LadderMemo,
     // --- spec-derived config (per job; a few bytes) ---
     allowed: KindMask,
-    /// How much of the cross-stall ladder memo to apply (production: [`MemoMode::Full`];
-    /// the lesser modes only for the A/B).
-    memo_mode: MemoMode,
 }
 
 impl GateEngine {
-    pub fn new(spec: &Spec, memo_mode: MemoMode) -> Self {
+    pub fn new(spec: &Spec) -> Self {
         GateEngine {
             baseline: false,
             stack: Vec::with_capacity(64),
@@ -201,7 +198,6 @@ impl GateEngine {
             query: SolveQuery::EMPTY,
             memo: LadderMemo::INVALID,
             allowed: spec.baseline_mask(),
-            memo_mode,
         }
     }
 
@@ -250,9 +246,7 @@ impl Engine for GateEngine {
             } else if dead {
                 Some(self.trace(false))
             } else {
-                let memo = self.memo_mode.memo_on().then_some(&mut self.memo);
-                let fish = self.memo_mode.fish();
-                match ladder_step(&mut b.r, &mut b.unsolved, l, self.allowed, memo, fish) {
+                match ladder_step(&mut b.r, &mut b.unsolved, l, self.allowed, &mut self.memo) {
                     Some(k) => {
                         self.counts[k] = self.counts[k].saturating_add(1);
                         None
@@ -503,10 +497,9 @@ where
 fn gate_ticket<I: Iterator<Item = u64>>(
     shared: &SharedRef<I>,
     spec: &Spec,
-    memo_mode: MemoMode,
 ) -> Ticket<GateEngine, Attempt<I>> {
     Ticket {
-        engine: GateEngine::new(spec, memo_mode),
+        engine: GateEngine::new(spec),
         attempt: attempt(shared.clone(), spec.clone()),
     }
 }
@@ -663,14 +656,7 @@ impl<I: Iterator<Item = u64>> GateStream<I> {
     /// 2-digit) UA pre-filter; its soundness keeps each seed's attempt lane-for-lane
     /// identical to the scalar [`attempt`](super::random::attempt) from the same seed.
     pub fn new(seeds: I, spec: &Spec) -> Self {
-        Self::new_opts(seeds, spec, MemoMode::Full)
-    }
-
-    /// [`new`](Self::new) with the warp's cross-stall harder-ladder memo selectable
-    /// (every [`MemoMode`] is exact/first-fire-preserving, so all produce identical
-    /// puzzles; only the cost differs — the knob the `laddermemoab` A/B drives).
-    pub fn new_opts(seeds: I, spec: &Spec, memo_mode: MemoMode) -> Self {
-        PuzzleStream::assemble(seeds, |shared| gate_ticket(shared, spec, memo_mode))
+        PuzzleStream::assemble(seeds, |shared| gate_ticket(shared, spec))
     }
 }
 
