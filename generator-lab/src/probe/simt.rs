@@ -95,16 +95,11 @@ pub(crate) const BOX_CELLS: [u32; 3] = {
 
 /// Lane-parallel "exactly one bit set" over a per-lane field: `f != 0 && f &
 /// (f-1) == 0`. The lanes whose field holds a lone bit (a hidden single).
+/// Compiles to a vectorized popcount on AVX-512
 #[inline(always)]
 pub(crate) fn one_bit(x: V) -> M {
     x.simd_ne(ZERO) & (x & (x - ONE)).simd_eq(ZERO)
 }
-
-/*
-#[inline(always)]
-pub fn one_bit(x: V) -> M {
-    x.count_ones().simd_eq(ONE)
-}*/
 
 
 /// The peer union of a placed group (the cells to clear digit `d` from) plus the
