@@ -67,16 +67,29 @@ use std::rc::Rc;
 //   [0] probe-phase lane-passes        [1] baseline-phase lane-passes
 //   [2] kernel cycles (warp_pass_full)
 //   [3] probe-engine-service cycles    [4] baseline-engine-service cycles
-//   [5] coroutine (resume) cycles — the host: strip bookkeeping + fill + verify
+//   [5] coroutine (resume) cycles — the host: strip walk + per-seed loop + fill/ua/verify
 //   [6] unique (keep) probe retirements  [7] non-unique (revert) probe retirements
-// Slots [8..11] decompose the coroutine slice [5] (which SIMT does not vectorize) into its
-// named host phases, each timed ONCE per attempt inside the coroutine body (the cheap
-// per-cell UA pre-filter is left in the residual rather than rdtsc-bracketed per cell):
+// Slots [8..10] name the directly-bracketed sub-spans of the coroutine slice [5] (which
+// SIMT does not vectorize), each timed ONCE per attempt inside the coroutine body (the
+// cheap per-cell UA pre-filter is left in the residual rather than rdtsc-bracketed per cell):
 //   [8] fill cycles (random_solution)  [9] ua-build cycles (StripState::new_ua library)
 //   [10] verify cycles (final irreplaceability check)
-// so the strip-walk is the residual `[5] - [8] - [9] - [10]`.
+// so the strip residual is `[5] - [8] - [9] - [10]` — the strip walk plus the coroutine's
+// own per-seed bookkeeping (seed pull, rng, shuffle, finalize) and resume machinery; a
+// derived remainder, not a direct bracket, but genuine host work (not measurement slop).
+// Slot [11] is the per-tick warp DRIVER loop in `tick`: the host plumbing that wraps the
+// kernel (active-mask build, bitmask extraction, service-set; plus the count-build's own
+// per-tick lane-pass tally). Bracketing it keeps it out of the whole-run `unaccounted`.
+//   [11] tick-driver (warp host-loop) cycles
+// Slot [12] names the single dominant piece of the coroutine `unaccounted`
+// (`[5]-[8]-[9]-[10]`): the per-cell strip() core (candidate elimination/propagation),
+// bracketed per call (count-only, ~0.5us of its own rdtsc). The rest of that remainder --
+// seed-setup, gate I/O (export_r / revert / baseline), finalize, the cheap per-cell scans
+// (digit_at / ua-caught / keep_trivial / reforced) and the coroutine resume machinery -- was
+// each measured small and is left lumped: the remainder `[5]-[8]-[9]-[10]-[12]`.
+//   [12] strip() core cycles
 // `ph_add(i, v)` tallies (no-op without the feature). Read by `findpar-bench`.
-counter_block!(PHSTAT: 11, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
+counter_block!(PHSTAT: 13, inc = ph_inc, add = ph_add, snapshot = phstat_snapshot, reset = phstat_reset);
 
 /// rdtsc timestamp for the kernel/service split (0 off-x86 or without the feature, so the
 /// cycle counters stay zero there while the lane-pass counters — exact — still work).
@@ -354,7 +367,9 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                 if strip.ua_caught_before_strip(cell, orig) {
                     continue;
                 }
+                let t_s = rdtsc();
                 let alts = strip.strip(cell, orig);
+                ph_add(12, rdtsc().wrapping_sub(t_s)); // strip() core (candidate elimination/propagation)
                 if alts == 0 {
                     strip.keep_trivial(cell);
                     continue;
@@ -600,6 +615,10 @@ where
     /// snapshot, so an occupant whose phase flips mid-tick is not re-serviced until
     /// the next pass.
     fn tick(&mut self) {
+        // Open the per-tick warp-driver bracket (slot [11]) at the very top so the
+        // active-mask build is inside it. rdtsc is 0 and ph_add a no-op off the count+x86
+        // path, so the whole bracket vanishes in production.
+        let h0 = rdtsc();
         let active_mask = M::from_array(self.active);
         if !active_mask.any() {
             return;
@@ -619,14 +638,17 @@ where
             }
         }
         let k0 = rdtsc();
+        ph_add(11, k0.wrapping_sub(h0)); // tick-driver: mask build + lane-pass tally (pre-kernel)
         let (changed, dead, solved) =
             warp_pass_full(&mut self.boards.r, &mut self.boards.unsolved, active_mask);
-        ph_add(2, rdtsc().wrapping_sub(k0)); // kernel cycles (the engine/coroutine slices self-time)
+        let k1 = rdtsc();
+        ph_add(2, k1.wrapping_sub(k0)); // kernel cycles (the engine/coroutine slices self-time)
 
         let solved_b = solved.to_bitmask();
         let dead_b = dead.to_bitmask();
         let changed_b = changed.to_bitmask();
         let mut service = active_b & (solved_b | dead_b | !changed_b);
+        ph_add(11, rdtsc().wrapping_sub(k1)); // tick-driver: bitmask extraction + service-set (post-kernel)
         while service != 0 {
             let l = service.trailing_zeros() as usize;
             service &= service - 1;
