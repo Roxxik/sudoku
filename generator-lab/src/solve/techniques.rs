@@ -180,55 +180,102 @@ fn on_line(c: CellIdx, line: usize) -> bool {
     if line < 9 { c / 9 == line } else { c % 9 == line - 9 }
 }
 
+/// One unit's **naked subset** of `size`, off its precomputed candidate marks: returns
+/// whether it eliminated anything (the first firing). Shared verbatim by both
+/// [`naked_subset`] entry paths (scalar fresh-marks and SIMT cached-marks), so the
+/// combination/elimination body lives once. `#[inline]` so each call site specialises
+/// on its `marks` provenance (a stack-local gather vs the shared cache slice), keeping
+/// the read single-source exactly as the two hand-written bodies were.
+///
+/// `get` is the digit-major board's costly 9-board gather, so the combination search
+/// reads `marks`, never re-`get`s. No `Vec` — a unit is a fixed nine cells.
+#[inline]
+fn naked_unit<V: LogicBoard>(v: &mut V, unit: &[CellIdx; 9], marks: &[Mark; 9], size: usize) -> bool {
+    // Candidate slots: empty cells with 2..=size candidates (a filled cell reads as the
+    // empty mark, so `len` 0 excludes it). `cand` holds slot indices 0..9.
+    let mut cand = [0usize; 9];
+    let mut n = 0;
+    for i in 0..9 {
+        let len = marks[i].len() as usize;
+        if (2..=size).contains(&len) {
+            cand[n] = i;
+            n += 1;
+        }
+    }
+    if n < size {
+        return false;
+    }
+    let mut applied = false;
+    for_each_combination(&cand[..n], size, |combo| {
+        let union = combo.iter().fold(Mark::EMPTY, |acc, &k| acc | marks[k]);
+        if union.len() as usize != size {
+            return true; // not a subset — keep searching
+        }
+        // Eliminate the subset's digits from the unit's OTHER cells.
+        let mut did = false;
+        for i in 0..9 {
+            if combo.contains(&i) {
+                continue;
+            }
+            for d in (marks[i] & union).iter() {
+                v.eliminate(unit[i], d);
+                did = true;
+            }
+        }
+        applied = did;
+        !did // stop once we eliminated something
+    });
+    applied
+}
+
 /// **Naked subset** of `size`: `size` cells in a unit whose candidate union is
 /// exactly `size` digits — those digits leave the other cells of the unit.
 ///
-/// Each cell's candidates are read once per unit into a stack `[Mark; 9]` (bb's
-/// `cand_masks`): `get` is the digit-major board's costly 9-board gather, so the
-/// combination search must read the cache, never re-`get`. No `Vec` — units are a
-/// fixed nine cells and a subset eliminates in place at the first firing.
-pub(super) fn naked_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
-    for unit in &UNITS {
-        let marks: [Mark; 9] = core::array::from_fn(|i| v.get(unit[i]));
-        // Candidate slots: empty cells with 2..=size candidates (a filled cell reads
-        // as the empty mark, so `len` 0 excludes it). `cand` holds slot indices 0..9.
-        let mut cand = [0usize; 9];
-        let mut n = 0;
-        for i in 0..9 {
-            let len = marks[i].len() as usize;
-            if (2..=size).contains(&len) {
-                cand[n] = i;
-                n += 1;
-            }
-        }
-        if n < size {
-            continue;
-        }
-        let mut applied = false;
-        for_each_combination(&cand[..n], size, |combo| {
-            let union = combo.iter().fold(Mark::EMPTY, |acc, &k| acc | marks[k]);
-            if union.len() as usize != size {
-                return true; // not a subset — keep searching
-            }
-            // Eliminate the subset's digits from the unit's OTHER cells.
-            let mut did = false;
-            for i in 0..9 {
-                if combo.contains(&i) {
+/// `cache` / `memo` are the SIMT ladder's cross-stall optimisations, dispatched ONCE
+/// here (not per unit, so the scalar arm carries none of their overhead):
+/// - `cache` supplies the per-unit marks built ONCE per stall and shared by all three
+///   naked sizes (see [`crate::solve::simt`]'s `SubsetCache`), so the gather is paid
+///   once, not per size; the scalar solvers pass `None` and gather each unit fresh.
+/// - `memo` is `(no_fire, ladder_bit)`: a unit verified no-fire on a board unchanged
+///   since cannot newly fire this kind, so it is skipped; a clean full scan sets its
+///   bit. First-fire order is preserved either way.
+///
+/// The fast path needs BOTH `cache` and `memo` (the SIMT ladder always supplies both);
+/// any other combination takes the scalar fresh-gather arm.
+pub(super) fn naked_subset<V: LogicBoard>(
+    v: &mut V,
+    size: usize,
+    cache: Option<&[[Mark; 9]; 27]>,
+    memo: Option<(&mut [u8; 27], u8)>,
+) -> bool {
+    match (cache, memo) {
+        // SIMT: cached per-unit marks + cross-stall no-fire memo.
+        (Some(c), Some((no_fire, ladder_bit))) => {
+            let bit = 1u8 << ladder_bit;
+            for (u, unit) in UNITS.iter().enumerate() {
+                if no_fire[u] & bit != 0 {
+                    subset_tally(false);
                     continue;
                 }
-                for d in (marks[i] & union).iter() {
-                    v.eliminate(unit[i], d);
-                    did = true;
+                subset_tally(true);
+                if naked_unit(v, unit, &c[u], size) {
+                    return true;
+                }
+                no_fire[u] |= bit; // clean full scan: skip this unit until it changes
+            }
+            false
+        }
+        // Scalar: gather each unit's marks fresh, scan every unit.
+        _ => {
+            for unit in &UNITS {
+                let marks: [Mark; 9] = core::array::from_fn(|i| v.get(unit[i]));
+                if naked_unit(v, unit, &marks, size) {
+                    return true;
                 }
             }
-            applied = did;
-            !did // stop once we eliminated something
-        });
-        if applied {
-            return true;
+            false
         }
     }
-    false
 }
 
 /// The basic-fish kinds, for the "does this toolbox have any fish at all" gate shared
@@ -364,6 +411,15 @@ fn tech_checked(_bit: usize) {
 fn fish_tally(_run: bool) {
     #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
     crate::solve::simt::lstat_inc(if _run { 3 } else { 4 });
+}
+
+/// Tally a subset per-unit scan into the SIMT harder-ladder memo counter (`run = false`
+/// means the per-unit memo skipped it) — the subset twin of [`fish_tally`] (LSTAT [1]
+/// run / [2] skipped), reached only on the memoized path and `cfg`-gated out on wasm.
+#[inline(always)]
+fn subset_tally(_run: bool) {
+    #[cfg(all(feature = "count", not(target_arch = "wasm32")))]
+    crate::solve::simt::lstat_inc(if _run { 1 } else { 2 });
 }
 
 /// **Basic fish** of `size` (X-Wing 2, Swordfish 3, Jellyfish 4): for one digit,
@@ -551,66 +607,120 @@ fn fish_eliminate<V: LogicBoard>(
     did
 }
 
-/// **Hidden subset** of `size`: `size` digits confined to the same `size` cells of
-/// a unit — the other digits leave those cells. Caches the unit's per-cell marks
-/// once (see [`naked_subset`]) and derives the per-digit position masks off them.
-pub(super) fn hidden_subset<V: LogicBoard>(v: &mut V, size: usize) -> bool {
-    for unit in &UNITS {
-        let marks: [Mark; 9] = core::array::from_fn(|i| v.get(unit[i]));
-        // Position mask (over the 9 unit-cell slots) per digit, for digits with
-        // 2..=size candidate cells (a placed digit has none — see module doc).
-        let mut positions = [0u16; 9];
-        let mut digits = [0usize; 9];
-        let mut n = 0;
-        for di in 0..9 {
-            let d = Digit::from_index(di);
-            let mut pos = 0u16;
-            for i in 0..9 {
-                if marks[i].contains(d) {
-                    pos |= 1 << i;
-                }
-            }
-            let pc = pos.count_ones() as usize;
-            if (2..=size).contains(&pc) {
-                positions[di] = pos;
-                digits[n] = di;
-                n += 1;
-            }
-        }
-        if n < size {
-            continue;
-        }
-        let mut applied = false;
-        for_each_combination(&digits[..n], size, |combo| {
-            let union: u16 = combo.iter().map(|&di| positions[di]).fold(0, |a, x| a | x);
-            if union.count_ones() as usize != size {
-                return true;
-            }
-            // The combo digits stay; every other candidate leaves the union's cells.
-            let keep = combo
-                .iter()
-                .fold(Mark::EMPTY, |mut acc, &di| {
-                    acc.insert(Digit::from_index(di));
-                    acc
-                });
-            let mut did = false;
-            for i in 0..9 {
-                if union & (1 << i) == 0 {
-                    continue;
-                }
-                for d in marks[i].without(keep).iter() {
-                    v.eliminate(unit[i], d);
-                    did = true;
-                }
-            }
-            applied = did;
-            !did
-        });
-        if applied {
-            return true;
+/// One unit's **hidden subset** of `size`, off its precomputed marks + per-digit
+/// position masks: returns whether it eliminated anything. The twin of [`naked_unit`] —
+/// shared verbatim by both [`hidden_subset`] entry paths, `#[inline]` so each call site
+/// specialises on its data provenance.
+#[inline]
+fn hidden_unit<V: LogicBoard>(
+    v: &mut V,
+    unit: &[CellIdx; 9],
+    marks: &[Mark; 9],
+    positions: &[u16; 9],
+    size: usize,
+) -> bool {
+    // Digits with 2..=size candidate cells in this unit (a placed digit has none — see
+    // module doc).
+    let mut digits = [0usize; 9];
+    let mut n = 0;
+    for di in 0..9 {
+        let pc = positions[di].count_ones() as usize;
+        if (2..=size).contains(&pc) {
+            digits[n] = di;
+            n += 1;
         }
     }
-    false
+    if n < size {
+        return false;
+    }
+    let mut applied = false;
+    for_each_combination(&digits[..n], size, |combo| {
+        let union: u16 = combo.iter().map(|&di| positions[di]).fold(0, |a, x| a | x);
+        if union.count_ones() as usize != size {
+            return true;
+        }
+        // The combo digits stay; every other candidate leaves the union's cells.
+        let keep = combo
+            .iter()
+            .fold(Mark::EMPTY, |mut acc, &di| {
+                acc.insert(Digit::from_index(di));
+                acc
+            });
+        let mut did = false;
+        for i in 0..9 {
+            if union & (1 << i) == 0 {
+                continue;
+            }
+            for d in marks[i].without(keep).iter() {
+                v.eliminate(unit[i], d);
+                did = true;
+            }
+        }
+        applied = did;
+        !did
+    });
+    applied
+}
+
+/// **Hidden subset** of `size`: `size` digits confined to the same `size` cells of
+/// a unit — the other digits leave those cells. Reads the unit's per-cell marks and
+/// derives the per-digit position masks off them (see [`naked_subset`]).
+///
+/// `pos` / `marks_cache` / `memo` are the SIMT ladder's cross-stall optimisations,
+/// dispatched ONCE here exactly as in [`naked_subset`] (so the scalar arm carries none
+/// of their overhead): `pos` supplies the per-unit digit-position masks and `marks_cache`
+/// the per-unit cell marks, both built ONCE per stall and shared across the three hidden
+/// sizes (see [`crate::solve::simt`]'s `SubsetCache`); `memo` no-fire-gates per unit. The
+/// scalar solvers pass all `None` and derive both views fresh per unit; the fast path
+/// needs all three.
+pub(super) fn hidden_subset<V: LogicBoard>(
+    v: &mut V,
+    size: usize,
+    pos: Option<&[[u16; 9]; 27]>,
+    marks_cache: Option<&[[Mark; 9]; 27]>,
+    memo: Option<(&mut [u8; 27], u8)>,
+) -> bool {
+    match (pos, marks_cache, memo) {
+        // SIMT: cached per-unit positions + marks + cross-stall no-fire memo.
+        (Some(p), Some(m), Some((no_fire, ladder_bit))) => {
+            let bit = 1u8 << ladder_bit;
+            for (u, unit) in UNITS.iter().enumerate() {
+                if no_fire[u] & bit != 0 {
+                    subset_tally(false);
+                    continue;
+                }
+                subset_tally(true);
+                if hidden_unit(v, unit, &m[u], &p[u], size) {
+                    return true;
+                }
+                no_fire[u] |= bit;
+            }
+            false
+        }
+        // Scalar: derive each unit's marks and the per-digit position transpose fresh.
+        // `positions[di]` bit `i` is set iff digit `di` is a candidate of the unit's
+        // `i`-th cell.
+        _ => {
+            for unit in &UNITS {
+                let marks: [Mark; 9] = core::array::from_fn(|i| v.get(unit[i]));
+                let mut positions = [0u16; 9];
+                for di in 0..9 {
+                    let d = Digit::from_index(di);
+                    let mut p = 0u16;
+                    for i in 0..9 {
+                        if marks[i].contains(d) {
+                            p |= 1 << i;
+                        }
+                    }
+                    positions[di] = p;
+                }
+                if hidden_unit(v, unit, &marks, &positions, size) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
 }
 
 // --- Bivalue-chain branch: the wing family ------------------------------------

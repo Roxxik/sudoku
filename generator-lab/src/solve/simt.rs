@@ -43,7 +43,6 @@
 //! contract leaves them undefined, and the fast path's requirement check never reads
 //! one — a Forced cheap kind routes off the fused/SIMT path entirely).
 
-use super::combinations::for_each_combination;
 use super::techniques;
 use crate::counters::counter_block;
 use crate::probe::simt::{
@@ -529,11 +528,12 @@ fn band_rows(bands: &[u32; 3]) -> [u16; 9] {
     core::array::from_fn(|r| ((bands[r / 3] >> (9 * (r % 3))) & 0x1FF) as u16)
 }
 
-/// The six subsets share a single [`SubsetCache`] built up front (so the per-unit
-/// transpose is paid once, not three times per kind); the rarer fish/wings — guarded
-/// out entirely for the subset-only HiddenQuad toolbox — fall back to the generic
-/// [`super::techniques`] bodies on the cell-major `cm` (every unit reachable via `get`,
-/// columns included). `memo` is the lane's cross-stall [`LadderMemo`], already diffed
+/// Every technique runs through the generic [`super::techniques`] bodies on the
+/// cell-major `cm` (every unit reachable via `get`, columns included). The six subsets
+/// share a single [`SubsetCache`] built up front and passed in (so the per-unit marks
+/// gather and the digit-position transpose are paid once, not three times per kind); the
+/// rarer fish/wings — guarded out entirely for the subset-only HiddenQuad toolbox — take
+/// the cache-free path. `memo` is the lane's cross-stall [`LadderMemo`], already diffed
 /// by [`ladder_step`]: the per-unit subset verdicts gate the subset scans, the
 /// per-digit fish verdicts gate the fish scans, and the stale cached fish positions
 /// are rebuilt here, lazily, from the diffed `prev` bands.
@@ -570,12 +570,14 @@ fn cellmarks_step_harder(
                 }
             };
         }
-        try_kind!(NAKED_PAIR, cached_naked_subset(cm, &cache, 2, 0, no_fire));
-        try_kind!(HIDDEN_PAIR, cached_hidden_subset(cm, &cache, 2, 1, no_fire));
-        try_kind!(NAKED_TRIPLE, cached_naked_subset(cm, &cache, 3, 2, no_fire));
-        try_kind!(HIDDEN_TRIPLE, cached_hidden_subset(cm, &cache, 3, 3, no_fire));
-        try_kind!(NAKED_QUAD, cached_naked_subset(cm, &cache, 4, 4, no_fire));
-        try_kind!(HIDDEN_QUAD, cached_hidden_subset(cm, &cache, 4, 5, no_fire));
+        let m = Some(&cache.marks);
+        let p = Some(&cache.positions);
+        try_kind!(NAKED_PAIR, techniques::naked_subset(cm, 2, m, Some((&mut *no_fire, 0))));
+        try_kind!(HIDDEN_PAIR, techniques::hidden_subset(cm, 2, p, m, Some((&mut *no_fire, 1))));
+        try_kind!(NAKED_TRIPLE, techniques::naked_subset(cm, 3, m, Some((&mut *no_fire, 2))));
+        try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(cm, 3, p, m, Some((&mut *no_fire, 3))));
+        try_kind!(NAKED_QUAD, techniques::naked_subset(cm, 4, m, Some((&mut *no_fire, 4))));
+        try_kind!(HIDDEN_QUAD, techniques::hidden_subset(cm, 4, p, m, Some((&mut *no_fire, 5))));
     }
     // Fish memo: refresh the cached positions for exactly the digits the entry diff
     // flagged stale, straight off the diffed bands (pure bit ops — no board re-read).
@@ -635,13 +637,14 @@ pub(crate) fn tchk_gated(bit: usize) {
     }
 }
 
-/// Per-unit candidate cache for the subset ladder, built ONCE per stall and shared by
+/// Per-unit candidate cache for the subset ladder, built ONCE per stall and handed to
 /// all six subset techniques. The generic [`techniques::naked_subset`] /
-/// [`techniques::hidden_subset`] each re-derive their per-unit inputs on every call, so
-/// the three sizes rebuild the same per-unit marks (naked) and the same digit-position
-/// transpose (hidden) three times over. Here the difficulty order is unchanged — each
-/// size still scans all 27 units, first-fire-wins — but the inputs are read from this
-/// cache, so the transpose is paid once. Valid because the board is untouched until a
+/// [`techniques::hidden_subset`] would otherwise re-derive their per-unit inputs on
+/// every call, so the three sizes would rebuild the same per-unit marks (naked) and the
+/// same digit-position transpose (hidden) three times over. Passing this cache in
+/// (`Some(..)` on their `cache`/`pos`/`marks` params) leaves the difficulty order
+/// unchanged — each size still scans all 27 units, first-fire-wins — but the marks
+/// gather and the transpose are paid once. Valid because the board is untouched until a
 /// technique fires (and then [`cellmarks_step_harder`] returns), so a cache built before
 /// the first scan stays exact for every later size.
 struct SubsetCache {
@@ -675,134 +678,6 @@ impl SubsetCache {
         }
         SubsetCache { marks, positions }
     }
-}
-
-/// Cache-fed [`techniques::naked_subset`] (see [`SubsetCache`]): identical first-fire
-/// logic and elimination order, reading the precomputed per-unit marks instead of
-/// re-gathering them per size. Eliminations are logged into `cm` (only ever on the
-/// firing step, after which the ladder returns). `ladder_bit`/`no_fire` is the
-/// cross-stall memo (see [`LadderMemo`]): units verified no-fire on an unchanged
-/// board are skipped; a clean full scan of a unit sets its bit.
-fn cached_naked_subset(
-    cm: &mut CellMarks,
-    cache: &SubsetCache,
-    size: usize,
-    ladder_bit: u8,
-    no_fire: &mut [u8; 27],
-) -> bool {
-    let bit = 1u8 << ladder_bit;
-    for u in 0..27 {
-        if no_fire[u] & bit != 0 {
-            lstat_inc(2);
-            continue;
-        }
-        lstat_inc(1);
-        let marks = &cache.marks[u];
-        // Candidate slots: empty cells with 2..=size candidates (a filled cell reads as
-        // the empty mark, so `len` 0 excludes it). `cand` holds slot indices 0..9.
-        let mut cand = [0usize; 9];
-        let mut n = 0;
-        for i in 0..9 {
-            let len = marks[i].len() as usize;
-            if (2..=size).contains(&len) {
-                cand[n] = i;
-                n += 1;
-            }
-        }
-        if n < size {
-            continue;
-        }
-        let mut applied = false;
-        for_each_combination(&cand[..n], size, |combo| {
-            let union = combo.iter().fold(Mark::EMPTY, |acc, &k| acc | marks[k]);
-            if union.len() as usize != size {
-                return true; // not a subset — keep searching
-            }
-            // Eliminate the subset's digits from the unit's OTHER cells.
-            let mut did = false;
-            for i in 0..9 {
-                if combo.contains(&i) {
-                    continue;
-                }
-                for d in (marks[i] & union).iter() {
-                    cm.eliminate(UNITS[u][i], d);
-                    did = true;
-                }
-            }
-            applied = did;
-            !did // stop once we eliminated something
-        });
-        if applied {
-            return true;
-        }
-        no_fire[u] |= bit;
-    }
-    false
-}
-
-/// Cache-fed [`techniques::hidden_subset`] (see [`SubsetCache`]): identical first-fire
-/// logic and elimination order, reading the precomputed per-unit position masks instead
-/// of rebuilding the digit-position transpose per size. `ladder_bit`/`no_fire` as in
-/// [`cached_naked_subset`].
-fn cached_hidden_subset(
-    cm: &mut CellMarks,
-    cache: &SubsetCache,
-    size: usize,
-    ladder_bit: u8,
-    no_fire: &mut [u8; 27],
-) -> bool {
-    let bit = 1u8 << ladder_bit;
-    for u in 0..27 {
-        if no_fire[u] & bit != 0 {
-            lstat_inc(2);
-            continue;
-        }
-        lstat_inc(1);
-        let marks = &cache.marks[u];
-        let pos_all = &cache.positions[u];
-        // Digits with 2..=size candidate cells in this unit (a placed digit has none).
-        let mut digits = [0usize; 9];
-        let mut n = 0;
-        for di in 0..9 {
-            let pc = pos_all[di].count_ones() as usize;
-            if (2..=size).contains(&pc) {
-                digits[n] = di;
-                n += 1;
-            }
-        }
-        if n < size {
-            continue;
-        }
-        let mut applied = false;
-        for_each_combination(&digits[..n], size, |combo| {
-            let union: u16 = combo.iter().map(|&di| pos_all[di]).fold(0, |a, x| a | x);
-            if union.count_ones() as usize != size {
-                return true;
-            }
-            // The combo digits stay; every other candidate leaves the union's cells.
-            let keep = combo.iter().fold(Mark::EMPTY, |mut acc, &di| {
-                acc.insert(Digit::from_index(di));
-                acc
-            });
-            let mut did = false;
-            for i in 0..9 {
-                if union & (1 << i) == 0 {
-                    continue;
-                }
-                for d in marks[i].without(keep).iter() {
-                    cm.eliminate(UNITS[u][i], d);
-                    did = true;
-                }
-            }
-            applied = did;
-            !did
-        });
-        if applied {
-            return true;
-        }
-        no_fire[u] |= bit;
-    }
-    false
 }
 
 /// Snapshot stalled lane `l` out of the warp into a scalar [`SolverState`], run one

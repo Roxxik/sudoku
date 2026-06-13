@@ -93,12 +93,12 @@ fn step_once<V: LogicBoard>(b: &mut V, allowed: KindMask) -> Option<usize> {
     try_kind!(HIDDEN_SINGLE, techniques::hidden_single(b));
     try_kind!(LC_POINTING, techniques::lc_pointing(b));
     try_kind!(LC_CLAIMING, techniques::lc_claiming(b));
-    try_kind!(NAKED_PAIR, techniques::naked_subset(b, 2));
-    try_kind!(HIDDEN_PAIR, techniques::hidden_subset(b, 2));
-    try_kind!(NAKED_TRIPLE, techniques::naked_subset(b, 3));
-    try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3));
-    try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4));
-    try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4));
+    try_kind!(NAKED_PAIR, techniques::naked_subset(b, 2, None, None));
+    try_kind!(HIDDEN_PAIR, techniques::hidden_subset(b, 2, None, None, None));
+    try_kind!(NAKED_TRIPLE, techniques::naked_subset(b, 3, None, None));
+    try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(b, 3, None, None, None));
+    try_kind!(NAKED_QUAD, techniques::naked_subset(b, 4, None, None));
+    try_kind!(HIDDEN_QUAD, techniques::hidden_subset(b, 4, None, None, None));
     if let Some(k) = techniques::fish_step(b, allowed, None) {
         return Some(k);
     }
@@ -182,7 +182,8 @@ fn step_harder_ordered<V: LogicBoard>(
                     3 => NAKED_TRIPLE,
                     _ => NAKED_QUAD,
                 };
-                (allowed & (1 << bit) != 0 && techniques::naked_subset(b, s as usize)).then_some(bit)
+                (allowed & (1 << bit) != 0 && techniques::naked_subset(b, s as usize, None, None))
+                    .then_some(bit)
             }
             HardStep::HiddenSubset(s) => {
                 let bit = match s {
@@ -190,7 +191,8 @@ fn step_harder_ordered<V: LogicBoard>(
                     3 => HIDDEN_TRIPLE,
                     _ => HIDDEN_QUAD,
                 };
-                (allowed & (1 << bit) != 0 && techniques::hidden_subset(b, s as usize)).then_some(bit)
+                (allowed & (1 << bit) != 0 && techniques::hidden_subset(b, s as usize, None, None, None))
+                    .then_some(bit)
             }
             HardStep::Fish => techniques::fish_step(b, allowed, None),
             HardStep::Wings => techniques::wing_step(b, allowed),
