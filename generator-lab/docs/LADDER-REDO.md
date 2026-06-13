@@ -2,10 +2,13 @@
 
 Status. **Step 1 (FOLD ONLY) is landed and committed** on the worktree `ladder-redo` —
 measured neutral on both paths; see Step 1 below for numbers and the implementation note.
-A first *bundled* attempt (Step 2's shared layout, NOT the fold) was once built, verified
-output-identical, measured to regress slightly, then accidentally discarded with `git
-restore` (recoverable only from the session transcript — see Reconstruction notes). This
-doc captures everything so the work resumes cleanly at Step 2.
+The branch is now **rebased on `master`** (which brought the `harvest` seed->puzzle
+fixtures), and the yield gate has switched from the slow full-range `findpar` diff to the
+fast **both-paths `harvest_reconstructs` test** (scalar + SIMT) — see Verification
+methodology. **Step 2 is next.** A first *bundled* attempt (Step 2's shared layout, NOT the
+fold) was once built, verified output-identical, measured to regress slightly, then
+accidentally discarded with `git restore` (recoverable only from the session transcript —
+see Reconstruction notes). This doc captures everything so the work resumes cleanly at Step 2.
 
 ## Goal
 
@@ -157,14 +160,15 @@ Then A/B two efficient variants (perf decides):
   the per-unit layout is only populated when `ANY_HIDDEN` is in scope. Derivation shared,
   reads contiguous for both, storage slightly larger.
 
-`findpar-bench` (the 4 specs, interleaved) picks 2a vs 2b; `findpar` diff = 0 + tests each.
+`findpar-bench` (the 4 specs, interleaved) picks 2a vs 2b; the both-paths harvest yield gate
+(`cargo test --release`, scalar + SIMT) must stay green for each.
 Expectation: 2b ("shared, done right") does the row/col derivation once and should be
 neutral-or-better than 2a; but the perf comp is the decider, per the user.
 
 ### Step 3 — OPTIONAL, separate, measured: lazy-`cm` reorder
 Order is free, so try digit-major techniques first (LC -> hidden subsets -> fishes ->
 naked subsets -> wings) so the 81x9 `cm` transpose is built only when a cell-major
-technique is reached. A/B; keep only if faster; `findpar` diff = 0.
+technique is reached. A/B; keep only if faster; both-paths harvest yield gate green.
 
 ## Reconstruction notes (the discarded bundle)
 
@@ -187,20 +191,33 @@ follow Step 1/Step 2, not this):
 
 ## Verification methodology (reuse)
 
-- **Yield identity (the gate).** `findpar` over a FIXED seed range (one seed = one attempt;
-  `--count` huge so it never early-stops, `--max` = the seed-range size), output `sort`ed
-  and diffed pre/post. Deterministic run-to-run (confirmed). Specs + budgets used:
-  - `--force hidden-quad` `--max 2000000` (44 puzzles) — subset-heavy / fishless
-  - `--force jellyfish` `--max 1500000` (132) — fish
-  - `--force w-wing --force jellyfish` `--max 1000000` (134) — fish + wing
-  - `--force swordfish --force naked-triple` `--max 1000000` (106) — mixed
-  - `--force xy-wing` `--max 200000` (35266) — subset + wing; the heavy sensitivity
-    workhorse (a tiny ladder error shifts thousands of these)
-  - all with `--toolbox train --seed 1`.
-- **Tests.** `cargo test --release -p generator-lab` (release: real generation): lib (22),
-  `confluence` (2), `equiv_warp_repr` (2 — the SIMT==scalar gold standard, the strongest
-  ladder check), `faithful` (12), `logic_equiv` (6), `prober_equiv` (3). `equiv_warp_repr`
-  only exercises `train(NAKED_PAIR)`, so fish/wing SIMT paths rely on the `findpar` diff.
+- **Yield identity (the gate) — now the harvest fixtures, BOTH paths.** `cargo test
+  --release -p generator-lab --test harvest_reconstructs` replays the
+  `tests/fixtures/harvest/*.txt` seed->puzzle fixtures and asserts the generator still maps
+  each seed to its exact puzzle, through **both** the scalar `attempt`
+  (`harvest_fixtures_reconstruct_scalar`) AND the W=8 SIMT warp `GateStream`
+  (`harvest_fixtures_reconstruct_simt`). This is the fast replacement for the old full-range
+  `findpar` diff: it only drives the known yielders plus each window's small negative control
+  (the `xy-wing` exhaustive window is 2000 seeds), not millions of empty seeds — ~0.3s for
+  both paths. Deterministic. The fixtures cover singles/doubles/triples incl. hidden-pair /
+  hidden-triple (so the SIMT subset path — incl. box-unit positions — is exercised), naked
+  subsets, fishes, and an exhaustive xy-wing window. A window fixture pins BOTH directions
+  (yields <=> recorded); sample fixtures pin the forward direction only. **This is the Step 2
+  gate** — a `subset_pos` transpose bug shifts an elimination, which shifts a yield, which
+  fails this test loudly with the seed. Regenerate/extend via `examples/harvest.rs` +
+  `scripts/rarity` (do NOT re-run by default — the committed fixtures ARE the baseline).
+- **Tests (full).** `cargo test --release -p generator-lab` (release: real generation): lib
+  (22), `confluence` (2), `equiv_warp_repr` (2 — the SIMT==scalar gold standard, but only
+  `train(NAKED_PAIR)`), `faithful` (12), `harvest_reconstructs` (2 — the both-paths yield
+  gate above; covers the hidden/fish/wing SIMT paths `equiv_warp_repr` does not),
+  `logic_equiv` (6), `prober_equiv` (3). Whole suite ~5.5s.
+- **`findpar` diff (heavy fallback, optional).** The original gate, still valid for specs the
+  fixtures don't cover or for a broader sweep. `findpar` over a FIXED seed range (one seed =
+  one attempt; `--count` huge so it never early-stops, `--max` = the seed-range size), output
+  `sort`ed and diffed pre/post. Specs + budgets once used: `hidden-quad --max 2000000` (44,
+  subset-heavy/fishless), `jellyfish --max 1500000` (132, fish), `w-wing + jellyfish --max
+  1000000` (134, fish+wing), `swordfish + naked-triple --max 1000000` (106, mixed), `xy-wing
+  --max 200000` (35266, the heavy sensitivity workhorse); all `--toolbox train --seed 1`.
 - **Perf.** `findpar-bench` (fixed budget, yield-independent, folds an order-independent
   puzzle-set fingerprint). Build the OLD binary from the main repo at
   `/home/roxxik/repos/sudoku` (on `master`); run it interleaved with the worktree NEW
