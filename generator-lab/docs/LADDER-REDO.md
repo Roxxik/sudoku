@@ -5,7 +5,8 @@ measured neutral on both paths; see Step 1 below for numbers and the implementat
 The branch is now **rebased on `master`** (which brought the `harvest` seed->puzzle
 fixtures), and the yield gate has switched from the slow full-range `findpar` diff to the
 fast **both-paths `harvest_reconstructs` test** (scalar + SIMT) — see Verification
-methodology. **Step 2 is next.** A first *bundled* attempt (Step 2's shared layout, NOT the
+methodology. **Step 2a (SEPARATE) is now landed** — neutral-to-slightly-faster, fp-matched
+(see the Step 2 Outcome); **2b SHARED and the 2a-vs-2b A/B remain.** A first *bundled* attempt (Step 2's shared layout, NOT the
 fold) was once built, verified output-identical, measured to regress slightly, then
 accidentally discarded with `git restore` (recoverable only from the session transcript —
 see Reconstruction notes). This doc captures everything so the work resumes cleanly at Step 2.
@@ -152,18 +153,44 @@ mistake #1) and the box masks are built only when hidden subsets are actually in
 (mistake #2). Keep the naked per-unit marks cache (mistake #3).
 
 Then A/B two efficient variants (perf decides):
-- **2a SEPARATE**: two memo caches — `subset_pos: [[u16;9];27]` (per-unit, hidden) and the
-  existing per-orientation fish cache — each rebuilt only when its consumer is in scope,
-  sharing one `pos_stale` digit mask. Row/col computed twice (cheap, incremental).
-- **2b SHARED**: one struct holding BOTH layouts (per-orientation for fish + per-unit for
-  hidden); one `rebuild_digit` computes rows/cols(/boxes) once and scatters into both;
-  the per-unit layout is only populated when `ANY_HIDDEN` is in scope. Derivation shared,
-  reads contiguous for both, storage slightly larger.
+- **2a SEPARATE  ✅ DONE** (see Outcome below): two memo caches — `subset_pos: [[u16;9];27]`
+  (per-unit, hidden) and the existing per-orientation fish cache — each rebuilt only when its
+  consumer is in scope. Row/col computed twice (cheap, incremental). **Deviation from the
+  sketch: TWO stale masks, not one shared `pos_stale`.** A single shared mask cannot be
+  cleared correctly for two consumers at different ladder points — a subset fire returns
+  before the fish rebuild, and a fishless toolbox (e.g. `hidden-quad`) never reaches the fish
+  block, so a shared mask would either never clear (defeating the incremental rebuild) or
+  clear before fish read it. `subset_stale` + `fish_stale`, each set by the entry diff and
+  cleared right after its own rebuild loop, is the faithful SEPARATE design and preserves
+  Step 1's lazy properties (subset fire skips fish maintenance; fishless skips fish entirely).
+- **2b SHARED** (NOT YET BUILT): one struct holding BOTH layouts (per-orientation for fish +
+  per-unit for hidden); one `rebuild_digit` computes rows/cols(/boxes) once and scatters into
+  both; the per-unit layout is only populated when `ANY_HIDDEN` is in scope. Derivation
+  shared, reads contiguous for both, storage slightly larger.
 
 `findpar-bench` (the 4 specs, interleaved) picks 2a vs 2b; the both-paths harvest yield gate
 (`cargo test --release`, scalar + SIMT) must stay green for each.
 Expectation: 2b ("shared, done right") does the row/col derivation once and should be
 neutral-or-better than 2a; but the perf comp is the decider, per the user.
+
+**2a Outcome.** Landed (worktree `ladder-redo`). `subset_pos` (rows `u` 0..9 / cols 9..18 /
+boxes 18..27) built incrementally per dirty digit from the diffed `prev` bands via
+`rebuild_subset_digit`, gated on `ANY_HIDDEN`; `SubsetCache` reduced to marks-only; the old
+`sr -> cm -> positions` double transpose is gone. Byte-identical to Step 1 (the cm transpose
+and the band-derived masks read the same per-cell candidacy with the same `UNITS[u][i]` slot
+order). Verified: full `cargo test --release -p generator-lab` green incl. BOTH harvest paths
+(`..._scalar` / `..._simt` — the latter drives the changed SIMT subset path over dozens of
+hidden-pair/-triple specs, exercising the box masks) and `equiv_warp_repr`. Perf (interleaved
+OLD Step-1 vs NEW 2a, `findpar-bench`, 3 rounds, `--attempts 400000`, median us/att; `fp`
+matched OLD==NEW every spec):
+- hidden-quad (subset-heavy/fishless): 31.83 -> 31.80 (**flat**)
+- xy-wing (sensitivity workhorse):     30.74 -> 30.53 (**-0.7%**)
+- w-wing + jellyfish (fish+wing):      37.43 -> 37.30 (**-0.3%**) — the SEPARATE row/col
+  double-compute case; the discarded bundle regressed +0.8% here, 2a does NOT
+- swordfish + naked-triple (mixed):    30.09 -> 30.07 (**flat**)
+
+Net: neutral-to-slightly-faster everywhere, no regression — matching the expectation. **Next:
+2b SHARED, then the 2a-vs-2b A/B decision.**
 
 ### Step 3 — OPTIONAL, separate, measured: lazy-`cm` reorder
 Order is free, so try digit-major techniques first (LC -> hidden subsets -> fishes ->
