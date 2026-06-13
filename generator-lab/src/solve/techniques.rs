@@ -1097,30 +1097,33 @@ struct ConjugatePairs {
 }
 
 impl ConjugatePairs {
-    /// One pass over the 27 units: per unit, tally each digit's holder cells, and emit
-    /// a conjugate pair for every digit held by exactly two of them.
+    /// One pass over the 27 units: per unit, transpose the nine cell masks into per-digit
+    /// slot-position masks, then emit a conjugate pair for every digit held by exactly two
+    /// cells (popcount 2). The transpose is **branchless** — `pos[di]` bit `i` is set to
+    /// bit `di` of slot `i`'s mark — the same shape the subset cache's hidden transpose
+    /// uses, and for the same reason: a per-cell `trailing_zeros` scatter with a per-digit
+    /// `match` is data-dependent-branch heavy and measurably mispredicts, where the fixed
+    /// 9-wide transpose carries no such branch. Cells are walked in slot order and the two
+    /// set bits read low-first, so each pair stays `(lower-slot, higher-slot)` and the
+    /// per-digit lists stay in unit order — byte-identical to the per-digit tally it
+    /// replaces (and thus to the verdict and generator fingerprint).
     fn scan<V: LogicBoard>(v: &V) -> Self {
         let mut pairs = [[(0usize, 0usize); 27]; 9];
         let mut len = [0u8; 9];
         for unit in &UNITS {
-            let mut cnt = [0u8; 9];
-            let mut ends = [(0usize, 0usize); 9];
-            for &c in unit {
-                let mut bits = v.get(c).bits();
-                while bits != 0 {
-                    let di = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    match cnt[di] {
-                        0 => ends[di].0 = c,
-                        1 => ends[di].1 = c,
-                        _ => {}
-                    }
-                    cnt[di] += 1;
+            // pos[di] = 9-bit mask (over unit slots) of the cells holding digit `di`.
+            let mut pos = [0u16; 9];
+            for i in 0..9 {
+                let row = v.get(unit[i]).bits();
+                for di in 0..9 {
+                    pos[di] |= ((row >> di) & 1) << i;
                 }
             }
             for di in 0..9 {
-                if cnt[di] == 2 {
-                    pairs[di][len[di] as usize] = ends[di];
+                if pos[di].count_ones() == 2 {
+                    let s0 = pos[di].trailing_zeros() as usize;
+                    let s1 = (pos[di] & (pos[di] - 1)).trailing_zeros() as usize;
+                    pairs[di][len[di] as usize] = (unit[s0], unit[s1]);
                     len[di] += 1;
                 }
             }
