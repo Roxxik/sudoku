@@ -8,8 +8,11 @@ fast **both-paths `harvest_reconstructs` test** (scalar + SIMT) — see Verifica
 methodology. **Step 2 is DONE: 2a SEPARATE landed, then 2b SHARED built + A/B'd, and the
 A/B picked 2b SHARED** (output-identical; flat where the shared transpose can't fire,
 ~0.4% faster on the cross-branch hidden+fish specs where it does — see the 2b Outcome /
-A/B verdict). The remaining open item is the optional Step 3 (lazy-`cm` reorder). A first
-*bundled* attempt (Step 2's shared layout, NOT the fold) was once built, verified
+A/B verdict). **Step 3a is DONE: the hidden subset is now marks-free (positions-only),
+landed as a standalone clarity + small perf win** (~0.7% faster on hidden-heavy specs,
+flat where no hidden is in scope — see the Step 3a Outcome). That removes hidden's last
+cell-major (`cm`) dependency, which **unblocks** the still-open Step 3b (the lazy-`cm`
+reorder). A first *bundled* attempt (Step 2's shared layout, NOT the fold) was once built, verified
 output-identical, measured to regress slightly, then accidentally discarded with `git
 restore` (recoverable only from the session transcript — see Reconstruction notes). This
 doc captures everything; the 2b adopted here is the "shared, done right" the bundle wasn't.
@@ -248,10 +251,60 @@ rebuild placement (up-front under `ANY_HIDDEN`, else lazy before the fishes), do
 (hidden-pair) to also skip the transpose when a naked subset fires first — a narrow extra
 laziness, equally applicable to 2a, left out here to keep the dual-arm logic readable.
 
-### Step 3 — OPTIONAL, separate, measured: lazy-`cm` reorder
+### Step 3a — hidden subset marks-free (positions-only)  ✅ DONE (cleaner + faster)
+The hidden subset still read TWO representations: per-digit positions for the SEARCH
+(Step 2's digit-major cache) and per-cell `marks` (gathered off `cm`) for the
+ELIMINATION (`marks[i].without(keep)`). 3a folds the elimination onto the positions too,
+so the hidden subset reads ONLY its positions and the marks dependency is gone:
+`hidden_unit`/`hidden_subset` drop the `marks` param; `SubsetCache` (the per-unit marks
+cache) is now consumed by the NAKED subsets alone.
+
+**The win is not free-by-construction — it took three tries, perf-gated each time** (the
+elimination genuinely lost the pre-gathered marks, exactly the bundle's lesson #3 risk):
+1. **Naive** (per union cell, iterate all 9 digits, `combo.contains`): **+0.6% on
+   hidden-quad** — a no-op exact cover (a hidden pair whose two cells hold only those two
+   digits) now walked a per-cell 9-digit loop where `marks[i].without(keep).iter()` was
+   zero iterations. The exact-cover block runs on EVERY cover (firing or not), so it is
+   not cold. Caught immediately; this is why hidden's marks looked load-bearing.
+2. **Digit-driven** (for each non-combo digit, eliminate from `positions[di] & union`):
+   fixed hidden-quad (no-op covers now have `positions[di] & union == 0`, inner walk
+   skipped) but **+0.5% on pair-heavy `swordfish + naked-triple`** (real, controlled
+   against an old-vs-old order-bias run) — iterating all 9 digits per cover still cost,
+   and pair-heavy specs hit far more covers than quad-heavy ones.
+3. **Present-digit** (walk only `present & !combo`, `present` = digits with >=1 candidate
+   cell, gathered for free in the existing count loop): **faster than the marks baseline.**
+
+**Step 3a Outcome.** Landed. Byte-identical eliminations (same `(cell, digit)` SET; the
+emission order is digit-major now, but the per-bit writeback in `ladder_step` and the
+solve fixpoint are order-independent). Full `cargo test --release -p generator-lab` green
+incl. BOTH harvest paths + `equiv_warp_repr`; `findpar-bench` `fp` matched OLD==NEW on all
+specs. Perf (interleaved OLD post-2b vs NEW present-digit, `--attempts 400000`, median
+us/att; read against the **`xy-wing` control = +0.23%**, the code-layout/thermal floor —
+`xy-wing` has no hidden in scope so `hidden_unit` never runs and its delta is pure jitter):
+
+| spec                          | scope                       | raw delta | vs floor |
+|-------------------------------|-----------------------------|-----------|----------|
+| hidden-quad                   | Subset only (heavy hidden)  | -1.13%    | **~-1.1% faster** |
+| hidden-triple + swordfish     | hidden + fish               | -0.51%    | **~-0.5% faster** |
+| swordfish + naked-triple      | hidden-pair + fish          | +0.23%    | ~flat    |
+| xy-wing (control)             | Bivalue only (no hidden)    | +0.23%    | 0 by construction |
+
+Net: faster on hidden-heavy specs, flat where no hidden fires. The marks gather is no
+longer paid for hidden at all; `present`-restricted, digit-driven elimination beats the
+per-cell `marks[i].without(keep)` walk. *Noted follow-up (separate, trivially-safe):* the
+`SubsetCache` build is still gated on `ANY_SUBSET`; it could narrow to `ANY_NAKED` (marks
+are now a naked-only cache), skipping the gather for a hidden-only-no-naked toolbox — but
+the Subset branch pulls naked in alongside hidden, so this is dormant in production.
+
+### Step 3b — OPTIONAL, separate, measured: lazy-`cm` reorder (now unblocked by 3a)
 Order is free, so try digit-major techniques first (LC -> hidden subsets -> fishes ->
 naked subsets -> wings) so the 81x9 `cm` transpose is built only when a cell-major
-technique is reached. A/B; keep only if faster; both-paths harvest yield gate green.
+technique is reached. **3a unblocks this**: hidden is now positions-only, so the only
+`cm`-marks consumers left are the naked subsets and wings — a stall where a hidden/fish
+fires first need never build `cm`. Caveat from the 3a measurements: the win is confined to
+toolboxes with nothing cell-major *forced* (a naked-forced spec like `swordfish +
+naked-triple` reaches naked on most stalls and needs `cm` anyway), so A/B a hidden/fish-
+pure toolbox to size it. A/B; keep only if faster; both-paths harvest yield gate green.
 
 ## Reconstruction notes (the discarded bundle)
 
@@ -323,5 +376,10 @@ follow Step 1/Step 2, not this):
 
 - User has an idea for the found puzzles, to share after the work is finished.
 - Shared-vs-separate (2a vs 2b) decision: **RESOLVED — 2b SHARED adopted** (see the A/B verdict).
-- Step 3 (lazy-`cm` reorder) remains optional/unstarted; plus the noted micro-opt of making the
-  `ANY_HIDDEN` rebuild lazy past naked-pair (separate, measured).
+- Step 3a (hidden subset marks-free): **DONE — cleaner + ~0.7% faster on hidden-heavy specs**
+  (see Step 3a Outcome). It removes hidden's `cm`-marks dependency and unblocks 3b.
+- Step 3b (lazy-`cm` reorder) remains optional/unstarted, now unblocked by 3a — A/B a
+  hidden/fish-pure toolbox to size the win (naked-forced specs need `cm` regardless).
+- Two noted micro-opts, both separate + measured: narrow the `SubsetCache` build gate from
+  `ANY_SUBSET` to `ANY_NAKED` (marks now naked-only; dormant in production); and make the
+  `ANY_HIDDEN` position rebuild lazy past naked-pair.

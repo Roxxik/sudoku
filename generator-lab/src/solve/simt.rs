@@ -541,13 +541,14 @@ fn band_rows(bands: &[u32; 3]) -> [u16; 9] {
 }
 
 /// Every technique runs through the generic [`super::techniques`] bodies on the
-/// cell-major `cm` (every unit reachable via `get`, columns included). The six subsets
-/// share a single [`SubsetCache`] of per-unit marks built up front and passed in (so the
-/// marks gather is paid once, not three times per kind); the hidden subsets and the basic
-/// fish additionally read their cached digit-position masks from the memo's shared
-/// [`techniques::UnitPositions`], rebuilt here lazily (per dirty digit, straight from the
-/// diffed `prev` bands — NOT the old `sr -> cm -> positions` transpose). The rarer wings
-/// take the cache-free path. `memo` is the lane's cross-stall [`LadderMemo`], already
+/// cell-major `cm` (every unit reachable via `get`, columns included). The three NAKED
+/// subsets share a single [`SubsetCache`] of per-unit marks built up front and passed in
+/// (so the marks gather is paid once, not three times per size); the hidden subsets and the
+/// basic fish are purely digit-major — they read their cached digit-position masks from the
+/// memo's shared [`techniques::UnitPositions`], rebuilt here lazily (per dirty digit,
+/// straight from the diffed `prev` bands — NOT the old `sr -> cm -> positions` transpose)
+/// and need no marks at all. The rarer wings take the cache-free path. `memo` is the lane's
+/// cross-stall [`LadderMemo`], already
 /// diffed by [`ladder_step`]: the per-unit subset verdicts gate the subset scans, the
 /// per-digit fish verdicts gate the fish scans, and the stale shared positions are rebuilt
 /// here, lazily.
@@ -617,11 +618,11 @@ fn cellmarks_step_harder(
         let m = Some(&cache.marks);
         let p = Some(&memo.pos.subset);
         try_kind!(NAKED_PAIR, techniques::naked_subset(cm, 2, m, Some((&mut *no_fire, 0))));
-        try_kind!(HIDDEN_PAIR, techniques::hidden_subset(cm, 2, p, m, Some((&mut *no_fire, 1))));
+        try_kind!(HIDDEN_PAIR, techniques::hidden_subset(cm, 2, p, Some((&mut *no_fire, 1))));
         try_kind!(NAKED_TRIPLE, techniques::naked_subset(cm, 3, m, Some((&mut *no_fire, 2))));
-        try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(cm, 3, p, m, Some((&mut *no_fire, 3))));
+        try_kind!(HIDDEN_TRIPLE, techniques::hidden_subset(cm, 3, p, Some((&mut *no_fire, 3))));
         try_kind!(NAKED_QUAD, techniques::naked_subset(cm, 4, m, Some((&mut *no_fire, 4))));
-        try_kind!(HIDDEN_QUAD, techniques::hidden_subset(cm, 4, p, m, Some((&mut *no_fire, 5))));
+        try_kind!(HIDDEN_QUAD, techniques::hidden_subset(cm, 4, p, Some((&mut *no_fire, 5))));
     }
     // Shared rebuild, lazy arm: only reached with work to do when NO hidden subset rebuilt
     // above (so `pos_stale` is still set — a fish-without-hidden toolbox). Refresh the stale
@@ -681,21 +682,20 @@ pub(crate) fn tchk_gated(bit: usize) {
     }
 }
 
-/// Per-unit **marks** cache for the subset ladder, built ONCE per stall and handed to all
-/// six subset techniques. The generic [`techniques::naked_subset`] /
-/// [`techniques::hidden_subset`] would otherwise re-gather each unit's per-cell marks on
-/// every call, so the three naked sizes (and the three hidden sizes' elimination reads)
-/// would rebuild the same per-unit marks three times over. Passing this cache in
-/// (`Some(..)` on their `cache`/`marks` params) leaves the difficulty order unchanged —
-/// each size still scans all 27 units, first-fire-wins — but the marks gather is paid
-/// once. Valid because the board is untouched until a technique fires (and then
-/// [`cellmarks_step_harder`] returns), so a cache built before the first scan stays exact
-/// for every later size.
+/// Per-unit **marks** cache for the NAKED subset ladder, built ONCE per stall and handed
+/// to all three naked sizes. The generic [`techniques::naked_subset`] would otherwise
+/// re-gather each unit's per-cell marks on every call, rebuilding the same per-unit marks
+/// three times over. Passing this cache in (`Some(..)` on its `cache` param) leaves the
+/// difficulty order unchanged — each size still scans all 27 units, first-fire-wins — but
+/// the marks gather is paid once. Valid because the board is untouched until a technique
+/// fires (and then [`cellmarks_step_harder`] returns), so a cache built before the first
+/// scan stays exact for every later size.
 ///
-/// The hidden subsets' per-unit *digit-position* masks are NOT here: they live in the
-/// memo's shared [`techniques::UnitPositions`], built incrementally from the digit-major
-/// `prev` bands rather than transposed out of `cm` — that fold killed the old `sr -> cm ->
-/// positions` double transpose (see [`LadderMemo`]).
+/// The naked subset is the only marks (cell-major) consumer in the subset ladder: the
+/// hidden subsets are purely digit-major (they read the memo's shared
+/// [`techniques::UnitPositions`] per-unit masks, built incrementally from the digit-major
+/// `prev` bands rather than transposed out of `cm`, and derive their eliminations from
+/// those masks — no marks; see [`LadderMemo`] and [`techniques::hidden_subset`]).
 struct SubsetCache {
     /// `marks[u][i]` = the candidate set of unit `u`'s `i`-th cell (`UNITS[u][i]`).
     marks: [[Mark; 9]; 27],

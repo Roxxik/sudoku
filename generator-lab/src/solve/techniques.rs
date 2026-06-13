@@ -672,24 +672,32 @@ fn fish_eliminate<V: LogicBoard>(
     did
 }
 
-/// One unit's **hidden subset** of `size`, off its precomputed marks + per-digit
-/// position masks: returns whether it eliminated anything. The twin of [`naked_unit`] —
-/// shared verbatim by both [`hidden_subset`] entry paths, `#[inline]` so each call site
-/// specialises on its data provenance.
+/// One unit's **hidden subset** of `size`, off its per-digit position masks alone:
+/// returns whether it eliminated anything. The twin of [`naked_unit`] — shared verbatim
+/// by both [`hidden_subset`] entry paths, `#[inline]` so each call site specialises on
+/// its data provenance. A hidden subset is a purely digit-major technique: the position
+/// masks `positions[di]` ARE the unit's candidacy (bit `i` set iff digit `di` is a
+/// candidate of slot `i`), so both the search and the elimination read them directly,
+/// with no per-cell marks (the last cell-major dependency the redo folds out — see
+/// `generator-lab/docs/LADDER-REDO.md`).
 #[inline]
 fn hidden_unit<V: LogicBoard>(
     v: &mut V,
     unit: &[CellIdx; 9],
-    marks: &[Mark; 9],
     positions: &[u16; 9],
     size: usize,
 ) -> bool {
-    // Digits with 2..=size candidate cells in this unit (a placed digit has none — see
-    // module doc).
+    // One pass over the digits classifies each by its candidate-cell count: those with
+    // 2..=size cells are the subset-search candidates (`digits`); every digit with >=1 cell
+    // is `present` (an unplaced digit — a placed one has no candidate cell). `present` is the
+    // elimination's search space below, gathered here for free alongside the count the search
+    // already needs.
     let mut digits = [0usize; 9];
     let mut n = 0;
+    let mut present = 0u16;
     for di in 0..9 {
         let pc = positions[di].count_ones() as usize;
+        present |= ((pc != 0) as u16) << di;
         if (2..=size).contains(&pc) {
             digits[n] = di;
             n += 1;
@@ -704,20 +712,28 @@ fn hidden_unit<V: LogicBoard>(
         if union.count_ones() as usize != size {
             return true;
         }
-        // The combo digits stay; every other candidate leaves the union's cells.
-        let keep = combo
-            .iter()
-            .fold(Mark::EMPTY, |mut acc, &di| {
-                acc.insert(Digit::from_index(di));
-                acc
-            });
+        // The combo digits stay; every OTHER present digit leaves the cover cells it occupies.
+        // Read straight off the masks (digit `di` sits at slot `i` iff `positions[di]` bit `i`
+        // is set), so no marks: a non-combo digit's eliminations are exactly the cover cells
+        // where it is still a candidate (`positions[di] & union`). Walk only the `present`
+        // non-combo digits (placed/absent digits can eliminate nothing), and drive the loop BY
+        // DIGIT (not by cell) so the common no-op cover stays cheap — a cover whose cells hold
+        // only the combo digits has `positions[di] & union == 0` for every walked `di`, so the
+        // inner bit-walk never runs (recovering the marks path's zero-iteration `without(keep)`
+        // without the per-cell marks). Same (cell, digit) elimination SET as that path; the
+        // emission order is digit-major here, but the fixpoint — and the per-bit writeback in
+        // `ladder_step` — is order-independent.
+        let combo_mask: u16 = combo.iter().fold(0, |a, &di| a | (1 << di));
+        let mut elig = present & !combo_mask;
         let mut did = false;
-        for i in 0..9 {
-            if union & (1 << i) == 0 {
-                continue;
-            }
-            for d in marks[i].without(keep).iter() {
-                v.eliminate(unit[i], d);
+        while elig != 0 {
+            let di = elig.trailing_zeros() as usize;
+            elig &= elig - 1;
+            let mut hits = positions[di] & union;
+            while hits != 0 {
+                let i = hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                v.eliminate(unit[i], Digit::from_index(di));
                 did = true;
             }
         }
@@ -728,26 +744,26 @@ fn hidden_unit<V: LogicBoard>(
 }
 
 /// **Hidden subset** of `size`: `size` digits confined to the same `size` cells of
-/// a unit — the other digits leave those cells. Reads the unit's per-cell marks and
-/// derives the per-digit position masks off them (see [`naked_subset`]).
+/// a unit — the other digits leave those cells. A purely digit-major technique: it reads
+/// only the per-digit position masks (`positions[di]` bit `i` = digit `di` is a candidate
+/// of the unit's `i`-th cell), for both the search and the elimination (see [`hidden_unit`]).
 ///
-/// `pos` / `marks_cache` / `memo` are the SIMT ladder's cross-stall optimisations,
-/// dispatched ONCE here exactly as in [`naked_subset`] (so the scalar arm carries none
-/// of their overhead): `pos` supplies the per-unit digit-position masks and `marks_cache`
-/// the per-unit cell marks, both built ONCE per stall and shared across the three hidden
-/// sizes (see [`crate::solve::simt`]'s `SubsetCache`); `memo` no-fire-gates per unit. The
-/// scalar solvers pass all `None` and derive both views fresh per unit; the fast path
-/// needs all three.
+/// `pos` / `memo` are the SIMT ladder's cross-stall optimisations, dispatched ONCE here
+/// exactly as in [`naked_subset`] (so the scalar arm carries none of their overhead):
+/// `pos` supplies the per-unit digit-position masks built ONCE per stall and shared across
+/// the three hidden sizes (the memo's [`UnitPositions::subset`], rebuilt straight from the
+/// digit-major bands — see [`crate::solve::simt`]); `memo` no-fire-gates per unit. The
+/// scalar solvers pass both `None` and derive the position transpose fresh per unit; the
+/// fast path needs both.
 pub(super) fn hidden_subset<V: LogicBoard>(
     v: &mut V,
     size: usize,
     pos: Option<&[[u16; 9]; 27]>,
-    marks_cache: Option<&[[Mark; 9]; 27]>,
     memo: Option<(&mut [u8; 27], u8)>,
 ) -> bool {
-    match (pos, marks_cache, memo) {
-        // SIMT: cached per-unit positions + marks + cross-stall no-fire memo.
-        (Some(p), Some(m), Some((no_fire, ladder_bit))) => {
+    match (pos, memo) {
+        // SIMT: cached per-unit positions + cross-stall no-fire memo.
+        (Some(p), Some((no_fire, ladder_bit))) => {
             let bit = 1u8 << ladder_bit;
             for (u, unit) in UNITS.iter().enumerate() {
                 if no_fire[u] & bit != 0 {
@@ -755,31 +771,24 @@ pub(super) fn hidden_subset<V: LogicBoard>(
                     continue;
                 }
                 subset_tally(true);
-                if hidden_unit(v, unit, &m[u], &p[u], size) {
+                if hidden_unit(v, unit, &p[u], size) {
                     return true;
                 }
                 no_fire[u] |= bit;
             }
             false
         }
-        // Scalar: derive each unit's marks and the per-digit position transpose fresh.
-        // `positions[di]` bit `i` is set iff digit `di` is a candidate of the unit's
-        // `i`-th cell.
+        // Scalar: derive each unit's per-digit position transpose fresh. `positions[di]`
+        // bit `i` is set iff digit `di` is a candidate of the unit's `i`-th cell.
         _ => {
             for unit in &UNITS {
-                let marks: [Mark; 9] = core::array::from_fn(|i| v.get(unit[i]));
                 let mut positions = [0u16; 9];
-                for di in 0..9 {
-                    let d = Digit::from_index(di);
-                    let mut p = 0u16;
-                    for i in 0..9 {
-                        if marks[i].contains(d) {
-                            p |= 1 << i;
-                        }
+                for i in 0..9 {
+                    for d in v.get(unit[i]).iter() {
+                        positions[d.index()] |= 1 << i;
                     }
-                    positions[di] = p;
                 }
-                if hidden_unit(v, unit, &marks, &positions, size) {
+                if hidden_unit(v, unit, &positions, size) {
                     return true;
                 }
             }
