@@ -57,7 +57,7 @@ pub trait Propagate: Branchable {
 /// naked loop), [`Stuck`](Fixpoint::Stuck) means every unsolved cell has >= 2
 /// candidates so the sweep may still fire.
 #[inline(always)]
-fn drain_naked_singles<M: Branchable>(state: &mut SolverState<M>) -> Fixpoint {
+pub(crate) fn drain_naked_singles<M: Branchable>(state: &mut SolverState<M>) -> Fixpoint {
     loop {
         // The raw (unmasked) sieve: a decided cell's stale bits can inflate its tier,
         // but `& unsolved` below drops it — so the per-digit `& unsolved` `compute`
@@ -146,7 +146,7 @@ const SINGLE9: [u8; 512] = {
 /// The lone candidate's slot in a 9-bit unit mask, or `None` if the unit has zero or
 /// more than one candidate.
 #[inline]
-fn lone(unit: usize) -> Option<usize> {
+pub(crate) fn lone(unit: usize) -> Option<usize> {
     let s = SINGLE9[unit];
     (s != 0xFF).then_some(s as usize)
 }
@@ -157,7 +157,7 @@ fn lone(unit: usize) -> Option<usize> {
 /// by branching, never swept. Returns whether any placement was made, so the caller
 /// loops it against [`drain_naked_singles`] to a joint fixpoint.
 #[inline(always)]
-fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> bool {
+pub(crate) fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> bool {
     let mut changed = false;
     for b in 0..3 {
         for di in 0..9 {

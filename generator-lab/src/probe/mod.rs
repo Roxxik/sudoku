@@ -19,6 +19,10 @@ pub mod propagate;
 pub mod search;
 pub mod singles;
 pub mod techniques;
+// The propagation-toolbox experiment reuses the native scalar LC kernel (`solve::simt`),
+// so it is native-only like the warp it models.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod toolbox;
 
 // The packed W=8 SoA prober. An AVX native play; the wasm cdylib ships the scalar
 // `Search` path, so keep it (and the `std::simd` warp it builds) out of the wasm binary.

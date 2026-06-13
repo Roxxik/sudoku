@@ -1259,6 +1259,174 @@ pub fn reforce_stat(base_seed: u64, spec: &Spec, attempts: usize) -> ReforceStat
     s
 }
 
+/// Per-toolbox prober-work tallies from a [`toolbox_stat`] walk. Indexed by **clue
+/// count** (givens on the board at the posed gate, `0..=81`) and by **toolbox** (bit0
+/// naked, bit1 hidden-col, bit2 hidden-row+box; see [`crate::probe::toolbox`]). The
+/// posed-probe stream is the production one — UA pre-filter, `alts == 0`, and re-force
+/// fast paths all applied first — so the measured probes are exactly the ones the
+/// production prober actually pays for. Keep (the prober returned *unique* — the
+/// uniqueness-boundary probes that must exhaust their tree) vs revert (*non-unique* — a
+/// witness exists) are split, because their cost profiles are opposite.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct ToolboxStat {
+    pub attempts: usize,
+    /// Posed uniqueness probes (after the fast paths), total.
+    pub posed: u64,
+    /// Posed probes whose verdict was unique (keep) / non-unique (revert), total.
+    pub keeps: u64,
+    pub reverts: u64,
+    /// Fast-path skips (no probe posed): UA-caught, `alts == 0`, hidden-single re-force.
+    pub skip_ua: u64,
+    pub skip_alts0: u64,
+    pub skip_reforce: u64,
+    pub successes: u64,
+    /// Prober DFS nodes summed over keep / revert probes, per toolbox.
+    pub nodes_keep: [u64; TOOLBOXES],
+    pub nodes_revert: [u64; TOOLBOXES],
+    /// Propagation passes (warp-tick proxy) summed over keep / revert probes, per
+    /// toolbox. With warp util at 100%, warp time tracks total passes, so this is the
+    /// warp-cost axis; nodes is the branch-tree axis.
+    pub passes_keep: [u64; TOOLBOXES],
+    pub passes_revert: [u64; TOOLBOXES],
+    /// Probes whose search hit the node budget (a lower bound on their true nodes), per
+    /// toolbox — the propagation-poor toolboxes blow up on keeps.
+    pub capped_keep: [u64; TOOLBOXES],
+    pub capped_revert: [u64; TOOLBOXES],
+    /// Posed / keep / revert probe counts by clue count.
+    pub posed_by_clue: [u64; 82],
+    pub keep_by_clue: [u64; 82],
+    pub revert_by_clue: [u64; 82],
+    /// Prober nodes by clue count, per toolbox, split keep / revert.
+    pub nodes_keep_by_clue: [[u64; 82]; TOOLBOXES],
+    pub nodes_revert_by_clue: [[u64; 82]; TOOLBOXES],
+    /// Propagation passes by clue count, per toolbox, split keep / revert.
+    pub passes_keep_by_clue: [[u64; 82]; TOOLBOXES],
+    pub passes_revert_by_clue: [[u64; 82]; TOOLBOXES],
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::probe::toolbox::{TOOLBOXES, probe_all};
+
+/// Walk `attempts` faithful scalar strip attempts from `base_seed` and, at every posed
+/// uniqueness gate, replay the existence probe through every toolbox selected in `which`
+/// (bit `t` => toolbox `t`), tallying its DFS node count bucketed by clue count and
+/// keep/revert disposition. The trajectory is exactly [`attempt`]'s — the production UA
+/// pre-filter and both fast paths gate the loop, and the real (production-toolbox)
+/// verdict drives the strip — so the posed-probe stream and the produced puzzles match
+/// production, while the per-probe node counts show what each toolbox *would* have paid
+/// on that identical probe. `cap_nodes` bounds each probe's search (`0` = unbounded);
+/// probes that hit it are counted in `capped_*` and contribute the cap as a lower bound.
+/// Diagnostic only; no `count` feature (nodes are counted explicitly, not via `PCTR`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn toolbox_stat(base_seed: u64, spec: &Spec, attempts: usize, which: u32, cap_nodes: u64) -> ToolboxStat {
+    let baseline = spec.baseline_mask();
+    let fast = baseline_fast_applicable(spec);
+    let mut rng = Rng::from_seed(base_seed);
+    let mut s = ToolboxStat {
+        attempts: 0,
+        posed: 0,
+        keeps: 0,
+        reverts: 0,
+        skip_ua: 0,
+        skip_alts0: 0,
+        skip_reforce: 0,
+        successes: 0,
+        nodes_keep: [0; TOOLBOXES],
+        nodes_revert: [0; TOOLBOXES],
+        passes_keep: [0; TOOLBOXES],
+        passes_revert: [0; TOOLBOXES],
+        capped_keep: [0; TOOLBOXES],
+        capped_revert: [0; TOOLBOXES],
+        posed_by_clue: [0; 82],
+        keep_by_clue: [0; 82],
+        revert_by_clue: [0; 82],
+        nodes_keep_by_clue: [[0; 82]; TOOLBOXES],
+        nodes_revert_by_clue: [[0; 82]; TOOLBOXES],
+        passes_keep_by_clue: [[0; 82]; TOOLBOXES],
+        passes_revert_by_clue: [[0; 82]; TOOLBOXES],
+    };
+    for _ in 0..attempts {
+        s.attempts += 1;
+        let solution = random_solution(&mut rng);
+        let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
+        rng.shuffle(&mut positions);
+        let mut st: StripState = StripState::new_ua(&solution);
+        // Givens still on the board; the posed probe's clue count is this after the strip.
+        let mut givens = CELLS;
+        for cell in positions {
+            let Some(orig) = st.digit_at(cell) else {
+                continue;
+            };
+            // UA pre-filter: a caught cell is provably non-unique and never stripped.
+            if st.ua_caught_before_strip(cell, orig) {
+                s.skip_ua += 1;
+                continue;
+            }
+            let alts = st.strip(cell, orig);
+            givens -= 1;
+            if alts == 0 {
+                st.keep_trivial(cell);
+                s.skip_alts0 += 1;
+                continue;
+            }
+            if fast && st.reforced(cell, orig) != 0 {
+                st.keep_trivial(cell);
+                s.skip_reforce += 1;
+                continue;
+            }
+            // A real probe is posed. Ground-truth verdict (production prober) drives the
+            // trajectory; the per-toolbox replay measures the work on the same board.
+            let clue = givens;
+            let nonunique = st.scalar_nonunique(cell, orig);
+            let mut probe = st.state.row().clone();
+            probe.forbid(cell, orig);
+            let r = probe_all(&probe, which, cap_nodes);
+            s.posed += 1;
+            s.posed_by_clue[clue] += 1;
+            for (t, res) in r.iter().enumerate() {
+                if which & (1 << t) == 0 {
+                    continue;
+                }
+                // Soundness cross-check: a finished probe must agree with the production
+                // verdict — proves the column sweep (and the no-naked toolboxes) sound.
+                assert!(res.capped || res.exists == nonunique, "toolbox {t} verdict mismatch");
+                if nonunique {
+                    s.nodes_revert[t] += res.nodes;
+                    s.nodes_revert_by_clue[t][clue] += res.nodes;
+                    s.passes_revert[t] += res.passes;
+                    s.passes_revert_by_clue[t][clue] += res.passes;
+                    s.capped_revert[t] += res.capped as u64;
+                } else {
+                    s.nodes_keep[t] += res.nodes;
+                    s.nodes_keep_by_clue[t][clue] += res.nodes;
+                    s.passes_keep[t] += res.passes;
+                    s.passes_keep_by_clue[t][clue] += res.passes;
+                    s.capped_keep[t] += res.capped as u64;
+                }
+            }
+            if nonunique {
+                s.reverts += 1;
+                s.revert_by_clue[clue] += 1;
+            } else {
+                s.keeps += 1;
+                s.keep_by_clue[clue] += 1;
+            }
+            // Apply the gate exactly as production: revert non-unique, else baseline gate
+            // (which itself reverts a kept-but-unsolvable strip). Detect either revert by
+            // the clue reappearing, so `givens` stays exact for the next probe's bucket.
+            st.resolve_gate(cell, orig, nonunique, spec, baseline, fast);
+            if st.digit_at(cell).is_some() {
+                givens += 1;
+            }
+        }
+        if st.best.is_some() {
+            s.successes += 1;
+        }
+    }
+    s
+}
+
 /// Per-clue-count + run-shape tallies from a [`defer_stat`] walk — the deferred-strip
 /// (M1) and common-snapshot (M3) measurement. Every array is indexed by **clue count**
 /// (board fullness = givens still on the board at the gate, `0..=81`), the position axis

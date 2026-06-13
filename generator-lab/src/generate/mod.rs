@@ -23,6 +23,9 @@ pub use random::{
     AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt, determinism_fp,
     generate, reforce_stat, run_attempts, verify,
 };
+// Prober propagation-toolbox experiment — native-only (reuses the native scalar LC kernel).
+#[cfg(not(target_arch = "wasm32"))]
+pub use random::{ToolboxStat, toolbox_stat};
 // Deferred-strip (M1) + common-snapshot (M3) instrumentation — counter-gated.
 #[cfg(feature = "count")]
 pub use random::{DeferStat, defer_stat};

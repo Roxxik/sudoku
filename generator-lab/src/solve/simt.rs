@@ -907,6 +907,30 @@ impl Eliminate for CellMarks {
 /// Returns whether anything was eliminated. LC only prunes candidates, so `unsolved` is
 /// untouched.
 fn scalar_lc_fast(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
+    let mut any = false;
+    while scalar_lc_sweep(sr, su) {
+        any = true;
+    }
+    any
+}
+
+/// ONE locked-candidates sweep — both orientations once — returning whether it
+/// eliminated anything. The per-sweep primitive [`scalar_lc_fast`] loops to a fixpoint.
+/// Split into [`scalar_lc_row_sweep`] (box↔row) and [`scalar_lc_col_sweep`] (box↔column)
+/// so the prober-toolbox experiment ([`crate::probe::toolbox`]) can run each orientation
+/// independently — box↔row is in-lane per band, box↔column straddles the three bands, the
+/// same cleavage the toolbox's hidden-col vs hidden-row+box split is built on.
+pub(crate) fn scalar_lc_sweep(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
+    let r = scalar_lc_row_sweep(sr, su);
+    let c = scalar_lc_col_sweep(sr, su);
+    r | c
+}
+
+/// One **box↔row** locked-candidates sweep — in-lane per band (a row and the boxes it
+/// crosses both live in one band). For each band and digit, the band's 9-bit triplet
+/// occupancy indexes [`DROP_TRIP`] (the within-band pointing+claiming drop), and the
+/// dropped triplets are cleared. Returns whether anything was eliminated.
+pub(crate) fn scalar_lc_row_sweep(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
     use crate::solve::fused::DROP_TRIP;
     let occ_row = |live: u32| -> usize {
         let mut o = 0usize;
@@ -917,62 +941,64 @@ fn scalar_lc_fast(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
         }
         o
     };
-    let mut any = false;
-    loop {
-        let mut changed = false;
-        // Box <-> row, in-lane per band.
-        for b in 0..3 {
-            for d in 0..9 {
-                let live = sr[d][b] & su[b];
-                let dropped = DROP_TRIP[occ_row(live)];
-                if dropped != 0 {
-                    let mut clear = 0u32;
-                    let mut dd = dropped;
-                    while dd != 0 {
-                        let t = dd.trailing_zeros();
-                        dd &= dd - 1;
-                        clear |= 0b111u32 << (3 * t);
-                    }
-                    let before = sr[d][b];
-                    sr[d][b] &= !clear;
-                    changed |= sr[d][b] != before;
-                }
-            }
-        }
-        // Box <-> column: stack s, triplet (a = col-in-stack, g = band) at bit 3a+g.
-        for s in 0..3u32 {
-            for d in 0..9 {
-                let mut occ = 0usize;
-                for a in 0..3u32 {
-                    let c = 3 * s + a;
-                    let cm = (1u32 << c) | (1 << (c + 9)) | (1 << (c + 18));
-                    for gi in 0..3usize {
-                        if (sr[d][gi] & su[gi]) & cm != 0 {
-                            occ |= 1 << (3 * a as usize + gi);
-                        }
-                    }
-                }
-                let mut dd = DROP_TRIP[occ];
+    let mut changed = false;
+    for b in 0..3 {
+        for d in 0..9 {
+            let live = sr[d][b] & su[b];
+            let dropped = DROP_TRIP[occ_row(live)];
+            if dropped != 0 {
+                let mut clear = 0u32;
+                let mut dd = dropped;
                 while dd != 0 {
                     let t = dd.trailing_zeros();
                     dd &= dd - 1;
-                    let a = t / 3;
-                    let g = (t % 3) as usize;
-                    let c = 3 * s + a;
-                    let cm = (1u32 << c) | (1 << (c + 9)) | (1 << (c + 18));
-                    let before = sr[d][g];
-                    sr[d][g] &= !cm;
-                    changed |= sr[d][g] != before;
+                    clear |= 0b111u32 << (3 * t);
                 }
+                let before = sr[d][b];
+                sr[d][b] &= !clear;
+                changed |= sr[d][b] != before;
             }
         }
-        if changed {
-            any = true;
-        } else {
-            break;
+    }
+    changed
+}
+
+/// One **box↔column** locked-candidates sweep — across bands (a column straddles the
+/// three bands). For each column-stack and digit, the triplet (column-in-stack `a`, band
+/// `g`) occupancy is folded across the bands into the same 9-bit index [`DROP_TRIP`]
+/// reads, and the dropped column segments are cleared in their band. Returns whether
+/// anything was eliminated.
+pub(crate) fn scalar_lc_col_sweep(sr: &mut [[u32; 3]; 9], su: &[u32; 3]) -> bool {
+    use crate::solve::fused::DROP_TRIP;
+    let mut changed = false;
+    // stack s, triplet (a = col-in-stack, g = band) at bit 3a+g.
+    for s in 0..3u32 {
+        for d in 0..9 {
+            let mut occ = 0usize;
+            for a in 0..3u32 {
+                let c = 3 * s + a;
+                let cm = (1u32 << c) | (1 << (c + 9)) | (1 << (c + 18));
+                for gi in 0..3usize {
+                    if (sr[d][gi] & su[gi]) & cm != 0 {
+                        occ |= 1 << (3 * a as usize + gi);
+                    }
+                }
+            }
+            let mut dd = DROP_TRIP[occ];
+            while dd != 0 {
+                let t = dd.trailing_zeros();
+                dd &= dd - 1;
+                let a = t / 3;
+                let g = (t % 3) as usize;
+                let c = 3 * s + a;
+                let cm = (1u32 << c) | (1 << (c + 9)) | (1 << (c + 18));
+                let before = sr[d][g];
+                sr[d][g] &= !cm;
+                changed |= sr[d][g] != before;
+            }
         }
     }
-    any
+    changed
 }
 
 /// Scalar column-hidden-single recovery for one stalled baseline lane under the LEAN
