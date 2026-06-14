@@ -10,14 +10,17 @@ independent 1/X chance of yielding, so rarity is just hits/attempts; rarity.csv 
 reads as 0 hits over the budget (X then only known to exceed it).
 
 Pick a spec-list (all / single / double / triple) and one --attempts budget; per-tier budgets
-are just separate runs. Resumable: rarity.csv stores cumulative `attempts` per spec, so a rerun
-continues at seed = base + attempts and never rescans the same (usually empty) range. Start
+are just separate runs. Resumable: rarity.csv stores cumulative `attempts` per (toolbox, spec), so
+a rerun continues at seed = base + attempts and never rescans the same (usually empty) range. Start
 cheap, then deepen only the low/no-yield rows:
 
     scripts/rarity                                  # cheap sweep of everything (default attempts)
     scripts/rarity triple --attempts 5000           # just the triples, cheaper
     scripts/rarity --max-hits 5 --attempts 1000000  # deepen every row still under 5 hits
+    scripts/rarity --target-ci 5 --attempt-cap 50000000   # deepen until each rarity is +/-5% accurate
     scripts/rarity --attempt-cap 1000000            # bring every spec up to 1,000,000 attempts
+    scripts/rarity hidden-quad --attempts 8000000 --jobs 8 --batch 500000  # one spec, all cores
+    scripts/rarity --toolbox train,drill            # mine train-union AND drill-union in one run
     scripts/rarity report                           # confidence intervals + a readable table
     scripts/rarity --update-tests                   # ...and refresh the committed test fixtures
 
@@ -25,13 +28,31 @@ Hit-count window: --min-hits / --max-hits select which rows to (re)scan by their
 count -- scan iff `min-hits <= hits < max-hits`. Use --max-hits 5 to deepen only the rare rows
 (under 5 hits); use --min-hits to skip the truly-never-yielded rows and tighten the common ones.
 
+Precision target: --target-ci PCT is the hit-count-free alternative -- it scans only specs whose
+95% CI is not yet accurate to +/-PCT% of the estimate (relative margin of error still above PCT%,
+plus every 0-hit spec), and ANDs with the hit window if you also pass one. Pair it with
+--attempt-cap (or just rerun) to drive every spec to a uniform +/-PCT% precision instead of a
+uniform hit count -- rare specs then get the far larger budgets they need to reach the same error.
+
 Same-cap deepening: --attempt-cap N brings specs that have logged different amounts of mining all
 up to the same N total attempts. Per spec it adds `min(--attempts, N - current)` so it never
 overshoots; with no --attempts it adds exactly `N - current` (fills to the cap in one run) and
 skips rows already at N.
 
-Interruptible: Ctrl-C stops the sweep, cancels what hasn't started, and still writes the rarity
-table (and sample fixtures) with whatever the finished specs found -- so a long run is never lost.
+Sharding one spec: --jobs fans BATCHES across cores. Each spec's seed window is split into
+batches of at most --batch seeds (default: the whole window in one call), so with --batch you can
+put every core on a single deep spec, not just on many specs at once.
+
+Toolboxes: --toolbox picks the ladder around the forced kinds -- train (train-union, the default),
+drill (drill-union), or full. The rarity is toolbox-specific, so the CSV keys on (toolbox, spec)
+and carries a `toolbox` column; pass a comma list (--toolbox train,drill) to mine several in one
+run (each spec scanned once per toolbox, its own resumable row). Old toolbox-less CSVs still load
+(read as train) and upgrade on the next write.
+
+Interruptible: Ctrl-C stops the sweep, cancels the batches that haven't started, and still writes
+the rarity table (and sample fixtures) with the committed work. A spec's `attempts` watermark only
+ever advances over a gap-free prefix of completed batches, so an interrupt (or batches finishing
+out of order) rescans the uncommitted seeds next run -- it never skips a seed.
 
 What touches your tests: ONLY --update-tests. By default the run writes the rarity table
 (rarity.csv) and a throwaway copy of the captured sample fixtures under target/, and leaves the
@@ -95,14 +116,64 @@ def enumerate_specs(tier):
     return jobs
 
 
+def parse_spec_key(s):
+    """An explicit spec key like 'x-wing:2+swordfish' -> (canonical_key, force_args). The key is
+    canonicalized to taxonomy order so it matches the CSV/resume key no matter how it was typed
+    (e.g. 'w-wing+naked-pair' -> 'naked-pair+w-wing')."""
+    names = []
+    for tok in s.split("+"):
+        name, _, cnt = tok.partition(":")
+        if name not in KINDS:
+            sys.exit(f"rarity: unknown kind {name!r} in spec {s!r}; known: {', '.join(KINDS)}")
+        names += [name] * (int(cnt) if cnt.isdigit() else 1)
+    if not 1 <= len(names) <= 3:
+        sys.exit(f"rarity: spec {s!r} has {len(names)} kind(s); only single/double/triple (1-3) "
+                 "specs are tabulated")
+    names.sort(key=KINDS.index)
+    return group(names)
+
+
+def select_specs(targets):
+    """Resolve the positional target list to [(key, force_args), ...]: empty -> every spec; a
+    single tier name (all/single/double/triple) -> that tier; otherwise each target is an
+    explicit spec key (so you can mine or report just one or a few named specs)."""
+    if not targets:
+        return enumerate_specs("all")
+    if len(targets) == 1 and targets[0] in ("all", "single", "double", "triple"):
+        return enumerate_specs(targets[0])
+    return [parse_spec_key(t) for t in targets]
+
+
+def parse_toolboxes(s):
+    """A --toolbox value (single or comma list) -> ordered, deduped list of valid toolbox names."""
+    out = []
+    for tb in s.split(","):
+        tb = tb.strip()
+        if tb not in ("train", "drill", "full"):
+            sys.exit(f"rarity: unknown toolbox {tb!r}; choices: train, drill, full")
+        if tb not in out:
+            out.append(tb)
+    return out
+
+
 def load_csv(path):
-    """rarity.csv -> {key: [attempts, hits]} (the resume state)."""
+    """rarity.csv -> {(toolbox, key): [attempts, hits]} (the resume state). Accepts both the new
+    `tier,toolbox,spec,attempts,hits,one_in` layout and the old toolbox-less
+    `tier,spec,attempts,hits,one_in` (read as toolbox=train), so pre-toolbox tables keep resuming
+    and upgrade on the next write_csv."""
     state = {}
-    if path.exists():
-        for line in path.read_text().splitlines()[1:]:  # skip header
-            f = line.split(",")
-            if len(f) >= 4 and f[1]:
-                state[f[1]] = [int(f[2]), int(f[3])]
+    if not path.exists():
+        return state
+    lines = path.read_text().splitlines()
+    if not lines:
+        return state
+    has_tb = "toolbox" in lines[0].split(",")  # detect the layout from the header
+    for line in lines[1:]:
+        f = line.split(",")
+        if has_tb and len(f) >= 5 and f[2]:
+            state[(f[1], f[2])] = [int(f[3]), int(f[4])]
+        elif not has_tb and len(f) >= 4 and f[1]:
+            state[("train", f[1])] = [int(f[2]), int(f[3])]
     return state
 
 
@@ -130,36 +201,40 @@ def parse_fixture(text):
 
 def load_samples(fixdir):
     """The committed scan fixtures are the persistent sample store; read them back so an
-    iterate pass keeps the samples it already captured. -> {key: {toolbox, pairs}}."""
+    iterate pass keeps the samples it already captured. -> {(toolbox, key): pairs}."""
     samples = {}
     for tier in TIER_NAME.values():
         p = fixdir / f"scan-{tier}s.txt"
         if p.exists():
             for rec in parse_fixture(p.read_text()):
-                samples[rec["key"]] = {"toolbox": rec["toolbox"], "pairs": rec["pairs"]}
+                samples[(rec["toolbox"], rec["key"])] = rec["pairs"]
     return samples
 
 
 def write_csv(path, state):
-    """rarity.csv, sorted by tier, then commonest first (smallest one_in), 0-hit specs last."""
+    """rarity.csv (tier,toolbox,spec,attempts,hits,one_in), sorted by tier then toolbox, commonest
+    first (smallest one_in) within each, 0-hit specs last. A single-toolbox table keeps the exact
+    ordering it had before the toolbox column existed."""
     rows = []
-    for key, (att, hit) in state.items():
+    for (tb, key), (att, hit) in state.items():
         size = size_of_key(key)
         one_in = att // hit if hit else None
         rank = one_in if hit else 1 << 60  # X unknown -> last within its tier
-        rows.append((size, rank, key, att, hit, one_in))
+        rows.append((size, tb, rank, key, att, hit, one_in))
     rows.sort()
-    lines = ["tier,spec,attempts,hits,one_in"]
-    for size, _rank, key, att, hit, one_in in rows:
-        lines.append(f"{TIER_NAME[size]},{key},{att},{hit},{'' if one_in is None else one_in}")
+    lines = ["tier,toolbox,spec,attempts,hits,one_in"]
+    for size, tb, _rank, key, att, hit, one_in in rows:
+        lines.append(f"{TIER_NAME[size]},{tb},{key},{att},{hit},{'' if one_in is None else one_in}")
     path.write_text("\n".join(lines) + "\n")
 
 
 def write_fixtures(fixdir, samples):
-    """Regenerate the per-tier sample fixtures from the (merged) sample store."""
+    """Regenerate the per-tier sample fixtures from the (merged) sample store, one record per
+    (toolbox, spec) -- so a spec mined under both train and drill keeps both sample sets."""
     fixdir.mkdir(parents=True, exist_ok=True)
     for size, tier in TIER_NAME.items():
-        items = sorted((k, r) for k, r in samples.items() if size_of_key(k) == size)
+        items = sorted(((key, tb, pairs) for (tb, key), pairs in samples.items()
+                        if size_of_key(key) == size), key=lambda it: (it[0], it[1]))
         if not items:
             continue
         out = [
@@ -167,19 +242,20 @@ def write_fixtures(fixdir, samples):
             "# scripts/rarity. Positive-only: each 'sample' seed must still reconstruct its",
             "# puzzle (no window => no negative claim). See tests/harvest_reconstructs.rs.",
         ]
-        for key, rec in items:
+        for key, tb, pairs in items:
             out.append("")
             out += [f"force {t}" for t in key.split("+")]
-            out.append(f"toolbox {rec['toolbox']}")
-            out += [f"sample {seed} {puz}" for seed, puz in rec["pairs"]]
+            out.append(f"toolbox {tb}")
+            out += [f"sample {seed} {puz}" for seed, puz in pairs]
         (fixdir / f"scan-{tier}s.txt").write_text("\n".join(out) + "\n")
 
 
 def scan(argv):
     ap = argparse.ArgumentParser(prog="rarity", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("tier", nargs="?", default="all", choices=["all", "single", "double", "triple"],
-                    help="which spec-list to scan (default all)")
+    ap.add_argument("targets", nargs="*", default=[],
+                    help="what to scan: a tier (all/single/double/triple, default all), OR one or "
+                         "more explicit spec keys like 'naked-pair' or 'x-wing:2+swordfish'")
     ap.add_argument("--attempts", type=int, default=None,
                     help=f"attempts to add per spec this run (default {DEFAULT_ATTEMPTS:,}); with "
                          "--attempt-cap and no --attempts, each spec is filled straight to the cap")
@@ -187,12 +263,26 @@ def scan(argv):
                     help="bring every spec up to this many TOTAL attempts: add only "
                          "min(--attempts, cap - current) per spec, and skip rows already at the cap")
     ap.add_argument("--jobs", type=int, default=1,
-                    help="parallel harvest processes; mining goes ~Nx faster (default 1, sequential)")
+                    help="parallel harvest processes, run over BATCHES (across specs and, with "
+                         "--batch, within one spec); mining goes ~Nx faster (default 1, sequential)")
+    ap.add_argument("--batch", type=int, default=None,
+                    help="max seeds a single harvest invocation scans (default: a spec's whole "
+                         "window in one call). Smaller batches let --jobs shard ONE deep spec "
+                         "across cores and make an interrupt waste less; a spec's window is "
+                         "committed in contiguous batch order, so cancelling never skips seeds")
     ap.add_argument("--min-hits", type=int, default=None,
                     help="only (re)scan specs with AT LEAST this many hits (lower edge of the window)")
     ap.add_argument("--max-hits", type=int, default=None,
                     help="only (re)scan specs with FEWER than this many hits -- deepen the rare ones")
-    ap.add_argument("--toolbox", default="train", choices=["train", "drill", "full"])
+    ap.add_argument("--target-ci", type=float, default=None, metavar="PCT",
+                    help="precision selector (instead of, or on top of, --min/--max-hits): scan only "
+                         "specs whose 95-percent CI is not yet accurate to +/-PCT percent of the "
+                         "estimate -- relative margin of error above PCT, plus every 0-hit spec. "
+                         "Deepen (pair with --attempt-cap) until each rarity is pinned to +/-PCT percent")
+    ap.add_argument("--toolbox", default="train",
+                    help="toolbox(es) around the forced kinds: train (train-union, default), drill "
+                         "(drill-union), or full. Comma-separate to mine several in one run (e.g. "
+                         "train,drill) -- each spec is scanned once per toolbox into its own row")
     ap.add_argument("--seed", type=int, default=1, help="seed base; resume continues at base+attempts")
     ap.add_argument("--samples", type=int, default=4,
                     help="seed -> puzzle pairs to capture per yielding spec, written as 'sample' lines "
@@ -208,6 +298,8 @@ def scan(argv):
                          "test input, so writing it cannot affect tests")
     a = ap.parse_args(argv)
 
+    toolboxes = parse_toolboxes(a.toolbox)  # one or more of train/drill/full, deduped, in order
+
     # Resolve the per-spec attempt chunk. `chunk is None` means "fill straight to --attempt-cap"
     # (only reachable when a cap is set), otherwise it's a fixed budget added per spec this run.
     if a.attempts is not None:
@@ -216,6 +308,9 @@ def scan(argv):
         chunk = None
     else:
         chunk = DEFAULT_ATTEMPTS
+
+    # z for the --target-ci precision selector's 95% CI (computed once when that filter is active).
+    ci_z = NormalDist().inv_cdf(0.975) if a.target_ci is not None else None
 
     root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                capture_output=True, text=True, check=True).stdout.strip())
@@ -232,65 +327,104 @@ def scan(argv):
     state = load_csv(csv_path)
     samples = load_samples(fixdir)
 
-    # The specs to scan this run, after the tier + hit-window filters and the attempt-cap
-    # skip. `eff` is the attempts to ADD to each spec this run (may vary per spec under a cap).
-    todo = []
-    for key, fargs in enumerate_specs(a.tier):
-        att, hit = state.get(key, [0, 0])
-        if a.min_hits is not None and hit < a.min_hits:
-            continue  # below the window's lower edge
-        if a.max_hits is not None and hit >= a.max_hits:
-            continue  # already at/above the window's upper edge -- common enough
-        if chunk is None:
-            eff = max(0, a.attempt_cap - att)
-        else:
-            eff = chunk if a.attempt_cap is None else min(chunk, max(0, a.attempt_cap - att))
-        if eff <= 0:
-            continue  # already at the attempt cap; nothing to add
-        todo.append((key, fargs, size_of_key(key), att, hit, eff))
+    # Build the run as a flat list of BATCHES so --jobs can shard a single deep spec, not just
+    # fan whole specs. Each spec adds `eff` attempts over the contiguous seed window
+    # [seed+att, seed+att+eff); that window is tiled into batches of at most `--batch` seeds (one
+    # whole-window batch when --batch is unset). The batch is the unit the pool runs AND the unit
+    # we commit: per spec we keep a watermark and only ever advance it over a gap-free prefix of
+    # finished batches (`nextc`). A batch that finishes ahead of an earlier one waits in `pending`
+    # until the gap fills; on interrupt the still-pending (and in-flight) batches are dropped and
+    # their seeds rescanned next run -- so cancelling redoes seeds, never skips them.
+    progs = {}       # (toolbox, key) -> per-spec commit state
+    batch_jobs = []  # (toolbox, key, fargs, size, batch_base_seed, batch_count, batch_idx)
+    specs = select_specs(a.targets)
+    for tb in toolboxes:
+        for key, fargs in specs:
+            att, hit = state.get((tb, key), [0, 0])
+            if a.min_hits is not None and hit < a.min_hits:
+                continue  # below the window's lower edge
+            if a.max_hits is not None and hit >= a.max_hits:
+                continue  # already at/above the window's upper edge -- common enough
+            if a.target_ci is not None and rel_ci(hit, att, ci_z) <= a.target_ci / 100:
+                continue  # rarity already pinned to +/-target_ci% of the estimate -- precise enough
+            if chunk is None:
+                eff = max(0, a.attempt_cap - att)
+            else:
+                eff = chunk if a.attempt_cap is None else min(chunk, max(0, a.attempt_cap - att))
+            if eff <= 0:
+                continue  # already at the attempt cap; nothing to add
+            size = size_of_key(key)
+            bsize = a.batch if a.batch else eff  # one whole-window batch when --batch is unset
+            lo = a.seed + att
+            progs[(tb, key)] = {"size": size, "att": att, "hit0": hit, "catt": att, "chit": hit,
+                                "nextc": 0, "pending": {}, "run_hits": 0, "spairs": [],
+                                "have_samples": (tb, key) in samples, "counted_new": False}
+            for i in range((eff + bsize - 1) // bsize):
+                batch_jobs.append((tb, key, fargs, size, lo + i * bsize, min(bsize, eff - i * bsize), i))
 
     def run_one(job):
-        key, fargs, size, att, hit, eff = job
-        p = subprocess.run([harvest, *fargs, "--toolbox", a.toolbox, "--seed", str(a.seed + att),
-                            "--attempts", str(eff)], capture_output=True, text=True)
+        tb, key, fargs, size, bseed, bcount, idx = job
+        p = subprocess.run([harvest, *fargs, "--toolbox", tb, "--seed", str(bseed),
+                            "--attempts", str(bcount)], capture_output=True, text=True)
         m = re.search(r"hits=(\d+)", p.stderr)
-        # Only a clean exit WITH a hits= line counts; a child killed by our Ctrl-C (or any
-        # harvest failure) returns ok=False so we never record a falsely-empty scanned range.
+        # Only a clean exit WITH a hits= line counts; a batch killed by our Ctrl-C (or any harvest
+        # failure) returns ok=False so its seeds stay uncommitted -- rescanned, never recorded as
+        # a falsely-empty range.
         ok = p.returncode == 0 and m is not None
         h = int(m.group(1)) if m else 0
         pairs = [ln.split(" ", 1) for ln in p.stdout.splitlines() if ln.strip()][: a.samples]
         return job, ok, h, pairs
 
-    # Each spec's scan is independent (own seed range, own warp) -- fan them across --jobs
-    # processes and merge as each FINISHES (as_completed, so a slow spec can't stall the
-    # progress line). State is updated only here in the main thread.
-    total = len(todo)
-    print(f"rarity: scanning {total} spec(s) on {a.jobs} job(s)"
-          f"{'' if a.attempt_cap is None else f' up to cap {a.attempt_cap:,}'}...", file=sys.stderr)
+    # Fan the batches across --jobs processes and merge as each FINISHES (as_completed, so a slow
+    # batch can't stall the progress line). State is mutated only here in the main thread.
+    nspecs, total = len({k for _, k in progs}), len(batch_jobs)
+    cap_note = "" if a.attempt_cap is None else f" up to cap {a.attempt_cap:,}"
+    batch_note = "" if a.batch is None else f" of <= {a.batch:,} seeds"
+    tb_note = "" if len(toolboxes) == 1 else f" x {len(toolboxes)} toolboxes [{','.join(toolboxes)}]"
+    print(f"rarity: scanning {nspecs} spec(s){tb_note} in {total} batch(es){batch_note} on "
+          f"{a.jobs} job(s){cap_note}...", file=sys.stderr)
     done = new_yields = found_now = 0
     interrupted = False
     t_start = last_beat = time.monotonic()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-            futures = [ex.submit(run_one, job) for job in todo]
+            futures = [ex.submit(run_one, job) for job in batch_jobs]
             try:
                 for fut in concurrent.futures.as_completed(futures):
-                    (key, fargs, size, att, hit, eff), ok, h, pairs = fut.result()
+                    (tb, key, fargs, size, bseed, bcount, idx), ok, h, pairs = fut.result()
                     done += 1
                     if not ok:
-                        continue  # interrupted/failed child -- leave this spec's state untouched
-                    state[key] = [att + eff, hit + h]
-                    found_now += h
-                    if h > 0:
-                        if key not in samples:  # capture lowest-seed samples the first time it yields
-                            samples[key] = {"toolbox": a.toolbox, "pairs": [(s, puz) for s, puz in pairs]}
-                        tot = hit + h
-                        one_in = (att + eff) // tot
-                        if hit == 0:  # a spec we'd never seen yield -- the interesting discovery
+                        continue  # interrupted/failed batch -- leave it uncommitted (rescanned)
+                    pr = progs[(tb, key)]
+                    pr["pending"][idx] = (bcount, h, pairs)
+                    # Commit the longest contiguous run of finished batches from the front, so the
+                    # watermark only ever covers a gap-free prefix of the window.
+                    c0, gained = pr["nextc"], 0
+                    while pr["nextc"] in pr["pending"]:
+                        cnt, hh, pp = pr["pending"].pop(pr["nextc"])
+                        pr["catt"] += cnt
+                        pr["chit"] += hh
+                        pr["run_hits"] += hh
+                        gained += hh
+                        if not pr["have_samples"] and len(pr["spairs"]) < a.samples:
+                            pr["spairs"].extend(pp[: a.samples - len(pr["spairs"])])  # lowest seeds first
+                        pr["nextc"] += 1
+                    if pr["nextc"] == c0:
+                        continue  # this batch only buffered (waiting on an earlier one) -- nothing committed
+                    state[(tb, key)] = [pr["catt"], pr["chit"]]
+                    if not pr["have_samples"] and pr["spairs"]:
+                        samples[(tb, key)] = list(pr["spairs"])
+                        pr["have_samples"] = len(pr["spairs"]) >= a.samples
+                    if gained > 0:
+                        found_now += gained
+                        first = pr["hit0"] == 0 and not pr["counted_new"]  # first-ever yield, once
+                        if first:
                             new_yields += 1
-                        tag = "NEW" if hit == 0 else "+"
-                        print(f"  {tag:<4}{TIER_NAME[size]} {key}: +{h} this run, {tot} total -> ~1 in {one_in}",
-                              file=sys.stderr)
+                            pr["counted_new"] = True
+                        tag = "NEW" if first else "+"
+                        tbtag = "" if len(toolboxes) == 1 else f" [{tb}]"
+                        print(f"  {tag:<4}{TIER_NAME[size]} {key}{tbtag}: +{pr['run_hits']} this run, "
+                              f"{pr['chit']} total -> ~1 in {pr['catt'] // pr['chit']}", file=sys.stderr)
                     now = time.monotonic()
                     if now - last_beat >= 3 or done == total:  # throttled heartbeat with ETA
                         last_beat = now
@@ -300,10 +434,11 @@ def scan(argv):
                               f"  ({new_yields} new yields, {found_now} puzzles this run)", file=sys.stderr)
             except KeyboardInterrupt:
                 interrupted = True
-                print("\nrarity: interrupted -- cancelling pending specs, saving progress so far...",
+                print("\nrarity: interrupted -- cancelling pending batches, saving the committed "
+                      "prefix (uncommitted seeds are rescanned next run, never skipped)...",
                       file=sys.stderr)
                 for f in futures:
-                    f.cancel()  # drop not-yet-started specs so shutdown doesn't run them
+                    f.cancel()  # drop not-yet-started batches so shutdown doesn't run them
     finally:
         write_csv(csv_path, state)
         write_fixtures(fixdir, samples)
@@ -329,15 +464,29 @@ def wilson(h, n, z):
     return (max(0.0, center - half), min(1.0, center + half))
 
 
+def rel_ci(h, n, z):
+    """Relative margin of error of the yield estimate: the CI half-width as a fraction of the
+    point estimate p_hat = h/n (so 0.05 == the estimate is good to +/-5%). inf when there's no
+    estimate yet (n == 0 or h == 0), so an unmeasured or never-yielded spec always reads as
+    imprecise and keeps getting deepened. Same for p and for its reciprocal 1-in-X to first order."""
+    if n == 0 or h == 0:
+        return math.inf
+    lo, hi = wilson(h, n, z)
+    return (hi - lo) / (2 * (h / n))
+
+
 def report(argv):
     """`scripts/rarity report` -- read rarity.csv and print proper rarity statistics: a Wilson
     confidence interval on each spec's true yield probability (and on its 1-in-X reciprocal), in
     an aligned, human-readable table. Read-only; never touches the CSV, fixtures, or tests."""
     ap = argparse.ArgumentParser(prog="rarity report",
                                  description="confidence intervals + readable table over rarity.csv")
-    ap.add_argument("tier", nargs="?", default="all", choices=["all", "single", "double", "triple"],
-                    help="which tier to report (default all)")
+    ap.add_argument("targets", nargs="*", default=[],
+                    help="what to report: a tier (all/single/double/triple, default all), OR one "
+                         "or more explicit spec keys like 'naked-pair' or 'x-wing:2+swordfish'")
     ap.add_argument("--conf", type=float, default=95.0, help="confidence level, percent (default 95)")
+    ap.add_argument("--toolbox", default=None,
+                    help="restrict to these toolbox(es) (comma list: train/drill/full); default all present")
     ap.add_argument("--csv", default=None, help="rarity table to read (default generator-lab/rarity.csv)")
     a = ap.parse_args(argv)
 
@@ -350,57 +499,76 @@ def report(argv):
         return
 
     z = NormalDist().inv_cdf(1 - (1 - a.conf / 100) / 2)
+    tbfilter = set(parse_toolboxes(a.toolbox)) if a.toolbox else None
+    # None => every row in the CSV; otherwise restrict to the named tier / explicit spec keys.
+    all_tiers = not a.targets or (len(a.targets) == 1 and a.targets[0] == "all")
+    selkeys = None if all_tiers else {k for k, _ in select_specs(a.targets)}
 
     def fmt(x):
         return "inf" if x == math.inf else f"{round(x):,}"
 
-    # One row per spec: 1-in-X estimate and its confidence interval (inverted from the p interval,
-    # so the CI on the RARE end is the small p / large X -- p_lo gives X_hi and vice versa).
-    rows_by_tier = {1: [], 2: [], 3: []}
+    # Bin by toolbox -> tier. Each row: 1-in-X estimate + CI (inverted from the p interval, so the
+    # rare end is the small p / large X -- p_lo gives X_hi and vice versa) + the relative margin of
+    # error `rel` (the same metric --target-ci selects on, so the +/-% column tracks that flag).
+    by_tb = {}  # toolbox -> {1: [], 2: [], 3: []}
     tot_att = tot_hits = 0
-    for key, (att, hit) in state.items():
-        size = size_of_key(key)
-        if a.tier != "all" and TIER_NAME[size] != a.tier:
+    for (tb, key), (att, hit) in state.items():
+        if tbfilter is not None and tb not in tbfilter:
             continue
+        if selkeys is not None and key not in selkeys:
+            continue
+        size = size_of_key(key)
         tot_att += att
         tot_hits += hit
         plo, phi = wilson(hit, att, z)
         x_lo = 1 / phi if phi > 0 else math.inf  # likeliest-end bound (fewest attempts per hit)
         x_hi = 1 / plo if plo > 0 else math.inf  # rarest-end bound
         x_est = att / hit if hit else math.inf
-        rows_by_tier[size].append((x_est, key, att, hit, x_lo, x_hi))
+        rel = rel_ci(hit, att, z)  # relative margin of error (inf for 0-hit)
+        by_tb.setdefault(tb, {1: [], 2: [], 3: []})[size].append((x_est, key, att, hit, x_lo, x_hi, rel))
 
     print(f"rarity report  ({a.conf:g}% Wilson confidence interval on the true 1-in-X rarity)")
     print(f"source: {csv_path}")
     print()
 
-    for size in (1, 2, 3):
-        rows = rows_by_tier[size]
-        if not rows:
-            continue
-        rows.sort(key=lambda r: (r[0], r[1]))  # commonest first; 0-hit (inf) last
-        ny = sum(1 for r in rows if r[3] > 0)
-        print(f"== {TIER_NAME[size]} ({len(rows)} specs, {ny} with yield) ==")
-
-        # Pre-format the numeric cells so columns line up under their widest value.
-        cells = []
-        for x_est, key, att, hit, x_lo, x_hi in rows:
-            est = fmt(x_est) if hit else f">= {fmt(x_lo)}"  # 0 hits -> one-sided lower bound
-            ci = "--" if not hit else f"{fmt(x_lo)} .. {fmt(x_hi)}"
-            cells.append((key, f"{att:,}", f"{hit:,}", est, ci))
-        wk = max(len(c[0]) for c in cells)
-        wa = max(len(c[1]) for c in cells)
-        wh = max(len(c[2]) for c in cells)
-        we = max(len(c[3]) for c in cells)
-        hdr = f"  {'spec':<{wk}}  {'attempts':>{wa}}  {'hits':>{wh}}  {'1 in':>{we}}  95% CI (1 in)"
-        print(hdr.replace("95%", f"{a.conf:g}%"))
-        for key, att, hit, est, ci in cells:
-            print(f"  {key:<{wk}}  {att:>{wa}}  {hit:>{wh}}  {est:>{we}}  {ci}")
+    for tb in sorted(by_tb):
+        print(f"##### toolbox: {tb} #####")
         print()
+        for size in (1, 2, 3):
+            rows = by_tb[tb][size]
+            if not rows:
+                continue
+            rows.sort(key=lambda r: (r[0], r[1]))  # commonest first; 0-hit (inf) last
+            ny = sum(1 for r in rows if r[3] > 0)
+            print(f"== {TIER_NAME[size]} ({len(rows)} specs, {ny} with yield) ==")
 
-    specs = sum(len(r) for r in rows_by_tier.values())
-    yielded = sum(1 for r in rows_by_tier.values() for row in r if row[3] > 0)
-    print(f"summary: {specs} spec(s), {yielded} with yield, "
+            # Pre-format the numeric cells so columns line up under their widest value.
+            cells = []
+            for x_est, key, att, hit, x_lo, x_hi, rel in rows:
+                est = fmt(x_est) if hit else f">= {fmt(x_lo)}"  # 0 hits -> one-sided lower bound
+                marg = "--" if rel == math.inf else f"{rel * 100:.1f}%"  # relative margin of error
+                ci = "--" if not hit else f"{fmt(x_lo)} .. {fmt(x_hi)}"
+                cells.append((key, f"{att:,}", f"{hit:,}", est, marg, ci))
+            wk = max(len(c[0]) for c in cells)
+            wa = max(len(c[1]) for c in cells)
+            wh = max(len(c[2]) for c in cells)
+            we = max(len(c[3]) for c in cells)
+            wm = max(len(c[4]) for c in cells)
+            print(f"  {'spec':<{wk}}  {'attempts':>{wa}}  {'hits':>{wh}}  {'1 in':>{we}}  "
+                  f"{'+/-%':>{wm}}  {a.conf:g}% CI (1 in)")
+            for key, att, hit, est, marg, ci in cells:
+                print(f"  {key:<{wk}}  {att:>{wa}}  {hit:>{wh}}  {est:>{we}}  {marg:>{wm}}  {ci}")
+            print()
+
+    if selkeys is not None:
+        present = {key for d in by_tb.values() for rows in d.values() for (_, key, *_r) in rows}
+        missing = sorted(selkeys - present)
+        if missing:
+            print(f"not yet in {csv_path.name} (no attempts logged): {', '.join(missing)}")
+            print()
+    nrows = sum(len(rows) for d in by_tb.values() for rows in d.values())
+    yielded = sum(1 for d in by_tb.values() for rows in d.values() for row in rows if row[3] > 0)
+    print(f"summary: {nrows} row(s), {yielded} with yield, "
           f"{tot_att:,} total attempts, {tot_hits:,} total puzzles recorded")
 
 
