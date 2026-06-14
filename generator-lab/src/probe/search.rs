@@ -13,8 +13,46 @@
 
 use super::propagate::Fixpoint;
 use super::Propagate;
-use crate::repr::{Digit, Marks, SolverState};
+use crate::repr::{CellIdx, Digit, GridMask, Marks, PerDigit, SolverState};
 use crate::scan::{BranchStrategy, Scan};
+
+/// Of branch `cell`'s candidate digits (`cands`), the most-constraining value: the digit
+/// currently a candidate in the most *unsolved* peers of `cell` — the one whose placement
+/// the next propagation pass would clear from the most peers. Ties resolve to the lowest
+/// digit (the production ascending order), so a bivalue cell whose two candidates eliminate
+/// equally branches exactly as before.
+///
+/// A digit `d`'s constrainingness is the number of unsolved peers of `cell` still holding it
+/// as a candidate — `(peers(cell) & candidates[d] & unsolved).len()`. (`& unsolved` is
+/// load-bearing: a hidden-single placement zeroes only the placed digit's board at that cell,
+/// so a solved cell can still carry stray candidate bits in the other digit boards.) No extra
+/// propagation pass — just the snapshot the scan already holds and a few set-algebra ops.
+///
+/// Reordering the children is verdict-neutral (a completion count is branch-order- and
+/// technique-independent), so generated puzzles stay byte-identical; the payoff is reaching
+/// the first witness sooner once a cap-bounded search has a completion to find. The scalar
+/// twin of the warp prober's [`crate::probe::simt`] `mcv_first` (see
+/// `generator-lab/docs/PROBER-BRANCH-RULE.md`).
+#[inline]
+fn mcv_first<M: GridMask>(board: &PerDigit<M>, unsolved: M, cell: CellIdx, cands: u16) -> usize {
+    let peer = M::peers(cell);
+    let boards = board.each();
+    let mut best_d = cands.trailing_zeros() as usize;
+    let mut best_elim = 0u32;
+    let mut first = true;
+    let mut m = cands;
+    while m != 0 {
+        let d = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let elim = (peer & boards[d] & unsolved).len();
+        if first || elim > best_elim {
+            best_d = d;
+            best_elim = elim;
+            first = false;
+        }
+    }
+    best_d
+}
 
 /// The number of completions of `state`, counting only up to `cap`, branching by
 /// strategy `S` (which carries its own sieve-depth cap — that only changes which
@@ -57,10 +95,16 @@ where
         else {
             return;
         };
+        // Most-constraining value first: try the candidate the next propagation pass clears
+        // from the most unsolved peers, then the rest ascending. Value order changes only the
+        // order children are visited, never the completion count, so the verdict is unchanged
+        // (see [`mcv_first`]) — but on a cap-bounded search that has a completion to reach,
+        // collapsing toward one fastest finds the first witness sooner.
+        let mut next = mcv_first(state.candidates(), state.unsolved(), cell, candidates);
         let mut m = candidates;
         loop {
-            let d = Digit::from_index(m.trailing_zeros() as usize);
-            m &= m - 1;
+            let d = Digit::from_index(next);
+            m &= !(1u16 << next);
             if m == 0 {
                 // Last candidate: place it into *this* state and re-loop rather than
                 // cloning — bb's `solve_first` spine. The clone is the per-branch cost
@@ -75,6 +119,7 @@ where
             if *found >= cap {
                 return;
             }
+            next = m.trailing_zeros() as usize;
         }
     }
 }
@@ -113,10 +158,13 @@ where
         else {
             return None;
         };
+        // Most-constraining value first, the rest ascending — the witness twin of the order
+        // in [`count`] (see [`mcv_first`]); verdict-neutral, so the same node it would solve.
+        let mut next = mcv_first(state.candidates(), state.unsolved(), cell, candidates);
         let mut m = candidates;
         loop {
-            let d = Digit::from_index(m.trailing_zeros() as usize);
-            m &= m - 1;
+            let d = Digit::from_index(next);
+            m &= !(1u16 << next);
             if m == 0 {
                 state.place(cell, d);
                 break;
@@ -126,6 +174,7 @@ where
             if let Some(sol) = first::<M, S>(&mut child) {
                 return Some(sol);
             }
+            next = m.trailing_zeros() as usize;
         }
     }
 }

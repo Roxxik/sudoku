@@ -47,6 +47,12 @@ impl GridMask for FlatGridMask {
     fn any(self) -> bool {
         self.0 != 0
     }
+    #[inline]
+    fn len(self) -> u32 {
+        // Identity layout: the top 47 bits stay zero, so a whole-word popcount is the
+        // 81-cell population.
+        self.0.count_ones()
+    }
 }
 
 impl Branchable for FlatGridMask {

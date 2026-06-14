@@ -44,6 +44,11 @@ pub trait GridMask:
     fn peers(cell: CellIdx) -> Self;
     /// Whether any cell is set.
     fn any(self) -> bool;
+    /// The number of cells in the set (its population count) — the cell-set analogue of
+    /// the digit-set [`crate::repr::Mark::len`]. The prober's most-constraining-value
+    /// branch order ranks a candidate digit by it: how many unsolved peers a placement
+    /// would clear the digit from.
+    fn len(self) -> u32;
 }
 
 /// A [`GridMask`] whose cells can be ordered for branching: it can yield its

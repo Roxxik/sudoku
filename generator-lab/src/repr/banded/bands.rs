@@ -107,6 +107,13 @@ impl<B: Banding> GridMask for Bands<B> {
     fn any(self) -> bool {
         self.0.simd_ne(Simd::from_array([0; 4])).any()
     }
+    #[inline]
+    fn len(self) -> u32 {
+        // A canonical set keeps only the low 27 bits of the three used lanes (lane 3 is
+        // unused), so summing their popcounts is the cell population.
+        let l = self.0.to_array();
+        l[0].count_ones() + l[1].count_ones() + l[2].count_ones()
+    }
 }
 
 /// `first` is correct (and a cheap `trailing_zeros`) only for [`RowMajor`], which
