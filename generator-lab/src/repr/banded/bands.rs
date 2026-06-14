@@ -6,7 +6,7 @@
 
 use super::band::Band;
 use super::banding::{Banding, RowMajor};
-use crate::repr::{Branchable, CellIdx, GridMask};
+use crate::repr::{Branchable, CELLS, CellIdx, GridMask};
 use std::marker::PhantomData;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 use std::simd::Simd;
@@ -108,10 +108,19 @@ impl<B: Banding> GridMask for Bands<B> {
     const FULL: Self = Bands(Simd::from_array([BAND_FULL, BAND_FULL, BAND_FULL, 0]), PhantomData);
     #[inline]
     fn cell(cell: CellIdx) -> Self {
+        // A CellIdx is 0..81 by construction (a shuffle of 0..81, a tzcnt over an
+        // 81-bit mask, or a const peer table), but the bare usize can't carry that, so
+        // the per-cell table index otherwise emits a bounds check it can never trigger.
+        debug_assert!(cell < CELLS, "cell index {cell} out of range");
+        // SAFETY: guaranteed by the 0..81 construction invariant asserted above.
+        unsafe { core::hint::assert_unchecked(cell < CELLS) };
         Bands(Simd::from_array(B::CELL_MASKS[cell]), PhantomData)
     }
     #[inline]
     fn peers(cell: CellIdx) -> Self {
+        debug_assert!(cell < CELLS, "cell index {cell} out of range");
+        // SAFETY: see `cell` — a CellIdx is 0..81 by construction.
+        unsafe { core::hint::assert_unchecked(cell < CELLS) };
         Bands(Simd::from_array(B::PEER_MASKS[cell]), PhantomData)
     }
     #[inline]
