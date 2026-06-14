@@ -39,7 +39,7 @@
 use super::{Eliminate, LogicBoard, LogicSolver, Solver, techniques};
 use crate::counters::counter_block;
 use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMajor};
-use crate::repr::{Branchable, CellIdx, Digit, GridMask, Mark, Marks, Occupancy};
+use crate::repr::{Branchable, CELLS, CellIdx, Digit, GridMask, Mark, Marks, Occupancy};
 use crate::scan::sieve::Sieve;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
@@ -456,6 +456,10 @@ impl Marks for CellBoard {
     }
     #[inline]
     fn get(&self, cell: CellIdx) -> Mark {
+        debug_assert!(cell < CELLS, "cell index {cell} out of range");
+        // SAFETY: a CellIdx is 0..81 by construction; the bare usize can't carry that,
+        // so this per-cell marks index otherwise emits a bounds check it can never hit.
+        unsafe { core::hint::assert_unchecked(cell < CELLS) };
         self.marks[cell]
     }
 }
@@ -466,6 +470,9 @@ impl Occupancy for CellBoard {
     /// [`Mark::EMPTY`] — so non-empty marks exactly identify the unsolved cells.
     #[inline]
     fn is_empty(&self, cell: CellIdx) -> bool {
+        debug_assert!(cell < CELLS, "cell index {cell} out of range");
+        // SAFETY: cell is a CellIdx (0..81 by construction).
+        unsafe { core::hint::assert_unchecked(cell < CELLS) };
         !self.marks[cell].is_empty()
     }
 }
@@ -474,6 +481,9 @@ impl Eliminate for CellBoard {
     #[inline]
     fn eliminate(&mut self, cell: CellIdx, d: Digit) {
         debug_assert!(self.n_elim < self.elims.len(), "harder-step eliminations exceeded buffer");
+        debug_assert!(cell < CELLS, "cell index {cell} out of range");
+        // SAFETY: cell is a CellIdx (0..81 by construction).
+        unsafe { core::hint::assert_unchecked(cell < CELLS) };
         self.elims[self.n_elim] = (cell as u8, d.index() as u8);
         self.n_elim += 1;
         self.marks[cell].remove(d);

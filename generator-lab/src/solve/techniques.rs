@@ -25,6 +25,10 @@ use crate::spec::kinds::{JELLYFISH, KindMask, SWORDFISH, W_WING, X_WING, XYZ_WIN
 /// linear `PEERS[s].contains(&c)` scan over the 20-element peer list).
 #[inline]
 fn sees(s: CellIdx, c: CellIdx) -> bool {
+    debug_assert!(s < CELLS, "cell index {s} out of range");
+    // SAFETY: a CellIdx is 0..81 by construction; the bare usize can't carry that, so
+    // the per-cell PEER_MASK index otherwise emits a bounds check it can never trigger.
+    unsafe { core::hint::assert_unchecked(s < CELLS) };
     (PEER_MASK[s] >> c) & 1 != 0
 }
 
@@ -841,6 +845,9 @@ fn eliminate_common_peers<V: LogicBoard>(
     // replaces an all-81-cells × all-endpoints `contains` sweep.
     let mut common = u128::MAX;
     for &s in must_see {
+        debug_assert!(s < CELLS, "cell index {s} out of range");
+        // SAFETY: s is a CellIdx (0..81 by construction).
+        unsafe { core::hint::assert_unchecked(s < CELLS) };
         common &= PEER_MASK[s];
     }
     for &e in exclude {
