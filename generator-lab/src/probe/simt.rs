@@ -319,8 +319,12 @@ pub(crate) fn branch_lane(r: &mut [[V; 3]; 9], unsolved: &mut [V; 3], stack: &mu
     snapshot_lane_into(r, unsolved, l, &mut frame.r, &mut frame.unsolved);
     let (cell, mask) = branch_cell(&frame.r, &frame.unsolved);
     frame.cell = cell as u32;
-    frame.remaining = mask & (mask - 1);
-    let d = mask.trailing_zeros() as usize;
+    // Most-constraining value first: try the candidate that clears the most peer candidates
+    // ahead of its sibling, leaving the rest (`mask` minus the chosen bit) for backtracking.
+    // Value order changes only the order children are visited, never the cap=1 existence
+    // verdict, so puzzles stay byte-identical (see [`mcv_first`]).
+    let d = mcv_first(&frame.r, &frame.unsolved, cell, mask);
+    frame.remaining = mask & !(1u16 << d);
     assign(r, l, cell, d);
 }
 
@@ -394,4 +398,54 @@ pub(crate) fn branch_cell(sr: &[[u32; 3]; 9], su: &[u32; 3]) -> (usize, u16) {
         }
     }
     (cell, mask)
+}
+
+/// Of branch `cell`'s candidate digits (`mask`), the most-constraining value: the digit
+/// currently a candidate in the most *unsolved* peers of `cell` — the one whose placement
+/// the next [`crate::solve::simt::warp_pass_full`] would clear from the most peers. Ties
+/// resolve to the lowest digit (the production ascending order), so a bivalue cell whose two
+/// candidates eliminate equally branches exactly as before.
+///
+/// The cell's peer mask is its row | box | column, assembled from [`ROW_MASK`] / [`BOX_CELLS`]
+/// the same way [`smear_v`] builds a placed group's peer union: the cell's own band carries
+/// row | box | column (minus the cell itself), the other two bands only the shared column.
+/// The constrainingness of digit `d` is `popcount(peer & r[d] & unsolved)` summed over the
+/// three bands — no extra propagation pass, just the scalar snapshot and a few band ALU ops.
+/// (`& unsolved` is load-bearing: a hidden-single placement zeroes only the placed digit's
+/// board at that cell, so a solved cell can still carry stray candidate bits in other boards.)
+///
+/// Reordering the children is verdict-neutral (existence is order- and technique-independent
+/// for a cap=1 search), so generated puzzles stay byte-identical; the payoff is fewer passes
+/// — on a revert the search stops at the first witness, and collapsing toward a completion
+/// fastest reaches one sooner (~-5% prober passes, see
+/// `generator-lab/docs/PROBER-BRANCH-RULE.md`).
+#[inline]
+fn mcv_first(sr: &[[u32; 3]; 9], su: &[u32; 3], cell: usize, mask: u16) -> usize {
+    let cl = rm_lane(cell);
+    let bit = rm_bit(cell);
+    let col = bit % 9;
+    let colmask = (1u32 << col) | (1u32 << (col + 9)) | (1u32 << (col + 18));
+    // Per-band peer mask: the cell's own band adds its row and box (less the cell itself);
+    // every band carries the column the cell sits in.
+    let mut peer = [colmask; 3];
+    peer[cl] |= ROW_MASK[bit / 9] | BOX_CELLS[col / 3];
+    peer[cl] &= !(1u32 << bit);
+
+    let mut best_d = mask.trailing_zeros() as usize;
+    let mut best_elim = 0u32;
+    let mut first = true;
+    let mut m = mask;
+    while m != 0 {
+        let d = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let elim = (peer[0] & sr[d][0] & su[0]).count_ones()
+            + (peer[1] & sr[d][1] & su[1]).count_ones()
+            + (peer[2] & sr[d][2] & su[2]).count_ones();
+        if first || elim > best_elim {
+            best_d = d;
+            best_elim = elim;
+            first = false;
+        }
+    }
+    best_d
 }
