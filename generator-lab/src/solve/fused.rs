@@ -216,41 +216,65 @@ fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
 /// candidates once and drive box↔row locked candidates ([`DROP_TRIP`]) and hidden
 /// singles in the three rows and three boxes ([`SINGLE9`]) off it. Returns whether
 /// anything changed. Mirror of bb's `band_update_rm`.
+///
+/// Digit-outer: the live candidate set `cand[d] & unsolved` is one SIMD AND across
+/// all three bands, so compute it once per digit and extract each band's lane, rather
+/// than re-AND-ing per (band, digit). A placement refreshes it (peers can cross bands).
+/// Reordering the per-(band,digit) sweep is fixpoint-confluent (singles + LC are monotone
+/// eliminations), so `propagate`'s closure reaches the identical board.
+///
+/// Band-unrolled: the three bands are swept by an explicit [`sweep_band_rm`] each (`B` a
+/// constant), not a `for band in 0..3`. A runtime band index makes `live_all.band(b)` read
+/// through [`as_array`](std::simd::Simd::as_array) — `vmovaps %xmm,(%rsp)` then an indexed
+/// `mov (%rsp,%rb,4),..` reload every band, feeding the hot `unit_single`/`triplet_occ` off
+/// a store-forward. A const index ([`Bands::band_at`]) keeps the extract a register
+/// `vpextrd`. Same memory-port win the prober's `band_hidden_singles` took.
 #[cfg_attr(prof_solver, inline(never))]
 fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
-    // Digit-outer: the live candidate set `cand[d] & unsolved` is one SIMD AND across
-    // all three bands, so compute it once per digit and extract each band's lane, rather
-    // than re-AND-ing per (band, digit). A placement refreshes it (peers can cross bands).
-    // Reordering the per-(band,digit) sweep is fixpoint-confluent (singles + LC are monotone
-    // eliminations), so `propagate`'s closure reaches the identical board.
     for di in 0..9 {
         let d = Digit::from_index(di);
         let mut live_all = b.row().candidates()[d] & b.row().unsolved();
-        for band in 0..3 {
-            let mut live = live_all.band(band);
-            if LC {
-                let dropped = DROP_TRIP[triplet_occ(live)];
-                if dropped != 0 {
-                    changed = true;
-                    *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
-                    drop_triplets::<RowMajor>(b, d, band, dropped);
-                    live_all = b.row().candidates()[d] & b.row().unsolved();
-                    live = live_all.band(band);
-                }
-            }
-            // Hidden singles in the six in-lane units (three rows, three boxes), each
-            // read in place via [`Band::unit_single`]: AND with a unit mask, single-bit
-            // test, the bit index doubling as the band position (no gather, no table).
-            for &mask in &Band::UNIT_MASKS {
-                if let Some(pos) = live.unit_single(mask) {
-                    b.place(RowMajor::cell_at(band, pos), d);
-                    changed = true;
-                    *fired |= 1 << HIDDEN_SINGLE;
-                    live_all = b.row().candidates()[d] & b.row().unsolved();
-                    live = live_all.band(band);
-                }
-            }
+        changed |= sweep_band_rm::<0, LC>(b, &mut live_all, d, fired);
+        changed |= sweep_band_rm::<1, LC>(b, &mut live_all, d, fired);
+        changed |= sweep_band_rm::<2, LC>(b, &mut live_all, d, fired);
+    }
+    changed
+}
+
+/// One row-major band's box↔row locked candidates + hidden singles, band index `B` a
+/// constant so the lane extract is a register `vpextrd`. Refreshes the shared `live_all`
+/// after each elimination/placement (it can cross bands), so the caller's next
+/// `sweep_band_rm` sees it.
+#[inline(always)]
+fn sweep_band_rm<const B: usize, const LC: bool>(
+    b: &mut DualSolverState,
+    live_all: &mut Bands<RowMajor>,
+    d: Digit,
+    fired: &mut u32,
+) -> bool {
+    let mut changed = false;
+    let mut live = live_all.band_at::<B>();
+    if LC {
+        let dropped = DROP_TRIP[triplet_occ(live)];
+        if dropped != 0 {
+            changed = true;
+            *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
+            drop_triplets::<RowMajor>(b, d, B, dropped);
+            *live_all = b.row().candidates()[d] & b.row().unsolved();
+            live = live_all.band_at::<B>();
+        }
+    }
+    // Hidden singles in the six in-lane units (three rows, three boxes), each
+    // read in place via [`Band::unit_single`]: AND with a unit mask, single-bit
+    // test, the bit index doubling as the band position (no gather, no table).
+    for &mask in &Band::UNIT_MASKS {
+        if let Some(pos) = live.unit_single(mask) {
+            b.place(RowMajor::cell_at(B, pos), d);
+            changed = true;
+            *fired |= 1 << HIDDEN_SINGLE;
+            *live_all = b.row().candidates()[d] & b.row().unsolved();
+            live = live_all.band_at::<B>();
         }
     }
     changed
@@ -259,35 +283,50 @@ fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> b
 /// One fused column-major sweep: the transpose of [`band_update_rm`] on the column
 /// view, giving box↔column locked candidates and hidden singles in the three
 /// columns. Boxes are already covered row-major, so only the lines (columns) are
-/// swept. Mirror of bb's `band_update_cm`.
+/// swept. Mirror of bb's `band_update_cm`. Band-unrolled like [`band_update_rm`].
 #[cfg_attr(prof_solver, inline(never))]
 fn band_update_cm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
     for di in 0..9 {
         let d = Digit::from_index(di);
         let mut live_all = b.col().candidates()[d] & b.col().unsolved();
-        for band in 0..3 {
-            let mut live = live_all.band(band);
-            if LC {
-                let dropped = DROP_TRIP[triplet_occ(live)];
-                if dropped != 0 {
-                    changed = true;
-                    *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
-                    drop_triplets::<ColMajor>(b, d, band, dropped);
-                    live_all = b.col().candidates()[d] & b.col().unsolved();
-                    live = live_all.band(band);
-                }
-            }
-            // Only the three lines (columns of this view); boxes are covered row-major.
-            for &mask in &Band::UNIT_MASKS[..3] {
-                if let Some(pos) = live.unit_single(mask) {
-                    b.place(ColMajor::cell_at(band, pos), d);
-                    changed = true;
-                    *fired |= 1 << HIDDEN_SINGLE;
-                    live_all = b.col().candidates()[d] & b.col().unsolved();
-                    live = live_all.band(band);
-                }
-            }
+        changed |= sweep_band_cm::<0, LC>(b, &mut live_all, d, fired);
+        changed |= sweep_band_cm::<1, LC>(b, &mut live_all, d, fired);
+        changed |= sweep_band_cm::<2, LC>(b, &mut live_all, d, fired);
+    }
+    changed
+}
+
+/// One column-major band's box↔column locked candidates + hidden singles in the three
+/// columns, band index `B` a constant ([`Bands::band_at`], register `vpextrd`). The
+/// transpose of [`sweep_band_rm`]; only the lines are swept (boxes are covered row-major).
+#[inline(always)]
+fn sweep_band_cm<const B: usize, const LC: bool>(
+    b: &mut DualSolverState,
+    live_all: &mut Bands<ColMajor>,
+    d: Digit,
+    fired: &mut u32,
+) -> bool {
+    let mut changed = false;
+    let mut live = live_all.band_at::<B>();
+    if LC {
+        let dropped = DROP_TRIP[triplet_occ(live)];
+        if dropped != 0 {
+            changed = true;
+            *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
+            drop_triplets::<ColMajor>(b, d, B, dropped);
+            *live_all = b.col().candidates()[d] & b.col().unsolved();
+            live = live_all.band_at::<B>();
+        }
+    }
+    // Only the three lines (columns of this view); boxes are covered row-major.
+    for &mask in &Band::UNIT_MASKS[..3] {
+        if let Some(pos) = live.unit_single(mask) {
+            b.place(ColMajor::cell_at(B, pos), d);
+            changed = true;
+            *fired |= 1 << HIDDEN_SINGLE;
+            *live_all = b.col().candidates()[d] & b.col().unsolved();
+            live = live_all.band_at::<B>();
         }
     }
     changed
