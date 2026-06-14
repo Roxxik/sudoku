@@ -9,22 +9,38 @@ use std::time::Instant;
 
 use generator_lab::generate::{run_attempts, ua_build_cost};
 use generator_lab::rng::Rng;
-use generator_lab::subset_spec_for_mode;
+use generator_lab::spec::Spec;
+use generator_lab::spec::kinds::{HIDDEN_QUAD, NAKED_PAIR};
 
 struct Args {
     attempts: usize,
     seed: u64,
+    /// Forced target kind. Defaults to the production `HiddenQuad`; an easier kind
+    /// (e.g. `naked-pair`) makes attempts yield puzzles, so the determinism fp folds a
+    /// real puzzle stream and bites as an A/B output-identity check (it is constant at
+    /// the 0-yield HiddenQuad rarity).
+    kind: usize,
 }
 
 fn parse_args() -> Args {
-    let mut out = Args { attempts: 4000, seed: 1 };
+    let mut out = Args { attempts: 4000, seed: 1, kind: HIDDEN_QUAD };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--attempts" => out.attempts = it.next().and_then(|s| s.parse().ok()).unwrap_or(out.attempts),
             "--seed" => out.seed = it.next().and_then(|s| s.parse().ok()).unwrap_or(out.seed),
+            "--kind" => {
+                out.kind = match it.next().as_deref() {
+                    Some("naked-pair") => NAKED_PAIR,
+                    Some("hidden-quad") | None => HIDDEN_QUAD,
+                    Some(other) => {
+                        eprintln!("unknown --kind {other:?} (naked-pair|hidden-quad)");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-h" | "--help" => {
-                println!("usage: bench [--attempts N] [--seed S]");
+                println!("usage: bench [--attempts N] [--seed S] [--kind naked-pair|hidden-quad]");
                 std::process::exit(0);
             }
             _ => {}
@@ -35,9 +51,10 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    let kind_label = if args.kind == NAKED_PAIR { "naked-pair" } else { "hidden-quad" };
     println!(
-        "generator-lab bench: {} attempts/mode, seed {} (random method)\n",
-        args.attempts, args.seed
+        "generator-lab bench: {} attempts/mode, seed {}, target {} (random method)\n",
+        args.attempts, args.seed, kind_label
     );
 
     // UA pre-filter per-board build cost (isolated enumeration time) for the production full
@@ -55,7 +72,7 @@ fn main() {
     );
 
     for (mode, label) in [(0u32, "train"), (1u32, "drill")] {
-        let spec = subset_spec_for_mode(mode);
+        let spec = if mode == 0 { Spec::train(args.kind) } else { Spec::drill(args.kind) };
         let mut rng = Rng::from_seed(args.seed);
         let start = Instant::now();
         let (stats, fp) = run_attempts(&mut rng, &spec, args.attempts);
