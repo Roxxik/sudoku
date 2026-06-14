@@ -239,20 +239,12 @@ fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> b
                     live = live_all.band(band);
                 }
             }
-            // Hidden singles in the three rows (each a contiguous 9-bit run).
-            for line in 0..3 {
-                if let Some(slot) = lone(live.line(line)) {
-                    b.place(RowMajor::cell_at(band, Band::line_pos(line, slot)), d);
-                    changed = true;
-                    *fired |= 1 << HIDDEN_SINGLE;
-                    live_all = b.row().candidates()[d] & b.row().unsolved();
-                    live = live_all.band(band);
-                }
-            }
-            // Hidden singles in the three boxes (each gathered into a 9-bit run).
-            for k in 0..3 {
-                if let Some(slot) = lone(live.box_unit(k)) {
-                    b.place(RowMajor::cell_at(band, Band::box_pos(k, slot)), d);
+            // Hidden singles in the six in-lane units (three rows, three boxes), each
+            // read in place via [`Band::unit_single`]: AND with a unit mask, single-bit
+            // test, the bit index doubling as the band position (no gather, no table).
+            for &mask in &Band::UNIT_MASKS {
+                if let Some(pos) = live.unit_single(mask) {
+                    b.place(RowMajor::cell_at(band, pos), d);
                     changed = true;
                     *fired |= 1 << HIDDEN_SINGLE;
                     live_all = b.row().candidates()[d] & b.row().unsolved();
@@ -286,9 +278,10 @@ fn band_update_cm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> b
                     live = live_all.band(band);
                 }
             }
-            for line in 0..3 {
-                if let Some(slot) = lone(live.line(line)) {
-                    b.place(ColMajor::cell_at(band, Band::line_pos(line, slot)), d);
+            // Only the three lines (columns of this view); boxes are covered row-major.
+            for &mask in &Band::UNIT_MASKS[..3] {
+                if let Some(pos) = live.unit_single(mask) {
+                    b.place(ColMajor::cell_at(band, pos), d);
                     changed = true;
                     *fired |= 1 << HIDDEN_SINGLE;
                     live_all = b.col().candidates()[d] & b.col().unsolved();
@@ -448,14 +441,6 @@ impl Eliminate for CellBoard {
     }
 }
 
-/// The lone candidate's slot in a 9-bit unit mask, or `None` for zero or more than
-/// one candidate — one [`SINGLE9`] load.
-#[inline]
-fn lone(unit: usize) -> Option<usize> {
-    let s = SINGLE9[unit];
-    (s != 0xFF).then_some(s as usize)
-}
-
 /// A band's 9-bit triplet occupancy: bit `3*r + k` set iff triplet (band-row `r`,
 /// box-column `k`) holds any candidate — three [`OCC3`] loads off the band's three
 /// 9-bit lines, the index [`DROP_TRIP`] reads.
@@ -467,19 +452,6 @@ fn triplet_occ(band: Band) -> usize {
 }
 
 // --- precomputed lookup tables (ported verbatim from `bb::layout`) -------------
-
-/// Hidden-single lookup: the lone bit's index of a 9-bit unit mask, else `0xFF`.
-const SINGLE9: [u8; 512] = {
-    let mut t = [0xFFu8; 512];
-    let mut v = 1usize;
-    while v < 512 {
-        if v & (v - 1) == 0 {
-            t[v] = v.trailing_zeros() as u8;
-        }
-        v += 1;
-    }
-    t
-};
 
 /// 9-bit line -> 3-bit triplet occupancy: bit `k` set iff the line's `k`-th 3-cell
 /// triplet holds any candidate.
