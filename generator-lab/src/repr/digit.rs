@@ -8,7 +8,14 @@ use std::num::NonZeroU8;
 /// for an empty cell. An empty cell is `Option<Digit>` (`None`); thanks to the
 /// null niche, `Option<Digit>` is one byte with `None` == 0, identical in memory
 /// to the old `0`-means-empty `u8` encoding.
+///
+/// `#[repr(transparent)]` makes that memory identity a *guarantee*, not just a
+/// likelihood: `Digit` has exactly `NonZeroU8`'s layout, so `Option<Digit>` is
+/// `Option<NonZeroU8>` — one byte, `None` == 0, `Some(d)` == `d.get()`. A grid of
+/// `Option<Digit>` is therefore byte-for-byte a `[u8; N]` of `0`/`1..=9`, which is
+/// what [`super::DigitGrid::as_bytes`] reinterprets with no copy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
 pub struct Digit(NonZeroU8);
 
 impl Digit {

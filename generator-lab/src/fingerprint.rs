@@ -25,6 +25,6 @@ pub fn fnv_fold_cells(fp: &mut u64, cells: &[u8; CELLS]) {
 /// two builds emit the same puzzles, regardless of the warp's completion order).
 pub fn grid_fp(grid: &DigitGrid) -> u64 {
     let mut fp = FNV_OFFSET;
-    fnv_fold_cells(&mut fp, &grid.cell_bytes());
+    fnv_fold_cells(&mut fp, grid.as_bytes());
     fp
 }

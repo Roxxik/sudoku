@@ -38,6 +38,9 @@ pub use random::{VerifyShare, verify_share};
 // UA pre-filter per-board build cost (stage-2 decision gate) — native, no counters.
 #[cfg(not(target_arch = "wasm32"))]
 pub use random::{ua_build_cost, ua_build_cost_pooled};
+// Fill-byproduct (clue map + UA coordinate inverse) old-vs-new cost — native, no counters.
+#[cfg(not(target_arch = "wasm32"))]
+pub use random::fill_byproduct_cost_pooled;
 
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, RowMajor};

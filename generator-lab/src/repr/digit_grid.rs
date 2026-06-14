@@ -66,11 +66,20 @@ impl DigitGrid {
         &self.0
     }
 
-    /// The 81 cells as raw bytes — `1..=9` for a digit, `0` for empty (the line/byte form;
-    /// [`cells`](Self::cells) keeps the `Option`s). Used for fingerprint folding.
+    /// The 81 cells reinterpreted as raw bytes with **no copy** — `1..=9` for a digit,
+    /// `0` for empty (the line/byte form; [`cells`](Self::cells) keeps the `Option`s).
+    /// [`Digit`] is `#[repr(transparent)]` over `NonZeroU8`, so `Option<Digit>` is one byte
+    /// (`None` == 0, `Some(d)` == `d.get()`) and `[Option<Digit>; CELLS]` is byte-identical to
+    /// `[u8; CELLS]`. A borrow of the existing storage, not a per-element rebuild — the natural
+    /// input wherever a consumer wants the dense grid bytes (fingerprint folding, the UA build's
+    /// `pshufb` digit gather) without paying a flatten.
     #[inline]
-    pub fn cell_bytes(&self) -> [u8; CELLS] {
-        core::array::from_fn(|i| self.0[i].map_or(0, |d| d.get()))
+    pub fn as_bytes(&self) -> &[u8; CELLS] {
+        // SAFETY: `Option<Digit>` is `Option<NonZeroU8>` by `Digit`'s `repr(transparent)`,
+        // so it is one byte with the same value encoding as `u8`; `[Option<Digit>; CELLS]`
+        // and `[u8; CELLS]` thus have identical size, alignment (1), and layout.
+        const _: () = assert!(core::mem::size_of::<Option<Digit>>() == 1);
+        unsafe { &*(self.0.as_ptr() as *const [u8; CELLS]) }
     }
 
     #[inline]

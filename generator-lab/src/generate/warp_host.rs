@@ -39,7 +39,7 @@
 
 use super::random::{GeneratedPuzzle, Stats, StripState, baseline_fast_applicable, verify};
 use crate::counters::counter_block;
-use crate::fill::random_solution;
+use crate::fill::{random_solution, random_solution_full};
 use crate::probe::simt::{Frame, LANES, M, Probe, V, ZERO, load_lane};
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{CELLS, Puzzle, SolverState};
@@ -377,15 +377,18 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
             let mut rng = Rng::from_seed(seed);
             shared.borrow_mut().stats.attempts += 1;
             // Fill + UA-build slices (subsets of this resume's coroutine cycles [5]):
-            // random_solution is the fill, new_ua is the per-board UA library build —
-            // the UA cost is the BUILD, not the cheap per-cell `caught` query, which
-            // stays in the strip residual. Timed once per attempt (low perturbation).
+            // random_solution_full is the fill PLUS its byproducts (clue map + UA coordinate
+            // inverse, one fused pass) — so [8] now also covers the byproduct production the
+            // strip/UA build used to re-derive. new_ua is the per-board UA library build, which
+            // consumes the fill's coordinate inverse (no precompute) — the cost is the per-pair
+            // enumeration, not the cheap per-cell `caught` query (that stays in the strip
+            // residual). Timed once per attempt (low perturbation).
             let tf = rdtsc();
-            let solution = random_solution(&mut rng);
+            let filled = random_solution_full(&mut rng);
             let tu = rdtsc();
-            ph_add(8, tu.wrapping_sub(tf)); // fill: random_solution
-            let mut strip: StripState<RowStrip> = StripState::new_ua(&solution);
-            ph_add(9, rdtsc().wrapping_sub(tu)); // ua-build: new_ua library
+            ph_add(8, tu.wrapping_sub(tf)); // fill: random_solution_full (incl. byproducts)
+            let mut strip: StripState<RowStrip> = StripState::new_ua(&filled);
+            ph_add(9, rdtsc().wrapping_sub(tu)); // ua-build: new_ua library (coords from fill)
             let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
             rng.shuffle(&mut positions);
             for idx in 0..CELLS {
@@ -445,7 +448,7 @@ pub(in crate::generate) fn attempt<I: Iterator<Item = u64>>(
                         sh.stats.total_givens += givens;
                         sh.ready.push_back((
                             seed,
-                            GeneratedPuzzle { puzzle: Puzzle(snap), solution, givens },
+                            GeneratedPuzzle { puzzle: Puzzle(snap), solution: filled.solution, givens },
                         ));
                     } else {
                         shared.borrow_mut().stats.not_forced += 1;

@@ -14,7 +14,7 @@
 
 use crate::counters::counter_block;
 use crate::repr::banded::{Bands, RowMajor};
-use crate::repr::{Branchable, Digit, DigitGrid, PerDigit, Solution};
+use crate::repr::{Branchable, CELLS, Digit, DigitGrid, GridMask, PerDigit, Solution};
 use crate::rng::Rng;
 use crate::scan::{BranchStrategy, Mrv, Scan};
 use std::marker::PhantomData;
@@ -55,26 +55,217 @@ pub fn random_solution_with<S: BranchStrategy>(rng: &mut Rng) -> Solution {
     Solution(f.digits)
 }
 
+/// The per-(line, digit) coordinate inverse of a *complete* grid, in the packed shape the
+/// UA build's `pshufb` engine consumes directly: one `[u8; 16]` per digit (slot `d` =
+/// digit `d + 1`), the nine real entries in lanes `0..9` and `0x80` (the
+/// `_mm_shuffle_epi8` don't-care fill, which zeroes on the index's high bit) padding lanes
+/// `9..16`. `r_map[d][row] = col`, `c_map[d][col] = row`, `bx_map[d][row] = box`,
+/// `rbox_map[d][box] = row`.
+///
+/// This is exactly the per-board precompute the UA library build used to derive on its own.
+/// The fill already places every digit, so it hands the inverse out as a byproduct (see
+/// [`random_solution_full`]) and the build skips re-deriving it. Each map loads straight
+/// into one `__m128i`; the scalar (non-x86) build reads the same maps re-indexed.
+#[derive(Clone)]
+pub struct GridCoords {
+    pub r_map: [[u8; 16]; 9],
+    pub c_map: [[u8; 16]; 9],
+    pub bx_map: [[u8; 16]; 9],
+    pub rbox_map: [[u8; 16]; 9],
+}
+
+/// `0x80` (the `pshufb` don't-care fill) for lanes a placement never overwrites.
+const COORD_HI: u8 = 0x80;
+
+impl GridCoords {
+    /// All-`0x80` maps — every lane the don't-care fill until a placement writes lanes
+    /// `0..9`.
+    fn empty() -> Self {
+        GridCoords {
+            r_map: [[COORD_HI; 16]; 9],
+            c_map: [[COORD_HI; 16]; 9],
+            bx_map: [[COORD_HI; 16]; 9],
+            rbox_map: [[COORD_HI; 16]; 9],
+        }
+    }
+
+    /// The coordinate inverse of a complete grid, in one pass — the standalone (clue-less)
+    /// derive the UA library build's wrapper uses when it has only the grid (the production
+    /// path takes it from the fill via [`byproducts`]). `g` must be complete.
+    pub fn from_grid(g: &DigitGrid) -> Self {
+        let mut coords = GridCoords::empty();
+        for cell in 0..CELLS {
+            let di = g.get(cell).expect("GridCoords::from_grid: grid must be complete").index();
+            let (row, col) = (cell / 9, cell % 9);
+            let bx = (row / 3) * 3 + col / 3;
+            coords.r_map[di][row] = col as u8;
+            coords.c_map[di][col] = row as u8;
+            coords.bx_map[di][row] = bx as u8;
+            coords.rbox_map[di][bx] = row as u8;
+        }
+        coords
+    }
+}
+
+/// The fill byproducts the strip and UA build would otherwise re-derive from the grid: the
+/// row-major clue map (the strip's `clue` seed, equal to
+/// `SolverState::<Bands<RowMajor>>::clue_map` of the grid) and the UA coordinate inverse
+/// ([`GridCoords`]). The fill accumulates them in `PerDigit<Bands>` space *as it places* (it
+/// already works there), so they are extracted directly rather than transposed back out of
+/// the cell-major [`DigitGrid`] — see [`ByproductSink`].
+#[derive(Clone)]
+pub struct Byproducts {
+    pub clue: PerDigit<Bands<RowMajor>>,
+    pub coords: GridCoords,
+}
+
+impl Byproducts {
+    fn new() -> Self {
+        Byproducts {
+            clue: PerDigit::new([<Bands<RowMajor> as GridMask>::EMPTY; 9]),
+            coords: GridCoords::empty(),
+        }
+    }
+
+    /// Record digit `d` placed at `cell`: set the clue bit and write the four coordinate-map
+    /// entries for this `(digit, line)`. The single source of truth for both byproducts; the
+    /// in-fill [`ByproductSink`] impl and the standalone [`byproducts`] driver both go through
+    /// it. The coordinate writes are **last-write-wins** — see [`unplace`](Self::unplace).
+    #[inline]
+    fn place(&mut self, cell: usize, d: Digit) {
+        let di = d.index();
+        let (row, col) = (cell / 9, cell % 9);
+        let bx = (row / 3) * 3 + col / 3;
+        self.clue[d] |= <Bands<RowMajor> as GridMask>::cell(cell);
+        self.coords.r_map[di][row] = col as u8;
+        self.coords.c_map[di][col] = row as u8;
+        self.coords.bx_map[di][row] = bx as u8;
+        self.coords.rbox_map[di][bx] = row as u8;
+    }
+
+    /// Undo a backtracked placement of `d` at `cell`: clear the clue bit. The coordinate maps
+    /// are deliberately **not** retracted — they are last-write-wins and self-heal. A
+    /// backtracked entry `(d, line)` is always overwritten by the placement that finally
+    /// commits `d` in that line, which the search reaches *after* the backtrack: once `d` is
+    /// committed in a line its candidate board excludes that line's cells, so `d` is never
+    /// re-tried (hence never stale-written) there again. So at completion every coordinate
+    /// entry holds its final placement, while only the clue mask needs explicit retraction.
+    #[inline]
+    fn unplace(&mut self, _cell: usize, d: Digit) {
+        self.clue[d] &= !<Bands<RowMajor> as GridMask>::cell(_cell);
+    }
+}
+
+/// Where the fill records byproducts as it places — a monomorphized policy, exactly like the
+/// [`BranchStrategy`] type parameter. [`NoByproducts`] (the default) makes every call a no-op
+/// the compiler erases, so the plain [`random_solution`] fill pays nothing; [`Byproducts`] is
+/// the production sink, so [`random_solution_full`] accumulates the clue map + coordinate
+/// inverse in-place and extracts them with no transpose pass over the grid.
+trait ByproductSink {
+    fn place(&mut self, cell: usize, d: Digit);
+    fn unplace(&mut self, cell: usize, d: Digit);
+}
+
+/// The no-op sink for fills that don't want byproducts — every method erases to nothing.
+#[derive(Default)]
+struct NoByproducts;
+impl ByproductSink for NoByproducts {
+    #[inline(always)]
+    fn place(&mut self, _cell: usize, _d: Digit) {}
+    #[inline(always)]
+    fn unplace(&mut self, _cell: usize, _d: Digit) {}
+}
+
+impl Default for Byproducts {
+    fn default() -> Self {
+        Byproducts::new()
+    }
+}
+
+impl ByproductSink for Byproducts {
+    #[inline]
+    fn place(&mut self, cell: usize, d: Digit) {
+        Byproducts::place(self, cell, d);
+    }
+    #[inline]
+    fn unplace(&mut self, cell: usize, d: Digit) {
+        Byproducts::unplace(self, cell, d);
+    }
+}
+
+/// The clue map + coordinate inverse of a complete `digits` grid, derived by driving the
+/// [`Byproducts`] sink over the grid's placements — the same per-cell work the in-fill sink
+/// does, but from a finished grid. The standalone reference (and the byproduct microbench's
+/// "fused pass" arm); the production path takes them straight from the fill
+/// ([`random_solution_full`]), never going through a grid at all. `digits` must be complete.
+pub fn byproducts(digits: &DigitGrid) -> Byproducts {
+    let mut bp = Byproducts::new();
+    for cell in 0..CELLS {
+        bp.place(cell, digits.get(cell).expect("byproducts: grid must be complete"));
+    }
+    bp
+}
+
+/// A complete [`Solution`] plus the fill [`Byproducts`] (clue map + UA coordinate inverse).
+/// The dense grid bytes the UA build also needs are the solution itself —
+/// `solution.0.as_bytes()`, a zero-copy borrow — so they are not stored here.
+pub struct Filled {
+    pub solution: Solution,
+    pub byproducts: Byproducts,
+}
+
+/// [`random_solution`] that also returns the fill [`Byproducts`]. The fill carries the
+/// [`Byproducts`] sink, accumulating the clue map and UA coordinate inverse in
+/// `PerDigit<Bands>` space *as it places*, so they are extracted with **no transpose pass**
+/// over the grid (the round-trip the cell-major [`DigitGrid`] would force). The production
+/// strip attempt seeds its [`crate::generate`] strip state from these directly. Byte-identical
+/// grid (and RNG trajectory) to [`random_solution`] for a given seed — the sink consumes no RNG.
+pub fn random_solution_full(rng: &mut Rng) -> Filled {
+    let mut f = Fill::<Bands<RowMajor>, Mrv, Byproducts>::new();
+    f.seed_diagonal(rng);
+    let ok = f.fill(rng);
+    debug_assert!(ok, "fill should always succeed after a valid diagonal seed");
+    // The in-fill sink must match the standalone derive from the finished grid — pins both the
+    // clue transpose and the last-write-wins coordinate maintenance.
+    debug_assert!(
+        {
+            let r = byproducts(&f.digits);
+            f.sink.clue == r.clue && f.sink.coords.r_map == r.coords.r_map
+                && f.sink.coords.c_map == r.coords.c_map
+                && f.sink.coords.bx_map == r.coords.bx_map
+                && f.sink.coords.rbox_map == r.coords.rbox_map
+        },
+        "in-fill byproducts must equal the grid-derived reference"
+    );
+    let Fill { digits, sink, .. } = f;
+    Filled { solution: Solution(digits), byproducts: sink }
+}
+
 /// Digit-transposed fill state: `board[d]` holds the cells where digit `d+1` can
 /// still go; `unsolved` is the cells not yet decided. A decided cell's stale bits
 /// in the other boards are never cleared — they are gated out by `unsolved`
 /// everywhere the scan reads them, so candidates of *unsolved* cells stay exactly
 /// correct (= the board's naked candidates). `digits` records the placed digit at
 /// each cell, the only thing the cell-sets can't answer, for the final grid.
-struct Fill<M: Branchable, S: BranchStrategy = Mrv> {
+struct Fill<M: Branchable, S: BranchStrategy = Mrv, B: ByproductSink = NoByproducts> {
     board: PerDigit<M>,
     unsolved: M,
     digits: DigitGrid,
+    /// Accumulates the fill byproducts as cells are placed (clue map + UA coordinate inverse
+    /// for [`Byproducts`], nothing for the default [`NoByproducts`]). A monomorphized policy:
+    /// the no-op sink erases, so the plain fill is unchanged.
+    sink: B,
     _strategy: PhantomData<S>,
 }
 
-impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
+impl<M: Branchable, S: BranchStrategy, B: ByproductSink + Default> Fill<M, S, B> {
     /// A fresh empty-board fill: every digit may go anywhere, every cell unsolved.
     fn new() -> Self {
         Fill {
             board: PerDigit::new([M::FULL; 9]),
             unsolved: M::FULL,
             digits: DigitGrid::EMPTY,
+            sink: B::default(),
             _strategy: PhantomData,
         }
     }
@@ -98,6 +289,7 @@ impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
                     self.unsolved &= !M::cell(cell);
                     self.board[d] &= !M::peers(cell);
                     self.digits.set(cell, d);
+                    self.sink.place(cell, d);
                     i += 1;
                 }
             }
@@ -137,9 +329,11 @@ impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
             let bu = self.board[d];
             self.board[d] &= not_peers;
             self.digits.set(cell, d);
+            self.sink.place(cell, d);
             if self.fill(rng) {
                 return true;
             }
+            self.sink.unplace(cell, d);
             self.board[d] = bu;
         }
         self.unsolved |= cell_mask;

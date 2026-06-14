@@ -23,7 +23,7 @@
 //! `BitBoard` for both gates. The lone `from_digits` is once per attempt, on the full
 //! solution.
 
-use crate::fill::random_solution;
+use crate::fill::{Filled, GridCoords, byproducts, random_solution, random_solution_full};
 use crate::probe::{Prober, Search};
 use crate::repr::banded::{Bands, DualSolverState, RowMajor};
 use crate::repr::{Board, CELLS, Digit, DigitGrid, GridMask, Mark, Marks, PerDigit, Puzzle, Solution, SolverState};
@@ -199,22 +199,40 @@ impl UaFilter {
         }
     }
 
-    /// Build the production (full 2-digit) UA library for the complete solution grid `sol`,
-    /// flattened once to a dense `[u8; 81]` the enumeration indexes. ([`DigitGrid`] is already
-    /// a cell-major `[Option<Digit>; 81]`, so the flatten is ~81 cheap reads — it is not the
-    /// cost; the per-pair enumeration work is. It is kept because a tight `u8` array is the
-    /// natural input for the coordinate-table fill below.)
+    /// Build the production (full 2-digit) UA library from a bare grid, deriving the
+    /// coordinate inverse + dense bytes the production [`build_full_from`](Self::build_full_from)
+    /// takes from the fill. The convenience wrapper for callers that hold only a grid — the
+    /// differential tests — so it is test-only (production and the build benches go through
+    /// [`build_full_from`](Self::build_full_from) with fill-provided coords).
     ///
     /// x86_64 (the perf target) runs the packed `pshufb` build; the scalar cycle-decomposition
     /// build stays as the oracle/fallback (it ships in the wasm cdylib and is the
     /// differential-test reference). Both produce a bit-identical `UaFilter` — see
     /// [`enumerate_2digit_packed`](Self::enumerate_2digit_packed) and `docs/UA-PACKED-BUILD.md`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn build_full(sol: &DigitGrid) -> Self {
+        // The production path takes the coordinate inverse + dense bytes from the fill (see
+        // [`build_full_from`] / [`StripState::new_ua`]); this wrapper derives them from a
+        // bare grid for the bench/test callers that have only a grid in hand.
+        Self::build_full_from(&GridCoords::from_grid(sol), sol.as_bytes())
+    }
+
+    /// Build the production (full 2-digit) UA library from the fill's precomputed coordinate
+    /// inverse `coords` ([`GridCoords`]) and the dense grid bytes `g` (`1..=9`, `0` empty —
+    /// a complete grid is all `1..=9`, taken zero-copy from the solution via
+    /// [`DigitGrid::as_bytes`]). The fill hands `coords` out as a byproduct, so the build no
+    /// longer derives the per-(line, digit) maps itself. `g` feeds only the packed build's
+    /// trailing `lens` rebuild (the scalar build needs `coords` alone). Bit-identical
+    /// [`UaFilter`] to the old grid-derived build.
+    fn build_full_from(coords: &GridCoords, g: &[u8; CELLS]) -> Self {
         let mut f = UaFilter::empty();
         #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
-        f.enumerate_2digit_packed(&Self::dense(sol));
+        f.enumerate_2digit_packed(coords, g);
         #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
-        f.enumerate_2digit(&Self::dense(sol));
+        {
+            let _ = g; // the scalar build reads `coords` only
+            f.enumerate_2digit(coords);
+        }
         f
     }
 
@@ -229,7 +247,11 @@ impl UaFilter {
     }
 
     /// The complete solution as a dense row-major digit array (`0..=8`). A complete grid has
-    /// every cell placed, so the `unwrap_or` is never taken.
+    /// every cell placed, so the `unwrap_or` is never taken. Only the `0..=8`-indexed UA4
+    /// codepath ([`enumerate_ua4`](Self::enumerate_ua4)) needs this transformed form — the
+    /// full build consumes the grid's raw `1..=9` bytes ([`DigitGrid::as_bytes`]) directly —
+    /// so it is test-only, like its sole caller [`build_ua4`](Self::build_ua4).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn dense(sol: &DigitGrid) -> [u8; CELLS] {
         core::array::from_fn(|c| sol.get(c).map_or(0, |d| d.index() as u8))
     }
@@ -370,8 +392,14 @@ impl UaFilter {
     /// [`enumerate_2digit_packed`](Self::enumerate_2digit_packed) instead; this scalar build
     /// stays as the wasm/other-arch path and the `packed_equals_scalar` differential oracle, so
     /// it is unused (but compiled) in a non-test x86_64+ssse3 build.
+    ///
+    /// The per-(line, digit) coordinate maps come in from the fill ([`GridCoords`]) rather
+    /// than a per-board precompute; `coords` stores them transposed (`[digit][line]`), so the
+    /// old `col_of[row][d]` reads as `coords.r_map[d][row]`, `row_in_col[col][d]` as
+    /// `coords.c_map[d][col]`, and `row_in_box[box][d]` as `coords.rbox_map[d][box]` (same
+    /// values, indices swapped).
     #[cfg_attr(all(target_arch = "x86_64", target_feature = "ssse3", not(test)), allow(dead_code))]
-    fn enumerate_2digit(&mut self, g: &[u8; CELLS]) {
+    fn enumerate_2digit(&mut self, coords: &GridCoords) {
         // Root of a `<=9`-element union-find with path halving (over cycle ids).
         fn root(p: &mut [u8; 9], mut x: usize) -> usize {
             while p[x] as usize != x {
@@ -380,21 +408,6 @@ impl UaFilter {
                 x = gp as usize;
             }
             x
-        }
-        // Precompute, once per board, each digit's coordinate within each line — the only
-        // divisions in the whole enumeration live here, hoisted out of the per-pair loops.
-        // A complete grid has exactly one cell per (unit, digit), so every entry is set.
-        let mut col_of = [[0u8; 9]; 9]; // [row][digit]    = column of the digit in that row
-        let mut row_in_col = [[0u8; 9]; 9]; // [column][digit] = row of the digit in that column
-        let mut row_in_box = [[0u8; 9]; 9]; // [box][digit]    = row of the digit in that box
-        for row in 0..9 {
-            for col in 0..9 {
-                let d = g[row * 9 + col] as usize;
-                let bx = (row / 3) * 3 + col / 3;
-                col_of[row][d] = col as u8;
-                row_in_col[col][d] = row as u8;
-                row_in_box[bx][d] = row as u8;
-            }
         }
         let mut cid = [0u8; 9]; // row -> row+column cycle id
         let mut comp = [0u8; 9]; // cycle id -> merged-component id (box-join union-find)
@@ -413,7 +426,7 @@ impl UaFilter {
                         visited[r] = true;
                         cid[r] = ncyc;
                         // pi(r): the row of b in the column where a sits in row r.
-                        r = row_in_col[col_of[r][a] as usize][b] as usize;
+                        r = coords.c_map[b][coords.r_map[a][r] as usize] as usize;
                     }
                     ncyc += 1;
                 }
@@ -437,8 +450,8 @@ impl UaFilter {
                 }
                 let mut merges = 0u8;
                 for bx in 0..9 {
-                    let ra = row_in_box[bx][a] as usize;
-                    let rb = row_in_box[bx][b] as usize;
+                    let ra = coords.rbox_map[a][bx] as usize;
+                    let rb = coords.rbox_map[b][bx] as usize;
                     let (x, y) =
                         (root(&mut comp, cid[ra] as usize), root(&mut comp, cid[rb] as usize));
                     if x != y {
@@ -469,7 +482,7 @@ impl UaFilter {
                         continue; // truncated UA (never reached: <=144 UAs/board)
                     }
                     self.counts[id as usize] += 2;
-                    for cell in [r * 9 + col_of[r][a] as usize, r * 9 + col_of[r][b] as usize] {
+                    for cell in [r * 9 + coords.r_map[a][r] as usize, r * 9 + coords.r_map[b][r] as usize] {
                         let ln = self.lens[cell] as usize;
                         if ln < UA_PER_CELL {
                             self.cell_uas[cell][ln] = id;
@@ -511,35 +524,17 @@ impl UaFilter {
     /// `0` (row 0 lies in the cycle/component whose minimum row is 0), so "all lanes 0..8 zero"
     /// is exactly "one 18-cell component", the cap-14 drop.
     #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
-    fn enumerate_2digit_packed(&mut self, g: &[u8; CELLS]) {
+    fn enumerate_2digit_packed(&mut self, coords: &GridCoords, g: &[u8; CELLS]) {
         use core::arch::x86_64::*;
 
-        const HI: u8 = 0x80; // don't-care fill for lanes 9..15
-
-        // Precompute, once per board, each digit's coordinate within each line — the only
-        // divisions in the enumeration, hoisted out of the per-pair loops (as in the scalar
-        // build). A complete grid sets every (unit, digit) entry exactly once. The 16-byte
-        // permutation maps the per-pair vector ops consume: `r_map`/`c_map` over lines
-        // (`R_d[row] = col`, `C_d[col] = row`, `C_d` the inverse of `R_d`) and
-        // `bx_map`/`rbox_map` over boxes (`B_d[row] = box`, `X_d[box] = row`, composing to the
-        // box-edge neighbor maps below). Emission's per-row column lookup reads `r_map[d][row]`
-        // directly: the old scalar `col_of[row][d]` was exactly `r_map`'s transpose (both store
-        // `col` at the same complete-grid `(row, d)` placement), so it was redundant store
-        // traffic — `docs/UA-PACKED-BUILD.md` section 14 candidate (b).
-        let mut r_map = [[HI; 16]; 9];
-        let mut c_map = [[HI; 16]; 9];
-        let mut bx_map = [[HI; 16]; 9]; // B_d[row] = box of d's cell in that row
-        let mut rbox_map = [[HI; 16]; 9]; // X_d[box] = row of d's cell in that box
-        for row in 0..9 {
-            for col in 0..9 {
-                let d = g[row * 9 + col] as usize;
-                let bx = (row / 3) * 3 + col / 3;
-                r_map[d][row] = col as u8;
-                c_map[d][col] = row as u8;
-                bx_map[d][row] = bx as u8;
-                rbox_map[d][bx] = row as u8;
-            }
-        }
+        // The per-(line, digit) permutation maps come in from the fill ([`GridCoords`]),
+        // already in the 16-byte-per-digit packed shape with the `0x80` don't-care fill in
+        // lanes 9..15 — the per-pair vector ops load each digit's map straight into one
+        // `__m128i`. `r_map`/`c_map` are over lines (`R_d[row] = col`, `C_d[col] = row`, the
+        // inverse of `R_d`); `bx_map`/`rbox_map` over boxes (`B_d[row] = box`,
+        // `X_d[box] = row`), composing to the box-edge neighbor maps below. Emission's per-row
+        // column lookup reads `coords.r_map[d][row]` directly. `g` (the raw `1..=9` grid bytes)
+        // feeds only the trailing `lens` rebuild.
 
         // SAFETY: every `_mm_*` below is SSE2/SSSE3, statically available under
         // `cfg(target_feature = "ssse3")` (the crate builds with `-C target-cpu=native`). All
@@ -558,10 +553,10 @@ impl UaFilter {
             let mut bx_vec = [zero; 9];
             let mut rbox_vec = [zero; 9];
             for d in 0..9 {
-                r_vec[d] = _mm_loadu_si128(r_map[d].as_ptr() as *const __m128i);
-                c_vec[d] = _mm_loadu_si128(c_map[d].as_ptr() as *const __m128i);
-                bx_vec[d] = _mm_loadu_si128(bx_map[d].as_ptr() as *const __m128i);
-                rbox_vec[d] = _mm_loadu_si128(rbox_map[d].as_ptr() as *const __m128i);
+                r_vec[d] = _mm_loadu_si128(coords.r_map[d].as_ptr() as *const __m128i);
+                c_vec[d] = _mm_loadu_si128(coords.c_map[d].as_ptr() as *const __m128i);
+                bx_vec[d] = _mm_loadu_si128(coords.bx_map[d].as_ptr() as *const __m128i);
+                rbox_vec[d] = _mm_loadu_si128(coords.rbox_map[d].as_ptr() as *const __m128i);
             }
             // Per-digit membership counters, standing in for the per-cell `lens` during the
             // build (the emission-restructure follow-up, `docs/UA-PACKED-BUILD.md` section 14).
@@ -571,9 +566,10 @@ impl UaFilter {
             // emitting pairs so far containing that digit. Tracking that single byte per digit
             // replaces the 18 per-pair `lens` read-modify-writes (whose store-to-load forwarding
             // chained across the consecutive pairs sharing a digit — the build's hottest line);
-            // `lens` itself is reconstructed in one pshufb pass after the pair loops. 16 lanes so
-            // the array loads straight into the flush's xmm; lanes 9..15 stay 0 (never indexed:
-            // grid digits are 0..8).
+            // `lens` itself is reconstructed in one pshufb pass after the pair loops. Indexed by
+            // the raw `1..=9` digit value (so the grid bytes index it directly in that rebuild),
+            // i.e. digit `d`'s counter is `cnt[d.value]` = `cnt[d + 1]`; 16 lanes so the array
+            // loads straight into the flush's xmm, with lane 0 and lanes 10..15 unused (zero).
             let mut cnt = [0u8; 16];
 
             for a in 0..9usize {
@@ -669,14 +665,15 @@ impl UaFilter {
                     //
                     // The membership slot is the per-digit counter, not a per-cell `lens` read:
                     // every earlier emitting pair containing `a` filled one slot in each of `a`'s
-                    // nine cells (all-rows emission), so each a-cell's next free slot IS `cnt[a]`
+                    // nine cells (all-rows emission), so each a-cell's next free slot IS `cnt[a+1]`
                     // — the same value the dropped `lens[cell]` load would have produced, keeping
                     // the slot assignment (and so the whole struct, via `packed_equals_scalar`)
-                    // bit-identical to the checked scalar build.
-                    let ka = cnt[a] as usize;
-                    let kb = cnt[b] as usize;
-                    cnt[a] += 1;
-                    cnt[b] += 1;
+                    // bit-identical to the checked scalar build. (`cnt` is `1..=9`-indexed; `a`/`b`
+                    // are 0-based digit slots, so the counter is at `a + 1` / `b + 1`.)
+                    let ka = cnt[a + 1] as usize;
+                    let kb = cnt[b + 1] as usize;
+                    cnt[a + 1] += 1;
+                    cnt[b + 1] += 1;
                     let mut label_ua = [u8::MAX; 9];
                     for r in 0..9 {
                         let m = fin[r] as usize;
@@ -693,9 +690,9 @@ impl UaFilter {
                         };
                         // SAFETY: id <= 143 < UA_CAP = counts.len().
                         *self.counts.get_unchecked_mut(id as usize) += 2;
-                        // Column of a/b in row r: `r_map[d][r]` (= the deleted `col_of[r][d]`).
-                        let ca = r * 9 + r_map[a][r] as usize;
-                        let cb = r * 9 + r_map[b][r] as usize;
+                        // Column of a/b in row r: `coords.r_map[d][r]` (the fill's coordinate inverse).
+                        let ca = r * 9 + coords.r_map[a][r] as usize;
+                        let cb = r * 9 + coords.r_map[b][r] as usize;
                         // SAFETY: ca/cb < CELLS (= cell_uas.len()); ka/kb < 8 = UA_PER_CELL,
                         // because a digit joins at most its 8 pairs, so its counter is <= 7
                         // before this pair's increment.
@@ -706,8 +703,9 @@ impl UaFilter {
             }
             // Reconstruct `lens` from the per-digit counters: a cell's membership count is
             // exactly the number of emitting pairs containing its digit, i.e. `cnt[g[cell]]`.
-            // Grid digits are 0..8 (high bit clear), so `pshufb(cnt, g-bytes)` is that lookup,
-            // 16 cells per shuffle; five chunks cover cells 0..80, the last cell goes scalar.
+            // `g` is the raw grid bytes (`1..=9`, high bit clear) and `cnt` is `1..=9`-indexed,
+            // so `pshufb(cnt, g-bytes)` is that lookup directly — no per-cell transform; 16 cells
+            // per shuffle, five chunks cover cells 0..80, the last cell goes scalar.
             let cnt_v = _mm_loadu_si128(cnt.as_ptr() as *const __m128i);
             for chunk in 0..5 {
                 let gv = _mm_loadu_si128(g.as_ptr().add(chunk * 16) as *const __m128i);
@@ -790,36 +788,43 @@ impl<S: StripView> StripState<S> {
     /// pre-filter — the diagnostic walks use this so they pay nothing and measure the
     /// unfiltered baseline. Production strips use [`new_ua`](Self::new_ua).
     pub(in crate::generate) fn new(solution: &Solution) -> Self {
-        Self::build(solution, UaFilter::empty())
+        // Diagnostic-only: no [`Filled`], so derive the clue map here (the production path
+        // takes it from the fill — see [`new_ua`]).
+        Self::build(solution.0.clone(), S::clue_map(&solution.0), UaFilter::empty())
     }
 
-    /// [`new`](Self::new) carrying the production (full 2-digit) UA pre-filter, built once
-    /// from the full solution grid. The filter is sound (only fast-rejects prober reverts),
+    /// [`new`](Self::new) carrying the production (full 2-digit) UA pre-filter, both the filter
+    /// and the strip's clue-map seed taken from the fill's [`Filled`] byproducts (the
+    /// coordinate inverse the build consumes and the clue map, handed out by the fill rather
+    /// than re-derived from the grid). The filter is sound (only fast-rejects prober reverts),
     /// so the strip trajectory is identical to the no-filter [`new`](Self::new) walk.
-    pub(in crate::generate) fn new_ua(solution: &Solution) -> Self {
-        Self::build(solution, UaFilter::build_full(&solution.0))
+    pub(in crate::generate) fn new_ua(filled: &Filled) -> Self {
+        let bp = &filled.byproducts;
+        let ua = UaFilter::build_full_from(&bp.coords, filled.solution.0.as_bytes());
+        Self::build(filled.solution.0.clone(), bp.clue, ua)
     }
 
-    /// Shared constructor: a fresh state stripping the full `solution` (nothing removed yet)
-    /// with the prepared pre-filter `ua` (empty for [`new`](Self::new), the full library for
-    /// [`new_ua`](Self::new_ua)). The strip mutates `state` in place thereafter.
+    /// Shared constructor: a fresh state stripping the full grid `digits` (nothing removed
+    /// yet) with the seed `clue` map and the prepared pre-filter `ua` (empty for
+    /// [`new`](Self::new), the full library for [`new_ua`](Self::new_ua)). The strip mutates
+    /// `state` in place thereafter.
     ///
-    /// `solution` is always a *complete* grid (the fill's output), and `from_digits` of a
+    /// `digits` is always a *complete* grid (the fill's output), and `from_digits` of a
     /// complete grid is the trivial solved state — every cell placed leaves no unsolved
     /// cells and no candidates — so [`StripView::solved`] builds it directly instead
     /// of running the 81-cell peer-clear loop (per carried view) only to clear nothing
     /// (~4% of the fill's cost, all of it wasted). The strip then reopens cells one at a
-    /// time via [`StripView::clear_clue`]. `clue_map` still walks the
-    /// placements (the clue map is genuinely the full grid).
-    fn build(solution: &Solution, ua: UaFilter) -> Self {
-        let digits = solution.0.clone();
+    /// time via [`StripView::clear_clue`]. `clue` is the per-digit placement map of `digits`
+    /// (equal to [`StripView::clue_map`]) — the production path takes it from the fill, the
+    /// diagnostic [`new`](Self::new) derives it; a debug assert pins the equality.
+    fn build(digits: DigitGrid, clue: PerDigit<RM>, ua: UaFilter) -> Self {
         debug_assert!(digits.is_complete(), "strip must start from a complete solution");
         let state = S::solved();
         debug_assert!(
             state == S::from_digits(&digits),
             "solved() must equal from_digits of a complete grid"
         );
-        let clue = S::clue_map(&digits);
+        debug_assert!(clue == S::clue_map(&digits), "seed clue map must equal clue_map(digits)");
         StripState { digits, state, clue, best: None, req_met: false, ua }
     }
 
@@ -1034,7 +1039,9 @@ impl StripState<DualSolverState> {
 pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     let baseline = spec.baseline_mask();
     let fast = baseline_fast_applicable(spec);
-    let solution = random_solution(rng);
+    // The fill hands out the strip's clue-map seed and the UA build's coordinate inverse as
+    // byproducts (one pass), so neither is re-derived from the grid below.
+    let filled = random_solution_full(rng);
     // Strip order — the 81 cell indices shuffled; a fixed stack array, no per-attempt
     // heap alloc. Same shuffle as bb, so the RNG stream and produced puzzle match.
     let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
@@ -1042,7 +1049,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
 
     // The scalar attempt strips on the dual-banded state (the default `StripView`):
     // its baseline gate below runs the scalar engines, which read both views.
-    let mut st: StripState = StripState::new_ua(&solution);
+    let mut st: StripState = StripState::new_ua(&filled);
     for cell in positions {
         let Some(orig) = st.digit_at(cell) else {
             continue;
@@ -1087,7 +1094,7 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
         Some(snap) => {
             if verify(&snap, spec) {
                 let givens = snap.digit_count();
-                AttemptResult::Success(GeneratedPuzzle { puzzle: Puzzle(snap), solution, givens })
+                AttemptResult::Success(GeneratedPuzzle { puzzle: Puzzle(snap), solution: filled.solution, givens })
             } else {
                 AttemptResult::NotForced
             }
@@ -1150,7 +1157,7 @@ pub fn run_attempts(rng: &mut Rng, spec: &Spec, n: usize) -> (Stats, u64) {
             AttemptResult::Success(p) => {
                 stats.successes += 1;
                 stats.total_givens += p.givens;
-                fnv_fold_cells(&mut fp, &p.puzzle.0.cell_bytes());
+                fnv_fold_cells(&mut fp, p.puzzle.0.as_bytes());
             }
             AttemptResult::NotForced => {
                 stats.not_forced += 1;
@@ -1348,10 +1355,10 @@ pub fn toolbox_stat(base_seed: u64, spec: &Spec, attempts: usize, which: u32, ca
     };
     for _ in 0..attempts {
         s.attempts += 1;
-        let solution = random_solution(&mut rng);
+        let filled = random_solution_full(&mut rng);
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
-        let mut st: StripState = StripState::new_ua(&solution);
+        let mut st: StripState = StripState::new_ua(&filled);
         // Givens still on the board; the posed probe's clue count is this after the strip.
         let mut givens = CELLS;
         for cell in positions {
@@ -2031,42 +2038,118 @@ pub fn verify_share(base_seed: u64, spec: &Spec, attempts: usize) -> VerifyShare
 
 /// Wall time to build the production (full 2-digit) UA pre-filter library over `attempts`
 /// random solutions from `base_seed` — the per-board enumeration cost in isolation.
-/// Solutions are filled up front so only the enumeration is timed; returns `(total_nanos,
-/// total_uas)` for ns/board and avg library size. Diagnostic only (no `count` feature).
+/// Solutions are filled up front and their coordinate inverses pre-derived (the fill's job —
+/// not the build's), so only the production build path [`UaFilter::build_full_from`] is timed,
+/// matching what `new_ua` actually pays. Returns `(total_nanos, total_uas)` for ns/board and
+/// avg library size. Diagnostic only (no `count` feature).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn ua_build_cost(base_seed: u64, attempts: usize) -> (u64, u64) {
     use std::time::Instant;
     let mut rng = Rng::from_seed(base_seed);
     let sols: Vec<DigitGrid> = (0..attempts).map(|_| random_solution(&mut rng).0).collect();
+    // The fill hands the coordinate inverse to the build, so derive it OUTSIDE the timed
+    // region (it is charged to the fill, not the build).
+    let coords: Vec<GridCoords> = sols.iter().map(GridCoords::from_grid).collect();
     let mut uas = 0u64;
     let t = Instant::now();
-    for s in &sols {
+    for (c, s) in coords.iter().zip(&sols) {
         // `uas` accumulates the library size so the build cannot be optimized away.
-        uas += UaFilter::build_full(s).nua as u64;
+        uas += UaFilter::build_full_from(c, s.as_bytes()).nua as u64;
     }
     (t.elapsed().as_nanos() as u64, uas)
 }
 
 /// Like [`ua_build_cost`] but pre-fills `boards` solutions ONCE and rebuilds the whole pool
 /// `repeats` times, so [`random_solution`]'s fill cost amortizes to near-zero and the timed
-/// (and `perf`-sampled) region is ~entirely [`UaFilter::build_full`]. Returns `(total_nanos,
-/// total_uas)` over `boards * repeats` builds; divide nanos by that product for ns/board.
-/// This is the "isolated pooled loop" the `docs/UA-PACKED-BUILD.md` measurements use to make
-/// the build the dominant process symbol for `perf annotate`. Diagnostic only.
+/// (and `perf`-sampled) region is ~entirely the production build [`UaFilter::build_full_from`]
+/// (coordinate inverses pre-derived outside the loop, as the fill hands them in). Returns
+/// `(total_nanos, total_uas)` over `boards * repeats` builds; divide nanos by that product for
+/// ns/board. This is the "isolated pooled loop" the `docs/UA-PACKED-BUILD.md` measurements use
+/// to make the build the dominant process symbol for `perf annotate`. Diagnostic only.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn ua_build_cost_pooled(base_seed: u64, boards: usize, repeats: usize) -> (u64, u64) {
     use std::time::Instant;
     let mut rng = Rng::from_seed(base_seed);
     let sols: Vec<DigitGrid> = (0..boards).map(|_| random_solution(&mut rng).0).collect();
+    let coords: Vec<GridCoords> = sols.iter().map(GridCoords::from_grid).collect();
     let mut uas = 0u64;
     let t = Instant::now();
     for _ in 0..repeats {
-        for s in &sols {
+        for (c, s) in coords.iter().zip(&sols) {
             // `uas` accumulates the library size so the build cannot be optimized away.
-            uas += UaFilter::build_full(s).nua as u64;
+            uas += UaFilter::build_full_from(c, s.as_bytes()).nua as u64;
         }
     }
     (t.elapsed().as_nanos() as u64, uas)
+}
+
+/// Isolated cost of the fill byproducts (clue map + UA coordinate inverse) the OLD vs NEW
+/// way, over a pooled corpus of `boards` solutions rebuilt `repeats` times (so the fill and
+/// the per-pair UA enumeration — both unchanged — amortize out and only the byproduct
+/// production is timed). Returns `(old_nanos, new_nanos)` over `boards * repeats` boards.
+///
+/// - OLD: the three separate passes the change removed — the strip's `clue_map`, the UA
+///   build's `dense` flatten (`0..=8`), and its coordinate precompute ([`GridCoords::from_grid`]).
+/// - NEW: the single fused [`byproducts`] pass (the dense bytes are now a zero-copy
+///   [`DigitGrid::as_bytes`] borrow, counted as free).
+///
+/// A checksum folded from every produced artifact keeps either path from being optimized
+/// away (and is a coarse equivalence tripwire). Diagnostic only (no `count` feature).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fill_byproduct_cost_pooled(base_seed: u64, boards: usize, repeats: usize) -> (u64, u64) {
+    use std::time::Instant;
+    let mut rng = Rng::from_seed(base_seed);
+    let grids: Vec<DigitGrid> = (0..boards).map(|_| random_solution(&mut rng).0).collect();
+
+    // Fold one lane / a few bytes of each artifact so neither loop is dead code.
+    let fold_coords = |acc: &mut u64, c: &GridCoords| {
+        *acc ^= c.r_map[0][0] as u64;
+        *acc = acc.wrapping_mul(FNV_PRIME);
+        *acc ^= c.rbox_map[8][8] as u64;
+    };
+    let fold_clue = |acc: &mut u64, clue: &PerDigit<RM>| {
+        *acc ^= clue.each()[0].to_lanes()[0] as u64;
+        *acc = acc.wrapping_mul(FNV_PRIME);
+    };
+
+    // Warm both paths once over the pool before timing.
+    let mut warm = 0u64;
+    for g in &grids {
+        fold_clue(&mut warm, &SolverState::<RM>::clue_map(g));
+        warm ^= UaFilter::dense(g)[0] as u64;
+        fold_coords(&mut warm, &GridCoords::from_grid(g));
+        let bp = byproducts(g);
+        fold_clue(&mut warm, &bp.clue);
+        fold_coords(&mut warm, &bp.coords);
+    }
+    std::hint::black_box(warm);
+
+    let mut acc_old = 0u64;
+    let t_old = Instant::now();
+    for _ in 0..repeats {
+        for g in &grids {
+            fold_clue(&mut acc_old, &SolverState::<RM>::clue_map(g)); // strip's old clue seed
+            acc_old ^= UaFilter::dense(g)[0] as u64; // UA build's old dense flatten
+            fold_coords(&mut acc_old, &GridCoords::from_grid(g)); // UA build's old coord precompute
+        }
+    }
+    let old = t_old.elapsed().as_nanos() as u64;
+    std::hint::black_box(acc_old);
+
+    let mut acc_new = 0u64;
+    let t_new = Instant::now();
+    for _ in 0..repeats {
+        for g in &grids {
+            let bp = byproducts(g); // one fused pass (the same per-cell work the in-fill sink does)
+            fold_clue(&mut acc_new, &bp.clue);
+            fold_coords(&mut acc_new, &bp.coords);
+            // dense is now `g.as_bytes()` — a zero-copy borrow, no per-cell work.
+        }
+    }
+    let new = t_new.elapsed().as_nanos() as u64;
+    std::hint::black_box(acc_new);
+
+    (old, new)
 }
 
 /// Cross-backend determinism fingerprint over `n` attempts' worth of the RNG stream.
@@ -2077,12 +2160,13 @@ pub fn ua_build_cost_pooled(base_seed: u64, boards: usize, repeats: usize) -> (u
 /// the guard that the Lemire `range`/shuffle and the fill are target-independent. It walks
 /// the identical RNG trajectory as `n` attempts (the strip consumes no RNG), so it is a
 /// faithful probe. This is a correctness guard, not a perf metric. The digit fold via
-/// [`DigitGrid::cell_bytes`] is pinned per seed in `tests/faithful` (and cross-checked by
+/// [`DigitGrid::as_bytes`] is pinned per seed in `tests/faithful` (and cross-checked by
 /// the wasm `det_fp` export).
 pub fn determinism_fp(rng: &mut Rng, n: usize) -> u64 {
     let mut fp: u64 = FNV_OFFSET;
     for _ in 0..n {
-        let cells = random_solution(rng).0.cell_bytes();
+        let grid = random_solution(rng).0;
+        let cells = grid.as_bytes();
         let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
         rng.shuffle(&mut positions);
         for i in 0..CELLS {
@@ -2206,11 +2290,11 @@ mod ua_filter_tests {
         for seed in 0..200 {
             let mut rng = Rng::from_seed(seed);
             let sol = random_solution(&mut rng).0;
-            let g = UaFilter::dense(&sol);
+            let coords = crate::fill::GridCoords::from_grid(&sol);
             let mut packed = UaFilter::empty();
-            packed.enumerate_2digit_packed(&g);
+            packed.enumerate_2digit_packed(&coords, sol.as_bytes());
             let mut scalar = UaFilter::empty();
-            scalar.enumerate_2digit(&g);
+            scalar.enumerate_2digit(&coords);
             assert_eq!(packed.nua, scalar.nua, "seed {seed}: nua differs");
             assert_eq!(packed.lens, scalar.lens, "seed {seed}: lens differ");
             assert_eq!(packed.counts, scalar.counts, "seed {seed}: counts differ");
