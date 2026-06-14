@@ -169,10 +169,16 @@ pub(crate) fn lone(unit: usize) -> Option<usize> {
 /// placement refreshes it (peers can cross bands). The reorder is fixpoint-confluent (hidden
 /// singles are monotone forced placements), so the propagation fixpoint — the only board the
 /// search ever branches on — is identical; mirrors the fused solver's `band_update_rm`.
-/// Interleaved A/B (proberab harness): -0.8% e2e on train/drill(HiddenQuad), -1.4% on
-/// naked-pair, fp-identical. The prober is memory-port-bound, not op-bound: this trades
-/// SIMD loads for cheaper scalar lane-extracts, so SDE shows MORE instructions yet it is
-/// faster — same physics as the closure's digit-outer hoist.
+///
+/// Band-unrolled: the three bands are swept by an explicit [`sweep_band`] each (`B` a
+/// constant), not a `for b in 0..3`. A runtime band index makes `live_all.band(b)` read
+/// through [`as_array`](std::simd::Simd::as_array), which stores the whole vector to the
+/// stack and reloads the lane every band — and the reload feeds the hot `unit_single`
+/// AND/popcnt off a store-forward. With a const index ([`Bands::band_at`]) the extract is a
+/// register `vpextrd`, no stack round-trip. The prober is memory-port-bound, not op-bound
+/// (SDE icount points the wrong way), so killing the per-band store + reload is the win:
+/// interleaved A/B (proberab harness) -2.7% e2e on train+drill(naked-pair), fp-identical,
+/// over the already-digit-outer baseline. Same physics as the digit-outer hoist above.
 #[inline(always)]
 pub(crate) fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> bool {
     let mut changed = false;
@@ -181,16 +187,30 @@ pub(crate) fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> b
         // The digit's live candidates across all three bands, re-read after each placement
         // (a place can create another hidden single, in this band or another).
         let mut live_all = state.candidates()[digit] & state.unsolved();
-        for b in 0..3 {
-            let mut band = live_all.band(b);
-            for &mask in &Band::UNIT_MASKS {
-                if let Some(pos) = band.unit_single(mask) {
-                    state.place(RowMajor::cell_at(b, pos), digit);
-                    changed = true;
-                    live_all = state.candidates()[digit] & state.unsolved();
-                    band = live_all.band(b);
-                }
-            }
+        changed |= sweep_band::<0>(state, &mut live_all, digit);
+        changed |= sweep_band::<1>(state, &mut live_all, digit);
+        changed |= sweep_band::<2>(state, &mut live_all, digit);
+    }
+    changed
+}
+
+/// One band's six in-lane units swept for a hidden single, band index `B` a constant.
+/// Refreshes the shared `live_all` after each placement (a place can create a hidden
+/// single in this or a later band), so the caller's next `sweep_band` sees it.
+#[inline(always)]
+fn sweep_band<const B: usize>(
+    state: &mut SolverState<Bands<RowMajor>>,
+    live_all: &mut Bands<RowMajor>,
+    digit: Digit,
+) -> bool {
+    let mut changed = false;
+    let mut band = live_all.band_at::<B>();
+    for &mask in &Band::UNIT_MASKS {
+        if let Some(pos) = band.unit_single(mask) {
+            state.place(RowMajor::cell_at(B, pos), digit);
+            changed = true;
+            *live_all = state.candidates()[digit] & state.unsolved();
+            band = live_all.band_at::<B>();
         }
     }
     changed

@@ -41,6 +41,17 @@ impl<B: Banding> Bands<B> {
     pub(crate) fn band(self, i: usize) -> Band {
         Band(self.0[i])
     }
+
+    /// Extract band `I` (a compile-time constant) as a scalar [`Band`]. Same value as
+    /// [`band`](Bands::band), but the `Index` form `self.0[i]` reads through
+    /// [`as_array`](std::simd::Simd::as_array), which forces the vector to a stack slot —
+    /// a store + indexed reload per access. Taking the lane off a by-value `to_array`
+    /// with a constant index lets the optimizer keep it a register `vpextrd`, which the
+    /// memory-port-bound hidden-single sweep wants when it unrolls the three bands.
+    #[inline]
+    pub(crate) fn band_at<const I: usize>(self) -> Band {
+        Band(self.0.to_array()[I])
+    }
 }
 
 // Set algebra over the bands — banding-independent, so generic over `B`. These
