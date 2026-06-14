@@ -53,4 +53,33 @@ impl Band {
     pub(crate) fn box_pos(k: usize, slot: usize) -> usize {
         (slot / 3) * 9 + 3 * k + slot % 3
     }
+
+    /// The six in-band units as 27-bit masks over the band word, in the hidden-single
+    /// sweep's scan order: the three lines (each a contiguous 9-bit run) then the three
+    /// boxes (each line's `k`-th 3-cell triplet, so a box's three triplets sit 9 bits
+    /// apart). Masking the band to one unit and testing for a single candidate
+    /// ([`unit_single`](Band::unit_single)) detects a hidden single in place — no
+    /// [`box_unit`](Band::box_unit) gather, and the set bit's index is already the band
+    /// position, so no [`line_pos`](Band::line_pos)/[`box_pos`](Band::box_pos) remap.
+    pub(crate) const UNIT_MASKS: [u32; 6] = [
+        0x1FF,        // line 0
+        0x1FF << 9,   // line 1
+        0x1FF << 18,  // line 2
+        0x7 | (0x7 << 9) | (0x7 << 18), // box 0
+        (0x7 | (0x7 << 9) | (0x7 << 18)) << 3, // box 1
+        (0x7 | (0x7 << 9) | (0x7 << 18)) << 6, // box 2
+    ];
+
+    /// The band-local bit position of the lone candidate in the unit selected by `mask`
+    /// (one of [`UNIT_MASKS`](Band::UNIT_MASKS)), or `None` if that unit holds zero or
+    /// more than one candidate. Reads the unit in place: `band & mask` isolates it, the
+    /// power-of-two test `u & (u - 1) == 0` is "at most one bit", and `trailing_zeros`
+    /// returns the set bit's index — which *is* its position in the 27-bit band, ready for
+    /// [`Banding::cell_at`](super::banding::Banding::cell_at). One AND + two ALU ops per
+    /// unit, versus the gather + 512-byte `SINGLE9` table load + slot remap it replaces.
+    #[inline]
+    pub(crate) fn unit_single(self, mask: u32) -> Option<usize> {
+        let u = self.0 & mask;
+        (u != 0 && u & (u - 1) == 0).then(|| u.trailing_zeros() as usize)
+    }
 }

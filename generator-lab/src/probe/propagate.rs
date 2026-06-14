@@ -156,6 +156,13 @@ pub(crate) fn lone(unit: usize) -> Option<usize> {
 /// row or box (the units in-lane in this view). Columns straddle bands and are reached
 /// by branching, never swept. Returns whether any placement was made, so the caller
 /// loops it against [`drain_naked_singles`] to a joint fixpoint.
+///
+/// Each of the six in-lane units is read in place via [`Band::unit_single`]: one AND with
+/// a [`Band::UNIT_MASKS`] constant plus a power-of-two test, the set bit's index serving
+/// directly as the band position. This is the prober's hot path (~a quarter of scalar
+/// generation), and the in-place read replaces the per-unit `box_unit` gather, 512-byte
+/// `SINGLE9` table load, and slot->position remap the lookup form paid — same placements,
+/// same order, fewer instructions and no table.
 #[inline(always)]
 pub(crate) fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> bool {
     let mut changed = false;
@@ -165,16 +172,9 @@ pub(crate) fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> b
             // The digit's live candidates in band b, re-read after each placement (a
             // place in this band can create another hidden single later in the scan).
             let mut band = (state.candidates()[digit] & state.unsolved()).band(b);
-            for line in 0..3 {
-                if let Some(slot) = lone(band.line(line)) {
-                    state.place(RowMajor::cell_at(b, Band::line_pos(line, slot)), digit);
-                    changed = true;
-                    band = (state.candidates()[digit] & state.unsolved()).band(b);
-                }
-            }
-            for k in 0..3 {
-                if let Some(slot) = lone(band.box_unit(k)) {
-                    state.place(RowMajor::cell_at(b, Band::box_pos(k, slot)), digit);
+            for &mask in &Band::UNIT_MASKS {
+                if let Some(pos) = band.unit_single(mask) {
+                    state.place(RowMajor::cell_at(b, pos), digit);
                     changed = true;
                     band = (state.candidates()[digit] & state.unsolved()).band(b);
                 }
