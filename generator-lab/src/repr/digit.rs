@@ -48,6 +48,15 @@ impl Digit {
     /// This owns the `digit - 1` conversion so callers never spell it inline.
     #[inline]
     pub fn index(self) -> usize {
-        (self.0.get() - 1) as usize
+        let i = (self.0.get() - 1) as usize;
+        // A `Digit` is 1..=9 by construction, so the slot is always 0..=8 — but the
+        // `NonZeroU8` only tells the optimizer "!= 0", so without a hint every
+        // `PerDigit[Digit]` index emits a bounds check it can never trigger. The
+        // `debug_assert` keeps the invariant honest under test (where the hint is
+        // otherwise unguarded UB); `assert_unchecked` lets release elide the check.
+        debug_assert!(i < 9, "digit index {i} out of range");
+        // SAFETY: guaranteed by the 1..=9 construction invariant asserted above.
+        unsafe { core::hint::assert_unchecked(i < 9) };
+        i
     }
 }
