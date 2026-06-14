@@ -25,20 +25,29 @@ use std::marker::PhantomData;
 // single exists) is worth it. Read by `fillbench` under `count`.
 counter_block!(FILLSTAT: 10, inc = fillstat_inc, add = fillstat_add, snapshot = fillstat_snapshot, reset = fillstat_reset);
 
-/// A random complete [`Solution`]. Same MRV+shuffle search as core — identical
-/// grid and RNG stream for a given seed. The fill is scan-bound (~83 nodes/grid,
-/// one MRV scan each, ~1.7 backtracks), so the cheap popcount-free scan over the
-/// digit-transposed cell-sets is the win. Runs on the banded
-/// [`Bands<RowMajor>`](crate::repr::banded) packing — the sieve fits one SIMD
-/// register, so it avoids the flat `u128` sieve's GPR spill storm (~1.13x native).
-/// Swap the type parameter to [`FlatGridMask`] to fall back.
+/// A random complete [`Solution`]: the three **diagonal** boxes (top-left, centre,
+/// bottom-right) pre-seeded by independent random permutations, then the remaining
+/// 54 cells completed by the MRV+shuffle search. The diagonal boxes pairwise share
+/// no row, column, or box, so the 27 seed cells are placed branch-free and can
+/// never conflict — they cost 3 shuffles instead of the 27 *most expensive* early
+/// MRV scans, and the scan is the fill's whole cost (the fill is scan-bound: ~82
+/// nodes/grid, one sieve scan each, ~1.6 backtracks). Net ~-30% fill wall-clock
+/// over the plain empty-board fill, with the completion's shape unchanged (a random
+/// diagonal always extends) — see `docs/FILL-BRANCH-RULE.md`. Runs on the banded
+/// [`Bands<RowMajor>`](crate::repr::banded) packing (the sieve fits one SIMD
+/// register). The plain empty-board fill is still available as
+/// [`random_solution_with`]`::<Mrv>` for benching.
 pub fn random_solution(rng: &mut Rng) -> Solution {
-    random_solution_with::<Mrv>(rng)
+    let mut f = Fill::<Bands<RowMajor>, Mrv>::new();
+    f.seed_diagonal(rng);
+    let ok = f.fill(rng);
+    debug_assert!(ok, "fill should always succeed after a valid diagonal seed");
+    Solution(f.digits)
 }
 
-/// A random complete [`Solution`] under an explicit [`BranchStrategy`], on the
-/// production banded rep — so strategies can be benched head-to-head (see
-/// `examples/stratbench.rs`). [`random_solution`] is this with [`Mrv`].
+/// A random complete [`Solution`] from the **empty board** under an explicit
+/// [`BranchStrategy`], on the production banded rep — so strategies (and the plain
+/// fill vs the diagonal-seeded [`random_solution`]) can be benched head-to-head.
 pub fn random_solution_with<S: BranchStrategy>(rng: &mut Rng) -> Solution {
     let mut f = Fill::<Bands<RowMajor>, S>::new();
     let ok = f.fill(rng);
@@ -67,6 +76,31 @@ impl<M: Branchable, S: BranchStrategy> Fill<M, S> {
             unsolved: M::FULL,
             digits: DigitGrid::EMPTY,
             _strategy: PhantomData,
+        }
+    }
+
+    /// Pre-seed the three diagonal boxes (0, 4, 8) with independent random
+    /// permutations of the nine digits. They pairwise share no row, column, or box,
+    /// so every placement is branch-free and conflict-free: one [`Rng::shuffle`] per
+    /// box, then place each digit exactly as the search's inner loop does (drop the
+    /// cell from `unsolved`, forbid the digit on its peers, record it). Used by
+    /// [`random_solution`] to replace the 27 most expensive early MRV scans with 3 shuffles.
+    fn seed_diagonal(&mut self, rng: &mut Rng) {
+        for bx in [0usize, 4, 8] {
+            let (r0, c0) = ((bx / 3) * 3, (bx % 3) * 3);
+            let mut idxs = [0u8, 1, 2, 3, 4, 5, 6, 7, 8];
+            rng.shuffle(&mut idxs);
+            let mut i = 0;
+            for r in r0..r0 + 3 {
+                for c in c0..c0 + 3 {
+                    let cell = r * 9 + c;
+                    let d = Digit::from_index(idxs[i] as usize);
+                    self.unsolved &= !M::cell(cell);
+                    self.board[d] &= !M::peers(cell);
+                    self.digits.set(cell, d);
+                    i += 1;
+                }
+            }
         }
     }
 
@@ -167,6 +201,46 @@ mod tests {
             let mut mrv = Fill::<Bands<RowMajor>>::new();
             assert!(mrv.fill(&mut rm));
             assert_ne!(g.to_line(), mrv.digits.to_line(), "bivalue == mrv, seed {seed}");
+        }
+    }
+
+    /// [`super::random_solution`] (now the diagonal-seeded fill) must always produce a valid,
+    /// complete grid: the three diagonal boxes seeded by permutations, then MRV-completed.
+    /// Checks completeness, peer-validity, that each diagonal box is itself a permutation of
+    /// the nine digits, and that it differs from the plain empty-board MRV grid (the diagonal
+    /// seed actually changed the search).
+    #[test]
+    fn diagonal_fill_is_valid() {
+        use super::{random_solution, random_solution_with};
+        use crate::repr::Digit;
+        use crate::scan::Mrv;
+        for seed in 0..300u64 {
+            let mut rd = Rng::from_seed(seed);
+            let sol = random_solution(&mut rd);
+            let g = &sol.0;
+            assert!(g.is_complete(), "diagonal grid incomplete, seed {seed}");
+            for cell in 0..81 {
+                let d = g.get(cell).expect("complete");
+                for &p in &PEERS[cell] {
+                    assert!(g.get(p).expect("complete") != d, "peer conflict at {cell}, seed {seed}");
+                }
+            }
+            // Each diagonal box holds all nine digits exactly once (the branch-free seed).
+            for bx in [0usize, 4, 8] {
+                let (r0, c0) = ((bx / 3) * 3, (bx % 3) * 3);
+                let mut seen = [false; 9];
+                for r in r0..r0 + 3 {
+                    for c in c0..c0 + 3 {
+                        let d: Digit = g.get(r * 9 + c).expect("complete");
+                        seen[d.index()] = true;
+                    }
+                }
+                assert!(seen.iter().all(|&s| s), "box {bx} not a permutation, seed {seed}");
+            }
+            // A different construction than empty-board MRV (same seed) -> a different grid.
+            let mut rm = Rng::from_seed(seed);
+            let mrv = random_solution_with::<Mrv>(&mut rm);
+            assert_ne!(g.to_line(), mrv.0.to_line(), "diagonal == mrv, seed {seed}");
         }
     }
 }
