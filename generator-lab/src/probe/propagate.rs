@@ -151,7 +151,7 @@ pub(crate) fn lone(unit: usize) -> Option<usize> {
     (s != 0xFF).then_some(s as usize)
 }
 
-/// One pass of bb's fused row-major hidden-single sweep: for each band and digit, read
+/// One pass of bb's fused row-major hidden-single sweep: for each digit and band, read
 /// the band's live candidates once and place any digit forced into a single cell of a
 /// row or box (the units in-lane in this view). Columns straddle bands and are reached
 /// by branching, never swept. Returns whether any placement was made, so the caller
@@ -161,22 +161,34 @@ pub(crate) fn lone(unit: usize) -> Option<usize> {
 /// a [`Band::UNIT_MASKS`] constant plus a power-of-two test, the set bit's index serving
 /// directly as the band position. This is the prober's hot path (~a quarter of scalar
 /// generation), and the in-place read replaces the per-unit `box_unit` gather, 512-byte
-/// `SINGLE9` table load, and slot->position remap the lookup form paid — same placements,
-/// same order, fewer instructions and no table.
+/// `SINGLE9` table load, and slot->position remap the lookup form paid.
+///
+/// Digit-outer: the live set `candidates[d] & unsolved` is one SIMD AND across all three
+/// bands, so compute it once per digit and extract each band's lane, rather than re-AND-ing
+/// per (band, digit) (~18 fewer 16-byte SIMD loads + ANDs per no-placement sweep). A
+/// placement refreshes it (peers can cross bands). The reorder is fixpoint-confluent (hidden
+/// singles are monotone forced placements), so the propagation fixpoint — the only board the
+/// search ever branches on — is identical; mirrors the fused solver's `band_update_rm`.
+/// Interleaved A/B (proberab harness): -0.8% e2e on train/drill(HiddenQuad), -1.4% on
+/// naked-pair, fp-identical. The prober is memory-port-bound, not op-bound: this trades
+/// SIMD loads for cheaper scalar lane-extracts, so SDE shows MORE instructions yet it is
+/// faster — same physics as the closure's digit-outer hoist.
 #[inline(always)]
 pub(crate) fn band_hidden_singles(state: &mut SolverState<Bands<RowMajor>>) -> bool {
     let mut changed = false;
-    for b in 0..3 {
-        for di in 0..9 {
-            let digit = Digit::from_index(di);
-            // The digit's live candidates in band b, re-read after each placement (a
-            // place in this band can create another hidden single later in the scan).
-            let mut band = (state.candidates()[digit] & state.unsolved()).band(b);
+    for di in 0..9 {
+        let digit = Digit::from_index(di);
+        // The digit's live candidates across all three bands, re-read after each placement
+        // (a place can create another hidden single, in this band or another).
+        let mut live_all = state.candidates()[digit] & state.unsolved();
+        for b in 0..3 {
+            let mut band = live_all.band(b);
             for &mask in &Band::UNIT_MASKS {
                 if let Some(pos) = band.unit_single(mask) {
                     state.place(RowMajor::cell_at(b, pos), digit);
                     changed = true;
-                    band = (state.candidates()[digit] & state.unsolved()).band(b);
+                    live_all = state.candidates()[digit] & state.unsolved();
+                    band = live_all.band(b);
                 }
             }
         }
