@@ -18,3 +18,9 @@ wasm-bindgen = "0.2"
 # live JS values directly. The UI turns that data into display strings.
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
+# The generation web worker (src/bin/gen_worker.rs) runs lab generation off the
+# main thread so a slow/hard target never freezes the UI; cancellation is a
+# worker.terminate(). It talks to the page over postMessage, so it needs the
+# worker global scope and message-event bindings.
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["DedicatedWorkerGlobalScope", "MessageEvent"] }

@@ -7,6 +7,19 @@
 [build]
 target = "index.html"
 
+# Pregenerate the campaign taxonomy before each build, from the same `lab::kinds`
+# source as the wasm `curriculum()` export (no drift). Emitted as an ES module
+# (`export default [...]`) so the start page imports it as part of its module
+# graph -- no extra runtime fetch / round-trip -- and renders the tree without
+# waiting for wasm. cwd is this dir, so the file lands in web/.
+[[hooks]]
+stage = "pre_build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "printf 'export default %s;\\n' \"$(cargo run --quiet --manifest-path ../core/Cargo.toml --example gen_curriculum)\" > curriculum.js",
+]
+
 # Rebuild when the frontend OR the Rust sources behind the wasm bridge change.
 # Listing `watch` explicitly replaces Trunk's default (the html dir), so the web
 # assets are named here too; core and wasm live outside web/ so add their paths.
@@ -14,6 +27,13 @@ target = "index.html"
 watch = [
   "index.html",
   "app.js",
+  "wasm.js",
+  "gen.js",
+  "store.js",
+  "util.js",
+  "play.js",
+  "home.js",
+  "stats.js",
   "style.css",
   "../wasm/src",
   "../wasm/Cargo.toml",

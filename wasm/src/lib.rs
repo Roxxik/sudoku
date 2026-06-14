@@ -148,9 +148,110 @@ pub fn generate_lab(seed: u64, target: u32, drill: bool) -> Result<JsValue, JsVa
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// The player-facing curriculum taxonomy, one entry per technique kind, built
+/// straight from [`lab::kinds`] so the Home tree can't drift from the Rust
+/// source of truth (`CURRICULUM.md` / `kinds.rs`). The UI groups by `tier` then
+/// `branch` and offers Train always, Drill iff `hasDrill` (Beginner is
+/// train-only). `kindIndex` is what [`generateLab`] takes as its `target`.
+#[wasm_bindgen]
+pub fn curriculum() -> Result<JsValue, JsValue> {
+    use lab::kinds;
+    let entries: Vec<TechniqueEntry> = (0..kinds::NUM)
+        .map(|i| {
+            let tier = kinds::tier_of(i);
+            TechniqueEntry {
+                kind_index: i as u32,
+                id: kinds::NAMES[i],
+                difficulty: kinds::DIFFICULTY[i],
+                tier: tier_str(tier),
+                branch: branch_str(kinds::branch_of(i)),
+                // Beginner is train-only (nothing to concede); every other tier
+                // offers a drill — see `Spec::drill` / `CURRICULUM.md`.
+                has_drill: tier != kinds::Tier::Beginner,
+            }
+        })
+        .collect();
+    serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The spec's per-technique tagging for a given target/mode, as three bitmasks
+/// over `lab::kinds` indices (`1 << kind`). The UI classifies each hint:
+/// `forced` bit -> Forced; else in `baseline` -> Allowed; else in `inScope` ->
+/// Conceded; else untagged/out-of-scope. Lets the hint show Allowed+Forced and
+/// tuck Conceded+untagged behind "Show other techniques". `target` is a
+/// `lab::kinds` index; `drill` picks drill-mode over train.
+#[wasm_bindgen(js_name = specMasks)]
+pub fn spec_masks(target: u32, drill: bool) -> Result<JsValue, JsValue> {
+    let target = target as usize;
+    if target >= lab::kinds::NUM {
+        return Err(JsValue::from_str(&format!(
+            "target kind {} out of range (0..{})",
+            target,
+            lab::kinds::NUM
+        )));
+    }
+    let spec = if drill {
+        lab::Spec::drill(target)
+    } else {
+        lab::Spec::train(target)
+    };
+    let data = SpecMaskData {
+        baseline: spec.baseline_mask(),
+        in_scope: spec.in_scope_mask(),
+        forced: spec.forced_mask(),
+    };
+    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn tier_str(t: lab::kinds::Tier) -> &'static str {
+    use lab::kinds::Tier;
+    match t {
+        Tier::Beginner => "beginner",
+        Tier::Intermediate => "intermediate",
+        Tier::Expert => "expert",
+        Tier::Master => "master",
+    }
+}
+
+fn branch_str(b: lab::kinds::Branch) -> &'static str {
+    use lab::kinds::Branch;
+    match b {
+        Branch::Trunk => "trunk",
+        Branch::Fish => "fish",
+        Branch::Subset => "subset",
+        Branch::Bivalue => "bivalue",
+    }
+}
+
 // ---- Wire shapes -----------------------------------------------------------
 // Plain mirrors of the core types, serialized to JS objects. Cells are raw
 // indices (0..81, row-major) and houses are 0-based; the UI renders R/C labels.
+
+#[derive(Serialize)]
+struct TechniqueEntry {
+    #[serde(rename = "kindIndex")]
+    kind_index: u32,
+    /// Stable kebab-case identifier (e.g. `"hidden-single"`, `"x-wing"`).
+    id: &'static str,
+    difficulty: u32,
+    /// `"beginner"`, `"intermediate"`, `"expert"`, or `"master"`.
+    tier: &'static str,
+    /// `"trunk"`, `"fish"`, `"subset"`, or `"bivalue"`.
+    branch: &'static str,
+    #[serde(rename = "hasDrill")]
+    has_drill: bool,
+}
+
+#[derive(Serialize)]
+struct SpecMaskData {
+    /// Allowed | Forced (`1 << kind`).
+    baseline: u32,
+    /// Allowed | Forced | Conceded.
+    #[serde(rename = "inScope")]
+    in_scope: u32,
+    /// Forced only.
+    forced: u32,
+}
 
 #[derive(Serialize)]
 struct PuzzleData {
@@ -192,13 +293,13 @@ struct DeductionData {
     digit: u8,
 }
 
-#[allow(deprecated)] // solver_order: pending difficulty/curriculum migration
 fn step_data(s: &Step) -> StepData {
     StepData {
         technique: TechniqueData {
             id: s.technique.cli_name(),
             name: s.technique.name(),
-            difficulty: s.technique.solver_order(),
+            // Player-facing curriculum score; the UI buckets it into a tier.
+            difficulty: s.technique.difficulty(),
         },
         focus_cells: s.focus_cells.iter().map(|&c| c as u8).collect(),
         house: s.focus_house.as_ref().map(|h| HouseData {

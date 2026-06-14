@@ -35,6 +35,14 @@ html, body {
   min-height: 100%;
 }
 
+/* ---- Views ---- */
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.view[hidden] { display: none; }
+
 .topbar {
   display: flex;
   align-items: center;
@@ -276,3 +284,410 @@ html, body {
   font-size: 0.95rem;
   color: var(--user);
 }
+
+/* ---- Home: sections ---- */
+.home-section { display: flex; flex-direction: column; gap: 8px; }
+.home-section > h2 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--mark);
+}
+
+/* ---- Home: Continue list ---- */
+.continue-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.continue-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: var(--text);
+  cursor: pointer;
+}
+.continue-item:active { background: var(--cell-sel); }
+.ci-name { font-weight: 600; font-size: 1.05rem; }
+.ci-meta { color: var(--mark); font-size: 0.85rem; }
+
+/* ---- Home: campaign tree ---- */
+.campaign { display: flex; flex-direction: column; gap: 8px; }
+
+details.tier {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+details.tier > summary {
+  font-size: 1.1rem;
+  font-weight: 600;
+  padding: 12px 14px;
+}
+details.branch {
+  margin: 0 10px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--cell);
+}
+details.branch > summary {
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 10px 12px;
+  color: var(--text);
+}
+
+summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  user-select: none;
+}
+summary::-webkit-details-marker { display: none; }
+summary::before {
+  content: "";
+  width: 8px; height: 8px;
+  border-right: 2px solid var(--mark);
+  border-bottom: 2px solid var(--mark);
+  transform: rotate(-45deg);
+  margin-right: 8px;
+  flex: none;
+  transition: transform 0.15s ease;
+}
+details[open] > summary::before { transform: rotate(45deg); }
+summary > span:first-of-type { flex: 1; }
+
+.count-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(122, 184, 255, 0.12);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+/* ---- Home: technique rows ---- */
+.tech-list { list-style: none; margin: 0; padding: 4px 10px 10px; display: flex; flex-direction: column; gap: 8px; }
+details.branch .tech-list { padding: 4px 10px 10px; }
+.tech-row {
+  background: var(--cell);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+details.branch .tech-row { background: var(--bg); }
+.tech-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tech-name { font-weight: 600; }
+
+.mode-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mode-buttons:has(.mode-btn:only-child) { grid-template-columns: 1fr; }
+.mode-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 0;
+  color: var(--text);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.mode-btn:active { background: var(--cell-sel); }
+.mb-label { font-weight: 600; }
+.mb-sub { font-size: 0.72rem; color: var(--mark); }
+
+/* ---- Stats page ---- */
+.stats-summary {
+  display: flex;
+  gap: 12px;
+}
+.stats-summary > div {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: center;
+}
+.ss-num { font-size: 1.6rem; font-weight: 700; }
+.ss-label { font-size: 0.8rem; color: var(--mark); }
+
+.stats-tier {
+  margin: 8px 0 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--mark);
+}
+.stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.stats-table th, .stats-table td {
+  padding: 8px 10px;
+  text-align: left;
+  font-size: 0.9rem;
+  border-bottom: 1px solid var(--line);
+}
+.stats-table th { color: var(--mark); font-weight: 600; font-size: 0.78rem; }
+.stats-table tr:last-child td { border-bottom: none; }
+.col-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- Solved screen ---- */
+.solved-body { text-align: center; padding: 24px 20px; }
+.solved-body h2 { margin: 0 0 6px; font-size: 1.4rem; }
+.solved-time {
+  margin: 0 0 18px;
+  font-size: 2.4rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+}
+.solved-actions { display: flex; flex-direction: column; gap: 8px; }
+
+/* ---- Generation overlay ---- */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.overlay[hidden] { display: none; }
+.overlay-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  width: min(80vw, 280px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+}
+.overlay-card p { margin: 0; }
+.spinner {
+  width: 36px; height: 36px;
+  border: 3px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.overlay.error .spinner { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- Navigable campaign + start-page fixes ---- */
+/* These elements set display:flex, which would override the bare [hidden]
+   attribute; restore hiding. */
+.iconbtn[hidden],
+.continue-item[hidden] { display: none; }
+
+/* The overlay's action button should fill the card, not shrink to its text. */
+.overlay-card .key { width: 100%; }
+
+/* Tier / branch navigation buttons. */
+.nav-grid { display: flex; flex-direction: column; gap: 8px; }
+.nav-btn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  color: var(--text);
+  font-size: 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.nav-btn:active { background: var(--cell-sel); }
+.nav-btn .nav-label { flex: 1; }
+/* Trailing chevron hinting that the button drills in. */
+.nav-btn::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid var(--mark);
+  border-bottom: 2px solid var(--mark);
+  transform: rotate(-45deg);
+  flex: none;
+}
+
+/* ---- Continue cards: preview + text ---- */
+.continue-item { flex-direction: row; align-items: center; gap: 12px; }
+.ci-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+/* Static grid preview of a game. ~60px in lists (scannable), ~96px as the
+   "Continue last" hero. Thin uniform grid lines via a 1px gap; givens are bright,
+   the player's entries use the accent. */
+.mini {
+  flex: none;
+  width: 60px;
+  height: 60px;
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  grid-template-rows: repeat(9, 1fr);
+  gap: 1px;
+  padding: 1px;
+  background: var(--line-strong);
+  border-radius: 4px;
+  overflow: hidden;
+  font-size: 5px;
+  line-height: 1;
+}
+.mini-lg { width: 96px; height: 96px; font-size: 8px; }
+/* Continue page: roughly 2x the list thumbnail so the position reads clearly. */
+.mini-xl { width: 120px; height: 120px; font-size: 10px; }
+.mini > span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--cell);
+  color: var(--user);
+}
+.mini > span.g { color: var(--given); font-weight: 600; }
+
+/* Reserve the best-time line so Train/Drill buttons are the same height whether
+   or not a best time exists. */
+.mb-sub { min-height: 0.85rem; }
+
+/* ---- Explainer text (bottom of techniques / Expert branch pages) ---- */
+/* Plain muted text, not a panel -- a card-like block reads as tappable. Extra
+   top margin and a little side padding set it apart from the buttons above. */
+.mode-explainer {
+  margin-top: 18px;
+  padding: 0 6px;
+  color: var(--mark);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.mode-explainer p { margin: 0; }
+.mode-explainer p + p { margin-top: 6px; }
+.mode-explainer strong { color: var(--text); }
+
+/* ---- Hint panel (replaces the pad while open; board stays visible) ---- */
+.hint-panel { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+.hint-panel[hidden] { display: none; }
+.hint-head { display: flex; align-items: center; gap: 8px; }
+.hint-head h2 { flex: 1; margin: 0; font-size: 1.05rem; font-weight: 600; }
+.hint-body { overflow-y: auto; max-height: 42vh; }
+
+.hint-stage { display: flex; flex-direction: column; gap: 10px; }
+
+.hint-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--cell);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.hint-row.focused { border-color: var(--accent); }
+.hint-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.hint-primary { font-weight: 600; }
+.hint-secondary { color: var(--mark); font-size: 0.85rem; }
+.hint-deduction {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+  color: var(--user);
+}
+.hint-row-ctl { display: flex; gap: 6px; flex: none; }
+.hint-more, .hint-apply {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+  white-space: nowrap;
+  touch-action: manipulation;
+}
+.hint-apply { background: var(--accent); color: #10131a; border-color: var(--accent); }
+
+/* The Hint button flips colour while cheat mode is on (persistent indicator). */
+.key.cheat { background: var(--accent); color: #10131a; border-color: var(--accent); }
+
+/* ---- Board highlights driven by the focused hint row ---- */
+.cell.hl-unit { background: var(--cell-peer); }
+.cell.hl-cell { background: var(--cell-sel); }
+.cell.hl-place { background: #2f5d3a; color: #d8ffd8; }
+.cell.hl-elim { background: #5d2f35; color: #ffd8dc; }
+
+/* The pad sets display:flex, which overrides the bare [hidden] attribute -- so
+   it stayed visible behind the hint panel. Restore hiding. */
+.pad[hidden] { display: none; }
+
+/* "Show harder options" toggle under the easiest-tier hint list. */
+.hint-harder { align-self: flex-start; margin-top: 2px; }
+
+/* A solved Train/Drill mode (per mode -- they're tracked separately). */
+.mode-btn.solved { border-color: var(--accent); }
+.mode-btn.solved .mb-sub { color: var(--accent); }
+
+/* Instance rows expanded from a "· N spots" group header. */
+.hint-row.hint-child { margin-left: 14px; border-left: 2px solid var(--line-strong); }
+/* Focus must win the left border too (the .hint-child rule above would otherwise
+   keep the left border grey while the other three turn accent). */
+.hint-row.hint-child.focused { border-left-color: var(--accent); }
+
+/* ---- Status / mistake banner (first hint layer + error stage) ---- */
+.hint-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 1.2rem;
+  font-weight: 700;
+  padding: 4px 0 2px;
+}
+.hint-banner .banner-icon { width: 30px; height: 30px; flex: none; }
+.hint-banner.ok { color: #5fd08a; }
+.hint-banner.bad { color: #ff7b7b; }
+
+/* Large, stacked actions for the first layer / error stage. */
+.hint-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.hint-bigbtn {
+  width: 100%;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.hint-bigbtn:active { background: var(--cell-sel); }
+.hint-bigbtn.cheat { background: var(--accent); color: #10131a; border-color: var(--accent); }
