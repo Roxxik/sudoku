@@ -11,8 +11,21 @@ pub struct Rng {
 
 impl Rng {
     pub fn from_seed(seed: u64) -> Self {
+        // SplitMix64-finalize the seed before it becomes xorshift64 state. A directly-loaded
+        // small/sequential seed avalanches too slowly: the first `next_u64()`'s high bits are
+        // tiny, so the first bounded draw `range(9)` is 0 for *every* small seed (the first
+        // Fisher-Yates swap is then deterministic). For the diagonal-prefill fill that dead
+        // draw lands on the grid's structural backbone and pins a cell constant across all
+        // sequential seeds — see `docs/FILL-BRANCH-RULE.md` §6.5. The finalizer decorrelates
+        // sequential seeds in one shot, and is pure integer math so native == wasm holds.
+        let mut z = seed.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        // The xorshift64 state must be non-zero (zero is an absorbing fixed point); `z` is
+        // zero for exactly one seed, so keep the guard.
         Self {
-            state: if seed == 0 { 0xDEADBEEFCAFEBABE } else { seed },
+            state: if z == 0 { 0xDEADBEEFCAFEBABE } else { z },
         }
     }
 
