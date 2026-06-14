@@ -5,3 +5,20 @@ members = ["core", "cli", "wasm", "solver-lab", "generator-lab"]
 [profile.release]
 debug = 2
 strip = false
+
+# Run `cargo test` optimized but WITH the checks that `--release` strips.
+# `debug_assert!` and the `#[cfg(debug_assertions)]` invariant cross-checks
+# (incremental-drift, UA pre-filter, ...) only compile in when `debug-assertions`
+# is on. The `test` profile has that — and overflow-checks — on by default, but at
+# opt-level 0 the real-generation equivalence tests were too slow to tolerate,
+# which is why we used to reach for `--release` — silently compiling the asserts
+# back out, so they never ran. Bumping opt-level here makes plain `cargo test`
+# fast enough to not annoy AND keep its checks: no flag to remember, no footgun.
+# It inherits dev's incremental, high-codegen-unit build, so rebuilds stay quick
+# (faster to compile than a release-based profile, fast enough to run).
+# debug-assertions/overflow-checks are restated to pin the intent against a silent
+# regression — do NOT run tests with `--release`, it strips exactly these.
+[profile.test]
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
