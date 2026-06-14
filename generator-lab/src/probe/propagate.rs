@@ -88,11 +88,25 @@ pub(crate) fn drain_naked_singles<M: Branchable>(state: &mut SolverState<M>) -> 
         // digit off the board this way replaces the per-cell 9-board candidate search
         // the one-at-a-time placement paid. A placement only removes candidates, so no
         // new single appears mid-pass; the next pass's sieve surfaces those.
+        //
+        // Each group `singles & candidates[d]` is invariant across the placements below:
+        // `place_single_group(d, …)` only removes digit `d` from peers and solves cells
+        // whose sole candidate was `d`, so it cannot change `singles & candidates[d']`
+        // for any *other* digit `d'` (a `d'`-single keeps its `d'` bit, and `singles` is
+        // fixed). So read all nine groups up front, before any placement mutates the
+        // board. The obvious interleaved form made each `candidates[d']` load wait on the
+        // previous `place_single_group`'s candidate store — a store-forward stall on the
+        // hot drain loop, plus a digit-indexed address recomputed every iteration;
+        // reading first lets the loads pipeline off the sieve's already-loaded boards.
+        // Placement order (`di` ascending) and the placed groups are unchanged, so the
+        // propagation trajectory — the only board the search branches on — is identical.
+        let mut groups = [M::EMPTY; 9];
         for di in 0..9 {
-            let d = Digit::from_index(di);
-            let group = singles & state.candidates()[d];
-            if group.any() {
-                state.place_single_group(d, group);
+            groups[di] = singles & state.candidates()[Digit::from_index(di)];
+        }
+        for di in 0..9 {
+            if groups[di].any() {
+                state.place_single_group(Digit::from_index(di), groups[di]);
             }
         }
     }
