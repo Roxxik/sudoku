@@ -31,6 +31,8 @@ watch = [
   "gen.js",
   "store.js",
   "util.js",
+  "ui.js",
+  "cheat.js",
   "play.js",
   "home.js",
   "stats.js",

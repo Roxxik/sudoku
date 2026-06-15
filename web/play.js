@@ -11,6 +11,8 @@
 import { bindings } from "./wasm.js";
 import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
+import { copyText } from "./ui.js";
+import { cheatOn, CHEAT_KEY } from "./cheat.js";
 
 const N = 81;
 
@@ -1005,34 +1007,10 @@ function applyStep(step, rerender) {
 // Enabled if the host is a private/dev IP, a persisted flag is set (via the
 // console `window.cheat()` or a >=5s long-press on Hint), reflected by a colour
 // flip on the Hint button so you can tell it's on.
-const CHEAT_KEY = "sudoku.cheat";
 const LONG_PRESS_MS = 5000;
 
-function privateHost() {
-  const h = location.hostname;
-  return (
-    h === "localhost" ||
-    h === "127.0.0.1" ||
-    /^10\./.test(h) ||
-    /^192\.168\./.test(h) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(h)
-  );
-}
-// Tri-state: "1" (forced on), "0" (forced off), or unset (default to the host).
-// The explicit setting wins, so you can turn cheat OFF even on a private host.
-function cheatStored() {
-  try {
-    return localStorage.getItem(CHEAT_KEY);
-  } catch {
-    return null;
-  }
-}
-function cheatOn() {
-  const s = cheatStored();
-  if (s === "1") return true;
-  if (s === "0") return false;
-  return privateHost();
-}
+// cheatOn() and the tri-state CHEAT_KEY default live in cheat.js (shared with the
+// stats history). Toggling and the play-view UI reactions stay here.
 function setCheat(on) {
   try {
     localStorage.setItem(CHEAT_KEY, on ? "1" : "0");
@@ -1040,6 +1018,7 @@ function setCheat(on) {
     /* ignore */
   }
   updateHintButton();
+  updateSeedLine();
   // Reflect the new mode in an open panel (adds/removes Apply buttons).
   if (!document.getElementById("hintPanel").hidden) openHint();
 }
@@ -1086,6 +1065,7 @@ export function loadGame(g) {
 
   notesBtn.setAttribute("aria-pressed", "false");
   setTitle(g);
+  updateSeedLine();
   updateDigitButtons();
   updateUndoButton();
   render();
@@ -1102,6 +1082,22 @@ function setTitle(g) {
   const name = techniqueName(curriculumIdFor(g.kindIndex));
   const mode = g.mode === "drill" ? "Drill" : "Train";
   h.textContent = `${name} · ${mode}`;
+}
+
+// Debug aid: under cheat mode, show the seed the current puzzle was generated
+// from (absent on puzzles made before seeds were recorded). Re-run whenever the
+// game changes (loadGame) or cheat is toggled mid-game (setCheat).
+function updateSeedLine() {
+  const el = document.getElementById("playSeed");
+  if (!el) return;
+  const seed = game && game.seed;
+  if (seed && cheatOn()) {
+    el.textContent = `Seed: ${seed}`;
+    el.hidden = false;
+  } else {
+    el.textContent = "";
+    el.hidden = true;
+  }
 }
 
 // kindIndex -> kebab id, filled in by initPlay from the curriculum.
@@ -1325,6 +1321,21 @@ function wireTopbar() {
   menuList.addEventListener("click", (e) => {
     const item = e.target.closest(".menu-item");
     if (!item) return;
+    // Export = copy the puzzle's clue line (`g.puzzle` is already to_line()
+    // output, '.' = empty; the solution is never copied). Keep the menu open
+    // briefly to confirm, so stop the click from bubbling to the close handler.
+    if (item.dataset.action === "copy") {
+      e.stopPropagation();
+      const label = item.textContent;
+      copyText(game.puzzle).then((ok) => {
+        item.textContent = ok ? "Copied!" : "Copy failed";
+        setTimeout(() => {
+          item.textContent = label;
+          closeMenu();
+        }, 900);
+      });
+      return;
+    }
     if (item.dataset.action === "restart") restart();
     else if (item.dataset.action === "generate") onNewPuzzle(game.kindIndex, game.mode);
     closeMenu();

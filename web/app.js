@@ -101,6 +101,7 @@ async function launch(kindIndex, mode, uncapped = false) {
     puzzle: result.puzzle,
     solution: result.solution,
     givens: result.givens,
+    seed: result.seed, // decimal-string u64 from the worker (debug/cheat display)
   });
   play.loadGame(game);
   goPlay();

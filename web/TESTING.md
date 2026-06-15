@@ -33,6 +33,8 @@ referenced throughout the app); if you change them, update this doc.
 { id, kindIndex, mode: "train"|"drill",
   puzzle, solution,          // 81-char strings, '.' = empty
   givens,                    // clue count
+  seed,                      // decimal string of the u64 generator seed,
+                             //   or null on records made before seeds existed
   value: number[81],         // player entries, 0 = empty
   marks: number[][81],       // pencil marks per cell
   elapsedMs, status: "active"|"solved",
@@ -109,6 +111,9 @@ These are load-bearing. Several are non-obvious and were the source of real bugs
 | Solved screen | `#solvedDialog`, `#solvedTime`, `#solvedHome`, `#solvedNew` |
 | Generation overlay | `#loadingOverlay`, `#loadingText`, `#loadingRetry` (error-state "Keep searching"), `#loadingCancel` |
 | Stats | `#statsBack`, `#statsBody`, `.stats-summary`, `.stats-table`, `.stats-tier` |
+| Stats history | `.hist-list`, `.hist-item`, `.mini` (thumbnail), `.hist-seed` (cheat only), `.hist-copy` |
+| Play menu | `#menuBtn`, `#menuList`, `.menu-item[data-action="generate"|"restart"|"copy"]` |
+| Play seed (cheat) | `#playSeed` (under the board; hidden unless cheat + record has a seed) |
 
 ---
 
@@ -133,9 +138,11 @@ Reserve **live generation** (driving the worker) for the dedicated generation /
 cancellation suite (§5) and one happy-path end-to-end (§4).
 
 ### Testability gaps to flag to the team
-- The worker **self-seeds** its RNG; generation is not reproducible from the UI.
-  Consider exposing a seed (or a deterministic test hook) so generation output
-  can be asserted exactly.
+- The worker **self-seeds** its RNG (still no _input_ seed from the UI, so output
+  isn't asserted exactly), but it now **returns** the seed it drew; it is stored
+  on the record (`seed`) and shown under cheat. Reproducing a puzzle from
+  `(seed, target, drill)` is possible via `generateLab` but not yet wired to a UI
+  control.
 - There is no app-level "reset all" beyond clearing `localStorage`.
 
 ---
@@ -163,9 +170,10 @@ be decoupled — Home must not block on `await init()`.)
 to the branch list; from there, `#campaignBack` returns to `#homeView`. From a
 Beginner/Intermediate technique list, `#campaignBack` returns straight to Home.
 
-**N5 — Stats button visibility (Home top bar).** `#statsBtn` is **hidden** until
-at least one `(kindIndex, mode)` stage has **≥ 2** solved games; then it is
-visible. (Seed solved games to test both sides.) Clicking it opens `#statsView`.
+**N5 — Stats button visibility (Home top bar).** `#statsBtn` is **hidden** with
+zero solved games and **visible** once **≥ 1** puzzle is solved (Stats also hosts
+the solved-puzzle history, so it appears as soon as there is anything to show).
+(Seed solved games to test both sides.) Clicking it opens `#statsView`.
 
 ---
 
@@ -230,7 +238,8 @@ Resuming an item opens it in Play. `#puzzlesBack` returns Home.
 
 **P5 — Solved games are retained.** A solved game stays in storage with
 `status:"solved"`, `solvedAt`, and final `elapsedMs`; it feeds Stats and the
-solved badges but does **not** appear in Continue.
+solved badges but does **not** appear in Continue. The history list on the Stats
+page is covered in §14 (ST3).
 
 ---
 
@@ -286,6 +295,11 @@ returns to `status:"active"`.
 
 **W4 — Pause on leave / tab hidden.** Elapsed time accrues only while Play is the
 active view and the tab is visible (pauses on Home / `visibilitychange` hidden).
+
+**W5 — Copy puzzle (export).** The play menu (`#menuBtn` →
+`.menu-item[data-action="copy"]`) copies the active game's `puzzle` line (the
+clue string, '.' = empty — **never** the `solution`) to the clipboard. Available
+regardless of cheat. The item briefly reads "Copied!" then the menu closes.
 
 ---
 
@@ -447,19 +461,35 @@ button that applies that specific deduction (undoable) and re-renders the tree.
 **C6 — Applied moves are undoable.** Any cheat apply goes through the normal
 commit path; `#undo` reverts it.
 
+**C7 — Seed display (play view + history).** With cheat **on**, the play view
+shows `#playSeed` under the board reading `"Seed: {record.seed}"` for a record
+that has a seed (hidden when the record has none). Toggling cheat off hides it;
+toggling on (incl. the long-press of C2) shows it without reloading. The Stats
+history shows the same seed per item — see ST3.
+
 ---
 
 ## 14. Suite: stats page
 
 Seed solved games.
 
-**ST1 — Empty / hidden.** With < 2 solves in every stage, `#statsBtn` is hidden
-and the page is unreachable from Home (see N5).
+**ST1 — Empty / hidden.** With **zero** solved games, `#statsBtn` is hidden and
+the page is unreachable from Home (see N5).
 
-**ST2 — Populated.** With ≥ 2 solves in some stage, `#statsView` shows a
+**ST2 — Populated.** With **≥ 1** solved game, `#statsView` shows a
 `.stats-summary` (total solved + total time) and per-tier `.stats-table`s with a
 row per solved `(technique, mode)` giving count, best, and average time. Times
 are formatted `m:ss` / `h:mm:ss`. `#statsBack` returns Home.
+
+**ST3 — Solved-puzzle history.** Below the tables, a "Solved puzzles" section
+(`.hist-list`) lists one `.hist-item` per solved game, **most-recently-solved
+first** (by `solvedAt`), each with a `.mini` thumbnail of the finished board and
+a meta line `"{Train|Drill} · {time} · {date}"`. Active games never appear. With
+cheat **off**, no `.hist-seed`; with cheat **on**, each item adds a `.hist-seed`
+reading `"Seed: {record.seed}"`, or `"Seed: (not recorded)"` when the record has
+no `seed`. Each item also has a `.hist-copy` button (regardless of cheat) that
+copies that game's `puzzle` clue line to the clipboard (never the `solution`) and
+briefly reads "Copied".
 
 ---
 
@@ -489,11 +519,11 @@ not mix with the hint's own highlights.
 | Generation & cancel | G1–G3 |
 | Persistence / Continue / previews | P1–P5 |
 | Campaign presentation | T1–T6 |
-| Timer & win | W1–W4 |
+| Timer & win | W1–W5 |
 | Hints: error stage | H-E1–H-E4 |
 | Hints: status layer | H-S1–H-S4 |
 | Hints: technique tree (spec) | H-T1–H-T7 |
 | Hints: reveal & highlights | H-R1–H-R6 |
-| Cheat mode | C1–C6 |
-| Stats | ST1–ST2 |
+| Cheat mode | C1–C7 |
+| Stats | ST1–ST3 |
 | Input & board | I1–I4 |

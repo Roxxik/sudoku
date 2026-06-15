@@ -38,7 +38,7 @@ function spawn() {
     const p = pending;
     pending = null;
     if (e.data && e.data.error) p.reject(new Error(e.data.error));
-    else p.resolve(e.data); // { puzzle, solution, givens }
+    else p.resolve(e.data); // { puzzle, solution, givens, seed }
   });
 
   worker.addEventListener("error", (e) => {
@@ -52,8 +52,9 @@ function spawn() {
 // Generate one puzzle. `target` is a curriculum kindIndex, `drill` picks
 // drill-mode over train, and `uncapped` lifts the worker's attempt budget so the
 // search runs until it succeeds or is cancelled (the page offers this after a
-// capped attempt gives up). Resolves to { puzzle, solution, givens }; rejects on
-// a generation failure (capped budget exhausted) or if cancelled.
+// capped attempt gives up). Resolves to { puzzle, solution, givens, seed } (seed
+// is a decimal-string u64); rejects on a generation failure (capped budget
+// exhausted) or if cancelled.
 export function generate({ target, drill, uncapped }) {
   if (pending) return Promise.reject(new Error("a generation is already running"));
   if (!worker) spawn();

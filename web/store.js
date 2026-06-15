@@ -45,6 +45,8 @@ function newId() {
 //   id, kindIndex, mode: "train"|"drill",   (Beginner uses "train")
 //   puzzle, solution: 81-char lines ('.' = empty),
 //   givens: clue count,
+//   seed: decimal string of the u64 generator seed (debug only; absent on old
+//         records). Kept so cheat mode can display it and reproduce the puzzle.
 //   value: number[81]   player placements (0 = empty),
 //   marks: number[][81]  pencilled candidate digits per cell,
 //   elapsedMs: accumulated play time,
@@ -53,7 +55,7 @@ function newId() {
 // }
 
 // Create and persist a fresh active game from a generated puzzle.
-export function createGame({ kindIndex, mode, puzzle, solution, givens }) {
+export function createGame({ kindIndex, mode, puzzle, solution, givens, seed }) {
   const game = {
     id: newId(),
     kindIndex,
@@ -61,6 +63,7 @@ export function createGame({ kindIndex, mode, puzzle, solution, givens }) {
     puzzle,
     solution,
     givens,
+    seed: seed || null,
     value: new Array(N).fill(0),
     marks: Array.from({ length: N }, () => []),
     elapsedMs: 0,
@@ -98,6 +101,15 @@ export function activeGames() {
   const key = (g) => g.lastPlayedAt || g.createdAt;
   return loadAll()
     .filter((g) => g.status === "active")
+    .sort((a, b) => key(b) - key(a));
+}
+
+// Solved games, most-recently-SOLVED first -- the Stats page history list.
+// Falls back to createdAt for any record missing solvedAt.
+export function solvedGames() {
+  const key = (g) => g.solvedAt || g.createdAt;
+  return loadAll()
+    .filter((g) => g.status === "solved")
     .sort((a, b) => key(b) - key(a));
 }
 

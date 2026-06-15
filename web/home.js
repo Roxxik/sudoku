@@ -14,6 +14,7 @@
 // at every level. The puzzle list (puzzlesView) lists all in-progress games.
 
 import * as store from "./store.js";
+import { miniBoard, textColumn } from "./ui.js";
 import {
   formatDuration,
   techniqueName,
@@ -60,9 +61,9 @@ export function renderHome() {
   const stats = store.statsByKind();
   renderTiers(stats);
   renderContinue();
-  // Stats only earns a button once a stage has enough solves to say more than
-  // the tree's own headers/badges already do (>=2 in some technique+mode).
-  document.getElementById("statsBtn").hidden = !hasMeaningfulStats(stats);
+  // The Stats page also hosts the solved-puzzle history (a debug aid), so it
+  // earns its button as soon as anything has been solved.
+  document.getElementById("statsBtn").hidden = !hasAnySolve(stats);
   showHome();
 }
 
@@ -311,50 +312,15 @@ function badge(text) {
   return b;
 }
 
-// The text half of a continue card: a bold title over a muted meta line.
-function textColumn(title, meta) {
-  const col = document.createElement("div");
-  col.className = "ci-text";
-  const name = document.createElement("span");
-  name.className = "ci-name";
-  name.textContent = title;
-  const m = document.createElement("span");
-  m.className = "ci-meta";
-  m.textContent = meta;
-  col.append(name, m);
-  return col;
-}
-
-// A small static preview of a game's current grid: givens plus the player's
-// entries (no pencil marks). `size` is an optional size-modifier class
-// ("mini-lg" hero, "mini-xl" on the Continue page).
-function miniBoard(g, size) {
-  const wrap = document.createElement("div");
-  wrap.className = size ? `mini ${size}` : "mini";
-  for (let i = 0; i < 81; i++) {
-    const cell = document.createElement("span");
-    const given = g.puzzle[i] >= "1" && g.puzzle[i] <= "9" ? g.puzzle[i] : 0;
-    const entered = (g.value && g.value[i]) || 0;
-    if (given) {
-      cell.textContent = given;
-      cell.className = "g";
-    } else if (entered) {
-      cell.textContent = entered;
-    }
-    wrap.appendChild(cell);
-  }
-  return wrap;
-}
-
 function rollup(stats, entries) {
   let n = 0;
   for (const e of entries) n += store.solvedCountForKind(stats, e.kindIndex);
   return n;
 }
 
-function hasMeaningfulStats(stats) {
+function hasAnySolve(stats) {
   for (const k of Object.values(stats))
-    for (const m of Object.values(k)) if (m.count >= 2) return true;
+    for (const m of Object.values(k)) if (m.count >= 1) return true;
   return false;
 }
 

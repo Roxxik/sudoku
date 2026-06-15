@@ -575,6 +575,51 @@ details.branch .tech-row { background: var(--bg); }
 }
 .mini > span.g { color: var(--given); font-weight: 600; }
 
+/* ---- Stats: solved-puzzle history ---- */
+/* Static cards (not tappable) -- thumbnail of the finished board beside its
+   technique/mode/time, mirroring the Continue cards' look. */
+.hist-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.hist-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+/* The cheat-mode seed: a long number, so give it its own monospace line. */
+.hist-seed {
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+/* Per-card export button: copies the puzzle clue line. Pushed to the right. */
+.hist-copy {
+  margin-left: auto;
+  flex: none;
+  align-self: center;
+  background: var(--cell);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.8rem;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.hist-copy:active { background: var(--cell-sel); }
+
+/* Cheat-only debug line under the play board: the generator seed. */
+.play-seed {
+  margin: 4px 0 0;
+  text-align: center;
+  color: var(--mark);
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
 /* Reserve the best-time line so Train/Drill buttons are the same height whether
    or not a best time exists. */
 .mb-sub { min-height: 0.85rem; }

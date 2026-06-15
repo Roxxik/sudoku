@@ -17,13 +17,15 @@
 //! Message protocol (plain structured-clone objects, no owned wasm handles):
 //!   worker -> page, on init:        `{ ready: true }`
 //!   page   -> worker, to generate:  `{ target: <kindIndex>, drill: <bool>, uncapped: <bool> }`
-//!   worker -> page, on success:     `{ puzzle, solution, givens }`
+//!   worker -> page, on success:     `{ puzzle, solution, givens, seed }`
 //!   worker -> page, on failure:     `{ error: <string> }`
 //! `uncapped` (default false) lifts the per-request attempt budget so a hard
 //! target keeps searching until it finds a puzzle or the page terminates us —
 //! the page offers it after a capped request gives up.
 //! The worker seeds its own RNG (we want variety, not reproducibility), so the
-//! page never sends a seed.
+//! page never *sends* a seed — but the seed it drew is *returned* (as a decimal
+//! string, since a u64 won't fit a JS Number) so the page can show it for
+//! debugging and, with the same (seed, target, drill), reproduce the puzzle.
 
 use js_sys::{Math, Object, Reflect};
 use sudoku_core::lab;
@@ -80,7 +82,8 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
     } else {
         lab::Spec::train_isolated(target)
     };
-    let mut rng = lab::Rng::from_seed(random_seed());
+    let seed = random_seed();
+    let mut rng = lab::Rng::from_seed(seed);
     let budget = if uncapped { usize::MAX } else { MAX_ATTEMPTS };
     let (generated, _stats) = lab::generate(&mut rng, &spec, budget);
     match generated {
@@ -89,6 +92,9 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
             set_str(&obj, "puzzle", &g.puzzle.0.to_line());
             set_str(&obj, "solution", &g.solution.0.to_line());
             let _ = Reflect::set(&obj, &"givens".into(), &(g.givens as f64).into());
+            // Decimal string: the seed is a u64 and would lose precision as a
+            // JS Number. The page persists it for the cheat-mode seed display.
+            set_str(&obj, "seed", &seed.to_string());
             obj.into()
         }
         None => err(&format!("could not generate a puzzle within {MAX_ATTEMPTS} attempts")),

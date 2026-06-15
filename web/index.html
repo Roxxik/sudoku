@@ -14,9 +14,11 @@
   <link rel="modulepreload" href="home.js">
   <link rel="modulepreload" href="store.js">
   <link rel="modulepreload" href="util.js">
+  <link rel="modulepreload" href="ui.js">
   <link rel="modulepreload" href="curriculum.js">
   <link rel="modulepreload" href="play.js">
   <link rel="modulepreload" href="stats.js">
+  <link rel="modulepreload" href="cheat.js">
   <link rel="modulepreload" href="gen.js">
   <link rel="modulepreload" href="wasm.js">
   <!-- The cdylib bridge (Board/hint/generate/curriculum) on the main thread.
@@ -37,6 +39,8 @@
   <link data-trunk rel="copy-file" href="gen.js">
   <link data-trunk rel="copy-file" href="store.js">
   <link data-trunk rel="copy-file" href="util.js">
+  <link data-trunk rel="copy-file" href="ui.js">
+  <link data-trunk rel="copy-file" href="cheat.js">
   <link data-trunk rel="copy-file" href="play.js">
   <link data-trunk rel="copy-file" href="home.js">
   <link data-trunk rel="copy-file" href="stats.js">
@@ -51,8 +55,8 @@
       <header class="topbar">
         <span class="iconbtn" aria-hidden="true"></span>
         <h1>Sudoku</h1>
-        <!-- Hidden until there's something worth aggregating (a stage with >=2
-             solves); set by home.renderHome(). -->
+        <!-- Hidden until at least one puzzle is solved (Stats also hosts the
+             solved-puzzle history); set by home.renderHome(). -->
         <button id="statsBtn" class="iconbtn" aria-label="Stats" hidden>
           <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
             <path fill="currentColor" d="M4 20V10h3v10H4zm6.5 0V4h3v16h-3zM17 20v-7h3v7h-3z"/>
@@ -119,12 +123,16 @@
           <ul id="menuList" class="menu-list" hidden>
             <li><button class="menu-item" data-action="generate">New puzzle</button></li>
             <li><button class="menu-item" data-action="restart">Restart</button></li>
+            <li><button class="menu-item" data-action="copy">Copy puzzle</button></li>
           </ul>
         </div>
       </header>
 
       <!-- 81 cells are injected by play.js. -->
       <div id="board" class="board" role="grid" aria-label="Sudoku board"></div>
+
+      <!-- Cheat-mode debug line: the seed the puzzle was generated from. -->
+      <p id="playSeed" class="play-seed" hidden></p>
 
       <div id="playPad" class="pad">
         <div class="actions">
