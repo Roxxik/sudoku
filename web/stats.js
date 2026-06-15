@@ -102,6 +102,11 @@ function historyCard(g) {
     seed.className = "ci-meta hist-seed";
     seed.textContent = g.seed ? `Seed: ${g.seed}` : "Seed: (not recorded)";
     col.appendChild(seed);
+    const attempts = document.createElement("span");
+    attempts.className = "ci-meta hist-seed";
+    attempts.textContent =
+      g.attempts != null ? `Attempts: ${g.attempts}` : "Attempts: (not recorded)";
+    col.appendChild(attempts);
   }
   card.append(miniBoard(g, "mini-lg"), col, copyButton(g));
   return card;

@@ -18,7 +18,7 @@
 //!   worker -> page, on init:        `{ ready: true }`
 //!   page   -> worker, campaign:     `{ target: <kindIndex>, drill: <bool>, uncapped: <bool> }`
 //!   page   -> worker, custom spec:  `{ spec: [<usage per kind>], uncapped: <bool> }`
-//!   worker -> page, on success:     `{ puzzle, solution, givens, seed }`
+//!   worker -> page, on success:     `{ puzzle, solution, givens, seed, attempts }`
 //!   worker -> page, on failure:     `{ error: <string> }`
 //! A `spec` field (an array of per-kind usage codes — 0 off / 1 Allowed /
 //! 2 Forced / 3 Conceded, see `web/spec.js`) selects the custom-spec path and
@@ -127,7 +127,7 @@ fn run_spec(spec: &lab::Spec, uncapped: bool) -> JsValue {
     let seed = random_seed();
     let mut rng = lab::Rng::from_seed(seed);
     let budget = if uncapped { usize::MAX } else { MAX_ATTEMPTS };
-    let (generated, _stats) = lab::generate(&mut rng, spec, budget);
+    let (generated, stats) = lab::generate(&mut rng, spec, budget);
     match generated {
         Some(g) => {
             let obj = Object::new();
@@ -137,6 +137,10 @@ fn run_spec(spec: &lab::Spec, uncapped: bool) -> JsValue {
             // Decimal string: the seed is a u64 and would lose precision as a
             // JS Number. The page persists it for the cheat-mode seed display.
             set_str(&obj, "seed", &seed.to_string());
+            // Rejection-sampling attempts spent to find this puzzle (the count of
+            // the successful attempt). Persisted for the cheat-mode display; well
+            // within a JS Number.
+            let _ = Reflect::set(&obj, &"attempts".into(), &(stats.attempts as f64).into());
             obj.into()
         }
         // Budget exhaustion is the one failure worth retrying uncapped: a hard or

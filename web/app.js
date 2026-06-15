@@ -109,7 +109,8 @@ async function launch(req, uncapped = false) {
     return;
   }
   hideLoading();
-  // decimal-string u64 seed comes back from the worker for the cheat-mode display.
+  // The worker also returns debug metadata (decimal-string u64 seed + the attempt
+  // count) for the cheat-mode display.
   const game = req.usages
     ? store.createGame({
         mode: "custom",
@@ -120,6 +121,7 @@ async function launch(req, uncapped = false) {
         solution: result.solution,
         givens: result.givens,
         seed: result.seed,
+        attempts: result.attempts,
       })
     : store.createGame({
         kindIndex: req.kindIndex,
@@ -128,6 +130,7 @@ async function launch(req, uncapped = false) {
         solution: result.solution,
         givens: result.givens,
         seed: result.seed,
+        attempts: result.attempts,
       });
   play.loadGame(game);
   goPlay();

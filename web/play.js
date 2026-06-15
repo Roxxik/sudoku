@@ -1200,14 +1200,17 @@ function setTitle(g) {
 }
 
 // Debug aid: under cheat mode, show the seed the current puzzle was generated
-// from (absent on puzzles made before seeds were recorded). Re-run whenever the
-// game changes (loadGame) or cheat is toggled mid-game (setCheat).
+// from and how many generator attempts it took, on a single line (each absent on
+// puzzles made before it was recorded). Re-run whenever the game changes
+// (loadGame) or cheat is toggled mid-game (setCheat).
 function updateSeedLine() {
   const el = document.getElementById("playSeed");
   if (!el) return;
-  const seed = game && game.seed;
-  if (seed && cheatOn()) {
-    el.textContent = `Seed: ${seed}`;
+  const parts = [];
+  if (game && game.seed) parts.push(`Seed: ${game.seed}`);
+  if (game && game.attempts != null) parts.push(`Attempts: ${game.attempts}`);
+  if (parts.length && cheatOn()) {
+    el.textContent = parts.join(" · ");
     el.hidden = false;
   } else {
     el.textContent = "";

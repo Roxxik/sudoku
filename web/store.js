@@ -47,6 +47,8 @@ function newId() {
 //   givens: clue count,
 //   seed: decimal string of the u64 generator seed (debug only; absent on old
 //         records). Kept so cheat mode can display it and reproduce the puzzle.
+//   attempts: rejection-sampling attempts the generator spent (debug only; absent
+//             on old records). Shown under cheat next to the seed.
 //   value: number[81]         player placements (0 = empty),
 //   centerMarks: number[][81] centred "usual" pencil notes per cell,
 //   cornerMarks: number[][81] Snyder corner notes per cell,
@@ -71,7 +73,7 @@ function newId() {
 
 // Create and persist a fresh active game from a generated puzzle. `kindIndex` is
 // null for a custom game; `spec`/`specMasks`/`label` are the custom extras; `seed`
-// is the worker's decimal-string u64 (cheat-mode display).
+// and `attempts` are the worker's debug metadata (cheat-mode display).
 export function createGame({
   kindIndex = null,
   mode,
@@ -82,6 +84,7 @@ export function createGame({
   solution,
   givens,
   seed,
+  attempts,
 }) {
   const game = {
     id: newId(),
@@ -94,6 +97,7 @@ export function createGame({
     solution,
     givens,
     seed: seed || null,
+    attempts: attempts ?? null,
     value: new Array(N).fill(0),
     centerMarks: Array.from({ length: N }, () => []),
     cornerMarks: Array.from({ length: N }, () => []),
