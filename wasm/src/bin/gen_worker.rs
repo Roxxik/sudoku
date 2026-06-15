@@ -16,9 +16,12 @@
 //!
 //! Message protocol (plain structured-clone objects, no owned wasm handles):
 //!   worker -> page, on init:        `{ ready: true }`
-//!   page   -> worker, to generate:  `{ target: <kindIndex>, drill: <bool> }`
+//!   page   -> worker, to generate:  `{ target: <kindIndex>, drill: <bool>, uncapped: <bool> }`
 //!   worker -> page, on success:     `{ puzzle, solution, givens }`
 //!   worker -> page, on failure:     `{ error: <string> }`
+//! `uncapped` (default false) lifts the per-request attempt budget so a hard
+//! target keeps searching until it finds a puzzle or the page terminates us —
+//! the page offers it after a capped request gives up.
 //! The worker seeds its own RNG (we want variety, not reproducibility), so the
 //! page never sends a seed.
 
@@ -28,8 +31,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
-/// Rejection-sampling budget per request — mirrors `lib.rs`. Easy targets never
-/// approach it; the hardest may exhaust it, surfacing as an `{ error }` reply.
+/// Rejection-sampling budget for a normal request — mirrors `lib.rs`. Easy
+/// targets never approach it; the hardest may exhaust it, surfacing as an
+/// `{ error }` reply (which the page can retry uncapped — see `generate`).
 const MAX_ATTEMPTS: usize = 10_000;
 
 fn main() {
@@ -40,7 +44,8 @@ fn main() {
         let data = msg.data();
         let target = num_field(&data, "target").unwrap_or(-1.0);
         let drill = bool_field(&data, "drill");
-        let reply = generate(target, drill);
+        let uncapped = bool_field(&data, "uncapped");
+        let reply = generate(target, drill, uncapped);
         // Best-effort: if the page already terminated us this never runs.
         let _ = scope_for_msg.post_message(&reply);
     }) as Box<dyn Fn(MessageEvent)>);
@@ -56,8 +61,10 @@ fn main() {
 }
 
 /// Generate one puzzle for `target` (a `lab::kinds` index) in train or drill
-/// mode, returning the reply object the page expects.
-fn generate(target: f64, drill: bool) -> JsValue {
+/// mode, returning the reply object the page expects. `uncapped` lifts the
+/// attempt budget so the search runs until it succeeds (or the page terminates
+/// us); the only way out of a runaway uncapped search is `worker.terminate()`.
+fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
     if !(target >= 0.0) || target as usize >= lab::kinds::NUM {
         return err(&format!("target kind {target} out of range (0..{})", lab::kinds::NUM));
     }
@@ -68,7 +75,8 @@ fn generate(target: f64, drill: bool) -> JsValue {
         lab::Spec::train(target)
     };
     let mut rng = lab::Rng::from_seed(random_seed());
-    let (generated, _stats) = lab::generate(&mut rng, &spec, MAX_ATTEMPTS);
+    let budget = if uncapped { usize::MAX } else { MAX_ATTEMPTS };
+    let (generated, _stats) = lab::generate(&mut rng, &spec, budget);
     match generated {
         Some(g) => {
             let obj = Object::new();
@@ -77,7 +85,7 @@ fn generate(target: f64, drill: bool) -> JsValue {
             let _ = Reflect::set(&obj, &"givens".into(), &(g.givens as f64).into());
             obj.into()
         }
-        None => err("could not generate a puzzle within the attempt budget"),
+        None => err(&format!("could not generate a puzzle within {MAX_ATTEMPTS} attempts")),
     }
 }
 

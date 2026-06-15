@@ -50,9 +50,11 @@ function spawn() {
 }
 
 // Generate one puzzle. `target` is a curriculum kindIndex, `drill` picks
-// drill-mode over train. Resolves to { puzzle, solution, givens }; rejects on a
-// generation failure (budget exhausted) or if cancelled.
-export function generate({ target, drill }) {
+// drill-mode over train, and `uncapped` lifts the worker's attempt budget so the
+// search runs until it succeeds or is cancelled (the page offers this after a
+// capped attempt gives up). Resolves to { puzzle, solution, givens }; rejects on
+// a generation failure (capped budget exhausted) or if cancelled.
+export function generate({ target, drill, uncapped }) {
   if (pending) return Promise.reject(new Error("a generation is already running"));
   if (!worker) spawn();
   return new Promise((resolve, reject) => {
@@ -60,7 +62,7 @@ export function generate({ target, drill }) {
     const mine = pending;
     ready.then(() => {
       // Guard against a cancel() that fired between request and readiness.
-      if (pending === mine) worker.postMessage({ target, drill });
+      if (pending === mine) worker.postMessage({ target, drill, uncapped: !!uncapped });
     });
   });
 }

@@ -107,7 +107,7 @@ These are load-bearing. Several are non-obvious and were the source of real bugs
 | Hint panel | `#hintPanel`, `#hintTitle`, `#hintClose`, `#hintBody` |
 | Hint content | `.hint-banner.ok/.bad`, `.banner-icon`, `.hint-actions`, `.hint-bigbtn`, `.hint-list`, `.hint-row`, `.hint-row.hint-child`, `.hint-row.focused`, `.hint-row-text` (`.hint-primary`, `.hint-secondary`, `.hint-deduction`), `.hint-more`, `.hint-apply`, `.hint-harder`, `.hint-note` |
 | Solved screen | `#solvedDialog`, `#solvedTime`, `#solvedHome`, `#solvedNew` |
-| Generation overlay | `#loadingOverlay`, `#loadingText`, `#loadingCancel` |
+| Generation overlay | `#loadingOverlay`, `#loadingText`, `#loadingRetry` (error-state "Keep searching"), `#loadingCancel` |
 | Stats | `#statsBack`, `#statsBody`, `.stats-summary`, `.stats-table`, `.stats-tier` |
 
 ---
@@ -185,7 +185,20 @@ hidden), and **no** new game record was created. Afterwards a fresh, fast
 generation still works (the worker respawns).
 
 **G3 — Budget exhaustion (best effort).** If generation fails (attempt budget),
-the overlay shows an error state and a dismiss control; no game is created.
+the overlay enters its error state (`#loadingOverlay.error`, spinner hidden),
+`#loadingText` shows the failure message, `#loadingRetry` ("Keep searching")
+becomes visible, and `#loadingCancel` reads "Close". Clicking Close dismisses the
+overlay; no game is created.
+
+**G4 — Keep searching (uncapped retry).** Given the error state from G3, When you
+click `#loadingRetry`, Then the overlay returns to its loading state (spinner
+back, `#loadingText` "Still searching…", `#loadingRetry` hidden) and generation
+restarts for the **same** (technique, mode) uncapped — it runs
+until it finds a puzzle (then opens `#playView` with a new game) or you cancel it
+via `#loadingCancel` (which terminates the worker, same as G2). To exercise this
+deterministically, force the first attempt to fail (e.g. build the worker with a
+tiny `MAX_ATTEMPTS`) so the capped request gives up and the uncapped retry
+succeeds.
 
 ---
 

@@ -190,11 +190,13 @@
   </dialog>
 
   <!-- Generation overlay. Backed by the cancellable worker; Cancel terminates
-       the in-flight generation. -->
+       the in-flight generation. On a budget-exhausted failure, "Keep searching"
+       restarts generation uncapped (shown only in the error state). -->
   <div id="loadingOverlay" class="overlay" hidden>
     <div class="overlay-card">
       <div class="spinner" aria-hidden="true"></div>
       <p id="loadingText">Generating…</p>
+      <button id="loadingRetry" class="key wide" hidden>Keep searching</button>
       <button id="loadingCancel" class="key wide">Cancel</button>
     </div>
   </div>

@@ -46,12 +46,18 @@ function goPlay() {
 const overlay = {
   el: null,
   text: null,
+  retryBtn: null,
   cancelBtn: null,
 };
+
+// The (kindIndex, mode) of the in-flight/last generation, so the error screen's
+// "Keep searching" can restart it uncapped.
+let lastLaunch = null;
 
 function showLoading(label) {
   overlay.el.classList.remove("error");
   overlay.text.textContent = label;
+  overlay.retryBtn.hidden = true;
   overlay.cancelBtn.textContent = "Cancel";
   overlay.el.hidden = false;
 }
@@ -59,6 +65,9 @@ function showLoading(label) {
 function showLoadError(message) {
   overlay.el.classList.add("error");
   overlay.text.textContent = message;
+  // Offer the uncapped retry whenever we know what to re-run -- which is every
+  // failure that came through launch(), since it records lastLaunch first.
+  overlay.retryBtn.hidden = lastLaunch === null;
   overlay.cancelBtn.textContent = "Close";
 }
 
@@ -67,13 +76,16 @@ function hideLoading() {
 }
 
 // Generate a fresh puzzle for (kindIndex, mode), store it as a new game, and
-// open it. Cancel terminates the worker and returns to where we were.
-async function launch(kindIndex, mode) {
+// open it. Cancel terminates the worker and returns to where we were. `uncapped`
+// (the error screen's "Keep searching") lifts the worker's attempt budget so a
+// hard target keeps trying until it succeeds or is cancelled.
+async function launch(kindIndex, mode, uncapped = false) {
   await heavyReady; // need gen + play wired
-  showLoading("Generating puzzle…");
+  lastLaunch = { kindIndex, mode };
+  showLoading(uncapped ? "Still searching…" : "Generating puzzle…");
   let result;
   try {
-    result = await gen.generate({ target: kindIndex, drill: mode === "drill" });
+    result = await gen.generate({ target: kindIndex, drill: mode === "drill", uncapped });
   } catch (e) {
     if (e && e.name === "AbortError") {
       hideLoading(); // user cancelled
@@ -108,7 +120,13 @@ async function resume(gameId) {
 function wireOverlay() {
   overlay.el = document.getElementById("loadingOverlay");
   overlay.text = document.getElementById("loadingText");
+  overlay.retryBtn = document.getElementById("loadingRetry");
   overlay.cancelBtn = document.getElementById("loadingCancel");
+  overlay.retryBtn.addEventListener("click", () => {
+    // Only reachable from the error state, where lastLaunch holds the failed
+    // request; re-run it uncapped.
+    if (lastLaunch) launch(lastLaunch.kindIndex, lastLaunch.mode, true);
+  });
   overlay.cancelBtn.addEventListener("click", () => {
     if (gen && gen.isGenerating()) gen.cancel(); // rejects launch() with AbortError
     else hideLoading(); // error state: just dismiss
