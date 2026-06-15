@@ -413,6 +413,19 @@ function toggleMark(set, d) {
   else set.add(d);
 }
 
+// Cheat: a placed digit can't be a candidate in any peer, so strike it from
+// their pencil notes (both center and corner). Keeps the displayed candidates
+// honest and the marks-aware hint engine (see solverBoard) in lock-step with the
+// grid as cells fill in. Caller invokes inside a `commit`, so it is one undo step
+// with the placement.
+function clearPeerMarks(i, d) {
+  for (let j = 0; j < N; j++) {
+    if (j === i || !isPeer(i, j)) continue;
+    centerMarks[j].delete(d);
+    cornerMarks[j].delete(d);
+  }
+}
+
 function applyDigitToCell(i, d) {
   if (given[i] !== 0) return;
   if (noteMode === MODE_NORMAL) {
@@ -420,6 +433,8 @@ function applyDigitToCell(i, d) {
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
     cornerMarks[i].clear();
+    // value[i] === d means we placed (not toggled off): clean the peers (cheat).
+    if (cheatOn() && value[i] === d) clearPeerMarks(i, d);
   } else {
     // Pencil marks are meaningless once a value is placed.
     if (value[i] !== 0) return;
@@ -441,6 +456,7 @@ function applyOppositeToCell(i, d) {
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
     cornerMarks[i].clear();
+    if (cheatOn() && value[i] === d) clearPeerMarks(i, d);
   }
 }
 
@@ -631,6 +647,29 @@ function toggleHintPanel() {
   else closeHint();
 }
 
+// Build a solver Board from the current grid. In cheat mode the player's center
+// pencil notes ride along as a per-cell candidate mask (bit d-1 set for each
+// noted digit), so the hint engine reasons over the *reduced* candidate set
+// instead of re-deriving it from placements alone. That is what lets "Apply
+// easiest" progress past singles: a technique elimination narrows the notes, and
+// the next hint sees the narrower set (a cell with no center notes means
+// "unspecified" -> it stays grid-derived). Corner (Snyder) notes mark where a
+// digit can go, not a full candidate set, so they are not forwarded. Off cheat we
+// pass no marks, so hints reflect the true position. Caller owns `.free()`.
+function solverBoard(wasm) {
+  const cellDigits = new Uint8Array(N);
+  for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
+  if (!cheatOn()) return new wasm.Board(cellDigits);
+  const cand = new Uint16Array(N); // 0 = unspecified (keep grid-derived)
+  for (let i = 0; i < N; i++) {
+    if (digitAt(i) !== 0 || centerMarks[i].size === 0) continue;
+    let m = 0;
+    for (const d of centerMarks[i]) m |= 1 << (d - 1);
+    cand[i] = m;
+  }
+  return new wasm.Board(cellDigits, cand);
+}
+
 // Build the panel content for the current board and show it.
 function openHint() {
   const body = document.getElementById("hintBody");
@@ -668,11 +707,9 @@ function openHint() {
     showPanel();
     return;
   }
-  const cellDigits = new Uint8Array(N);
-  for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
   let steps, isSolved;
   try {
-    const board = new wasm.Board(cellDigits);
+    const board = solverBoard(wasm);
     try {
       steps = wasm.hint(board);
       isSolved = board.isSolved();
@@ -761,10 +798,8 @@ function renderTechStage() {
   const wasm = bindings();
   let steps = [];
   if (wasm) {
-    const cellDigits = new Uint8Array(N);
-    for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
     try {
-      const board = new wasm.Board(cellDigits);
+      const board = solverBoard(wasm);
       try {
         steps = wasm.hint(board);
       } finally {
@@ -1091,6 +1126,7 @@ function applyStep(step, rerender) {
         value[d.cell] = d.digit;
         centerMarks[d.cell].clear();
         cornerMarks[d.cell].clear();
+        clearPeerMarks(d.cell, d.digit); // already a cheat-only path
       } else {
         // The digit is no longer a candidate in either notation.
         centerMarks[d.cell].delete(d.digit);
@@ -1104,6 +1140,36 @@ function applyStep(step, rerender) {
   // be spammed.
   if (finished) closeHint();
   else (rerender || renderTechStage)();
+}
+
+// The candidate set for an empty cell: every digit not already placed by a peer
+// (row / col / box). Pure board logic -- mirrors what the solver reasons over,
+// so the center notes it pens match the candidates an "Apply easiest" elimination
+// will strike out.
+function candidatesFor(i) {
+  const used = new Set();
+  for (let j = 0; j < N; j++) {
+    if (j === i || !isPeer(i, j)) continue;
+    const d = digitAt(j);
+    if (d !== 0) used.add(d);
+  }
+  const cand = new Set();
+  for (let d = 1; d <= 9; d++) if (!used.has(d)) cand.add(d);
+  return cand;
+}
+
+// Cheat: pencil the full candidate set into every empty cell's center notes,
+// overwriting them. This is what makes "Apply easiest" eliminations visible -- a
+// ≠ deduction only has something to strike once the candidates are penned. Re-run
+// it any time to refresh notes that placements have left stale.
+function fillAllCandidates() {
+  commit(() => {
+    for (let i = 0; i < N; i++) {
+      if (digitAt(i) !== 0) continue;
+      centerMarks[i] = candidatesFor(i);
+    }
+  });
+  render();
 }
 
 // ---- Cheat mode ----
@@ -1453,6 +1519,9 @@ function wireTopbar() {
   menuBtn.addEventListener("click", (e) => {
     e.stopPropagation(); // don't let the document handler immediately re-close
     const open = menuList.hidden;
+    // "Fill all candidates" is a cheat-only affordance; reveal it only while
+    // cheat mode is on, re-checked each time the menu opens.
+    document.getElementById("menuFill").hidden = !cheatOn();
     menuList.hidden = !open;
     menuBtn.setAttribute("aria-expanded", String(open));
   });
@@ -1477,6 +1546,7 @@ function wireTopbar() {
     }
     if (item.dataset.action === "restart") restart();
     else if (item.dataset.action === "generate") onNewPuzzle(game);
+    else if (item.dataset.action === "fillCandidates") fillAllCandidates();
     closeMenu();
   });
 

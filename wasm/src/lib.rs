@@ -6,14 +6,17 @@
 //! fields mirror `core::techniques::Step` — the UI owns all string formatting
 //! (cell names, technique labels, the hint sentence).
 //!
-//! Pencil marks are intentionally not part of the board: a hint reflects the
-//! true position, and the solver derives the real candidates from the
-//! placements itself. A future marks-aware mode would be an additive input (a
-//! per-cell candidate bitmask applied after the placements) rather than a
-//! change to this path — see [`Board::new`].
+//! Pencil marks are normally not part of the board: a hint reflects the true
+//! position, and the solver derives the real candidates from the placements
+//! itself. The optional marks-aware mode ([`Board::new`]'s second argument) is
+//! additive — a per-cell candidate bitmask whose missing candidates are
+//! `eliminate`d after placing — so the solver reasons over a *reduced* candidate
+//! set. The web app uses it (cheat only) to forward the player's pencil marks so
+//! "Apply easiest" can progress past singles: each technique elimination narrows
+//! the marks, which the next hint then sees.
 
 use serde::Serialize;
-use sudoku_core::board::UnitKind;
+use sudoku_core::board::{ALL_DIGITS, UnitKind};
 use sudoku_core::{Deduction, Rng, Spec, Step, Tier, all_techniques, make_puzzle_for_spec};
 use sudoku_core::lab;
 use wasm_bindgen::prelude::*;
@@ -36,10 +39,15 @@ impl Board {
     /// length is wrong or the placements form an illegal position (a digit
     /// repeated in a row/column/box).
     ///
-    /// A marks-aware mode would take a second argument here — a per-cell
-    /// candidate mask — and `eliminate` the missing candidates after placing.
+    /// `candidates` is the optional marks-aware input: a per-cell 9-bit mask
+    /// (bit `d-1` set if digit `d` is a candidate). For an empty cell with a
+    /// non-zero mask, every grid-derived candidate the mask omits is
+    /// `eliminate`d, so the solver reasons over the player's reduced set. A zero
+    /// mask (or `undefined` for the whole argument) means "unspecified": keep the
+    /// grid-derived candidates. Since `eliminate` only removes, a mask can never
+    /// add a candidate the placements forbid — the grid still dominates.
     #[wasm_bindgen(constructor)]
-    pub fn new(cells: &[u8]) -> Result<Board, JsValue> {
+    pub fn new(cells: &[u8], candidates: Option<Box<[u16]>>) -> Result<Board, JsValue> {
         if cells.len() != 81 {
             return Err(JsValue::from_str(&format!(
                 "expected 81 cells, got {}",
@@ -65,6 +73,26 @@ impl Board {
                 )));
             }
             inner.place(i, d);
+        }
+        if let Some(masks) = candidates {
+            if masks.len() != 81 {
+                return Err(JsValue::from_str(&format!(
+                    "expected 81 candidate masks, got {}",
+                    masks.len()
+                )));
+            }
+            for (i, &mask) in masks.iter().enumerate() {
+                if mask == 0 || cells[i] != 0 {
+                    continue;
+                }
+                let keep = mask & ALL_DIGITS;
+                let remove = inner.candidates(i) & !keep;
+                for d in 1..=9u8 {
+                    if remove & (1u16 << (d - 1)) != 0 {
+                        inner.eliminate(i, d);
+                    }
+                }
+            }
         }
         Ok(Board { inner })
     }

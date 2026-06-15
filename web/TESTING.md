@@ -114,7 +114,7 @@ These are load-bearing. Several are non-obvious and were the source of real bugs
 | Generation overlay | `#loadingOverlay`, `#loadingText`, `#loadingRetry` (error-state "Keep searching"), `#loadingCancel` |
 | Stats | `#statsBack`, `#statsBody`, `.stats-summary`, `.stats-table`, `.stats-tier` |
 | Stats history | `.hist-list`, `.hist-item`, `.mini` (thumbnail), `.hist-seed` (cheat only), `.hist-copy` |
-| Play menu | `#menuBtn`, `#menuList`, `.menu-item[data-action="generate"|"restart"|"copy"]` |
+| Play menu | `#menuBtn`, `#menuList`, `.menu-item[data-action="generate"|"restart"|"copy"|"fillCandidates"]` (fillCandidates = `#menuFill`, cheat only) |
 | Play seed (cheat) | `#playSeed` (under the board; hidden unless cheat + record has a seed) |
 
 ---
@@ -469,6 +469,33 @@ that has a seed (hidden when the record has none). Toggling cheat off hides it;
 toggling on (incl. the long-press of C2) shows it without reloading. The Stats
 history shows the same seed per item — see ST3.
 
+**C8 — Fill all candidates (cheat menu).** The play menu (`#menuBtn`) shows a
+**"Fill all candidates"** item (`#menuFill` → `.menu-item[data-action="fillCandidates"]`)
+**only while cheat is on** — the `<li id="menuFill">` is revealed each time the
+menu opens iff `cheatOn()`, hidden otherwise. Clicking it pencils the full
+candidate set (every digit not placed by a row/col/box peer) into every empty
+cell's **center notes** (`centerMarks`), overwriting them, in **one undoable**
+step. Filled and clue cells are untouched; corner notes are not changed.
+
+**C9 — Apply easiest strikes notes.** With candidates filled (C8), an "Apply
+easiest" / per-row "Apply" whose deduction is an elimination (`≠`) removes that
+digit from the target cell's notes (undoable). Without filled notes the
+elimination is a silent no-op (nothing to strike) — eliminations only become
+visible once candidates are penned.
+
+**C10 — Hints reason over notes (cheat).** With cheat on, the board handed to
+`hint()` carries the player's **center** notes as a candidate mask, so the engine
+reasons over the *reduced* set — this is what lets repeated "Apply easiest" make
+progress past singles on puzzles needing eliminations (each elimination narrows
+the notes the next hint sees). A cell with no center notes stays grid-derived;
+corner (Snyder) notes are not forwarded; off cheat no notes are forwarded (hints
+reflect the true position).
+
+**C11 — Placing a digit clears peer candidates (cheat).** With cheat on, placing
+a digit `d` in cell `c` (manually via pad/keyboard, or via an "Apply" placement)
+removes `d` from the center **and** corner notes of every row/col/box peer of
+`c`, in the same undoable step. Off cheat, peer notes are left untouched.
+
 ---
 
 ## 14. Suite: stats page
@@ -549,6 +576,6 @@ not mix with the hint's own highlights.
 | Hints: status layer | H-S1–H-S4 |
 | Hints: technique tree (spec) | H-T1–H-T7 |
 | Hints: reveal & highlights | H-R1–H-R6 |
-| Cheat mode | C1–C7 |
+| Cheat mode | C1–C11 |
 | Stats | ST1–ST3 |
 | Input & board | I1–I4 (incl. I2b redo, I2c persist across reopen) |
