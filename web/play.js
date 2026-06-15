@@ -44,18 +44,35 @@ let finished = false; // true once solved -- freezes the timer
 let onHome = () => {};
 let onNewPuzzle = () => {};
 
-let boardEl, notesBtn, undoBtn;
+let boardEl, notesBtn, undoBtn, redoBtn;
 
-// ---- Undo history ----
-// Each entry is a full snapshot of the editable state (values + pencil marks)
-// taken *before* a change. `commit` records one only when a mutation actually
-// changes the board, so no-op taps don't waste an undo step. The optimistic
-// double-tap rollbacks reuse this same stack (see onCellTap / onDigitTap), so a
-// place->convert double-tap collapses to a single undo step.
+// ---- Undo / redo history ----
+// Each entry is a full snapshot of the editable state (values + pencil marks).
+// `history` holds the states to undo *to* (one is pushed, before a change, only
+// when a mutation actually changes the board, so no-op taps don't waste a step);
+// `redoStack` holds the states an undo stepped away from, so redo can return to
+// them. A fresh commit clears `redoStack` -- a new move invalidates the redo
+// branch. The optimistic double-tap rollbacks reuse `history` directly (see
+// onCellTap / onDigitTap), so a place->convert double-tap collapses to one step.
+//
+// Both stacks ride along in the game record (see persist / loadGame), so the
+// whole undo/redo timeline survives closing and reopening a puzzle.
 const history = [];
+const redoStack = [];
 
 function snapshot() {
   return { v: value.slice(), m: marks.map((s) => new Set(s)) };
+}
+
+// Snapshots persist in the store, so they have to survive JSON: the per-cell
+// pencil-mark Sets serialize as plain arrays and rehydrate back into Sets. The
+// value array is JSON-friendly already (`v` is a fresh slice from `snapshot`).
+function snapshotToJSON(s) {
+  return { v: s.v, m: s.m.map((set) => [...set]) };
+}
+
+function snapshotFromJSON(s) {
+  return { v: (s.v || []).slice(), m: (s.m || []).map((a) => new Set(a)) };
 }
 
 function applySnapshot(s) {
@@ -81,7 +98,8 @@ function commit(mutate) {
   mutate();
   if (boardMatches(before)) return false;
   history.push(before);
-  updateUndoButton();
+  redoStack.length = 0; // a fresh move invalidates the redo branch
+  updateHistoryButtons();
   persist();
   checkWin();
   return true;
@@ -89,14 +107,25 @@ function commit(mutate) {
 
 function undo() {
   if (history.length === 0) return;
+  redoStack.push(snapshot()); // remember where we are so redo can return here
   applySnapshot(history.pop());
-  updateUndoButton();
+  updateHistoryButtons();
   persist();
   render();
 }
 
-function updateUndoButton() {
+function redo() {
+  if (redoStack.length === 0) return;
+  history.push(snapshot()); // the state we leave becomes undoable again
+  applySnapshot(redoStack.pop());
+  updateHistoryButtons();
+  persist();
+  render();
+}
+
+function updateHistoryButtons() {
   if (undoBtn) undoBtn.disabled = history.length === 0;
+  if (redoBtn) redoBtn.disabled = redoStack.length === 0;
 }
 
 // ---- Persistence / timer ----
@@ -112,6 +141,8 @@ function persist() {
     marks: marks.map((s) => [...s]),
     elapsedMs: elapsedMs(),
     lastPlayedAt: Date.now(),
+    history: history.map(snapshotToJSON),
+    redo: redoStack.map(snapshotToJSON),
   });
 }
 
@@ -292,7 +323,7 @@ function onCellTap(i) {
     if (cellSinglePushed) {
       applySnapshot(history.pop());
       cellSinglePushed = false;
-      updateUndoButton();
+      updateHistoryButtons();
     }
     commit(() => applyOppositeToCell(i, activeDigit)); // the other thing
     render();
@@ -391,6 +422,7 @@ function restart() {
     marks[i] = new Set();
   }
   history.length = 0;
+  redoStack.length = 0;
   selected = null;
   activeDigit = 0;
   notesMode = false;
@@ -407,13 +439,15 @@ function restart() {
 
   notesBtn.setAttribute("aria-pressed", "false");
   updateDigitButtons();
-  updateUndoButton();
+  updateHistoryButtons();
   store.updateGame(game.id, {
     value: value.slice(),
     marks: marks.map(() => []),
     elapsedMs: 0,
     status: "active",
     solvedAt: null,
+    history: [],
+    redo: [],
   });
   game = store.getGame(game.id);
   render();
@@ -1039,7 +1073,9 @@ function showSolved(finalMs) {
 
 // ---- Load a game ----
 // Swap in a game record: clues, solution, the player's saved work, and the
-// timer. Resets gesture/undo state and starts the clock.
+// timer. Resets gesture state and starts the clock. The undo/redo stacks are
+// restored from the record (older records have none -> empty), so the timeline
+// persists across closing and reopening the puzzle.
 export function loadGame(g) {
   closeHint();
   game = g;
@@ -1050,6 +1086,9 @@ export function loadGame(g) {
     marks[i] = new Set(g.marks[i] || []);
   }
   history.length = 0;
+  redoStack.length = 0;
+  for (const s of g.history || []) history.push(snapshotFromJSON(s));
+  for (const s of g.redo || []) redoStack.push(snapshotFromJSON(s));
   selected = null;
   activeDigit = 0;
   notesMode = false;
@@ -1067,7 +1106,7 @@ export function loadGame(g) {
   setTitle(g);
   updateSeedLine();
   updateDigitButtons();
-  updateUndoButton();
+  updateHistoryButtons();
   render();
   resume();
   // Opening a puzzle counts as playing it, so it sorts to the top of Continue
@@ -1196,7 +1235,7 @@ function onDigitTap(d) {
       if (digitSinglePushed) {
         applySnapshot(history.pop());
         digitSinglePushed = false;
-        updateUndoButton();
+        updateHistoryButtons();
       }
       setLock(d);
     }
@@ -1226,6 +1265,7 @@ function wirePad() {
   document.getElementById("erase").addEventListener("click", erase);
   notesBtn.addEventListener("click", toggleNotes);
   if (undoBtn) undoBtn.addEventListener("click", undo);
+  if (redoBtn) redoBtn.addEventListener("click", redo);
 }
 
 // Keyboard only acts while the play view is on screen.
@@ -1251,6 +1291,13 @@ function wireKeyboard() {
       moveSelection(0, 1);
     } else if (e.key === "n" || e.key === "N") {
       toggleNotes();
+    } else if (
+      // Redo before undo: Shift+Z reports e.key "Z", which the undo branch also
+      // matches, so the redo (Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y) check must win.
+      (e.ctrlKey || e.metaKey) &&
+      (e.key === "y" || e.key === "Y" || ((e.key === "z" || e.key === "Z") && e.shiftKey))
+    ) {
+      redo();
     } else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
       undo();
     } else {
@@ -1378,6 +1425,7 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle }) {
   boardEl = document.getElementById("board");
   notesBtn = document.getElementById("notes");
   undoBtn = document.getElementById("undo");
+  redoBtn = document.getElementById("redo");
 
   buildBoard();
   wirePad();
@@ -1385,6 +1433,6 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle }) {
   wireTopbar();
   wireHint();
   wireSolved();
-  updateUndoButton();
+  updateHistoryButtons();
   updateHintButton();
 }

@@ -105,7 +105,7 @@ These are load-bearing. Several are non-obvious and were the source of real bugs
 | Explainer | `#campaignBody .mode-explainer` (`p` lines) |
 | Puzzles list | `#puzzlesBack`, `#puzzlesList .continue-item` |
 | Board | `#board .cell` (`.given`, `.filled`, `.selected`, `.peer`, `.same`, `.hl-unit`, `.hl-cell`, `.hl-place`, `.hl-elim`) |
-| Pad | `#playPad`, `#undo`, `#notes`, `#erase`, `#hint`, `.key[data-digit]` |
+| Pad | `#playPad`, `#undo`, `#redo`, `#notes`, `#erase`, `#hint`, `.key[data-digit]` |
 | Hint panel | `#hintPanel`, `#hintTitle`, `#hintClose`, `#hintBody` |
 | Hint content | `.hint-banner.ok/.bad`, `.banner-icon`, `.hint-actions`, `.hint-bigbtn`, `.hint-list`, `.hint-row`, `.hint-row.hint-child`, `.hint-row.focused`, `.hint-row-text` (`.hint-primary`, `.hint-secondary`, `.hint-deduction`), `.hint-more`, `.hint-apply`, `.hint-harder`, `.hint-note` |
 | Solved screen | `#solvedDialog`, `#solvedTime`, `#solvedHome`, `#solvedNew` |
@@ -503,6 +503,17 @@ mirrors this; the pad's same-digit double-tap (within 280 ms) pen-locks a digit
 **I2 — Undo.** `#undo` reverts the last board mutation; it is disabled when there
 is nothing to undo; a place→convert double-tap collapses to one undo step.
 
+**I2b — Redo.** `#redo` re-applies the most recently undone move (Ctrl/Cmd+Y or
+Ctrl/Cmd+Shift+Z); it is disabled when there is nothing to redo. Making a *new*
+move after an undo clears the redo stack (so `#redo` goes disabled). A no-op tap
+does not clear it.
+
+**I2c — Undo/redo persist across reopen.** Make a few moves, undo one, leave the
+puzzle (Home) and reopen it from Continue: `#undo` and `#redo` are still enabled
+exactly as left, and stepping them reproduces the same board states. (The stacks
+ride along in the game record's `history` / `redo` fields; old records without
+them load as empty.) Restart clears both.
+
 **I3 — Givens are immutable.** Cells with class `given` cannot be changed/erased.
 
 **I4 — Selection highlight cleared on hint open.** When the hint panel opens, any
@@ -526,4 +537,4 @@ not mix with the hint's own highlights.
 | Hints: reveal & highlights | H-R1–H-R6 |
 | Cheat mode | C1–C7 |
 | Stats | ST1–ST3 |
-| Input & board | I1–I4 |
+| Input & board | I1–I4 (incl. I2b redo, I2c persist across reopen) |

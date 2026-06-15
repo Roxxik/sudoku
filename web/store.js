@@ -49,10 +49,15 @@ function newId() {
 //         records). Kept so cheat mode can display it and reproduce the puzzle.
 //   value: number[81]   player placements (0 = empty),
 //   marks: number[][81]  pencilled candidate digits per cell,
+//   history: snapshot[]  undo stack (states to undo *to*),
+//   redo: snapshot[]     redo stack (states an undo stepped away from),
+//     a snapshot is { v: number[81], m: number[][81] } -- value + marks-as-arrays,
 //   elapsedMs: accumulated play time,
 //   status: "active"|"solved",
 //   createdAt, solvedAt (ms epoch, solvedAt null until solved)
 // }
+// (Old records predating history/redo simply lack those fields -> treated as
+// empty stacks on load.)
 
 // Create and persist a fresh active game from a generated puzzle.
 export function createGame({ kindIndex, mode, puzzle, solution, givens, seed }) {
@@ -66,6 +71,8 @@ export function createGame({ kindIndex, mode, puzzle, solution, givens, seed }) 
     seed: seed || null,
     value: new Array(N).fill(0),
     marks: Array.from({ length: N }, () => []),
+    history: [],
+    redo: [],
     elapsedMs: 0,
     status: "active",
     createdAt: Date.now(),
