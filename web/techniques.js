@@ -14,8 +14,6 @@ export const TECHNIQUE_INFO = {
   "hidden-single": {
     description:
       "Within a single row, column, or box, a digit has just one cell left where it can legally go — even if that cell still shows other pencil-marks. Place it there.",
-    extra:
-      "For now Beginner mixes hidden singles in boxes and in lines together; they'll become their own lessons once the generator can target them apart.",
   },
   "naked-single": {
     description:

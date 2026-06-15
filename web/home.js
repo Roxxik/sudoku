@@ -313,7 +313,7 @@ function openBranches(tier) {
   note.className = "mode-explainer";
   note.appendChild(
     explPlain(
-      "These branches are only roughly ordered by difficulty — it mainly climbs within each branch. Work through the easier techniques in a branch before going deeper into it."
+      "These branches are only roughly ordered by difficulty — it mainly climbs within each branch. Work through the easier techniques in each branch before going deeper into it."
     )
   );
   document.getElementById("campaignBody").replaceChildren(grid, note);
