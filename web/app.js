@@ -12,11 +12,11 @@ import * as home from "./home.js";
 import CURRICULUM from "./curriculum.js";
 
 // Heavy/non-Home modules, bound once `heavyReady` resolves.
-let wasm, gen, play, stats;
+let wasm, gen, play, stats, custom;
 let heavyReady;
 
 // ---- View routing ----
-const VIEWS = ["homeView", "campaignView", "puzzlesView", "playView", "statsView"];
+const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView"];
 
 function showView(id) {
   for (const v of VIEWS) {
@@ -36,6 +36,13 @@ async function goStats() {
   stats.renderStats();
 }
 
+// The custom-spec builder lives in a heavy module (it talks to the wasm bridge
+// for presets and the worker to generate), so opening it waits for heavyReady.
+async function openCustomView() {
+  await heavyReady;
+  custom.openCustom();
+}
+
 function goPlay() {
   showView("playView");
 }
@@ -50,8 +57,9 @@ const overlay = {
   cancelBtn: null,
 };
 
-// The (kindIndex, mode) of the in-flight/last generation, so the error screen's
-// "Keep searching" can restart it uncapped.
+// The in-flight/last generation request, so the error screen's "Keep searching"
+// can restart it uncapped. A campaign request is { kindIndex, mode }; a custom
+// one is { usages, label, specMasks }.
 let lastLaunch = null;
 
 function showLoading(label) {
@@ -62,12 +70,13 @@ function showLoading(label) {
   overlay.el.hidden = false;
 }
 
-function showLoadError(message) {
+function showLoadError(message, retriable) {
   overlay.el.classList.add("error");
   overlay.text.textContent = message;
-  // Offer the uncapped retry whenever we know what to re-run -- which is every
-  // failure that came through launch(), since it records lastLaunch first.
-  overlay.retryBtn.hidden = lastLaunch === null;
+  // "Keep searching" lifts the attempt budget, so it only helps when the search
+  // merely ran out of attempts (retriable). Other failures -- a bad request, a
+  // solver error -- won't be fixed by retrying, so they get only "Close".
+  overlay.retryBtn.hidden = !(retriable && lastLaunch !== null);
   overlay.cancelBtn.textContent = "Close";
 }
 
@@ -75,36 +84,64 @@ function hideLoading() {
   overlay.el.hidden = true;
 }
 
-// Generate a fresh puzzle for (kindIndex, mode), store it as a new game, and
-// open it. Cancel terminates the worker and returns to where we were. `uncapped`
-// (the error screen's "Keep searching") lifts the worker's attempt budget so a
-// hard target keeps trying until it succeeds or is cancelled.
-async function launch(kindIndex, mode, uncapped = false) {
+// Generate a fresh puzzle for `req`, store it as a new game, and open it. `req`
+// is either a campaign request ({ kindIndex, mode }) or a custom-spec one
+// ({ usages, label, specMasks } from custom.js). Cancel terminates the worker and
+// returns to where we were. `uncapped` (the error screen's "Keep searching")
+// lifts the worker's attempt budget so a hard target keeps trying until it
+// succeeds or is cancelled.
+async function launch(req, uncapped = false) {
   await heavyReady; // need gen + play wired
-  lastLaunch = { kindIndex, mode };
+  lastLaunch = req;
   showLoading(uncapped ? "Still searching…" : "Generating puzzle…");
   let result;
   try {
-    result = await gen.generate({ target: kindIndex, drill: mode === "drill", uncapped });
+    const genReq = req.usages
+      ? { usages: req.usages, uncapped }
+      : { target: req.kindIndex, drill: req.mode === "drill", uncapped };
+    result = await gen.generate(genReq);
   } catch (e) {
     if (e && e.name === "AbortError") {
       hideLoading(); // user cancelled
     } else {
-      showLoadError(e && e.message ? e.message : "Generation failed.");
+      showLoadError(e && e.message ? e.message : "Generation failed.", !!(e && e.retriable));
     }
     return;
   }
   hideLoading();
-  const game = store.createGame({
-    kindIndex,
-    mode,
-    puzzle: result.puzzle,
-    solution: result.solution,
-    givens: result.givens,
-    seed: result.seed, // decimal-string u64 from the worker (debug/cheat display)
-  });
+  // decimal-string u64 seed comes back from the worker for the cheat-mode display.
+  const game = req.usages
+    ? store.createGame({
+        mode: "custom",
+        spec: req.usages,
+        specMasks: req.specMasks,
+        label: req.label,
+        puzzle: result.puzzle,
+        solution: result.solution,
+        givens: result.givens,
+        seed: result.seed,
+      })
+    : store.createGame({
+        kindIndex: req.kindIndex,
+        mode: req.mode,
+        puzzle: result.puzzle,
+        solution: result.solution,
+        givens: result.givens,
+        seed: result.seed,
+      });
   play.loadGame(game);
   goPlay();
+}
+
+// Re-generate a fresh puzzle for an existing game's spec (the play view's "New
+// puzzle"). A custom game replays its stored usage array; a campaign game its
+// (kindIndex, mode).
+function regenerate(g) {
+  launch(
+    g.spec
+      ? { usages: g.spec, label: g.label, specMasks: g.specMasks }
+      : { kindIndex: g.kindIndex, mode: g.mode }
+  );
 }
 
 async function resume(gameId) {
@@ -126,7 +163,7 @@ function wireOverlay() {
   overlay.retryBtn.addEventListener("click", () => {
     // Only reachable from the error state, where lastLaunch holds the failed
     // request; re-run it uncapped.
-    if (lastLaunch) launch(lastLaunch.kindIndex, lastLaunch.mode, true);
+    if (lastLaunch) launch(lastLaunch, true);
   });
   overlay.cancelBtn.addEventListener("click", () => {
     if (gen && gen.isGenerating()) gen.cancel(); // rejects launch() with AbortError
@@ -156,25 +193,34 @@ function boot() {
   home.initHome({
     curriculum: CURRICULUM,
     showView,
-    onLaunch: launch,
+    onLaunch: (kindIndex, mode) => launch({ kindIndex, mode }),
     onResume: resume,
     onStats: goStats,
+    onCustom: openCustomView,
   });
   goHome(); // <-- first paint: real saved puzzles + campaign tree
 
   heavyReady = (async () => {
-    const [p, s, g, w] = await Promise.all([
+    const [p, s, g, w, c] = await Promise.all([
       import("./play.js"),
       import("./stats.js"),
       import("./gen.js"),
       import("./wasm.js"),
+      import("./custom.js"),
     ]);
     play = p;
     stats = s;
     gen = g;
     wasm = w;
-    play.initPlay({ curriculum: CURRICULUM, onHome: goHome, onNewPuzzle: launch });
+    custom = c;
+    play.initPlay({ curriculum: CURRICULUM, onHome: goHome, onNewPuzzle: regenerate });
     stats.initStats({ curriculum: CURRICULUM, onHome: goHome });
+    custom.initCustom({
+      curriculum: CURRICULUM,
+      showView,
+      onGenerate: launch,
+      onHome: goHome,
+    });
     // Warm the wasm bridge so the first Hint is ready; Home and generation
     // (the worker) don't depend on it.
     wasm.ready();

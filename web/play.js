@@ -694,12 +694,7 @@ function openHint() {
   }
   // First layer: just confirm the board is fine, without revealing what's
   // possible. Revealing drills into the technique tree.
-  let masks = null;
-  try {
-    masks = wasm.specMasks(game.kindIndex, game.mode === "drill");
-  } catch {
-    masks = null;
-  }
+  const masks = specMasksFor(wasm);
   hintTitle("Hint");
   body.replaceChildren(statusStage(steps, masks));
   showPanel();
@@ -779,12 +774,7 @@ function renderTechStage() {
       steps = [];
     }
   }
-  let masks = null;
-  try {
-    masks = wasm.specMasks(game.kindIndex, game.mode === "drill");
-  } catch {
-    masks = null;
-  }
+  const masks = specMasksFor(wasm);
   hintTitle("Available moves");
   if (steps.length) {
     body.replaceChildren(techStage(groupSteps(steps), masks));
@@ -1200,6 +1190,10 @@ function setTitle(g) {
   // The play view title shows what the player is working on.
   const h = document.getElementById("playTitle");
   if (!h) return;
+  if (g.mode === "custom") {
+    h.textContent = g.label ? `Custom · ${g.label}` : "Custom";
+    return;
+  }
   const name = techniqueName(curriculumIdFor(g.kindIndex));
   const mode = g.mode === "drill" ? "Drill" : "Train";
   h.textContent = `${name} · ${mode}`;
@@ -1269,6 +1263,19 @@ const LAB_KIND = {
   "xyz-wing": 14,
   "w-wing": 15,
 };
+
+// The spec masks driving the hint tree's Allowed/Conceded split. A custom game
+// stores its own masks on the record (its spec isn't a single curriculum kind);
+// a campaign game derives them from (kindIndex, mode) via the wasm bridge. Null
+// on any failure, which the hint path treats as "everything in scope".
+function specMasksFor(wasm) {
+  if (game && game.specMasks) return game.specMasks;
+  try {
+    return wasm.specMasks(game.kindIndex, game.mode === "drill");
+  } catch {
+    return null;
+  }
+}
 
 // Whether a hint group is part of the puzzle's intended toolbox -- Allowed or
 // Forced (baseline = allowed|forced). Conceded and untagged/out-of-scope
@@ -1466,7 +1473,7 @@ function wireTopbar() {
       return;
     }
     if (item.dataset.action === "restart") restart();
-    else if (item.dataset.action === "generate") onNewPuzzle(game.kindIndex, game.mode);
+    else if (item.dataset.action === "generate") onNewPuzzle(game);
     closeMenu();
   });
 
@@ -1492,7 +1499,7 @@ function wireSolved() {
   });
   document.getElementById("solvedNew").addEventListener("click", () => {
     document.getElementById("solvedDialog").close();
-    onNewPuzzle(game.kindIndex, game.mode);
+    onNewPuzzle(game);
   });
 }
 

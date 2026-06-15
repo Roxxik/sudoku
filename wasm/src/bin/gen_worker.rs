@@ -16,18 +16,22 @@
 //!
 //! Message protocol (plain structured-clone objects, no owned wasm handles):
 //!   worker -> page, on init:        `{ ready: true }`
-//!   page   -> worker, to generate:  `{ target: <kindIndex>, drill: <bool>, uncapped: <bool> }`
+//!   page   -> worker, campaign:     `{ target: <kindIndex>, drill: <bool>, uncapped: <bool> }`
+//!   page   -> worker, custom spec:  `{ spec: [<usage per kind>], uncapped: <bool> }`
 //!   worker -> page, on success:     `{ puzzle, solution, givens, seed }`
 //!   worker -> page, on failure:     `{ error: <string> }`
-//! `uncapped` (default false) lifts the per-request attempt budget so a hard
-//! target keeps searching until it finds a puzzle or the page terminates us —
-//! the page offers it after a capped request gives up.
+//! A `spec` field (an array of per-kind usage codes — 0 off / 1 Allowed /
+//! 2 Forced / 3 Conceded, see `web/spec.js`) selects the custom-spec path and
+//! takes precedence over `target`/`drill`. `uncapped` (default false) lifts the
+//! per-request attempt budget so a hard target keeps searching until it finds a
+//! puzzle or the page terminates us — the page offers it after a capped request
+//! gives up.
 //! The worker seeds its own RNG (we want variety, not reproducibility), so the
 //! page never *sends* a seed — but the seed it drew is *returned* (as a decimal
 //! string, since a u64 won't fit a JS Number) so the page can show it for
 //! debugging and, with the same (seed, target, drill), reproduce the puzzle.
 
-use js_sys::{Math, Object, Reflect};
+use js_sys::{Array, Math, Object, Reflect};
 use sudoku_core::lab;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -44,10 +48,17 @@ fn main() {
 
     let onmessage = Closure::wrap(Box::new(move |msg: MessageEvent| {
         let data = msg.data();
-        let target = num_field(&data, "target").unwrap_or(-1.0);
-        let drill = bool_field(&data, "drill");
         let uncapped = bool_field(&data, "uncapped");
-        let reply = generate(target, drill, uncapped);
+        // A `spec` array is the custom-spec path; otherwise it's a campaign
+        // request keyed by target/drill.
+        let reply = match usages_field(&data, "spec") {
+            Some(usages) => generate_custom(&usages, uncapped),
+            None => {
+                let target = num_field(&data, "target").unwrap_or(-1.0);
+                let drill = bool_field(&data, "drill");
+                generate(target, drill, uncapped)
+            }
+        };
         // Best-effort: if the page already terminated us this never runs.
         let _ = scope_for_msg.post_message(&reply);
     }) as Box<dyn Fn(MessageEvent)>);
@@ -82,10 +93,41 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
     } else {
         lab::Spec::train_isolated(target)
     };
+    run_spec(&spec, uncapped)
+}
+
+/// Generate one puzzle for an **explicit**, UI-built spec. `usages` is one code
+/// per `lab::kinds` index — 0 = off (out of scope), 1 = Allowed, 2 = Forced,
+/// 3 = Conceded (see `web/spec.js`) — rebuilt into a [`lab::Spec`] via the same
+/// `explicit().allow/force/concede` API the curriculum builders use. Entries past
+/// `lab::kinds::NUM` are ignored; a Forced kind requires a single firing (count 1,
+/// as every builder uses). With nothing Forced the generator just yields the
+/// minimal puzzle the Allowed toolbox solves — the page gates Generate on at
+/// least one Forced kind, so that case is not normally reached.
+fn generate_custom(usages: &[u8], uncapped: bool) -> JsValue {
+    let mut spec = lab::Spec::explicit();
+    for (idx, &u) in usages.iter().enumerate() {
+        if idx >= lab::kinds::NUM {
+            break;
+        }
+        spec = match u {
+            1 => spec.allow(idx),
+            2 => spec.force(idx, 1),
+            3 => spec.concede(idx),
+            _ => spec, // 0 / unknown: leave out of scope
+        };
+    }
+    run_spec(&spec, uncapped)
+}
+
+/// Run the rejection-sampling generator for `spec` and build the page reply —
+/// shared by the campaign and custom-spec paths. `uncapped` lifts the attempt
+/// budget (the only way out of a runaway uncapped search is `worker.terminate()`).
+fn run_spec(spec: &lab::Spec, uncapped: bool) -> JsValue {
     let seed = random_seed();
     let mut rng = lab::Rng::from_seed(seed);
     let budget = if uncapped { usize::MAX } else { MAX_ATTEMPTS };
-    let (generated, _stats) = lab::generate(&mut rng, &spec, budget);
+    let (generated, _stats) = lab::generate(&mut rng, spec, budget);
     match generated {
         Some(g) => {
             let obj = Object::new();
@@ -97,7 +139,12 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
             set_str(&obj, "seed", &seed.to_string());
             obj.into()
         }
-        None => err(&format!("could not generate a puzzle within {MAX_ATTEMPTS} attempts")),
+        // Budget exhaustion is the one failure worth retrying uncapped: a hard or
+        // tightly-constrained spec may just need more attempts. The page offers
+        // "Keep searching" only for this `retriable` error.
+        None => err_retriable(&format!(
+            "could not generate a puzzle within {MAX_ATTEMPTS} attempts"
+        )),
     }
 }
 
@@ -116,6 +163,16 @@ fn err(message: &str) -> JsValue {
     obj.into()
 }
 
+/// An error the page may retry uncapped (budget exhaustion only). Adds
+/// `retriable: true` so the page shows "Keep searching"; plain [`err`] does not,
+/// so other failures (a bad request, a solver error) just offer "Close".
+fn err_retriable(message: &str) -> JsValue {
+    let obj = Object::new();
+    set_str(&obj, "error", message);
+    let _ = Reflect::set(&obj, &"retriable".into(), &JsValue::TRUE);
+    obj.into()
+}
+
 fn set_str(obj: &Object, key: &str, value: &str) {
     let _ = Reflect::set(obj, &key.into(), &JsValue::from_str(value));
 }
@@ -129,4 +186,20 @@ fn bool_field(data: &JsValue, key: &str) -> bool {
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// Read `key` as an array of small integers (the per-kind usage codes), or `None`
+/// when it's absent / not an array — which routes the request to the campaign
+/// path instead. Non-numeric entries fall back to 0 (off).
+fn usages_field(data: &JsValue, key: &str) -> Option<Vec<u8>> {
+    let v = Reflect::get(data, &key.into()).ok()?;
+    if !Array::is_array(&v) {
+        return None;
+    }
+    let arr: Array = v.unchecked_into();
+    let mut out = Vec::with_capacity(arr.length() as usize);
+    for i in 0..arr.length() {
+        out.push(arr.get(i).as_f64().unwrap_or(0.0) as u8);
+    }
+    Some(out)
 }

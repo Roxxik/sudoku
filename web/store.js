@@ -42,7 +42,7 @@ function newId() {
 
 // ---- Game records ----
 // {
-//   id, kindIndex, mode: "train"|"drill",   (Beginner uses "train")
+//   id, kindIndex, mode: "train"|"drill"|"custom",   (Beginner uses "train")
 //   puzzle, solution: 81-char lines ('.' = empty),
 //   givens: clue count,
 //   seed: decimal string of the u64 generator seed (debug only; absent on old
@@ -61,13 +61,35 @@ function newId() {
 // }
 // (Old records predating history/redo simply lack those fields -> treated as
 // empty stacks on load.)
+//
+// A CUSTOM game (mode "custom", built in custom.js) has no single curriculum
+// kind: kindIndex is null and three extra fields carry its spec --
+//   spec: number[16]      per-kind usage codes (re-generate the same spec),
+//   specMasks: {baseline, inScope, forced}  for the hint tree,
+//   label: string         a short title from its Forced techniques.
+// Campaign games leave all three null.
 
-// Create and persist a fresh active game from a generated puzzle.
-export function createGame({ kindIndex, mode, puzzle, solution, givens, seed }) {
+// Create and persist a fresh active game from a generated puzzle. `kindIndex` is
+// null for a custom game; `spec`/`specMasks`/`label` are the custom extras; `seed`
+// is the worker's decimal-string u64 (cheat-mode display).
+export function createGame({
+  kindIndex = null,
+  mode,
+  spec = null,
+  specMasks = null,
+  label = null,
+  puzzle,
+  solution,
+  givens,
+  seed,
+}) {
   const game = {
     id: newId(),
     kindIndex,
     mode,
+    spec,
+    specMasks,
+    label,
     puzzle,
     solution,
     givens,
@@ -133,6 +155,9 @@ export function statsByKind() {
   const out = {};
   for (const g of loadAll()) {
     if (g.status !== "solved") continue;
+    // Custom-spec games aren't a single curriculum kind, so they stay out of the
+    // per-kind badges and Stats table.
+    if (typeof g.kindIndex !== "number") continue;
     const k = (out[g.kindIndex] ||= {});
     const m = (k[g.mode] ||= { count: 0, bestMs: Infinity, avgMs: 0, lastMs: 0, _sum: 0 });
     m.count += 1;

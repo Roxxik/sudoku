@@ -21,6 +21,8 @@
   <link rel="modulepreload" href="cheat.js">
   <link rel="modulepreload" href="gen.js">
   <link rel="modulepreload" href="wasm.js">
+  <link rel="modulepreload" href="spec.js">
+  <link rel="modulepreload" href="custom.js">
   <!-- The cdylib bridge (Board/hint/generate/curriculum) on the main thread.
        data-target-name disambiguates it from the worker binary below. -->
   <link data-trunk rel="rust" href="../wasm/Cargo.toml" data-target-name="sudoku_wasm">
@@ -41,8 +43,10 @@
   <link data-trunk rel="copy-file" href="util.js">
   <link data-trunk rel="copy-file" href="ui.js">
   <link data-trunk rel="copy-file" href="cheat.js">
+  <link data-trunk rel="copy-file" href="spec.js">
   <link data-trunk rel="copy-file" href="play.js">
   <link data-trunk rel="copy-file" href="home.js">
+  <link data-trunk rel="copy-file" href="custom.js">
   <link data-trunk rel="copy-file" href="stats.js">
 </head>
 <body>
@@ -69,6 +73,11 @@
         <div id="tierButtons" class="nav-grid"></div>
       </section>
 
+      <!-- Custom-spec builder, between the campaign and the in-progress puzzles. -->
+      <button id="customBtn" class="nav-btn">
+        <span class="nav-label">Custom puzzle</span>
+      </button>
+
       <button id="continueLastBtn" class="continue-item" hidden></button>
       <button id="continueListBtn" class="continue-item" hidden></button>
     </section>
@@ -87,6 +96,22 @@
         <span class="iconbtn" aria-hidden="true"></span>
       </header>
       <div id="campaignBody"></div>
+    </section>
+
+    <!-- ========================= CUSTOM SPEC ========================= -->
+    <!-- Build an arbitrary generation spec (Off/Allow/Force/Concede per
+         technique), optionally from a campaign preset. Body filled by custom.js. -->
+    <section id="customView" class="view" hidden>
+      <header class="topbar">
+        <button id="customBack" class="iconbtn" aria-label="Back">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="2" d="M15 5l-7 7 7 7"/>
+          </svg>
+        </button>
+        <h1>Custom puzzle</h1>
+        <span class="iconbtn" aria-hidden="true"></span>
+      </header>
+      <div id="customBody"></div>
     </section>
 
     <!-- ====================== CONTINUE A PUZZLE ======================= -->

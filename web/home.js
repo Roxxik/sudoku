@@ -40,6 +40,7 @@ export function initHome(opts) {
   grouped = groupCurriculum(curriculum);
 
   document.getElementById("statsBtn").addEventListener("click", opts.onStats);
+  document.getElementById("customBtn").addEventListener("click", opts.onCustom);
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
   document
@@ -106,8 +107,15 @@ function renderContinue() {
 }
 
 function continueMeta(g) {
+  const time = formatDuration(g.elapsedMs);
+  if (g.mode === "custom") return `Custom · ${time}`;
   const mode = g.mode === "drill" ? "Drill" : "Train";
-  return `${techniqueName(idFor(g.kindIndex))} · ${mode} · ${formatDuration(g.elapsedMs)}`;
+  return `${techniqueName(idFor(g.kindIndex))} · ${mode} · ${time}`;
+}
+
+// The title for a game card: a custom game's own label, else its technique name.
+function gameTitle(g) {
+  return g.mode === "custom" ? g.label || "Custom" : techniqueName(idFor(g.kindIndex));
 }
 
 // ---- Campaign drill-down ----
@@ -285,7 +293,7 @@ function openPuzzles() {
     const btn = document.createElement("button");
     btn.className = "continue-item";
     btn.addEventListener("click", () => onResume(g.id));
-    btn.append(miniBoard(g, "mini-xl"), textColumn(techniqueName(idFor(g.kindIndex)), continueMeta(g)));
+    btn.append(miniBoard(g, "mini-xl"), textColumn(gameTitle(g), continueMeta(g)));
     li.appendChild(btn);
     list.appendChild(li);
   }

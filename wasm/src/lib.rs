@@ -209,6 +209,35 @@ pub fn spec_masks(target: u32, drill: bool) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Like [`specMasks`], but from the **isolated** builders
+/// (`train_isolated`/`drill_isolated`) the frontend actually generates with. The
+/// custom-spec builder presets its per-technique chips from a campaign
+/// technique's train/drill via these masks (decoded into Off/Allow/Force/Concede
+/// in `web/spec.js`), so the preset matches what generation would produce. Same
+/// three-mask shape as [`specMasks`]; `target` is a `lab::kinds` index.
+#[wasm_bindgen(js_name = specMasksIsolated)]
+pub fn spec_masks_isolated(target: u32, drill: bool) -> Result<JsValue, JsValue> {
+    let target = target as usize;
+    if target >= lab::kinds::NUM {
+        return Err(JsValue::from_str(&format!(
+            "target kind {} out of range (0..{})",
+            target,
+            lab::kinds::NUM
+        )));
+    }
+    let spec = if drill {
+        lab::Spec::drill_isolated(target)
+    } else {
+        lab::Spec::train_isolated(target)
+    };
+    let data = SpecMaskData {
+        baseline: spec.baseline_mask(),
+        in_scope: spec.in_scope_mask(),
+        forced: spec.forced_mask(),
+    };
+    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 fn tier_str(t: lab::kinds::Tier) -> &'static str {
     use lab::kinds::Tier;
     match t {
