@@ -44,9 +44,12 @@ export function initCustom(opts) {
   document.getElementById("customBack").addEventListener("click", onHome);
 }
 
-// Open the builder: paint it from the current `usages`, then enable presets once
-// the wasm bridge (which computes them) is up.
-export function openCustom() {
+// Open the builder. With no argument it paints from the current `usages` (kept
+// between opens so a half-built spec survives a trip Home); pass a usage array
+// (e.g. resurfaced from a solved custom game in Stats) to load that spec instead.
+// Presets are enabled once the wasm bridge (which computes them) is up.
+export function openCustom(initial) {
+  if (Array.isArray(initial)) usages = initial.slice();
   renderBody();
   showView("customView");
   ready().then(() => {

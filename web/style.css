@@ -639,6 +639,15 @@ details.branch .tech-row { background: var(--bg); }
   cursor: pointer;
 }
 .hist-copy:active { background: var(--cell-sel); }
+/* Stacked per-card actions (custom cards: Open spec + Copy), pushed right. */
+.hist-actions {
+  margin-left: auto;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hist-actions .hist-copy { margin-left: 0; }
 
 /* Cheat-only debug line under the play board: the generator seed. */
 .play-seed {

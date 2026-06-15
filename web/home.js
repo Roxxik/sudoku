@@ -63,8 +63,9 @@ export function renderHome() {
   renderTiers(stats);
   renderContinue();
   // The Stats page also hosts the solved-puzzle history (a debug aid), so it
-  // earns its button as soon as anything has been solved.
-  document.getElementById("statsBtn").hidden = !hasAnySolve(stats);
+  // earns its button as soon as anything -- campaign or custom -- has been
+  // solved. Custom games are excluded from statsByKind, so count solved games.
+  document.getElementById("statsBtn").hidden = store.solvedGames().length === 0;
   showHome();
 }
 
@@ -324,12 +325,6 @@ function rollup(stats, entries) {
   let n = 0;
   for (const e of entries) n += store.solvedCountForKind(stats, e.kindIndex);
   return n;
-}
-
-function hasAnySolve(stats) {
-  for (const k of Object.values(stats))
-    for (const m of Object.values(k)) if (m.count >= 1) return true;
-  return false;
 }
 
 function idFor(kindIndex) {

@@ -217,7 +217,11 @@ function boot() {
     wasm = w;
     custom = c;
     play.initPlay({ curriculum: CURRICULUM, onHome: goHome, onNewPuzzle: regenerate });
-    stats.initStats({ curriculum: CURRICULUM, onHome: goHome });
+    stats.initStats({
+      curriculum: CURRICULUM,
+      onHome: goHome,
+      onOpenSpec: (spec) => custom.openCustom(spec),
+    });
     custom.initCustom({
       curriculum: CURRICULUM,
       showView,

@@ -12,9 +12,11 @@ import { miniBoard, textColumn, copyText } from "./ui.js";
 import { cheatOn } from "./cheat.js";
 
 let curriculum = [];
+let onOpenSpec = () => {};
 
 export function initStats(opts) {
   curriculum = opts.curriculum;
+  onOpenSpec = opts.onOpenSpec || (() => {});
   document.getElementById("statsBack").addEventListener("click", opts.onHome);
 }
 
@@ -23,27 +25,18 @@ export function renderStats() {
   const stats = store.statsByKind();
   body.replaceChildren();
 
-  // Headline totals across everything solved.
-  let totalSolved = 0;
-  let totalMs = 0;
-  for (const k of Object.values(stats)) {
-    for (const m of Object.values(k)) {
-      totalSolved += m.count;
-      totalMs += m.avgMs * m.count;
-    }
-  }
-
-  if (totalSolved === 0) {
+  // Headline totals across every solved puzzle -- custom games included (they're
+  // solved too, even though they have no row in the per-kind tables below).
+  const solved = store.solvedGames();
+  if (solved.length === 0) {
     const p = document.createElement("p");
     p.className = "hint-note";
     p.textContent = "No puzzles solved yet. Finish one to start tracking your times.";
     body.appendChild(p);
     return;
   }
-
-  body.appendChild(
-    summaryCard(totalSolved, totalMs)
-  );
+  const totalMs = solved.reduce((sum, g) => sum + (g.elapsedMs || 0), 0);
+  body.appendChild(summaryCard(solved.length, totalMs));
 
   // One section per tier, in curriculum order; rows only for solved kinds.
   for (const tier of TIER_ORDER) {
@@ -94,9 +87,13 @@ function historySection() {
 function historyCard(g) {
   const card = document.createElement("div");
   card.className = "hist-item";
-  const mode = g.mode === "drill" ? "Drill" : "Train";
-  const meta = `${mode} · ${formatDuration(g.elapsedMs)} · ${solvedDate(g)}`;
-  const col = textColumn(techniqueName(idFor(g.kindIndex)), meta);
+  // A custom game isn't a single curriculum kind: title it by its spec label and
+  // mark the mode "Custom" (campaign games show their technique + Train/Drill).
+  const isCustom = g.mode === "custom";
+  const title = isCustom ? g.label || "Custom" : techniqueName(idFor(g.kindIndex));
+  const modeLabel = isCustom ? "Custom" : g.mode === "drill" ? "Drill" : "Train";
+  const meta = `${modeLabel} · ${formatDuration(g.elapsedMs)} · ${solvedDate(g)}`;
+  const col = textColumn(title, meta);
   if (cheatOn()) {
     const seed = document.createElement("span");
     seed.className = "ci-meta hist-seed";
@@ -108,8 +105,30 @@ function historyCard(g) {
       g.attempts != null ? `Attempts: ${g.attempts}` : "Attempts: (not recorded)";
     col.appendChild(attempts);
   }
-  card.append(miniBoard(g, "mini-lg"), col, copyButton(g));
+  card.append(miniBoard(g, "mini-lg"), col, cardActions(g));
   return card;
+}
+
+// The card's right-hand actions: every card can copy its puzzle; a custom card
+// also offers "Open spec" to resurface its spec in the builder.
+function cardActions(g) {
+  if (g.mode !== "custom" || !Array.isArray(g.spec)) return copyButton(g);
+  const wrap = document.createElement("div");
+  wrap.className = "hist-actions";
+  wrap.append(openSpecButton(g), copyButton(g));
+  return wrap;
+}
+
+// Reopen the custom-spec builder pre-loaded with this game's spec, so it can be
+// regenerated or tweaked (the spec is otherwise only built fresh each time).
+function openSpecButton(g) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "hist-copy";
+  btn.textContent = "Open spec";
+  btn.title = "Open this custom spec in the builder";
+  btn.addEventListener("click", () => onOpenSpec(g.spec));
+  return btn;
 }
 
 // Export the puzzle's clue line (`g.puzzle` is already to_line() output, '.' =
