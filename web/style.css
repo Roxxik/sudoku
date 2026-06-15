@@ -11,6 +11,7 @@
   --user: #7ab8ff;
   --mark: #9a9aa6;
   --accent: #7ab8ff;
+  --accent2: #f0b454;
   --text: #e8e8ec;
 }
 
@@ -123,6 +124,9 @@ html, body {
 
 .cell {
   position: relative;
+  /* A query container so the centred notes can size against the cell width
+     (cqw), shrinking to fit one row regardless of viewport. */
+  container-type: inline-size;
   background: var(--cell);
   border-right: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
@@ -149,8 +153,10 @@ html, body {
 .cell.same { background: var(--cell-same); }
 .cell.selected { background: var(--cell-sel); }
 
-/* Pencil marks: a 3x3 micro-grid filling the cell. */
-.cell .marks {
+/* Snyder (corner) notes: a 3x3 micro-grid. render fills the slots by ascending
+   rank, so a digit's corner depends on how many smaller corner digits share the
+   cell -- not on its value. */
+.cell .corner-notes {
   position: absolute;
   inset: 0;
   display: grid;
@@ -160,10 +166,27 @@ html, body {
   color: var(--mark);
   pointer-events: none;
 }
-.cell .marks span {
+.cell .corner-notes span {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* The "usual" notes: the sorted candidates packed into one centred row. `--n`
+   (the candidate count, set per render) shrinks the font so the row always fits
+   on one line; 2-3 candidates stay comfortably large, then it scales down. */
+.cell .center-notes {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--mark);
+  pointer-events: none;
+  line-height: 1;
+  white-space: nowrap;
+  letter-spacing: 0.06em;
+  font-size: clamp(0.4rem, calc(135cqw / var(--n, 3)), 1rem);
 }
 
 .cell .value { z-index: 1; }
@@ -203,10 +226,17 @@ html, body {
 .key.wide { font-size: 1rem; }
 .key:disabled { opacity: 0.4; cursor: default; }
 
-#notes[aria-pressed="true"] {
+/* The Notes button cycles modes; its colour names which note kind is armed
+   (blue accent for Center, amber accent2 for Corner; plain for Normal). */
+#notes[data-mode="1"] {
   background: var(--accent);
   color: #10131a;
   border-color: var(--accent);
+}
+#notes[data-mode="2"] {
+  background: var(--accent2);
+  color: #10131a;
+  border-color: var(--accent2);
 }
 
 /* Pen-locked digit (double-tapped, highlight mode active). */

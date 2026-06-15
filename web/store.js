@@ -47,11 +47,14 @@ function newId() {
 //   givens: clue count,
 //   seed: decimal string of the u64 generator seed (debug only; absent on old
 //         records). Kept so cheat mode can display it and reproduce the puzzle.
-//   value: number[81]   player placements (0 = empty),
-//   marks: number[][81]  pencilled candidate digits per cell,
+//   value: number[81]         player placements (0 = empty),
+//   centerMarks: number[][81] centred "usual" pencil notes per cell,
+//   cornerMarks: number[][81] Snyder corner notes per cell,
+//   (legacy records may carry `marks`; play.js loads it as centerMarks)
 //   history: snapshot[]  undo stack (states to undo *to*),
 //   redo: snapshot[]     redo stack (states an undo stepped away from),
-//     a snapshot is { v: number[81], m: number[][81] } -- value + marks-as-arrays,
+//     a snapshot is { v: number[81], c: number[][81], n: number[][81] } --
+//     value + center/corner marks-as-arrays (legacy snapshots carry `m` -> center),
 //   elapsedMs: accumulated play time,
 //   status: "active"|"solved",
 //   createdAt, solvedAt (ms epoch, solvedAt null until solved)
@@ -70,7 +73,8 @@ export function createGame({ kindIndex, mode, puzzle, solution, givens, seed }) 
     givens,
     seed: seed || null,
     value: new Array(N).fill(0),
-    marks: Array.from({ length: N }, () => []),
+    centerMarks: Array.from({ length: N }, () => []),
+    cornerMarks: Array.from({ length: N }, () => []),
     history: [],
     redo: [],
     elapsedMs: 0,

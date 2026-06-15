@@ -17,17 +17,24 @@ import { cheatOn, CHEAT_KEY } from "./cheat.js";
 const N = 81;
 
 // ---- State ----
-// `given[i]`  : 1..9 for a clue, 0 otherwise (immutable for the loaded puzzle).
-// `value[i]`  : 1..9 for a user-placed digit, 0 if empty.
-// `marks[i]`  : Set of candidate digits the player has pencilled in.
+// `given[i]`   : 1..9 for a clue, 0 otherwise (immutable for the loaded puzzle).
+// `value[i]`   : 1..9 for a user-placed digit, 0 if empty.
+// Two independent kinds of pencil mark per cell, each a Set of digits:
+//   `centerMarks[i]` : the usual notes, shown as one shrinking row in the middle.
+//   `cornerMarks[i]` : Snyder notes, dropped into the cell corners by rank.
 // `solution[i]`: 1..9, the unique solution (used only for win detection).
 const given = new Array(N).fill(0);
 const value = new Array(N).fill(0);
-const marks = Array.from({ length: N }, () => new Set());
+const centerMarks = Array.from({ length: N }, () => new Set());
+const cornerMarks = Array.from({ length: N }, () => new Set());
 const solution = new Array(N).fill(0);
 
 let selected = null; // index 0..80, or null
-let notesMode = false;
+// Input mode: NORMAL places values, CENTER/CORNER pencil the two note kinds. The
+// Notes button cycles NORMAL -> CENTER -> CORNER -> NORMAL.
+const MODE_NORMAL = 0, MODE_CENTER = 1, MODE_CORNER = 2;
+const NOTE_LABELS = ["Notes", "Center", "Corner"];
+let noteMode = MODE_NORMAL;
 let activeDigit = 0; // 1..9 when a digit is "pen-locked" (highlight mode), 0 otherwise
 
 const cells = []; // DOM nodes, index 0..80
@@ -61,32 +68,55 @@ const history = [];
 const redoStack = [];
 
 function snapshot() {
-  return { v: value.slice(), m: marks.map((s) => new Set(s)) };
+  return {
+    v: value.slice(),
+    c: centerMarks.map((s) => new Set(s)),
+    n: cornerMarks.map((s) => new Set(s)),
+  };
 }
 
 // Snapshots persist in the store, so they have to survive JSON: the per-cell
-// pencil-mark Sets serialize as plain arrays and rehydrate back into Sets. The
-// value array is JSON-friendly already (`v` is a fresh slice from `snapshot`).
+// pencil-mark Sets (center + corner) serialize as plain arrays and rehydrate back
+// into Sets. The value array is JSON-friendly already (`v` is a fresh slice from
+// `snapshot`).
 function snapshotToJSON(s) {
-  return { v: s.v, m: s.m.map((set) => [...set]) };
+  return {
+    v: s.v,
+    c: s.c.map((set) => [...set]),
+    n: s.n.map((set) => [...set]),
+  };
 }
 
 function snapshotFromJSON(s) {
-  return { v: (s.v || []).slice(), m: (s.m || []).map((a) => new Set(a)) };
+  // Legacy persisted snapshots only had `m` (the old single mark grid) -> center,
+  // mirroring the same migration loadGame applies to a record's top-level marks.
+  const c = s.c || s.m || [];
+  return {
+    v: (s.v || []).slice(),
+    c: c.map((a) => new Set(a)),
+    n: (s.n || []).map((a) => new Set(a)),
+  };
 }
 
 function applySnapshot(s) {
   for (let i = 0; i < N; i++) {
     value[i] = s.v[i];
-    marks[i] = new Set(s.m[i]);
+    centerMarks[i] = new Set(s.c[i]);
+    cornerMarks[i] = new Set(s.n[i]);
   }
+}
+
+function setsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const d of a) if (!b.has(d)) return false;
+  return true;
 }
 
 function boardMatches(s) {
   for (let i = 0; i < N; i++) {
     if (value[i] !== s.v[i]) return false;
-    if (marks[i].size !== s.m[i].size) return false;
-    for (const d of marks[i]) if (!s.m[i].has(d)) return false;
+    if (!setsEqual(centerMarks[i], s.c[i])) return false;
+    if (!setsEqual(cornerMarks[i], s.n[i])) return false;
   }
   return true;
 }
@@ -138,7 +168,8 @@ function persist() {
   if (!game) return;
   store.updateGame(game.id, {
     value: value.slice(),
-    marks: marks.map((s) => [...s]),
+    centerMarks: centerMarks.map((s) => [...s]),
+    cornerMarks: cornerMarks.map((s) => [...s]),
     elapsedMs: elapsedMs(),
     lastPlayedAt: Date.now(),
     history: history.map(snapshotToJSON),
@@ -184,16 +215,17 @@ function buildBoard() {
     if (c === 2 || c === 5) cell.classList.add("boxr");
     if (r === 2 || r === 5) cell.classList.add("boxb");
 
+    // Two note overlays under the value: Snyder corners (a 3x3 slot grid filled
+    // by rank in render) and the centred "usual" notes (one shrinking row).
+    const cornerEl = document.createElement("div");
+    cornerEl.className = "corner-notes";
+    for (let s = 0; s < 9; s++) cornerEl.appendChild(document.createElement("span"));
+    const centerEl = document.createElement("div");
+    centerEl.className = "center-notes";
     const valueEl = document.createElement("span");
     valueEl.className = "value";
-    const marksEl = document.createElement("div");
-    marksEl.className = "marks";
-    for (let d = 1; d <= 9; d++) {
-      const m = document.createElement("span");
-      m.dataset.d = d;
-      marksEl.appendChild(m);
-    }
-    cell.appendChild(marksEl);
+    cell.appendChild(cornerEl);
+    cell.appendChild(centerEl);
     cell.appendChild(valueEl);
 
     cell.addEventListener("pointerdown", (e) => {
@@ -245,11 +277,7 @@ function render() {
     }
 
     // Pencil marks only show on an empty cell.
-    const markSpans = cell.querySelectorAll(".marks span");
-    for (const span of markSpans) {
-      const show = d === 0 && marks[i].has(Number(span.dataset.d));
-      span.textContent = show ? span.dataset.d : "";
-    }
+    renderNotes(cell, i, d === 0);
 
     // Highlight classes.
     cell.classList.toggle("selected", i === selected);
@@ -259,6 +287,36 @@ function render() {
       highlightDigit !== 0 && i !== selected && d === highlightDigit
     );
   }
+}
+
+// The 3x3 corner slots are stored row-major (0=TL,1=TM,2=TR,3=LM,4=C,5=RM,6=BL,
+// 7=BM,8=BR). Corners fill in this order as the count grows -- TL, TR, BL, BR,
+// then the edge midpoints, then the centre -- so a few Snyder notes hug the
+// corners. The slots that end up occupied are then read out in row-major (visual)
+// order, so the digits stay in ascending reading order instead of jumbling (e.g.
+// "1 5 2") as more notes appear.
+const CORNER_FILL = [0, 2, 6, 8, 1, 7, 3, 5, 4];
+
+// Paint a cell's two note overlays. Center notes are the sorted candidates packed
+// into one row (`--n` drives the shrink-to-fit font). Corner notes drop into the
+// fixed slots by ascending rank. Both clear out once the cell holds a value.
+function renderNotes(cell, i, empty) {
+  const centerEl = cell.querySelector(".center-notes");
+  const cornerSpans = cell.querySelectorAll(".corner-notes span");
+  for (const s of cornerSpans) s.textContent = "";
+  if (!empty) {
+    centerEl.textContent = "";
+    return;
+  }
+  const center = [...centerMarks[i]].sort((a, b) => a - b);
+  centerEl.textContent = center.join("");
+  centerEl.style.setProperty("--n", center.length || 1);
+  const corner = [...cornerMarks[i]].sort((a, b) => a - b);
+  // Use the first N fill slots, but emit digits into them in row-major order.
+  const slots = CORNER_FILL.slice(0, corner.length).sort((a, b) => a - b);
+  corner.forEach((cd, rank) => {
+    cornerSpans[slots[rank]].textContent = cd;
+  });
 }
 
 function updateDigitButtons() {
@@ -350,35 +408,39 @@ function moveSelection(dr, dc) {
 // Place / toggle a digit (or pencil mark) into a specific cell, per the global
 // Notes mode. Clues are locked. Shared by the digit pad (cell-first) and the
 // pen-lock single tap (digit-first).
+function toggleMark(set, d) {
+  if (set.has(d)) set.delete(d);
+  else set.add(d);
+}
+
 function applyDigitToCell(i, d) {
   if (given[i] !== 0) return;
-  if (notesMode) {
+  if (noteMode === MODE_NORMAL) {
+    // Toggle off if re-entering the same digit; placing clears both note kinds.
+    value[i] = value[i] === d ? 0 : d;
+    centerMarks[i].clear();
+    cornerMarks[i].clear();
+  } else {
     // Pencil marks are meaningless once a value is placed.
     if (value[i] !== 0) return;
-    const set = marks[i];
-    if (set.has(d)) set.delete(d);
-    else set.add(d);
-  } else {
-    // Toggle off if re-entering the same digit; placing clears pencil marks.
-    value[i] = value[i] === d ? 0 : d;
-    marks[i].clear();
+    toggleMark(noteMode === MODE_CORNER ? cornerMarks[i] : centerMarks[i], d);
   }
 }
 
-// The pen-lock double-tap action: the opposite of a normal tap. If normal taps
-// place values, this pencils a mark -- clearing any placed value first so the
-// mark is actually visible (a value would otherwise hide it). If normal taps
-// pencil marks, this places the value instead.
+// The pen-lock double-tap action: the opposite of a normal tap, pairing a placed
+// value with the active note kind (CENTER in Normal/Center mode, CORNER in Corner
+// mode). In Normal mode a normal tap places the value, so this pencils that note
+// instead -- clearing the value first so the note is visible. In a note mode a
+// normal tap pencils the note, so this places the value instead.
 function applyOppositeToCell(i, d) {
   if (given[i] !== 0) return;
-  if (notesMode) {
-    value[i] = value[i] === d ? 0 : d;
-    marks[i].clear();
-  } else {
+  if (noteMode === MODE_NORMAL) {
     value[i] = 0;
-    const set = marks[i];
-    if (set.has(d)) set.delete(d);
-    else set.add(d);
+    toggleMark(centerMarks[i], d);
+  } else {
+    value[i] = value[i] === d ? 0 : d;
+    centerMarks[i].clear();
+    cornerMarks[i].clear();
   }
 }
 
@@ -402,14 +464,25 @@ function erase() {
   commit(() => {
     if (given[selected] !== 0) return;
     value[selected] = 0;
-    marks[selected].clear();
+    centerMarks[selected].clear();
+    cornerMarks[selected].clear();
   });
   render();
 }
 
-function toggleNotes() {
-  notesMode = !notesMode;
-  notesBtn.setAttribute("aria-pressed", String(notesMode));
+// Cycle the input mode: Normal -> Center notes -> Corner (Snyder) notes -> Normal.
+function cycleNoteMode() {
+  noteMode = (noteMode + 1) % 3;
+  updateNotesButton();
+}
+
+// Reflect the current mode on the Notes button: its label names the mode, the
+// data-mode drives the active colour (accent for Center, accent2 for Corner).
+function updateNotesButton() {
+  if (!notesBtn) return;
+  notesBtn.textContent = NOTE_LABELS[noteMode];
+  notesBtn.setAttribute("aria-pressed", String(noteMode !== MODE_NORMAL));
+  notesBtn.dataset.mode = String(noteMode);
 }
 
 // Clear all of the player's work and return to the puzzle's starting clues. The
@@ -419,13 +492,14 @@ function restart() {
   closeHint();
   for (let i = 0; i < N; i++) {
     value[i] = 0;
-    marks[i] = new Set();
+    centerMarks[i] = new Set();
+    cornerMarks[i] = new Set();
   }
   history.length = 0;
   redoStack.length = 0;
   selected = null;
   activeDigit = 0;
-  notesMode = false;
+  noteMode = MODE_NORMAL;
   finished = false;
   timerBase = 0;
   runStart = performance.now();
@@ -437,12 +511,13 @@ function restart() {
   digitSinglePushed = false;
   cellSinglePushed = false;
 
-  notesBtn.setAttribute("aria-pressed", "false");
+  updateNotesButton();
   updateDigitButtons();
   updateHistoryButtons();
   store.updateGame(game.id, {
     value: value.slice(),
-    marks: marks.map(() => []),
+    centerMarks: centerMarks.map(() => []),
+    cornerMarks: cornerMarks.map(() => []),
     elapsedMs: 0,
     status: "active",
     solvedAt: null,
@@ -759,7 +834,8 @@ function errorStage(kind, errCells) {
         for (const c of errCells) {
           if (given[c] === 0 && value[c] !== solution[c]) {
             value[c] = 0;
-            marks[c].clear();
+            centerMarks[c].clear();
+            cornerMarks[c].clear();
           }
         }
       });
@@ -1023,9 +1099,12 @@ function applyStep(step, rerender) {
       if (given[d.cell] !== 0) continue;
       if (d.kind === "place") {
         value[d.cell] = d.digit;
-        marks[d.cell].clear();
+        centerMarks[d.cell].clear();
+        cornerMarks[d.cell].clear();
       } else {
-        marks[d.cell].delete(d.digit);
+        // The digit is no longer a candidate in either notation.
+        centerMarks[d.cell].delete(d.digit);
+        cornerMarks[d.cell].delete(d.digit);
       }
     }
   });
@@ -1083,7 +1162,10 @@ export function loadGame(g) {
   parseLine(g.solution, solution);
   for (let i = 0; i < N; i++) {
     value[i] = g.value[i] || 0;
-    marks[i] = new Set(g.marks[i] || []);
+    // Old saves only carried `marks` (the grid notes) -> load them as center notes.
+    const center = g.centerMarks ? g.centerMarks[i] : g.marks ? g.marks[i] : null;
+    centerMarks[i] = new Set(center || []);
+    cornerMarks[i] = new Set((g.cornerMarks && g.cornerMarks[i]) || []);
   }
   history.length = 0;
   redoStack.length = 0;
@@ -1091,7 +1173,7 @@ export function loadGame(g) {
   for (const s of g.redo || []) redoStack.push(snapshotFromJSON(s));
   selected = null;
   activeDigit = 0;
-  notesMode = false;
+  noteMode = MODE_NORMAL;
   finished = g.status === "solved";
   timerBase = g.elapsedMs || 0;
   runStart = null;
@@ -1102,7 +1184,7 @@ export function loadGame(g) {
   digitSinglePushed = false;
   cellSinglePushed = false;
 
-  notesBtn.setAttribute("aria-pressed", "false");
+  updateNotesButton();
   setTitle(g);
   updateSeedLine();
   updateDigitButtons();
@@ -1263,7 +1345,7 @@ function wirePad() {
     btn.addEventListener("click", () => onDigitTap(d));
   }
   document.getElementById("erase").addEventListener("click", erase);
-  notesBtn.addEventListener("click", toggleNotes);
+  notesBtn.addEventListener("click", cycleNoteMode);
   if (undoBtn) undoBtn.addEventListener("click", undo);
   if (redoBtn) redoBtn.addEventListener("click", redo);
 }
@@ -1290,7 +1372,7 @@ function wireKeyboard() {
     } else if (e.key === "ArrowRight") {
       moveSelection(0, 1);
     } else if (e.key === "n" || e.key === "N") {
-      toggleNotes();
+      cycleNoteMode();
     } else if (
       // Redo before undo: Shift+Z reports e.key "Z", which the undo branch also
       // matches, so the redo (Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y) check must win.
@@ -1433,6 +1515,7 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle }) {
   wireTopbar();
   wireHint();
   wireSolved();
+  updateNotesButton();
   updateHistoryButtons();
   updateHintButton();
 }

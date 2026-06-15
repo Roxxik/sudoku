@@ -36,7 +36,9 @@ referenced throughout the app); if you change them, update this doc.
   seed,                      // decimal string of the u64 generator seed,
                              //   or null on records made before seeds existed
   value: number[81],         // player entries, 0 = empty
-  marks: number[][81],       // pencil marks per cell
+  centerMarks: number[][81], // centred "usual" pencil notes per cell
+  cornerMarks: number[][81], // Snyder corner notes per cell
+  // (legacy records may carry `marks`; play.js loads it as centerMarks)
   elapsedMs, status: "active"|"solved",
   createdAt, lastPlayedAt, solvedAt|null }
 ```
@@ -496,9 +498,21 @@ briefly reads "Copied".
 ## 15. Suite: input & board (carried over, still valid)
 
 **I1 — Digit entry & notes.** Keyboard 1–9 places into the selected cell; `0` /
-Backspace / Delete erases; arrow keys move selection; `n` toggles notes. The pad
-mirrors this; the pad's same-digit double-tap (within 280 ms) pen-locks a digit
-(then taps place that digit; double-tap on a cell pencils the opposite).
+Backspace / Delete erases; arrow keys move selection; `n` cycles the input mode.
+The `#notes` button cycles the mode too — **Normal → Center → Corner → Normal** —
+its label naming the current mode and its colour flagging it (blue accent for
+Center, amber for Corner). In a note mode, entering a digit toggles that note kind
+instead of placing a value. The pad mirrors this; the pad's same-digit double-tap
+(within 280 ms) pen-locks a digit (then taps place/note that digit; double-tap on
+a cell does the opposite, pairing the value with the active note kind — Center in
+Normal/Center mode, Corner in Corner mode).
+
+**I1b — The two note kinds.** Center notes render as one row of the sorted
+candidates in the middle of the cell, shrinking to stay on one line as the count
+grows. Corner (Snyder) notes fill corner-first (TL, TR, BL, BR, then edges, then
+centre) but are laid out in row-major reading order, so the digits always read
+ascending left-to-right, top-to-bottom. Both clear when a value is placed; both
+are persisted (`centerMarks`/`cornerMarks`) and survive reload.
 
 **I2 — Undo.** `#undo` reverts the last board mutation; it is disabled when there
 is nothing to undo; a place→convert double-tap collapses to one undo step.
