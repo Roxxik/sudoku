@@ -64,15 +64,21 @@ fn main() {
 /// mode, returning the reply object the page expects. `uncapped` lifts the
 /// attempt budget so the search runs until it succeeds (or the page terminates
 /// us); the only way out of a runaway uncapped search is `worker.terminate()`.
+///
+/// Uses the **isolated** spec builders (`train_isolated`/`drill_isolated`): an
+/// Expert target is required against every *easier* technique across all branches
+/// (so e.g. an X-Wing puzzle can't be solved with a Naked Pair instead). The
+/// legacy branch-scoped `train`/`drill` are kept for an in-flight debugging
+/// effort; see `generator-lab/src/spec/mod.rs`.
 fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
     if !(target >= 0.0) || target as usize >= lab::kinds::NUM {
         return err(&format!("target kind {target} out of range (0..{})", lab::kinds::NUM));
     }
     let target = target as usize;
     let spec = if drill {
-        lab::Spec::drill(target)
+        lab::Spec::drill_isolated(target)
     } else {
-        lab::Spec::train(target)
+        lab::Spec::train_isolated(target)
     };
     let mut rng = lab::Rng::from_seed(random_seed());
     let budget = if uncapped { usize::MAX } else { MAX_ATTEMPTS };

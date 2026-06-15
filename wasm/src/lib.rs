@@ -118,6 +118,12 @@ pub fn generate(seed: u64) -> Result<JsValue, JsValue> {
 /// may be reached, easier techniques allowed alongside). `seed` comes from JS for
 /// the same reason as [`generate`] (no entropy on wasm).
 ///
+/// The frontend uses the **isolated** spec builders (`train_isolated`/
+/// `drill_isolated`): an Expert target is required against every *easier*
+/// technique across all branches, so e.g. an X-Wing puzzle can't be sidestepped
+/// with a Naked Pair. (The legacy branch-scoped `train`/`drill` are kept for an
+/// in-flight debugging effort; see `generator-lab/src/spec/mod.rs`.)
+///
 /// The native-only SIMT path is not wired here — this is the scalar generator,
 /// which is all wasm has. Harder targets can exhaust the attempt budget; that
 /// surfaces as an error the same way [`generate`] reports an empty budget.
@@ -132,9 +138,9 @@ pub fn generate_lab(seed: u64, target: u32, drill: bool) -> Result<JsValue, JsVa
         )));
     }
     let spec = if drill {
-        lab::Spec::drill(target)
+        lab::Spec::drill_isolated(target)
     } else {
-        lab::Spec::train(target)
+        lab::Spec::train_isolated(target)
     };
     let mut rng = lab::Rng::from_seed(seed);
     let (generated, _stats) = lab::generate(&mut rng, &spec, MAX_ATTEMPTS);
