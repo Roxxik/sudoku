@@ -33,6 +33,7 @@ watch = [
   "util.js",
   "ui.js",
   "cheat.js",
+  "settings.js",
   "spec.js",
   "play.js",
   "home.js",

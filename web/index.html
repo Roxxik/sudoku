@@ -19,6 +19,7 @@
   <link rel="modulepreload" href="play.js">
   <link rel="modulepreload" href="stats.js">
   <link rel="modulepreload" href="cheat.js">
+  <link rel="modulepreload" href="settings.js">
   <link rel="modulepreload" href="gen.js">
   <link rel="modulepreload" href="wasm.js">
   <link rel="modulepreload" href="spec.js">
@@ -43,6 +44,7 @@
   <link data-trunk rel="copy-file" href="util.js">
   <link data-trunk rel="copy-file" href="ui.js">
   <link data-trunk rel="copy-file" href="cheat.js">
+  <link data-trunk rel="copy-file" href="settings.js">
   <link data-trunk rel="copy-file" href="spec.js">
   <link data-trunk rel="copy-file" href="play.js">
   <link data-trunk rel="copy-file" href="home.js">
@@ -66,6 +68,19 @@
             <path fill="currentColor" d="M4 20V10h3v10H4zm6.5 0V4h3v16h-3zM17 20v-7h3v7h-3z"/>
           </svg>
         </button>
+        <!-- Overflow menu (Settings for now; more items follow). Wired in home.js. -->
+        <div class="menu">
+          <button id="homeMenuBtn" class="iconbtn" aria-label="Menu" aria-haspopup="true" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+              <circle cx="12" cy="5" r="2" fill="currentColor"/>
+              <circle cx="12" cy="12" r="2" fill="currentColor"/>
+              <circle cx="12" cy="19" r="2" fill="currentColor"/>
+            </svg>
+          </button>
+          <ul id="homeMenuList" class="menu-list" hidden>
+            <li><button class="menu-item" data-action="settings">Settings</button></li>
+          </ul>
+        </div>
       </header>
 
       <section class="home-section">
@@ -146,12 +161,17 @@
             </svg>
           </button>
           <ul id="menuList" class="menu-list" hidden>
-            <li><button class="menu-item" data-action="restart">Restart</button></li>
             <li><button class="menu-item" data-action="copy">Copy puzzle</button></li>
+            <li><button class="menu-item" data-action="restart">Restart</button></li>
             <li id="menuFill" hidden><button class="menu-item" data-action="fillCandidates">Fill all candidates</button></li>
+            <li><button class="menu-item" data-action="settings">Settings</button></li>
           </ul>
         </div>
       </header>
+
+      <!-- Optional elapsed-time readout above the board (right-aligned). Hidden
+           unless the "Show timer" setting is on; updated by play.js. -->
+      <p id="playTimer" class="play-timer" hidden>0:00</p>
 
       <!-- 81 cells are injected by play.js. -->
       <div id="board" class="board" role="grid" aria-label="Sudoku board"></div>
@@ -208,6 +228,21 @@
         <span class="iconbtn" aria-hidden="true"></span>
       </header>
       <div id="statsBody"></div>
+    </section>
+
+    <!-- =========================== SETTINGS =========================== -->
+    <!-- App-wide preferences. Body (the toggle rows) is filled by home.js. -->
+    <section id="settingsView" class="view" hidden>
+      <header class="topbar">
+        <button id="settingsBack" class="iconbtn" aria-label="Back">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="2" d="M15 5l-7 7 7 7"/>
+          </svg>
+        </button>
+        <h1>Settings</h1>
+        <span class="iconbtn" aria-hidden="true"></span>
+      </header>
+      <div id="settingsBody"></div>
     </section>
   </main>
 

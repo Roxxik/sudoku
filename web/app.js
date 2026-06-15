@@ -16,7 +16,7 @@ let wasm, gen, play, stats, custom;
 let heavyReady;
 
 // ---- View routing ----
-const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView"];
+const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView", "settingsView"];
 
 function showView(id) {
   for (const v of VIEWS) {
@@ -45,6 +45,16 @@ async function openCustomView() {
 
 function goPlay() {
   showView("playView");
+}
+
+// Open Settings from the play view: freeze the solve clock, and route the
+// settings back button to return to the board and resume where it left off.
+function openSettingsFromPlay() {
+  play.pause();
+  home.openSettings(() => {
+    showView("playView");
+    play.resume();
+  });
 }
 
 // ---- Generation overlay ----
@@ -216,7 +226,12 @@ function boot() {
     gen = g;
     wasm = w;
     custom = c;
-    play.initPlay({ curriculum: CURRICULUM, onHome: goHome, onNewPuzzle: regenerate });
+    play.initPlay({
+      curriculum: CURRICULUM,
+      onHome: goHome,
+      onNewPuzzle: regenerate,
+      onSettings: openSettingsFromPlay,
+    });
     stats.initStats({
       curriculum: CURRICULUM,
       onHome: goHome,

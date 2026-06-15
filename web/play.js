@@ -13,6 +13,7 @@ import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { copyText } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
+import { eliminateCandidatesOn, showTimerOn } from "./settings.js";
 
 const N = 81;
 
@@ -50,6 +51,7 @@ let finished = false; // true once solved -- freezes the timer
 // Navigation callbacks supplied by the app shell.
 let onHome = () => {};
 let onNewPuzzle = () => {};
+let onSettings = () => {};
 
 let boardEl, notesBtn, undoBtn, redoBtn;
 
@@ -78,24 +80,29 @@ function snapshot() {
 // Snapshots persist in the store, so they have to survive JSON: the per-cell
 // pencil-mark Sets (center + corner) serialize as plain arrays and rehydrate back
 // into Sets. The value array is JSON-friendly already (`v` is a fresh slice from
-// `snapshot`).
+// `snapshot`). `t` (the pre-restart elapsed time) only rides restart entries, so
+// it's preserved iff present.
 function snapshotToJSON(s) {
-  return {
+  const j = {
     v: s.v,
     c: s.c.map((set) => [...set]),
     n: s.n.map((set) => [...set]),
   };
+  if (s.t !== undefined) j.t = s.t;
+  return j;
 }
 
 function snapshotFromJSON(s) {
   // Legacy persisted snapshots only had `m` (the old single mark grid) -> center,
   // mirroring the same migration loadGame applies to a record's top-level marks.
   const c = s.c || s.m || [];
-  return {
+  const out = {
     v: (s.v || []).slice(),
     c: c.map((a) => new Set(a)),
     n: (s.n || []).map((a) => new Set(a)),
   };
+  if (s.t !== undefined) out.t = s.t;
+  return out;
 }
 
 function applySnapshot(s) {
@@ -103,6 +110,13 @@ function applySnapshot(s) {
     value[i] = s.v[i];
     centerMarks[i] = new Set(s.c[i]);
     cornerMarks[i] = new Set(s.n[i]);
+  }
+  // A restart entry carries the pre-restart elapsed time (`t`) so undoing the
+  // restart also rewinds the clock; ordinary entries omit it and leave the timer
+  // running untouched (undoing a move never rewinds time).
+  if (s.t !== undefined) {
+    timerBase = s.t;
+    runStart = finished ? null : performance.now();
   }
 }
 
@@ -141,6 +155,7 @@ function undo() {
   applySnapshot(history.pop());
   updateHistoryButtons();
   persist();
+  refreshTimer(); // a restart-undo rewinds the clock -- show it at once
   render();
 }
 
@@ -150,6 +165,7 @@ function redo() {
   applySnapshot(redoStack.pop());
   updateHistoryButtons();
   persist();
+  refreshTimer();
   render();
 }
 
@@ -184,6 +200,8 @@ export function pause() {
     timerBase = elapsedMs();
     runStart = null;
   }
+  stopTimer();
+  refreshTimer(); // freeze the readout at the paused time
   persist();
 }
 
@@ -191,6 +209,35 @@ export function pause() {
 export function resume() {
   if (!finished && game && runStart === null) {
     runStart = performance.now();
+  }
+  startTimer();
+}
+
+// ---- In-play timer readout ----
+// The solve clock (timerBase/runStart) always runs for the solved time + stats;
+// these only govern the optional readout above the board (the "Show timer"
+// setting) and keep its text fresh once a second while the clock runs.
+let timerTick = null;
+
+function refreshTimer() {
+  const el = document.getElementById("playTimer");
+  if (!el) return;
+  const show = showTimerOn();
+  el.hidden = !show;
+  if (show) el.textContent = formatDuration(elapsedMs());
+}
+
+function startTimer() {
+  refreshTimer();
+  if (timerTick === null && showTimerOn() && runStart !== null) {
+    timerTick = setInterval(refreshTimer, 1000);
+  }
+}
+
+function stopTimer() {
+  if (timerTick !== null) {
+    clearInterval(timerTick);
+    timerTick = null;
   }
 }
 
@@ -413,11 +460,18 @@ function toggleMark(set, d) {
   else set.add(d);
 }
 
-// Cheat: a placed digit can't be a candidate in any peer, so strike it from
-// their pencil notes (both center and corner). Keeps the displayed candidates
-// honest and the marks-aware hint engine (see solverBoard) in lock-step with the
-// grid as cells fill in. Caller invokes inside a `commit`, so it is one undo step
-// with the placement.
+// Whether placing a digit should strike it from peers' Center and Corner marks.
+// Driven by the "Eliminate candidates" setting; cheat forces it on because its
+// marks-aware hint engine (see solverBoard) needs the displayed notes kept in
+// lock-step with the grid as cells fill in. ("Apply easiest" eliminates
+// regardless of either -- applyStep calls clearPeerMarks unconditionally.)
+function eliminateOn() {
+  return cheatOn() || eliminateCandidatesOn();
+}
+
+// A placed digit can't be a candidate in any peer, so strike it from their
+// pencil notes (both center and corner). Caller invokes inside a `commit`, so it
+// is one undo step with the placement.
 function clearPeerMarks(i, d) {
   for (let j = 0; j < N; j++) {
     if (j === i || !isPeer(i, j)) continue;
@@ -433,8 +487,8 @@ function applyDigitToCell(i, d) {
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
     cornerMarks[i].clear();
-    // value[i] === d means we placed (not toggled off): clean the peers (cheat).
-    if (cheatOn() && value[i] === d) clearPeerMarks(i, d);
+    // value[i] === d means we placed (not toggled off): clean the peers.
+    if (eliminateOn() && value[i] === d) clearPeerMarks(i, d);
   } else {
     // Pencil marks are meaningless once a value is placed.
     if (value[i] !== 0) return;
@@ -456,7 +510,7 @@ function applyOppositeToCell(i, d) {
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
     cornerMarks[i].clear();
-    if (cheatOn() && value[i] === d) clearPeerMarks(i, d);
+    if (eliminateOn() && value[i] === d) clearPeerMarks(i, d);
   }
 }
 
@@ -503,16 +557,24 @@ function updateNotesButton() {
 
 // Clear all of the player's work and return to the puzzle's starting clues. The
 // clock restarts too -- a restart is a fresh attempt. (The clues live in
-// `given`, so we only wipe the editable state.)
+// `given`, so we only wipe the editable state.) Restart is undoable: the whole
+// pre-restart attempt -- board plus elapsed time -- rides onto the undo stack, so
+// an accidental tap is fully recoverable with Undo.
 function restart() {
   closeHint();
+  // Push the pre-restart state as one undo entry, tagged with the elapsed time
+  // (`t`) so undoing the restart rewinds the clock too. Unlike a normal commit
+  // (board only), and unlike the old restart (which wiped the undo history).
+  const before = snapshot();
+  before.t = elapsedMs();
+  history.push(before);
+  redoStack.length = 0;
+
   for (let i = 0; i < N; i++) {
     value[i] = 0;
     centerMarks[i] = new Set();
     cornerMarks[i] = new Set();
   }
-  history.length = 0;
-  redoStack.length = 0;
   selected = null;
   activeDigit = 0;
   noteMode = MODE_NORMAL;
@@ -520,7 +582,7 @@ function restart() {
   timerBase = 0;
   runStart = performance.now();
   // Reset double-tap gesture state so a stray pending double can't pop the
-  // now-empty undo stack.
+  // freshly pushed undo entry.
   lastDigit = 0;
   lastCell = -1;
   firstTapWasLocked = false;
@@ -537,10 +599,11 @@ function restart() {
     elapsedMs: 0,
     status: "active",
     solvedAt: null,
-    history: [],
+    history: history.map(snapshotToJSON),
     redo: [],
   });
   game = store.getGame(game.id);
+  startTimer();
   render();
 }
 
@@ -1546,6 +1609,7 @@ function wireTopbar() {
     }
     if (item.dataset.action === "restart") restart();
     else if (item.dataset.action === "fillCandidates") fillAllCandidates();
+    else if (item.dataset.action === "settings") onSettings();
     closeMenu();
   });
 
@@ -1577,9 +1641,10 @@ function wireSolved() {
 
 // Build the board and wire all controls once. `curriculum` maps kindIndex -> id
 // for the title; the callbacks navigate the app shell.
-export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle }) {
+export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onSettings: settings }) {
   onHome = home;
   onNewPuzzle = newPuzzle;
+  onSettings = settings;
   idByKind = {};
   for (const t of curriculum) idByKind[t.kindIndex] = t.id;
 

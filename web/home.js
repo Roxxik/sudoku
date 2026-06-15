@@ -14,6 +14,7 @@
 // at every level. The puzzle list (puzzlesView) lists all in-progress games.
 
 import * as store from "./store.js";
+import * as settings from "./settings.js";
 import { miniBoard, textColumn } from "./ui.js";
 import {
   formatDuration,
@@ -41,6 +42,8 @@ export function initHome(opts) {
 
   document.getElementById("statsBtn").addEventListener("click", opts.onStats);
   document.getElementById("customBtn").addEventListener("click", opts.onCustom);
+  document.getElementById("settingsBack").addEventListener("click", () => settingsReturn());
+  wireHomeMenu();
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
   document
@@ -299,6 +302,100 @@ function openPuzzles() {
     list.appendChild(li);
   }
   showView("puzzlesView");
+}
+
+// ---- Settings ----
+// One screen of app-wide preferences, persisted via settings.js. Lives here (a
+// static, wasm-free module) so it opens instantly. Reachable from the home
+// overflow menu and the play view's menu.
+
+// Where the settings back button returns to. Set per-open by openSettings so the
+// screen routes back to wherever it was opened from (Home or the play view) --
+// mirrors campaignBack.
+let settingsReturn = showHome;
+
+// Open the settings screen. `onBack` is where its top-left back button goes
+// (defaults to Home); the play view passes a target that resumes the board.
+export function openSettings(onBack) {
+  settingsReturn = onBack || showHome;
+  document
+    .getElementById("settingsBody")
+    .replaceChildren(
+      settingToggle(
+        "Eliminate candidates",
+        "When you place a digit, strike it from the Center and Corner notes of every cell that sees it.",
+        settings.eliminateCandidatesOn(),
+        settings.setEliminateCandidates
+      ),
+      settingToggle(
+        "Show timer",
+        "Show a running timer above the board while you play.",
+        settings.showTimerOn(),
+        settings.setShowTimer
+      )
+    );
+  showView("settingsView");
+}
+
+// The home top-bar overflow menu (right of Stats). Settings for now; more items
+// will follow. Mirrors the play view's menu: toggle open, dismiss on an outside
+// click or Escape while Home is showing.
+function wireHomeMenu() {
+  const btn = document.getElementById("homeMenuBtn");
+  const list = document.getElementById("homeMenuList");
+  const close = () => {
+    list.hidden = true;
+    btn.setAttribute("aria-expanded", "false");
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation(); // don't let the document handler immediately re-close
+    const open = list.hidden;
+    list.hidden = !open;
+    btn.setAttribute("aria-expanded", String(open));
+  });
+  list.addEventListener("click", (e) => {
+    const item = e.target.closest(".menu-item");
+    if (!item) return;
+    if (item.dataset.action === "settings") openSettings();
+    close();
+  });
+  const homeVisible = () => !document.getElementById("homeView").hidden;
+  document.addEventListener("click", () => homeVisible() && close());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && homeVisible()) close();
+  });
+}
+
+// A labelled on/off row that reads as a switch. Writes through `onChange` on each
+// tap; `initial` seeds its visual state from the stored value.
+function settingToggle(name, desc, initial, onChange) {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "setting-row";
+  row.setAttribute("role", "switch");
+  row.setAttribute("aria-checked", String(initial));
+
+  const text = document.createElement("div");
+  text.className = "setting-text";
+  const title = document.createElement("span");
+  title.className = "setting-name";
+  title.textContent = name;
+  const sub = document.createElement("span");
+  sub.className = "setting-desc";
+  sub.textContent = desc;
+  text.append(title, sub);
+
+  const sw = document.createElement("span");
+  sw.className = "setting-switch";
+  sw.setAttribute("aria-hidden", "true");
+
+  row.append(text, sw);
+  row.addEventListener("click", () => {
+    const on = row.getAttribute("aria-checked") !== "true";
+    row.setAttribute("aria-checked", String(on));
+    onChange(on);
+  });
+  return row;
 }
 
 // ---- Shared bits ----
