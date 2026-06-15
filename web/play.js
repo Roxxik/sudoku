@@ -1545,7 +1545,6 @@ function wireTopbar() {
       return;
     }
     if (item.dataset.action === "restart") restart();
-    else if (item.dataset.action === "generate") onNewPuzzle(game);
     else if (item.dataset.action === "fillCandidates") fillAllCandidates();
     closeMenu();
   });

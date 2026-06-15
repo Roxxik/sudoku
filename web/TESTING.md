@@ -114,7 +114,7 @@ These are load-bearing. Several are non-obvious and were the source of real bugs
 | Generation overlay | `#loadingOverlay`, `#loadingText`, `#loadingRetry` (error-state "Keep searching"), `#loadingCancel` |
 | Stats | `#statsBack`, `#statsBody`, `.stats-summary`, `.stats-table`, `.stats-tier` |
 | Stats history | `.hist-list`, `.hist-item`, `.mini` (thumbnail), `.hist-seed` (cheat only), `.hist-copy` |
-| Play menu | `#menuBtn`, `#menuList`, `.menu-item[data-action="generate"|"restart"|"copy"|"fillCandidates"]` (fillCandidates = `#menuFill`, cheat only) |
+| Play menu | `#menuBtn`, `#menuList`, `.menu-item[data-action="restart"|"copy"|"fillCandidates"]` (fillCandidates = `#menuFill`, cheat only) |
 | Play seed (cheat) | `#playSeed` (under the board; hidden unless cheat + record has a seed) |
 
 ---
