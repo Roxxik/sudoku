@@ -137,8 +137,8 @@ function copyButton(g) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "hist-copy";
-  btn.textContent = "Copy";
-  btn.title = "Copy the puzzle (clues only)";
+  btn.textContent = "Export";
+  btn.title = "Export the puzzle (clues only)";
   btn.addEventListener("click", () => {
     const label = btn.textContent;
     copyText(g.puzzle).then((ok) => {

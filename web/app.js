@@ -43,6 +43,43 @@ async function openCustomView() {
   custom.openCustom();
 }
 
+// Open the custom-spec builder pre-loaded with a saved game's spec (the Continue
+// card's "Open spec"). Like openCustomView, it needs the heavy custom module.
+async function openSpecFromHome(spec) {
+  await heavyReady;
+  custom.openCustom(spec);
+}
+
+// Import a puzzle from a pasted clue line (the home menu's "Import puzzle"). The
+// wasm bridge solves it for the solution + clue count -- so far this only has to
+// re-accept what Export produces; richer parsing is a later concern. The result
+// is stored as a custom game (no spec) and opened. Needs the wasm bridge + play,
+// neither of which the first paint depends on, so it awaits heavyReady.
+async function importPuzzle() {
+  const raw = window.prompt("Paste a puzzle (81 cells, '.' for blanks):");
+  if (raw == null) return; // cancelled
+  const line = raw.trim();
+  if (!line) return;
+  await heavyReady;
+  const w = await wasm.ready();
+  let result;
+  try {
+    result = w.solveLine(line);
+  } catch (e) {
+    window.alert(e && e.message ? e.message : "Could not import this puzzle.");
+    return;
+  }
+  const game = store.createGame({
+    mode: "custom",
+    label: "Imported",
+    puzzle: result.puzzle,
+    solution: result.solution,
+    givens: result.givens,
+  });
+  play.loadGame(game);
+  goPlay();
+}
+
 function goPlay() {
   showView("playView");
 }
@@ -210,6 +247,8 @@ function boot() {
     onResume: resume,
     onStats: goStats,
     onCustom: openCustomView,
+    onOpenSpec: openSpecFromHome,
+    onImport: importPuzzle,
   });
   goHome(); // <-- first paint: real saved puzzles + campaign tree
 

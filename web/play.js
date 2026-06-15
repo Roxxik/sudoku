@@ -31,11 +31,16 @@ const cornerMarks = Array.from({ length: N }, () => new Set());
 const solution = new Array(N).fill(0);
 
 let selected = null; // index 0..80, or null
-// Input mode: NORMAL places values, CENTER/CORNER pencil the two note kinds. The
-// Notes button cycles NORMAL -> CENTER -> CORNER -> NORMAL.
-const MODE_NORMAL = 0, MODE_CENTER = 1, MODE_CORNER = 2;
-const NOTE_LABELS = ["Notes", "Center", "Corner"];
-let noteMode = MODE_NORMAL;
+// Input mode is two independent pieces of state:
+//   `placing` : true -> taps place values; false -> taps pencil a note.
+//   `markKind`: which note kind (Center or Corner) marking uses -- remembered
+//               even while placing, so the Notes button can show which kind is
+//               armed and a place-mode grid double-tap pencils that same kind.
+// The Notes button's single tap flips `placing`; its double tap switches
+// `markKind`.
+const MODE_CENTER = 1, MODE_CORNER = 2;
+let placing = true;
+let markKind = MODE_CENTER;
 let activeDigit = 0; // 1..9 when a digit is "pen-locked" (highlight mode), 0 otherwise
 
 const cells = []; // DOM nodes, index 0..80
@@ -482,7 +487,7 @@ function clearPeerMarks(i, d) {
 
 function applyDigitToCell(i, d) {
   if (given[i] !== 0) return;
-  if (noteMode === MODE_NORMAL) {
+  if (placing) {
     // Toggle off if re-entering the same digit; placing clears both note kinds.
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
@@ -492,20 +497,19 @@ function applyDigitToCell(i, d) {
   } else {
     // Pencil marks are meaningless once a value is placed.
     if (value[i] !== 0) return;
-    toggleMark(noteMode === MODE_CORNER ? cornerMarks[i] : centerMarks[i], d);
+    toggleMark(markKind === MODE_CORNER ? cornerMarks[i] : centerMarks[i], d);
   }
 }
 
-// The pen-lock double-tap action: the opposite of a normal tap, pairing a placed
-// value with the active note kind (CENTER in Normal/Center mode, CORNER in Corner
-// mode). In Normal mode a normal tap places the value, so this pencils that note
-// instead -- clearing the value first so the note is visible. In a note mode a
-// normal tap pencils the note, so this places the value instead.
+// The pen-lock double-tap action: the opposite of a normal tap. In place mode a
+// normal tap places the value, so this pencils a note instead -- in the armed
+// `markKind` (Center or Corner), clearing the value first so the note shows. In
+// mark mode a normal tap pencils the note, so this places the value instead.
 function applyOppositeToCell(i, d) {
   if (given[i] !== 0) return;
-  if (noteMode === MODE_NORMAL) {
+  if (placing) {
     value[i] = 0;
-    toggleMark(centerMarks[i], d);
+    toggleMark(markKind === MODE_CORNER ? cornerMarks[i] : centerMarks[i], d);
   } else {
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
@@ -540,19 +544,48 @@ function erase() {
   render();
 }
 
-// Cycle the input mode: Normal -> Center notes -> Corner (Snyder) notes -> Normal.
-function cycleNoteMode() {
-  noteMode = (noteMode + 1) % 3;
+// Flip between placing values and pencilling notes (the Notes button's single
+// tap and the "n" key).
+function togglePlacing() {
+  placing = !placing;
   updateNotesButton();
 }
 
-// Reflect the current mode on the Notes button: its label names the mode, the
-// data-mode drives the active colour (accent for Center, accent2 for Corner).
+// Switch the armed note kind, Center <-> Corner (the Notes button's double tap
+// and the "N" key). Leaves place/mark unchanged.
+function switchMarkKind() {
+  markKind = markKind === MODE_CENTER ? MODE_CORNER : MODE_CENTER;
+  updateNotesButton();
+}
+
+// Notes button gesture. A single tap flips place/mark; a double tap switches the
+// mark kind. Mirrors the pad's optimistic double-tap: the first tap flips placing
+// immediately, and a quick second tap reverts that flip and switches the kind
+// instead -- so a double-tap nets to "kind switched, place/mark unchanged".
+let lastNotesTap = 0;
+function onNotesTap() {
+  const now = performance.now();
+  const isDouble = now - lastNotesTap < DOUBLE_MS;
+  lastNotesTap = now;
+  if (isDouble) {
+    lastNotesTap = 0; // a third quick tap shouldn't read as another double
+    placing = !placing; // undo the single tap's flip
+    switchMarkKind(); // renders the button
+  } else {
+    togglePlacing();
+  }
+}
+
+// Reflect the current mode on the Notes button. In mark mode the label names the
+// kind and the button fills with its colour; in place mode it reads "Notes" but
+// still carries the armed kind (data-mark) so CSS can draw a coloured border
+// hinting what a switch-to-mark -- or a place-mode grid double-tap -- will pencil.
 function updateNotesButton() {
   if (!notesBtn) return;
-  notesBtn.textContent = NOTE_LABELS[noteMode];
-  notesBtn.setAttribute("aria-pressed", String(noteMode !== MODE_NORMAL));
-  notesBtn.dataset.mode = String(noteMode);
+  notesBtn.textContent = placing ? "Notes" : markKind === MODE_CORNER ? "Corner" : "Center";
+  notesBtn.setAttribute("aria-pressed", String(!placing));
+  notesBtn.dataset.placing = String(placing);
+  notesBtn.dataset.mark = markKind === MODE_CORNER ? "corner" : "center";
 }
 
 // Clear all of the player's work and return to the puzzle's starting clues. The
@@ -577,7 +610,8 @@ function restart() {
   }
   selected = null;
   activeDigit = 0;
-  noteMode = MODE_NORMAL;
+  placing = true;
+  markKind = MODE_CENTER;
   finished = false;
   timerBase = 0;
   runStart = performance.now();
@@ -585,6 +619,7 @@ function restart() {
   // freshly pushed undo entry.
   lastDigit = 0;
   lastCell = -1;
+  lastNotesTap = 0;
   firstTapWasLocked = false;
   digitSinglePushed = false;
   cellSinglePushed = false;
@@ -1292,13 +1327,15 @@ export function loadGame(g) {
   for (const s of g.redo || []) redoStack.push(snapshotFromJSON(s));
   selected = null;
   activeDigit = 0;
-  noteMode = MODE_NORMAL;
+  placing = true;
+  markKind = MODE_CENTER;
   finished = g.status === "solved";
   timerBase = g.elapsedMs || 0;
   runStart = null;
 
   lastDigit = 0;
   lastCell = -1;
+  lastNotesTap = 0;
   firstTapWasLocked = false;
   digitSinglePushed = false;
   cellSinglePushed = false;
@@ -1484,7 +1521,7 @@ function wirePad() {
     btn.addEventListener("click", () => onDigitTap(d));
   }
   document.getElementById("erase").addEventListener("click", erase);
-  notesBtn.addEventListener("click", cycleNoteMode);
+  notesBtn.addEventListener("click", onNotesTap);
   if (undoBtn) undoBtn.addEventListener("click", undo);
   if (redoBtn) redoBtn.addEventListener("click", redo);
 }
@@ -1510,8 +1547,10 @@ function wireKeyboard() {
       moveSelection(0, -1);
     } else if (e.key === "ArrowRight") {
       moveSelection(0, 1);
-    } else if (e.key === "n" || e.key === "N") {
-      cycleNoteMode();
+    } else if (e.key === "n") {
+      togglePlacing(); // place <-> mark
+    } else if (e.key === "N") {
+      switchMarkKind(); // Center <-> Corner
     } else if (
       // Redo before undo: Shift+Z reports e.key "Z", which the undo branch also
       // matches, so the redo (Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y) check must win.
@@ -1599,7 +1638,7 @@ function wireTopbar() {
       e.stopPropagation();
       const label = item.textContent;
       copyText(game.puzzle).then((ok) => {
-        item.textContent = ok ? "Copied!" : "Copy failed";
+        item.textContent = ok ? "Copied!" : "Failed";
         setTimeout(() => {
           item.textContent = label;
           closeMenu();

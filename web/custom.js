@@ -26,15 +26,47 @@ let showView = () => {};
 let onGenerate = () => {};
 let onHome = () => {};
 
-// The spec under construction, one usage code per kind. Kept across opens so a
-// half-built spec survives a trip Home.
-let usages = new Array(NUM_KINDS).fill(OFF);
+// The spec under construction, one usage code per kind. Persisted (see
+// loadUsages/saveUsages) so a half-built spec survives both a trip Home and a
+// page reload -- the builder reopens exactly where it was left.
+let usages = loadUsages();
 let chipEls = []; // kindIndex -> chip button, for in-place updates
 let genBtn = null;
 let presetSel = null;
 
 const USAGE_LABEL = ["Off", "Allow", "Force", "Concede"];
 const USAGE_CLASS = ["off", "allow", "force", "concede"];
+
+// Last-state persistence. The builder is otherwise stateless across reloads, so
+// stash the usage array under one key; a malformed/old value falls back to a
+// blank (all-Off) spec rather than bricking the page.
+const USAGES_KEY = "sudoku.custom.usages";
+
+function loadUsages() {
+  try {
+    const raw = localStorage.getItem(USAGES_KEY);
+    if (!raw) return new Array(NUM_KINDS).fill(OFF);
+    const arr = JSON.parse(raw);
+    if (
+      Array.isArray(arr) &&
+      arr.length === NUM_KINDS &&
+      arr.every((u) => Number.isInteger(u) && u >= OFF && u <= 3)
+    ) {
+      return arr;
+    }
+  } catch {
+    // Corrupt/old data: start blank.
+  }
+  return new Array(NUM_KINDS).fill(OFF);
+}
+
+function saveUsages() {
+  try {
+    localStorage.setItem(USAGES_KEY, JSON.stringify(usages));
+  } catch {
+    // Quota or privacy mode: the spec just won't persist this session.
+  }
+}
 
 export function initCustom(opts) {
   curriculum = opts.curriculum;
@@ -49,7 +81,10 @@ export function initCustom(opts) {
 // (e.g. resurfaced from a solved custom game in Stats) to load that spec instead.
 // Presets are enabled once the wasm bridge (which computes them) is up.
 export function openCustom(initial) {
-  if (Array.isArray(initial)) usages = initial.slice();
+  if (Array.isArray(initial)) {
+    usages = initial.slice();
+    saveUsages(); // a resurfaced spec becomes the new remembered state
+  }
   renderBody();
   showView("customView");
   ready().then(() => {
@@ -114,6 +149,7 @@ function applyPreset(value) {
     }
     usages = usagesFromMasks(masks);
   }
+  saveUsages();
   refreshAllChips();
   refreshGenerate();
 }
@@ -165,6 +201,7 @@ function techniqueRow(t) {
 // Tap cycles Off -> Allow -> Force -> Concede -> Off.
 function cycle(i) {
   usages[i] = (usages[i] + 1) % 4;
+  saveUsages();
   refreshChip(i);
   refreshGenerate();
   markPresetEdited();
@@ -226,7 +263,7 @@ function explainer() {
   box.appendChild(
     modeLine(
       "Concede",
-      "kept available so a forced technique can't be sidestepped by it — but the puzzle isn't promised solvable with it."
+      "kept available so a forced technique can't be sidestepped by it — but the puzzle will be solvable without using it."
     )
   );
   return box;

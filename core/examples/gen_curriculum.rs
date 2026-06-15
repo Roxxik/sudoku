@@ -46,8 +46,9 @@ fn main() {
             kinds::DIFFICULTY[i],
             tier_str(tier),
             branch_str(kinds::branch_of(i)),
-            // Beginner is train-only; every other tier offers a drill.
-            tier != Tier::Beginner,
+            // Train always; Drill only where it differs from Train (not Beginner,
+            // not the easiest kind of an Expert branch). See `curriculum`.
+            sudoku_core::curriculum::lab_kind_has_drill(i),
         ));
     }
     out.push(']');

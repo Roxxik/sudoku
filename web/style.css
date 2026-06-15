@@ -104,6 +104,8 @@ html, body {
   cursor: pointer;
 }
 .menu-item:active { background: var(--cell-sel); }
+/* Destructive row (e.g. a Continue card's Remove), matching the error red. */
+.menu-item.danger { color: #ff7b7b; }
 
 /* The board is a square that scales with the viewport but caps on desktop. */
 .board {
@@ -226,17 +228,28 @@ html, body {
 .key.wide { font-size: 1rem; }
 .key:disabled { opacity: 0.4; cursor: default; }
 
-/* The Notes button cycles modes; its colour names which note kind is armed
-   (blue accent for Center, amber accent2 for Corner; plain for Normal). */
-#notes[data-mode="1"] {
+/* The Notes button. Its colour names the armed note kind (blue accent = Center,
+   amber accent2 = Corner). In MARK mode (data-placing="false") it's filled; in
+   PLACE mode it stays unfilled but carries a coloured ring, so the armed kind --
+   what switching to mark, or a place-mode grid double-tap, will pencil -- is
+   always visible. */
+#notes[data-placing="false"][data-mark="center"] {
   background: var(--accent);
   color: #10131a;
   border-color: var(--accent);
 }
-#notes[data-mode="2"] {
+#notes[data-placing="false"][data-mark="corner"] {
   background: var(--accent2);
   color: #10131a;
   border-color: var(--accent2);
+}
+#notes[data-placing="true"][data-mark="center"] {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+#notes[data-placing="true"][data-mark="corner"] {
+  border-color: var(--accent2);
+  box-shadow: inset 0 0 0 2px var(--accent2);
 }
 
 /* Pen-locked digit (double-tapped, highlight mode active). */
@@ -344,6 +357,15 @@ html, body {
 .continue-item:active { background: var(--cell-sel); }
 .ci-name { font-weight: 600; font-size: 1.05rem; }
 .ci-meta { color: var(--mark); font-size: 0.85rem; }
+
+/* A Continue card = the full-width Resume button plus an ellipsis overflow menu
+   floated into its top-right corner. The card is the positioning context; the
+   menu's own dropdown anchors to the ellipsis. */
+.continue-card { position: relative; }
+.ci-menu { position: absolute; top: 6px; right: 6px; }
+.ci-menu-btn { color: var(--mark); }
+/* Reserve room so a long title/meta line doesn't slide under the ellipsis. */
+.continue-card .continue-item { padding-right: 44px; }
 
 /* ---- Settings: toggle rows ---- */
 #settingsBody { display: flex; flex-direction: column; gap: 8px; }

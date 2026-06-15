@@ -187,6 +187,39 @@ pub fn stage_by_key(key: &str) -> Option<&'static Stage> {
     CURRICULUM.iter().find(|s| s.key == key)
 }
 
+/// Whether a curriculum technique (addressed by its [`lab::kinds`](crate::lab::kinds)
+/// index) is worth offering a separate **Drill** mode alongside Train.
+///
+/// Train always exists. Drill is dropped wherever it would be indistinguishable
+/// from Train:
+///   - **Beginner** (hidden singles) is train-only — there is nothing easier to
+///     concede, so a drill is the same puzzle as a train.
+///   - The **easiest technique of each Expert branch** has no easier same-branch
+///     peer for a drill to set apart from train, so its drill collapses onto its
+///     train; only Train is surfaced (e.g. X-Wing, Naked Pair, XY-Wing).
+///
+/// The build-time `gen_curriculum` example and the wasm `curriculum()` export both
+/// read this, so the Home tree's per-technique mode buttons can't drift.
+pub fn lab_kind_has_drill(idx: usize) -> bool {
+    use crate::lab::kinds::{self, Tier};
+    let tier = kinds::tier_of(idx);
+    // Beginner is train-only; an Expert branch's easiest kind drills the same as
+    // it trains. Everything else (Intermediate, deeper Expert kinds) gets a drill.
+    if tier == Tier::Beginner {
+        return false;
+    }
+    !(tier == Tier::Expert && first_in_branch(idx))
+}
+
+/// Whether `idx` is the easiest kind in its [`Branch`](crate::lab::kinds::Branch),
+/// by player-facing difficulty (no same-branch kind is strictly easier).
+fn first_in_branch(idx: usize) -> bool {
+    use crate::lab::kinds;
+    let branch = kinds::branch_of(idx);
+    let d = kinds::DIFFICULTY[idx];
+    !(0..kinds::NUM).any(|j| kinds::branch_of(j) == branch && kinds::DIFFICULTY[j] < d)
+}
+
 impl Spec {
     /// Allow every technique in this tier and below, by player-facing
     /// difficulty. `Tier::Master` allows everything implemented.
@@ -274,5 +307,22 @@ mod tests {
     fn stage_by_key_lookup() {
         let s = stage_by_key("swordfish").expect("swordfish stage exists");
         assert_eq!(s.focus, TechniqueKind::Swordfish);
+    }
+
+    #[test]
+    fn drill_dropped_for_beginner_and_expert_branch_firsts() {
+        use crate::lab::kinds;
+        // Beginner (hidden single) is train-only.
+        assert!(!lab_kind_has_drill(kinds::HIDDEN_SINGLE));
+        // Each Expert branch's easiest kind drills the same as it trains.
+        assert!(!lab_kind_has_drill(kinds::NAKED_PAIR)); // Subset
+        assert!(!lab_kind_has_drill(kinds::X_WING)); // Fish
+        assert!(!lab_kind_has_drill(kinds::XY_WING)); // Bivalue
+        // Intermediate and deeper Expert kinds keep their drill.
+        assert!(lab_kind_has_drill(kinds::NAKED_SINGLE)); // Intermediate
+        assert!(lab_kind_has_drill(kinds::LC_POINTING)); // Intermediate
+        assert!(lab_kind_has_drill(kinds::HIDDEN_PAIR)); // Subset, not first
+        assert!(lab_kind_has_drill(kinds::SWORDFISH)); // Fish, not first
+        assert!(lab_kind_has_drill(kinds::W_WING)); // Bivalue, not first
     }
 }

@@ -182,6 +182,38 @@ pub fn generate_lab(seed: u64, target: u32, drill: bool) -> Result<JsValue, JsVa
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Adopt an imported puzzle from its clue line alone. `line` is the `to_line()`
+/// format the app exports (81 chars, `.`/`0` empty, `1`-`9` clues; whitespace and
+/// the `|`/`-`/`+` separators are ignored). Returns the same
+/// `{ puzzle, solution, givens }` shape as [`generate`], with the solution solved
+/// here, so the UI can load it as a game and detect a win.
+///
+/// Errors if the line is malformed or the puzzle lacks a unique solution. Parse
+/// robustness past the exported format is a later concern — this only has to
+/// re-accept what Export produces.
+#[wasm_bindgen(js_name = solveLine)]
+pub fn solve_line(line: &str) -> Result<JsValue, JsValue> {
+    let board = sudoku_core::Board::parse(line)
+        .map_err(|e| JsValue::from_str(&format!("could not read puzzle: {e}")))?;
+    // Require a UNIQUE solution: collect up to two completions and insist on
+    // exactly one. (`solve_unique` despite its name returns the *first* solution,
+    // so an under-constrained grid -- e.g. an empty one -- would otherwise be
+    // accepted.) Loosening this to accept multi-solution puzzles is a later step.
+    let mut solutions = sudoku_core::uniqueness::collect_solutions(&board, 2);
+    let solution = match solutions.len() {
+        1 => solutions.pop().unwrap(),
+        0 => return Err(JsValue::from_str("this puzzle has no solution")),
+        _ => return Err(JsValue::from_str("this puzzle has more than one solution")),
+    };
+    let givens = (0..81).filter(|&i| !board.is_empty(i)).count() as u32;
+    let data = PuzzleData {
+        puzzle: board.to_line(),
+        solution: solution.to_line(),
+        givens,
+    };
+    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// The player-facing curriculum taxonomy, one entry per technique kind, built
 /// straight from [`lab::kinds`] so the Home tree can't drift from the Rust
 /// source of truth (`CURRICULUM.md` / `kinds.rs`). The UI groups by `tier` then
@@ -199,9 +231,10 @@ pub fn curriculum() -> Result<JsValue, JsValue> {
                 difficulty: kinds::DIFFICULTY[i],
                 tier: tier_str(tier),
                 branch: branch_str(kinds::branch_of(i)),
-                // Beginner is train-only (nothing to concede); every other tier
-                // offers a drill — see `Spec::drill` / `CURRICULUM.md`.
-                has_drill: tier != kinds::Tier::Beginner,
+                // Train always; Drill only where it differs from Train — not
+                // Beginner, and not the easiest kind of an Expert branch (its
+                // drill is the same puzzle as its train). See `core::curriculum`.
+                has_drill: sudoku_core::curriculum::lab_kind_has_drill(i),
             }
         })
         .collect();

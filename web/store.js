@@ -119,6 +119,13 @@ export function getGame(id) {
   return loadAll().find((g) => g.id === id) || null;
 }
 
+// Permanently drop a game from the store (the Continue card's "Remove"). Unlike
+// solving -- which keeps the record, flipped to "solved" for the stats -- this
+// erases it outright, so it's gated behind a confirmation in the UI.
+export function deleteGame(id) {
+  saveAll(loadAll().filter((g) => g.id !== id));
+}
+
 // Merge `patch` into the stored game and persist. Returns the updated record (or
 // null if it's gone). Used to checkpoint player work, elapsed time, and the
 // solved transition.

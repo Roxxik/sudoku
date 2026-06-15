@@ -15,7 +15,7 @@
 
 import * as store from "./store.js";
 import * as settings from "./settings.js";
-import { miniBoard, textColumn } from "./ui.js";
+import { miniBoard, textColumn, copyText } from "./ui.js";
 import {
   formatDuration,
   techniqueName,
@@ -28,9 +28,10 @@ let curriculum = [];
 let showView = () => {};
 let onLaunch = () => {};
 let onResume = () => {};
+let onOpenSpec = () => {};
+let onImport = () => {};
 
 let grouped = {}; // tier -> branch -> [entries], sorted by difficulty
-let lastActiveId = null; // most-recent in-progress game, for "Continue last"
 let campaignBack = showHome; // where campaignView's back button goes right now
 
 export function initHome(opts) {
@@ -38,6 +39,8 @@ export function initHome(opts) {
   showView = opts.showView;
   onLaunch = opts.onLaunch;
   onResume = opts.onResume;
+  onOpenSpec = opts.onOpenSpec || (() => {});
+  onImport = opts.onImport || (() => {});
   grouped = groupCurriculum(curriculum);
 
   document.getElementById("statsBtn").addEventListener("click", opts.onStats);
@@ -46,10 +49,14 @@ export function initHome(opts) {
   wireHomeMenu();
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
-  document
-    .getElementById("continueLastBtn")
-    .addEventListener("click", () => lastActiveId && onResume(lastActiveId));
   document.getElementById("continueListBtn").addEventListener("click", openPuzzles);
+
+  // Per-card overflow menus (the Continue cards) close on any outside click or
+  // Escape -- across both the home hero and the puzzles list.
+  document.addEventListener("click", () => closeCardMenus());
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeCardMenus();
+  });
 }
 
 function groupCurriculum(list) {
@@ -89,24 +96,139 @@ function renderTiers(stats) {
 
 function renderContinue() {
   const active = store.activeGames();
-  const lastBtn = document.getElementById("continueLastBtn");
+  const lastCard = document.getElementById("continueLast");
   const listBtn = document.getElementById("continueListBtn");
 
-  lastBtn.hidden = active.length < 1;
+  lastCard.hidden = active.length < 1;
   listBtn.hidden = active.length < 2;
 
   if (active.length >= 1) {
-    lastActiveId = active[0].id;
-    lastBtn.replaceChildren(
-      miniBoard(active[0], "mini-lg"),
-      textColumn("Continue last puzzle", continueMeta(active[0]))
-    );
+    // The hero keeps its "Continue last puzzle" label (it's the resume-the-most-
+    // recent affordance), but now carries the per-puzzle overflow menu too.
+    lastCard.replaceChildren(continueCard(active[0], "Continue last puzzle", "mini-lg"));
   } else {
-    lastActiveId = null;
+    lastCard.replaceChildren();
   }
   if (active.length >= 2) {
     // No board preview here -- this is a link to the list, not a single puzzle.
     listBtn.replaceChildren(textColumn("Continue a puzzle", `${active.length} in progress`));
+  }
+}
+
+// One in-progress puzzle as a card: a full-width Resume button (board + title +
+// meta) plus an ellipsis overflow menu. Shared by the home hero and the puzzles
+// list, which differ only in the title shown and the thumbnail size.
+function continueCard(g, title, sizeClass) {
+  const card = document.createElement("div");
+  card.className = "continue-card";
+  const main = document.createElement("button");
+  main.className = "continue-item";
+  main.addEventListener("click", () => onResume(g.id));
+  main.append(miniBoard(g, sizeClass), textColumn(title, continueMeta(g)));
+  card.append(main, cardMenu(g));
+  return card;
+}
+
+// The per-card overflow menu for an in-progress puzzle: Export its clue line, and
+// (custom only) reopen its spec in the builder. Deliberately separate from the
+// Stats history cards -- those are solved games. The ellipsis toggles the
+// dropdown; outside-click/Escape dismissal is wired once in initHome.
+function cardMenu(g) {
+  const menu = document.createElement("div");
+  menu.className = "menu ci-menu";
+
+  const btn = document.createElement("button");
+  btn.className = "iconbtn ci-menu-btn";
+  btn.setAttribute("aria-label", "Puzzle menu");
+  btn.setAttribute("aria-haspopup", "true");
+  btn.setAttribute("aria-expanded", "false");
+  btn.innerHTML =
+    '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">' +
+    '<circle cx="12" cy="5" r="2" fill="currentColor"/>' +
+    '<circle cx="12" cy="12" r="2" fill="currentColor"/>' +
+    '<circle cx="12" cy="19" r="2" fill="currentColor"/></svg>';
+
+  const list = document.createElement("ul");
+  list.className = "menu-list";
+  list.hidden = true;
+  // Custom games can resurface their spec; campaign/imported games can't.
+  if (g.mode === "custom" && Array.isArray(g.spec)) {
+    list.appendChild(menuItemLi("Open spec", () => onOpenSpec(g.spec)));
+  }
+  list.appendChild(exportItemLi(g));
+  list.appendChild(menuItemLi("Remove", () => removeGame(g), "danger"));
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation(); // don't let the document handler immediately re-close
+    closeCardMenus(list); // only one card menu open at a time
+    const open = list.hidden;
+    list.hidden = !open;
+    btn.setAttribute("aria-expanded", String(open));
+  });
+
+  menu.append(btn, list);
+  return menu;
+}
+
+// A plain menu row: run `onClick`, then dismiss the menu. `cls` adds an extra
+// class (e.g. "danger" for a destructive action).
+function menuItemLi(label, onClick, cls) {
+  const li = document.createElement("li");
+  const b = document.createElement("button");
+  b.className = cls ? `menu-item ${cls}` : "menu-item";
+  b.textContent = label;
+  b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeCardMenus();
+    onClick();
+  });
+  li.appendChild(b);
+  return li;
+}
+
+// Discard an in-progress puzzle after confirming -- progress is lost, so we
+// double-check. Refreshes whatever Continue surface is showing; an emptied
+// puzzles subscreen drops back Home.
+function removeGame(g) {
+  if (!window.confirm("Remove this puzzle? Your progress will be lost.")) return;
+  store.deleteGame(g.id);
+  renderContinue();
+  if (!document.getElementById("puzzlesView").hidden) {
+    if (store.activeGames().length === 0) showHome();
+    else openPuzzles();
+  }
+}
+
+// Export = copy the puzzle's clue line (`g.puzzle` is already to_line() output,
+// '.' = empty; the solution is never copied), with a brief inline confirmation.
+function exportItemLi(g) {
+  const li = document.createElement("li");
+  const b = document.createElement("button");
+  b.className = "menu-item";
+  b.textContent = "Export puzzle";
+  b.addEventListener("click", (e) => {
+    e.stopPropagation(); // keep the menu open to show the confirmation
+    const label = b.textContent;
+    copyText(g.puzzle).then((ok) => {
+      b.textContent = ok ? "Copied!" : "Failed";
+      setTimeout(() => {
+        b.textContent = label;
+        closeCardMenus();
+      }, 900);
+    });
+  });
+  li.appendChild(b);
+  return li;
+}
+
+// Close every open Continue-card menu, optionally keeping `except` open. Card
+// menus appear in both the home hero and the puzzles list, so this spans views.
+function closeCardMenus(except) {
+  for (const list of document.querySelectorAll(".ci-menu .menu-list")) {
+    if (list === except || list.hidden) continue;
+    list.hidden = true;
+    const btn = list.parentElement.querySelector(".ci-menu-btn");
+    if (btn) btn.setAttribute("aria-expanded", "false");
   }
 }
 
@@ -294,11 +416,7 @@ function openPuzzles() {
   list.replaceChildren();
   for (const g of store.activeGames()) {
     const li = document.createElement("li");
-    const btn = document.createElement("button");
-    btn.className = "continue-item";
-    btn.addEventListener("click", () => onResume(g.id));
-    btn.append(miniBoard(g, "mini-xl"), textColumn(gameTitle(g), continueMeta(g)));
-    li.appendChild(btn);
+    li.appendChild(continueCard(g, gameTitle(g), "mini-xl"));
     list.appendChild(li);
   }
   showView("puzzlesView");
@@ -357,6 +475,7 @@ function wireHomeMenu() {
     const item = e.target.closest(".menu-item");
     if (!item) return;
     if (item.dataset.action === "settings") openSettings();
+    else if (item.dataset.action === "import") onImport();
     close();
   });
   const homeVisible = () => !document.getElementById("homeView").hidden;
