@@ -39,6 +39,7 @@ watch = [
   "home.js",
   "custom.js",
   "stats.js",
+  "techniques.js",
   "style.css",
   "../wasm/src",
   "../wasm/Cargo.toml",

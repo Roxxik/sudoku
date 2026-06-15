@@ -6,16 +6,24 @@
 // appear/disappear:
 //   1. Campaign  -- three tier buttons (Beginner / Intermediate / Expert),
 //                   always shown. Tapping a tier drills in.
-//   2. Continue last puzzle  -- shown when there is >=1 in-progress puzzle.
-//   3. Continue a puzzle (list)  -- shown when there are >=2.
+//   2. Custom puzzle  -- the spec builder (a separator sits above it).
+//   3. Continue last puzzle  -- shown when there is >=1 in-progress puzzle.
+//   4. Continue a puzzle (list)  -- shown when there are >=2.
+// Each tier button carries a subtitle listing its techniques (or, for the
+// multi-branch Expert tier, its branch names).
 //
-// Campaign drill-down (campaignView): tier -> branches (Expert only) ->
-// techniques, each technique offering Train/Drill. Solved-count rollups appear
-// at every level. The puzzle list (puzzlesView) lists all in-progress games.
+// Campaign drill-down (campaignView): tier -> branches (Expert only) -> a
+// technique list (shown only when a level holds more than one technique) -> the
+// technique page. The technique page has a description, a row per mode (Train,
+// and Drill where it differs) offering Play and Play from Forced, and any
+// aliases/extra notes. A single-technique level (e.g. Beginner) skips the list and
+// opens the page directly. Solved-count rollups appear at every level. The puzzle
+// list (puzzlesView) lists all in-progress games.
 
 import * as store from "./store.js";
 import * as settings from "./settings.js";
 import { miniBoard, textColumn, copyText } from "./ui.js";
+import { TECHNIQUE_INFO } from "./techniques.js";
 import {
   formatDuration,
   techniqueName,
@@ -46,6 +54,7 @@ export function initHome(opts) {
   document.getElementById("statsBtn").addEventListener("click", opts.onStats);
   document.getElementById("customBtn").addEventListener("click", opts.onCustom);
   document.getElementById("settingsBack").addEventListener("click", () => settingsReturn());
+  document.getElementById("helpBack").addEventListener("click", () => helpReturn());
   wireHomeMenu();
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
@@ -90,8 +99,23 @@ function renderTiers(stats) {
     const branches = grouped[tier];
     if (!branches) continue;
     const entries = Object.values(branches).flat();
-    root.appendChild(navButton(TIER_LABEL[tier], rollup(stats, entries), () => openTier(tier)));
+    root.appendChild(
+      navButton(TIER_LABEL[tier], tierSubtitle(tier), rollup(stats, entries), () => openTier(tier))
+    );
   }
+}
+
+// The subtitle under a tier button on the home page: a multi-branch tier (Expert)
+// lists its branch names; a single-branch tier (Beginner/Intermediate) lists its
+// technique names.
+function tierSubtitle(tier) {
+  const branches = grouped[tier];
+  if (Object.keys(branches).length > 1) {
+    return BRANCH_ORDER.filter((b) => branches[b])
+      .map((b) => BRANCH_LABEL[b])
+      .join(" · ");
+  }
+  return techniqueNames(Object.values(branches).flat());
 }
 
 function renderContinue() {
@@ -101,6 +125,10 @@ function renderContinue() {
 
   lastCard.hidden = active.length < 1;
   listBtn.hidden = active.length < 2;
+  // The Custom/Continue separator only earns its place when there's a Continue
+  // card below it.
+  const sep = document.getElementById("continueSep");
+  if (sep) sep.hidden = active.length < 1;
 
   if (active.length >= 1) {
     // The hero keeps its "Continue last puzzle" label (it's the resume-the-most-
@@ -245,12 +273,23 @@ function gameTitle(g) {
 }
 
 // ---- Campaign drill-down ----
+// Branch display order; also the order the Expert tier lists its branches in.
+const BRANCH_ORDER = ["fish", "subset", "bivalue", "trunk"];
+
 function openTier(tier) {
   const keys = Object.keys(grouped[tier]);
   // A multi-branch tier (Expert) gets the branch level; a single-branch tier
-  // (Beginner/Intermediate -- Trunk only) goes straight to its techniques.
+  // dives straight in: to its technique list, or (Beginner) the lone page.
   if (keys.length > 1) openBranches(tier);
-  else openTechniques(tier, keys[0]);
+  else openBranchOrTechniques(tier, keys[0], showHome);
+}
+
+// One branch: a list of technique pages when it holds more than one technique,
+// else straight to that technique's page. `back` is where the page above it goes.
+function openBranchOrTechniques(tier, branch, back) {
+  const entries = grouped[tier][branch];
+  if (entries.length > 1) openTechniqueList(tier, branch, back);
+  else openTechnique(tier, branch, entries[0], back);
 }
 
 function openBranches(tier) {
@@ -258,11 +297,16 @@ function openBranches(tier) {
   setCampaignTitle(TIER_LABEL[tier]);
   const grid = document.createElement("div");
   grid.className = "nav-grid";
-  for (const branch of ["fish", "subset", "bivalue", "trunk"]) {
+  for (const branch of BRANCH_ORDER) {
     const entries = grouped[tier][branch];
     if (!entries) continue;
     grid.appendChild(
-      navButton(BRANCH_LABEL[branch], rollup(stats, entries), () => openTechniques(tier, branch))
+      navButton(
+        BRANCH_LABEL[branch],
+        techniqueNames(entries),
+        rollup(stats, entries),
+        () => openBranchOrTechniques(tier, branch, () => openBranches(tier))
+      )
     );
   }
   const note = document.createElement("div");
@@ -277,58 +321,154 @@ function openBranches(tier) {
   showView("campaignView");
 }
 
-function openTechniques(tier, branch) {
+// A list of technique pages within one tier/branch (shown only when there's more
+// than one). Each row is a nav-button to that technique's page, badged with its
+// solved count. `back` is the level above (the branch list, or Home).
+function openTechniqueList(tier, branch, back) {
   const stats = store.statsByKind();
   const multiBranch = Object.keys(grouped[tier]).length > 1;
   setCampaignTitle(
     multiBranch ? `${TIER_LABEL[tier]} · ${BRANCH_LABEL[branch]}` : TIER_LABEL[tier]
   );
-  document
-    .getElementById("campaignBody")
-    .replaceChildren(techniqueList(grouped[tier][branch], stats), modeExplainer(tier, branch));
-  // Back up to the branch list if we came through it, else to Home.
-  campaignBack = multiBranch ? () => openBranches(tier) : showHome;
+  const grid = document.createElement("div");
+  grid.className = "nav-grid";
+  for (const t of grouped[tier][branch]) {
+    grid.appendChild(
+      navButton(
+        techniqueName(t.id),
+        null,
+        store.solvedCountForKind(stats, t.kindIndex),
+        () => openTechnique(tier, branch, t, () => openTechniqueList(tier, branch, back))
+      )
+    );
+  }
+  document.getElementById("campaignBody").replaceChildren(grid);
+  campaignBack = back;
   showView("campaignView");
 }
 
-// A short, tier/branch-aware note at the bottom of a techniques page. A shared
-// line states what both modes have in common (the chosen technique always
-// appears; earlier tiers stay available), then Train vs Drill differ only in
-// whether this page's peers are usable. Phrasing tracks CURRICULUM.md: an
-// Intermediate page is a flat tier (peers = all the others here), an Expert page
-// is an ordered branch (peers = the simpler ones above it). Beginner is
-// train-only, so it just gets a one-line description.
-function modeExplainer(tier, branch) {
+// The technique page: a hand-written description up top, a row per mode (Train
+// always, Drill when it differs) each offering Play and Play from Forced, a short
+// note on what Train vs Drill mean here, and any aliases / extra notes at the
+// bottom. `back` returns to whichever level opened it.
+function openTechnique(tier, branch, t, back) {
+  const stats = store.statsByKind();
+  setCampaignTitle(techniqueName(t.id));
+
+  const page = document.createElement("div");
+  page.className = "tech-page";
+
+  const info = TECHNIQUE_INFO[t.id] || {};
+  if (info.description) {
+    const desc = document.createElement("p");
+    desc.className = "tech-desc";
+    desc.textContent = info.description;
+    page.appendChild(desc);
+  }
+
+  // Play from Forced has nothing to place before the easiest technique of all
+  // (the hidden single), so only offer it when something easier than this exists.
+  const showForced = curriculum.some((k) => k.difficulty < t.difficulty);
+  page.appendChild(modeRow(t, "train", stats, showForced));
+  if (t.hasDrill) page.appendChild(modeRow(t, "drill", stats, showForced));
+
+  page.appendChild(modeNote(t, tier, branch));
+
+  const extra = techExtra(info);
+  if (extra) page.appendChild(extra);
+
+  document.getElementById("campaignBody").replaceChildren(page);
+  campaignBack = back;
+  showView("campaignView");
+}
+
+// One mode (Train or Drill) as a row: its label over the start buttons. Play uses
+// the minimal givens; Play from Forced seeds the board with the digits the solver
+// places up to the first forced technique (omitted when nothing is easier).
+function modeRow(t, mode, stats, showForced) {
+  const row = document.createElement("div");
+  row.className = "mode-row";
+
+  const head = document.createElement("div");
+  head.className = "mode-row-head";
+  head.textContent = mode === "drill" ? "Drill" : "Train";
+  row.appendChild(head);
+
+  const btns = document.createElement("div");
+  btns.className = "mode-buttons";
+  btns.appendChild(playButton(t, mode, "Play", false, stats));
+  if (showForced) btns.appendChild(playButton(t, mode, "Play from Forced", true, stats));
+  row.appendChild(btns);
+  return row;
+}
+
+// A start button. `fromForced` picks the head-start launch. The solved marker
+// (count + best time) under the label is specific to this start type -- a plain
+// Play and a Play-from-Forced are tracked separately, so the two buttons in a row
+// don't share a count.
+function playButton(t, mode, label, fromForced, stats) {
+  const btn = document.createElement("button");
+  btn.className = "mode-btn";
+  btn.addEventListener("click", () => onLaunch(t.kindIndex, mode, fromForced));
+
+  const lab = document.createElement("span");
+  lab.className = "mb-label";
+  lab.textContent = label;
+  btn.appendChild(lab);
+
+  const sub = document.createElement("span");
+  sub.className = "mb-sub";
+  const m = stats[t.kindIndex]?.[mode + (fromForced ? "Forced" : "")];
+  if (m && m.count > 0) {
+    btn.classList.add("solved");
+    sub.textContent = `${m.count} solved · ${formatDuration(m.bestMs)}`;
+  } else {
+    sub.textContent = "";
+  }
+  btn.appendChild(sub);
+  return btn;
+}
+
+// A short note on what Train and Drill mean for this technique. Phrasing tracks
+// CURRICULUM.md: an Intermediate technique sits in a flat tier (peers = the others
+// on its page), an Expert one in an ordered branch (peers = the simpler ones above
+// it). A train-only technique (Beginner) gets a single shared line.
+function modeNote(t, tier, branch) {
   const box = document.createElement("div");
   box.className = "mode-explainer";
 
-  if (tier === "beginner") {
+  if (!t.hasDrill) {
+    // The very easiest technique (hidden single) has nothing simpler to lean on;
+    // the others reachable here (the first of an Expert branch) do.
+    const hasEasier = curriculum.some((k) => k.difficulty < t.difficulty);
     box.appendChild(
       explPlain(
-        "Beginner puzzles need only hidden singles — the one spot in a row, column, or box where a digit can still go."
+        hasEasier
+          ? "Train builds puzzles that need this technique; the easier techniques you already know may also be needed along the way."
+          : "Train builds puzzles that are solved with this technique alone."
       )
     );
     return box;
   }
 
-  // The same-page peers, named per the page's shape; and which earlier tier the
-  // player is assumed to bring.
   const peers =
     tier === "intermediate"
-      ? "the other techniques on this page"
-      : `the simpler ${{ fish: "fishes", subset: "subsets", bivalue: "wings" }[branch]} above the one you picked`;
-  const basics =
-    tier === "intermediate"
-      ? "hidden singles are"
-      : "all the Beginner and Intermediate techniques are";
+      ? "the other Intermediate techniques"
+      : `the simpler ${{ fish: "fishes", subset: "subsets", bivalue: "wings" }[branch]} in this branch`;
+  box.appendChild(explMode("Train", `${peers}, plus the basics, may also be needed to finish the puzzle.`));
+  box.appendChild(explMode("Drill", `only this technique is required; ${peers} won't be needed to finish it.`));
+  return box;
+}
 
-  box.appendChild(
-    explPlain(`The technique you pick is guaranteed to appear, and ${basics} also needed throughout the puzzle.`)
-  );
-  box.appendChild(explMode("Train", `${peers} may also be needed.`));
-  box.appendChild(
-    explMode("Drill", `only the technique you pick is required; ${peers} won't be needed to finish the puzzle.`)
-  );
+// The aliases + extra-info block at the bottom of a technique page, or null when
+// the technique has neither.
+function techExtra(info) {
+  const aliases = info.aliases && info.aliases.length ? info.aliases : null;
+  if (!aliases && !info.extra) return null;
+  const box = document.createElement("div");
+  box.className = "mode-explainer tech-extra";
+  if (aliases) box.appendChild(explMode("Also known as", aliases.join(", ")));
+  if (info.extra) box.appendChild(explPlain(info.extra));
   return box;
 }
 
@@ -348,66 +488,6 @@ function explMode(label, rest) {
 
 function setCampaignTitle(text) {
   document.getElementById("campaignTitle").textContent = text;
-}
-
-function techniqueList(entries, stats) {
-  const ul = document.createElement("ul");
-  ul.className = "tech-list";
-  for (const t of entries) ul.appendChild(techniqueRow(t, stats));
-  return ul;
-}
-
-function techniqueRow(t, stats) {
-  const li = document.createElement("li");
-  li.className = "tech-row";
-
-  const head = document.createElement("div");
-  head.className = "tech-head";
-  const name = document.createElement("span");
-  name.className = "tech-name";
-  name.textContent = techniqueName(t.id);
-  head.appendChild(name);
-
-  const solved = store.solvedCountForKind(stats, t.kindIndex);
-  if (solved > 0) head.appendChild(badge(`${solved} solved`));
-  li.appendChild(head);
-
-  const modes = document.createElement("div");
-  modes.className = "mode-buttons";
-  modes.appendChild(modeButton(t, "train", stats));
-  if (t.hasDrill) modes.appendChild(modeButton(t, "drill", stats));
-  li.appendChild(modes);
-
-  return li;
-}
-
-// A Train/Drill button. Shows the per-mode best time when one exists; with no
-// solves it shows just the centered label (no placeholder dash).
-function modeButton(t, mode, stats) {
-  const btn = document.createElement("button");
-  btn.className = "mode-btn";
-  btn.addEventListener("click", () => onLaunch(t.kindIndex, mode));
-
-  const label = document.createElement("span");
-  label.className = "mb-label";
-  label.textContent = mode === "drill" ? "Drill" : "Train";
-  btn.appendChild(label);
-
-  // Per-mode solved marker: Train and Drill are tracked separately, so the
-  // solved count + best time live on each button (not just the technique row).
-  // Always render the sub line (empty when unsolved) so the buttons keep the
-  // same size -- no jump.
-  const sub = document.createElement("span");
-  sub.className = "mb-sub";
-  const m = stats[t.kindIndex]?.[mode];
-  if (m && m.count > 0) {
-    btn.classList.add("solved");
-    sub.textContent = `${m.count} solved · ${formatDuration(m.bestMs)}`;
-  } else {
-    sub.textContent = "";
-  }
-  btn.appendChild(sub);
-  return btn;
 }
 
 // ---- Continue-a-puzzle list ----
@@ -476,6 +556,7 @@ function wireHomeMenu() {
     if (!item) return;
     if (item.dataset.action === "settings") openSettings();
     else if (item.dataset.action === "import") onImport();
+    else if (item.dataset.action === "help") openHelp(showHome);
     close();
   });
   const homeVisible = () => !document.getElementById("homeView").hidden;
@@ -517,17 +598,114 @@ function settingToggle(name, desc, initial, onChange) {
   return row;
 }
 
+// ---- How to play ----
+// A static reference: the rules, a few "good to know" tips, then the play-view
+// controls described for the current device (touch gestures on a coarse pointer,
+// keyboard shortcuts otherwise). Reached from the home menu and the play menu.
+// Lives here (a static, wasm-free module) so it opens instantly, like Settings.
+
+// Where the help back button returns to. Set per-open (Home, or a target that
+// resumes the board when opened from play) -- mirrors settingsReturn.
+let helpReturn = showHome;
+
+const HELP_RULES = [
+  ["Goal", "Fill every empty cell with a digit from 1 to 9."],
+  ["No repeats", "Each row, each column, and each 3×3 box must hold all nine digits exactly once."],
+  ["One solution", "Every puzzle has a single solution, reachable by logic alone — you never have to guess."],
+];
+
+const HELP_TOUCH = [
+  ["Select a cell", "Tap it."],
+  ["Place a digit", "Select a cell, then tap a number. Tap the same number again to clear it."],
+  ["Lock a digit", "Double-tap a number to lock it; every cell you then tap gets that digit. Tap it once more to unlock, or double-tap a different number to switch."],
+  ["Pencil notes", "Tap Notes to switch between placing digits and pencilling notes."],
+  ["Switch note style", "Double-tap Notes to swap between center notes and corner (Snyder) notes."],
+  ["Quick opposite", "With a digit locked, double-tap a cell to do the opposite of your current mode — pencil a note while placing, or place while noting."],
+  ["Erase", "Tap Erase, or re-tap a digit you placed."],
+  ["Undo / Redo", "The Undo and Redo buttons step back and forth through your moves."],
+  ["Hint", "Tap Hint to see if you've made a mistake, or which technique could apply next."],
+];
+
+const HELP_KEYBOARD = [
+  ["Move the selection", "Arrow keys."],
+  ["Place a digit", "Press 1–9. Press the same digit again to clear the cell."],
+  ["Erase", "0, Backspace, or Delete."],
+  ["Pencil notes", "Press n to switch between placing digits and pencilling notes."],
+  ["Switch note style", "Press Shift+N to swap between center notes and corner (Snyder) notes."],
+  ["Undo", "Ctrl/Cmd+Z."],
+  ["Redo", "Ctrl/Cmd+Shift+Z, or Ctrl/Cmd+Y."],
+  ["Hint", "The Hint button shows if you've made a mistake, or which technique could apply next."],
+];
+
+const HELP_NOTES = [
+  ["Restart is undoable", "Your whole attempt rides on the undo stack, so a single Undo brings it all back."],
+  ["Two note styles", "Center notes sit as a row in the middle of a cell; corner (Snyder) notes tuck into its corners."],
+  ["Hints read your center notes", "Only your center notes feed the hint engine. If a cell's center notes leave out a digit that's still possible, its hints can be inaccurate — keep them complete, or clear them."],
+  ["Auto-cleanup", "Placing a digit can strike it from the notes of every cell that sees it — turn this on with “Eliminate candidates” in Settings."],
+  ["Play from Forced", "Starts you partway in, with clues filled up to the technique you're practising. Restart clears back to the original puzzle."],
+  ["The timer pauses", "It stops while you're on another tab or in Settings, so your solve time stays honest."],
+];
+
+export function openHelp(onBack) {
+  helpReturn = onBack || showHome;
+  const touch = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+  document
+    .getElementById("helpBody")
+    .replaceChildren(
+      helpSection("Rules", HELP_RULES),
+      helpSection("Good to know", HELP_NOTES),
+      helpSection(touch ? "Controls" : "Keyboard", touch ? HELP_TOUCH : HELP_KEYBOARD)
+    );
+  showView("helpView");
+}
+
+// A titled definition list: each row pairs an action with how to do it.
+function helpSection(title, rows) {
+  const sec = document.createElement("section");
+  sec.className = "help-section";
+  const h = document.createElement("h2");
+  h.textContent = title;
+  const dl = document.createElement("dl");
+  dl.className = "help-list";
+  for (const [term, desc] of rows) {
+    const dt = document.createElement("dt");
+    dt.textContent = term;
+    const dd = document.createElement("dd");
+    dd.textContent = desc;
+    dl.append(dt, dd);
+  }
+  sec.append(h, dl);
+  return sec;
+}
+
 // ---- Shared bits ----
-function navButton(label, solvedCount, onClick) {
+function navButton(label, subtitle, solvedCount, onClick) {
   const btn = document.createElement("button");
   btn.className = "nav-btn";
   btn.addEventListener("click", onClick);
+
+  // Label over an optional muted subtitle (the technique/branch list); the badge
+  // and the drill-in chevron sit to its right.
   const text = document.createElement("span");
-  text.className = "nav-label";
-  text.textContent = label;
+  text.className = "nav-text";
+  const name = document.createElement("span");
+  name.className = "nav-label";
+  name.textContent = label;
+  text.appendChild(name);
+  if (subtitle) {
+    const sub = document.createElement("span");
+    sub.className = "nav-sub";
+    sub.textContent = subtitle;
+    text.appendChild(sub);
+  }
   btn.appendChild(text);
   if (solvedCount > 0) btn.appendChild(badge(`${solvedCount} solved`));
   return btn;
+}
+
+// Technique display names of a set of entries, joined for a subtitle line.
+function techniqueNames(entries) {
+  return entries.map((t) => techniqueName(t.id)).join(" · ");
 }
 
 function badge(text) {

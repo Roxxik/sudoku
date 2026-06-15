@@ -24,6 +24,7 @@
   <link rel="modulepreload" href="wasm.js">
   <link rel="modulepreload" href="spec.js">
   <link rel="modulepreload" href="custom.js">
+  <link rel="modulepreload" href="techniques.js">
   <!-- The cdylib bridge (Board/hint/generate/curriculum) on the main thread.
        data-target-name disambiguates it from the worker binary below. -->
   <link data-trunk rel="rust" href="../wasm/Cargo.toml" data-target-name="sudoku_wasm">
@@ -50,6 +51,7 @@
   <link data-trunk rel="copy-file" href="home.js">
   <link data-trunk rel="copy-file" href="custom.js">
   <link data-trunk rel="copy-file" href="stats.js">
+  <link data-trunk rel="copy-file" href="techniques.js">
 </head>
 <body>
   <main id="app">
@@ -78,6 +80,7 @@
             </svg>
           </button>
           <ul id="homeMenuList" class="menu-list" hidden>
+            <li><button class="menu-item" data-action="help">How to play</button></li>
             <li><button class="menu-item" data-action="import">Import puzzle</button></li>
             <li><button class="menu-item" data-action="settings">Settings</button></li>
           </ul>
@@ -89,10 +92,18 @@
         <div id="tierButtons" class="nav-grid"></div>
       </section>
 
+      <hr class="sep">
+
       <!-- Custom-spec builder, between the campaign and the in-progress puzzles. -->
       <button id="customBtn" class="nav-btn">
-        <span class="nav-label">Custom puzzle</span>
+        <span class="nav-text">
+          <span class="nav-label">Custom puzzle</span>
+          <span class="nav-sub">Build your own puzzle from any mix of techniques.</span>
+        </span>
       </button>
+
+      <!-- Shown only when at least one Continue card sits below it (home.js). -->
+      <hr id="continueSep" class="sep" hidden>
 
       <div id="continueLast" hidden></div>
       <button id="continueListBtn" class="continue-item" hidden></button>
@@ -164,6 +175,7 @@
           <ul id="menuList" class="menu-list" hidden>
             <li><button class="menu-item" data-action="copy">Export puzzle</button></li>
             <li><button class="menu-item" data-action="restart">Restart</button></li>
+            <li><button class="menu-item" data-action="help">How to play</button></li>
             <li id="menuFill" hidden><button class="menu-item" data-action="fillCandidates">Fill all candidates</button></li>
             <li><button class="menu-item" data-action="settings">Settings</button></li>
           </ul>
@@ -244,6 +256,22 @@
         <span class="iconbtn" aria-hidden="true"></span>
       </header>
       <div id="settingsBody"></div>
+    </section>
+
+    <!-- =========================== HOW TO PLAY ======================== -->
+    <!-- Device-aware reference of the play-view controls (taps vs keyboard).
+         Body filled by home.js; reached from the home and play menus. -->
+    <section id="helpView" class="view" hidden>
+      <header class="topbar">
+        <button id="helpBack" class="iconbtn" aria-label="Back">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="2" d="M15 5l-7 7 7 7"/>
+          </svg>
+        </button>
+        <h1>How to play</h1>
+        <span class="iconbtn" aria-hidden="true"></span>
+      </header>
+      <div id="helpBody"></div>
     </section>
   </main>
 

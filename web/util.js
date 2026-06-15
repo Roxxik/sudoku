@@ -46,8 +46,8 @@ export function techniqueName(id) {
 export const BRANCH_LABEL = {
   trunk: "Trunk",
   fish: "Single-digit (Fish)",
-  subset: "Subsets",
-  bivalue: "Bivalue chains",
+  subset: "Subsets (Naked/Hidden)",
+  bivalue: "Bivalue chains (Wing)",
 };
 
 // Tier display labels, in curriculum order.

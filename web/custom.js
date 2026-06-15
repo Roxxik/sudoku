@@ -31,7 +31,8 @@ let onHome = () => {};
 // page reload -- the builder reopens exactly where it was left.
 let usages = loadUsages();
 let chipEls = []; // kindIndex -> chip button, for in-place updates
-let genBtn = null;
+let playBtn = null; // the two start buttons (Play / Play from first forced)
+let forcedBtn = null;
 let presetSel = null;
 
 const USAGE_LABEL = ["Off", "Allow", "Force", "Concede"];
@@ -94,7 +95,7 @@ export function openCustom(initial) {
 
 function renderBody() {
   const body = document.getElementById("customBody");
-  body.replaceChildren(presetRow(), explainer(), techniqueGroups(), generateButton());
+  body.replaceChildren(presetRow(), explainer(), techniqueGroups(), generateButtons());
   refreshAllChips();
   refreshGenerate();
 }
@@ -220,30 +221,47 @@ function refreshAllChips() {
 }
 
 // ---- Generate ----
-function generateButton() {
+// Two ways to start the assembled spec: Play (the minimal puzzle) and Play from
+// first forced (a head start up to the easiest Forced technique). A spec can force
+// several techniques, so this stops before the first one -- hence "first".
+function generateButtons() {
+  const wrap = document.createElement("div");
+  wrap.className = "spec-actions";
+  playBtn = actionButton("Play", () => generate(false));
+  forcedBtn = actionButton("Play from first forced", () => generate(true));
+  wrap.append(playBtn, forcedBtn);
+  return wrap;
+}
+
+function actionButton(label, onClick) {
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.id = "customGenerate";
   btn.className = "spec-generate";
-  btn.textContent = "Generate";
-  btn.addEventListener("click", generate);
-  genBtn = btn;
+  btn.textContent = label;
+  btn.addEventListener("click", onClick);
   return btn;
 }
 
-// A spec needs at least one Forced technique to be worth generating.
+// A spec needs at least one Forced technique to be worth playing.
 function refreshGenerate() {
-  if (genBtn) genBtn.disabled = !hasForce(usages);
+  const ok = hasForce(usages);
+  if (playBtn) playBtn.disabled = !ok;
+  if (forcedBtn) forcedBtn.disabled = !ok;
 }
 
-function generate() {
+function generate(fromForced) {
   if (!hasForce(usages)) return;
   const snapshot = usages.slice();
-  onGenerate({
+  const req = {
     usages: snapshot,
     label: labelFor(snapshot),
     specMasks: masksFromUsages(snapshot),
-  });
+  };
+  // "Play from first forced" advances the board with the spec's ALLOWED techniques
+  // until a Forced one is needed; app.js derives that allowed set from specMasks,
+  // so the forced-start flag is all that's extra here.
+  if (fromForced) req.fromForced = true;
+  onGenerate(req);
 }
 
 // A short title from the Forced techniques, e.g. "X-Wing" or "Naked Pair + X-Wing".
@@ -257,7 +275,7 @@ function labelFor(u) {
 function explainer() {
   const box = document.createElement("div");
   box.className = "mode-explainer spec-explainer";
-  box.appendChild(plain("Tap a technique to cycle how it's used. Force at least one to generate."));
+  box.appendChild(plain("Tap a technique to cycle how it's used. Force at least one to play."));
   box.appendChild(modeLine("Allow", "may be used to solve the puzzle."));
   box.appendChild(modeLine("Force", "must be needed at least once."));
   box.appendChild(

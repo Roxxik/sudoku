@@ -57,6 +57,7 @@ let finished = false; // true once solved -- freezes the timer
 let onHome = () => {};
 let onNewPuzzle = () => {};
 let onSettings = () => {};
+let onHelp = () => {};
 
 let boardEl, notesBtn, undoBtn, redoBtn;
 
@@ -1456,6 +1457,84 @@ function isInScope(group, masks) {
   return (masks.baseline & (1 << idx)) !== 0;
 }
 
+// "Play from Forced" head start. Run the solver forward from the bare puzzle,
+// applying every MODELLED technique easier than the target until none is left,
+// and return the resulting 81 placements -- the givens plus everything placed up
+// to the point where the forced technique is first needed. It uses the same wasm
+// `hint()` engine the player's hints do, so the stopping point matches the board
+// they then face. Eliminations made along the way are intentionally dropped (the
+// caller keeps no marks); redoing them to make the forced technique apply is part
+// of the exercise.
+//
+// `puzzleLine` is the minimal-clue line; `allowedMask` is the spec's ALLOWED
+// techniques only (`1 << labKind`) -- NOT the forced ones, and NOT conceded/off.
+// Only allowed techniques advance the board; the forced technique is the stopping
+// point (what the player is here to apply), so we never apply it. There is no
+// difficulty filter -- any allowed technique progresses the board, of any
+// difficulty. Since the puzzle requires its forced technique, the allowed set
+// alone gets stuck exactly where a forced technique is first needed. (This also
+// stops a degenerate spec -- e.g. hidden-triple forced but the subsets it needs
+// turned off -- from being fully solved by off-spec techniques.) The board is
+// rebuilt each pass from the placements plus an accumulated candidate mask, so a
+// technique's eliminations carry forward instead of being re-offered. Returns null
+// on any wasm hiccup or an empty allowed set, so the caller falls back to a plain
+// start.
+export function forcedStartValues(puzzleLine, allowedMask) {
+  const wasm = bindings();
+  if (!wasm) return null;
+  if (!allowedMask) return null;
+
+  const cells = new Uint8Array(N);
+  parseLine(puzzleLine, cells);
+  // 0 = unspecified (the Board keeps its grid-derived candidates). Once a
+  // technique strikes a candidate from a cell we seed that cell to all-9 and
+  // clear the struck bits, so the reduced set rides forward to the next pass.
+  const cand = new Uint16Array(N);
+
+  for (let guard = 0; guard < 256; guard++) {
+    let steps, board;
+    try {
+      board = new wasm.Board(cells, cand);
+    } catch {
+      return null;
+    }
+    try {
+      steps = wasm.hint(board);
+    } catch {
+      return null;
+    } finally {
+      board.free();
+    }
+    // Apply every available allowed step (each is a sound deduction on this same
+    // board), then re-derive. Stop once no allowed technique applies -- the board
+    // is "at" the forced technique. Forced/conceded/off techniques are not in
+    // `allowedMask`, so they're never applied.
+    let progressed = false;
+    for (const s of steps) {
+      const labIdx = LAB_KIND[s.technique.id];
+      if (labIdx === undefined) continue;
+      if ((allowedMask & (1 << labIdx)) === 0) continue;
+      for (const d of s.deductions) {
+        if (d.kind === "place") {
+          if (cells[d.cell] === 0) {
+            cells[d.cell] = d.digit;
+            progressed = true;
+          }
+        } else if (cells[d.cell] === 0) {
+          if (cand[d.cell] === 0) cand[d.cell] = 0x1ff;
+          const bit = 1 << (d.digit - 1);
+          if (cand[d.cell] & bit) {
+            cand[d.cell] &= ~bit;
+            progressed = true;
+          }
+        }
+      }
+    }
+    if (!progressed) break;
+  }
+  return Array.from(cells);
+}
+
 // ---- Wiring ----
 // Double-tap detection that never delays a single tap: the first tap acts
 // immediately and records how to undo itself; a second tap on the same digit
@@ -1649,6 +1728,7 @@ function wireTopbar() {
     if (item.dataset.action === "restart") restart();
     else if (item.dataset.action === "fillCandidates") fillAllCandidates();
     else if (item.dataset.action === "settings") onSettings();
+    else if (item.dataset.action === "help") onHelp();
     closeMenu();
   });
 
@@ -1680,10 +1760,11 @@ function wireSolved() {
 
 // Build the board and wire all controls once. `curriculum` maps kindIndex -> id
 // for the title; the callbacks navigate the app shell.
-export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onSettings: settings }) {
+export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onSettings: settings, onHelp: help }) {
   onHome = home;
   onNewPuzzle = newPuzzle;
   onSettings = settings;
+  onHelp = help || (() => {});
   idByKind = {};
   for (const t of curriculum) idByKind[t.kindIndex] = t.id;
 

@@ -11,6 +11,15 @@ import { formatDuration, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js
 import { miniBoard, textColumn, copyText } from "./ui.js";
 import { cheatOn } from "./cheat.js";
 
+// Per-kind stat buckets, in display order: each mode split into a plain Play and a
+// Play-from-Forced (the head start is tracked separately, matching statsByKind).
+const STAT_STARTS = [
+  ["train", "Train"],
+  ["trainForced", "Train · forced"],
+  ["drill", "Drill"],
+  ["drillForced", "Drill · forced"],
+];
+
 let curriculum = [];
 let onOpenSpec = () => {};
 
@@ -54,9 +63,9 @@ export function renderStats() {
     table.className = "stats-table";
     table.appendChild(headerRow());
     for (const t of entries) {
-      for (const mode of ["train", "drill"]) {
-        const m = stats[t.kindIndex][mode];
-        if (m) table.appendChild(dataRow(t, mode, m));
+      for (const [key, label] of STAT_STARTS) {
+        const m = stats[t.kindIndex][key];
+        if (m) table.appendChild(dataRow(t, label, m));
       }
     }
     body.appendChild(table);
@@ -184,11 +193,11 @@ function headerRow() {
   return tr;
 }
 
-function dataRow(t, mode, m) {
+function dataRow(t, modeLabel, m) {
   const tr = document.createElement("tr");
   const cells = [
     [techniqueName(t.id), "col-tech"],
-    [mode === "drill" ? "Drill" : "Train", "col-mode"],
+    [modeLabel, "col-mode"],
     [String(m.count), "col-num"],
     [formatDuration(m.bestMs), "col-num"],
     [formatDuration(m.avgMs), "col-num"],

@@ -50,6 +50,9 @@ function newId() {
 //   attempts: rejection-sampling attempts the generator spent (debug only; absent
 //             on old records). Shown under cheat next to the seed.
 //   value: number[81]         player placements (0 = empty),
+//   fromForced: bool          started via "Play from Forced" (a head start was
+//                             pre-placed). Tracked separately from a plain Play in
+//                             the per-mode stats; absent on old records -> false.
 //   centerMarks: number[][81] centred "usual" pencil notes per cell,
 //   cornerMarks: number[][81] Snyder corner notes per cell,
 //   (legacy records may carry `marks`; play.js loads it as centerMarks)
@@ -73,7 +76,11 @@ function newId() {
 
 // Create and persist a fresh active game from a generated puzzle. `kindIndex` is
 // null for a custom game; `spec`/`specMasks`/`label` are the custom extras; `seed`
-// and `attempts` are the worker's debug metadata (cheat-mode display).
+// and `attempts` are the worker's debug metadata (cheat-mode display). `value` is
+// an optional 81-cell starting placement (the "Play from Forced" head start —
+// digits the solver placed up to the first forced technique); it defaults to a
+// blank board. These are ordinary player placements, not givens, so Restart wipes
+// them back to the minimal clues.
 export function createGame({
   kindIndex = null,
   mode,
@@ -85,6 +92,8 @@ export function createGame({
   givens,
   seed,
   attempts,
+  value = null,
+  fromForced = false,
 }) {
   const game = {
     id: newId(),
@@ -98,7 +107,8 @@ export function createGame({
     givens,
     seed: seed || null,
     attempts: attempts ?? null,
-    value: new Array(N).fill(0),
+    fromForced: !!fromForced,
+    value: Array.isArray(value) && value.length === N ? value.slice() : new Array(N).fill(0),
     centerMarks: Array.from({ length: N }, () => []),
     cornerMarks: Array.from({ length: N }, () => []),
     history: [],
@@ -159,9 +169,12 @@ export function solvedGames() {
 
 // ---- Aggregates for badges and the Stats page ----
 
-// Per (kindIndex, mode) summary over SOLVED games:
-//   { [kindIndex]: { train: {count, bestMs, avgMs, lastMs}, drill: {...} } }
-// Modes with no solves are omitted. bestMs is the fastest solve, avgMs the mean.
+// Per (kindIndex, start) summary over SOLVED games, where `start` splits each mode
+// by whether it was a plain Play or a "Play from Forced":
+//   { [kindIndex]: { train, trainForced, drill, drillForced } }
+// each value { count, bestMs, avgMs, lastMs }. Starts with no solves are omitted.
+// A plain Play and a forced-start solve are distinct accomplishments, so they
+// never share a bucket. bestMs is the fastest solve, avgMs the mean.
 export function statsByKind() {
   const out = {};
   for (const g of loadAll()) {
@@ -170,7 +183,8 @@ export function statsByKind() {
     // per-kind badges and Stats table.
     if (typeof g.kindIndex !== "number") continue;
     const k = (out[g.kindIndex] ||= {});
-    const m = (k[g.mode] ||= { count: 0, bestMs: Infinity, avgMs: 0, lastMs: 0, _sum: 0 });
+    const key = g.mode + (g.fromForced ? "Forced" : "");
+    const m = (k[key] ||= { count: 0, bestMs: Infinity, avgMs: 0, lastMs: 0, _sum: 0 });
     m.count += 1;
     m._sum += g.elapsedMs;
     m.avgMs = m._sum / m.count;
@@ -183,9 +197,12 @@ export function statsByKind() {
   return out;
 }
 
-// Total solved count for one kind across both modes -- the technique-row badge.
+// Total solved count for one kind across every mode/start -- the technique-row
+// and tier/branch badges.
 export function solvedCountForKind(stats, kindIndex) {
   const k = stats[kindIndex];
   if (!k) return 0;
-  return (k.train?.count || 0) + (k.drill?.count || 0);
+  let n = 0;
+  for (const m of Object.values(k)) n += m.count || 0;
+  return n;
 }

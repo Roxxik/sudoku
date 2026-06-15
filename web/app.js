@@ -16,7 +16,7 @@ let wasm, gen, play, stats, custom;
 let heavyReady;
 
 // ---- View routing ----
-const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView", "settingsView"];
+const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView", "settingsView", "helpView"];
 
 function showView(id) {
   for (const v of VIEWS) {
@@ -84,11 +84,41 @@ function goPlay() {
   showView("playView");
 }
 
+// The spec's ALLOWED techniques (baseline minus the forced ones) for a forced-start
+// launch -- only these advance the board, so the head start follows the intended
+// path and stops at the forced technique. A custom spec carries its own masks; a
+// campaign launch reads the isolated builder's masks (the spec generateLab actually
+// used) via the warmed wasm bridge. Null on any miss -> the caller falls back to a
+// plain start.
+function allowedMaskFor(req) {
+  let masks = req.specMasks;
+  if (!masks) {
+    const w = wasm && wasm.bindings();
+    if (!w) return null;
+    try {
+      masks = w.specMasksIsolated(req.kindIndex, req.mode === "drill");
+    } catch {
+      return null;
+    }
+  }
+  return masks.baseline & ~masks.forced;
+}
+
 // Open Settings from the play view: freeze the solve clock, and route the
 // settings back button to return to the board and resume where it left off.
 function openSettingsFromPlay() {
   play.pause();
   home.openSettings(() => {
+    showView("playView");
+    play.resume();
+  });
+}
+
+// Open How-to-play from the play view: same pause/resume routing as Settings, so
+// reading the controls doesn't run the solve clock.
+function openHelpFromPlay() {
+  play.pause();
+  home.openHelp(() => {
     showView("playView");
     play.resume();
   });
@@ -155,6 +185,28 @@ async function launch(req, uncapped = false) {
     }
     return;
   }
+  // "Play from Forced": advance the solver to the first forced technique and seed
+  // the board with the digits placed along the way. Computed before the spinner
+  // clears so any brief solve cost stays hidden; a null result (wasm not warmed,
+  // or nothing easier to place -- e.g. hidden single) falls back to a plain start.
+  // The cutoff is the forced technique's difficulty: a custom spec passes its own
+  // (its first/easiest forced technique); a campaign launch derives it from the
+  // target kind.
+  let startValue = null;
+  if (req.fromForced) {
+    await wasm.ready(); // the head start runs on the main-thread solver bridge
+    const allowed = allowedMaskFor(req);
+    if (allowed) {
+      startValue = play.forcedStartValues(result.puzzle, allowed);
+      if (startValue) {
+        // Keep only the advanced placements: givens live in the puzzle line, not
+        // in value[], so the board preview and Restart treat them as clues.
+        for (let i = 0; i < startValue.length; i++) {
+          if (result.puzzle[i] >= "1" && result.puzzle[i] <= "9") startValue[i] = 0;
+        }
+      }
+    }
+  }
   hideLoading();
   // The worker also returns debug metadata (decimal-string u64 seed + the attempt
   // count) for the cheat-mode display.
@@ -169,6 +221,8 @@ async function launch(req, uncapped = false) {
         givens: result.givens,
         seed: result.seed,
         attempts: result.attempts,
+        value: startValue,
+        fromForced: !!req.fromForced,
       })
     : store.createGame({
         kindIndex: req.kindIndex,
@@ -178,6 +232,8 @@ async function launch(req, uncapped = false) {
         givens: result.givens,
         seed: result.seed,
         attempts: result.attempts,
+        value: startValue,
+        fromForced: !!req.fromForced,
       });
   play.loadGame(game);
   goPlay();
@@ -243,7 +299,7 @@ function boot() {
   home.initHome({
     curriculum: CURRICULUM,
     showView,
-    onLaunch: (kindIndex, mode) => launch({ kindIndex, mode }),
+    onLaunch: (kindIndex, mode, fromForced) => launch({ kindIndex, mode, fromForced }),
     onResume: resume,
     onStats: goStats,
     onCustom: openCustomView,
@@ -270,6 +326,7 @@ function boot() {
       onHome: goHome,
       onNewPuzzle: regenerate,
       onSettings: openSettingsFromPlay,
+      onHelp: openHelpFromPlay,
     });
     stats.initStats({
       curriculum: CURRICULUM,
