@@ -153,6 +153,15 @@ function boardMatches(s) {
 function commit(mutate) {
   const before = snapshot();
   mutate();
+  return commitSnapshot(before);
+}
+
+// Finalize an already-applied change as one undo step: push `before` iff the
+// board differs from it now, then clear redo, persist and check for a win.
+// `commit` takes `before` right before its mutation; gestures that mutate
+// optimistically as they go (the locked-digit drag paint) take it once up front
+// and call this at the end, so the whole gesture collapses to a single entry.
+function commitSnapshot(before) {
   if (boardMatches(before)) return false;
   history.push(before);
   redoStack.length = 0; // a fresh move invalidates the redo branch
@@ -302,6 +311,18 @@ function buildBoard() {
   boardEl.addEventListener("pointermove", onBoardPointerMove);
   boardEl.addEventListener("pointerup", onBoardPointerUp);
   boardEl.addEventListener("pointercancel", onBoardPointerUp);
+
+  // A press on the page background -- anywhere on the play view that isn't the
+  // board or a control (the top bar / pad / hint panel) -- drops the selection,
+  // the way clicking off a widget dismisses it. Cell and button presses match a
+  // region and bubble through untouched.
+  document.addEventListener("pointerdown", (e) => {
+    if (!playVisible()) return;
+    if (e.target.closest("#board, #playPad, #hintPanel, .topbar")) return;
+    if (selection.size === 0 && cursor === null) return;
+    clearSelection();
+    render();
+  });
 }
 
 // ---- Peer relationship (row / col / box) for selection highlighting. ----
@@ -462,10 +483,11 @@ let preTapSelection = null; // selection before an optimistic single-select tap
 function onCellPointerDown(i, e) {
   e.preventDefault();
   if (finished) return;
-  // With a digit pen-locked a board tap places it (and a double-tap pencils the
-  // opposite); there is no multi-select in that mode.
+  // With a digit pen-locked a board press places it (and a double-tap pencils
+  // the opposite); there is no multi-select in that mode. Dragging after a press
+  // that pencils a note paints that note across the cells it crosses.
   if (activeDigit !== 0) {
-    onCellTap(i);
+    onLockedPointerDown(i, e);
     return;
   }
 
@@ -502,13 +524,20 @@ function onCellPointerDown(i, e) {
   }
 }
 
-// Drag-paint: add each newly entered cell to the selection. A drag is never a
-// tap, so it disarms double-tap detection and commits the selection (no rollback).
+// Drag-paint as the pointer enters each new cell. A drag is never a tap, so it
+// disarms double-tap detection. With a digit pen-locked a mark gesture paints
+// that note across the crossed cells (value placements don't extend); otherwise
+// the gesture grows the selection.
 function onBoardPointerMove(e) {
   if (gesturePointer === null || e.pointerId !== gesturePointer) return;
   const i = cellIndexAt(e.clientX, e.clientY);
   if (i < 0 || i === lastPaintCell) return;
   lastPaintCell = i;
+  if (gestureLocked) {
+    lastCell = -1; // a drag is never a tap -> no double-tap next
+    if (lockMark) paintLockCell(i);
+    return;
+  }
   lastSelCell = -1;
   preTapSelection = null;
   if (selection.has(i)) cursor = i;
@@ -523,6 +552,15 @@ function onBoardPointerUp(e) {
     /* ignore */
   }
   gesturePointer = null;
+  if (gestureLocked) {
+    // Commit the whole gesture -- pressed cell plus any painted cells -- as one
+    // undo step (cellSinglePushed lets a following double-tap roll it back).
+    cellSinglePushed = commitSnapshot(lockBefore);
+    gestureLocked = false;
+    lockMark = null;
+    lockBefore = null;
+    lockPainted = null;
+  }
 }
 
 // The cell index under a viewport point, or -1 if the point isn't on a board
@@ -538,34 +576,84 @@ function cellIndexAt(x, y) {
 // Cell-tap state for pen-lock double-tap detection (place <-> note).
 let lastCell = -1;
 let lastCellTime = 0;
-let cellSinglePushed = false; // the last cell single-tap recorded an undo entry
+let cellSinglePushed = false; // the last locked gesture recorded an undo entry
+// State of the in-flight locked gesture (a board press while a digit is locked).
+let gestureLocked = false; // true between a locked pointerdown and its release
+let lockBefore = null; // board snapshot at the gesture's start, for a one-step undo
+let lockMark = null; // {corner, add, d} brush for a mark-painting drag, else null
+let lockPainted = null; // cells already painted this gesture (paint each once)
 
-// Board tap with a digit pen-locked: a tap places that digit, and a double-tap on
-// the same cell instead applies the opposite mode -- so if normal taps place
-// values, double-tapping pencils a mark, and vice-versa. Only reached while
-// locked; the unlocked path is the selection gesture above.
-function onCellTap(i) {
-  if (finished) return;
+// Extend a mark-painting drag onto one cell, at most once per gesture. The
+// direction is fixed by the anchor (`add`), so a drag only ever adds the mark or
+// only ever removes it -- never toggles per cell -- and crossing a cell that
+// already matches is a no-op. Values are left untouched; only the active note
+// kind on empty, non-clue cells changes.
+function paintLockCell(i) {
+  if (lockPainted.has(i)) return;
+  lockPainted.add(i);
+  const { corner, add, d } = lockMark;
+  const set = corner ? cornerMarks[i] : centerMarks[i];
+  if (add) {
+    if (given[i] === 0 && value[i] === 0) set.add(d);
+  } else if (given[i] === 0) {
+    set.delete(d);
+  }
+  render();
+}
+
+// Board press with a digit pen-locked: the pressed cell takes the normal action
+// (place the value, or pencil a note in mark mode), and a double-tap on the same
+// cell takes the opposite action -- so place mode's double-tap pencils a note and
+// mark mode's double-tap places the value. A drag after the press extends only
+// the *note* variants (onBoardPointerMove): placing a value is a single-cell
+// affordance, but pencilling marks paints across every cell the pointer crosses.
+// The whole gesture commits as one undo step at release (onBoardPointerUp). Only
+// reached while locked; the unlocked path is the selection gesture above.
+function onLockedPointerDown(i, e) {
   const now = performance.now();
   const isDouble = i === lastCell && now - lastCellTime < DOUBLE_MS;
-  lastCellTime = now;
+  const d = activeDigit;
 
-  if (isDouble) {
-    lastCell = -1; // don't let a third quick tap read as another double
-    // Roll the single tap back, then commit the opposite as one undo step.
-    if (cellSinglePushed) {
-      applySnapshot(history.pop());
-      cellSinglePushed = false;
-      updateHistoryButtons();
-    }
-    commit(() => applyOppositeToCell(i, activeDigit)); // the other thing
-    render();
-    return;
+  // A double-tap nets to "the opposite action": roll the prior single tap's
+  // commit back first so the whole double stays one undo step.
+  if (isDouble && cellSinglePushed) {
+    applySnapshot(history.pop());
+    cellSinglePushed = false;
+    updateHistoryButtons();
   }
 
-  lastCell = i;
-  cellSinglePushed = commit(() => applyDigitToCell(i, activeDigit));
+  gesturePointer = e.pointerId;
+  gestureLocked = true;
+  lastPaintCell = i;
+  try {
+    boardEl.setPointerCapture(e.pointerId);
+  } catch {
+    /* ignore */
+  }
+
+  // Whether this gesture pencils a mark (the only kind a drag extends). The
+  // normal action pencils in mark mode; the opposite action pencils in place
+  // mode -- i.e. exactly when `placing === isDouble`. For a mark gesture the drag
+  // brush adds the note iff the anchor doesn't already carry it (else removes),
+  // fixing one direction for the whole drag.
+  lockBefore = snapshot();
+  if (placing === isDouble) {
+    const corner = markKind === MODE_CORNER;
+    const set = corner ? cornerMarks[i] : centerMarks[i];
+    lockMark = { corner, add: !set.has(d), d };
+  } else {
+    lockMark = null; // a value placement: only the pressed cell takes it
+  }
+  lockPainted = new Set([i]);
+
+  // The pressed cell always gets the full single-cell action (value <-> note
+  // conversion, peer elimination); the drag, if any, only paints marks.
+  (isDouble ? applyOppositeToCell : applyDigitToCell)(i, d);
   render();
+
+  // A double consumes the pair; a single arms one for a quick repeat tap.
+  lastCell = isDouble ? -1 : i;
+  lastCellTime = now;
 }
 
 // Arrow-key movement. `extend` (Shift held) grows the selection by adding the
