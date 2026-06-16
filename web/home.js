@@ -615,7 +615,8 @@ const HELP_RULES = [
 ];
 
 const HELP_TOUCH = [
-  ["Select a cell", "Tap it."],
+  ["Select a cell", "Tap it. A single tap always selects just that one cell."],
+  ["Select several cells", "Drag across the grid to paint a selection. Double-tap a cell to add it to the selection, or double-tap then drag to add a whole region. A digit, note, or erase then applies to every selected cell at once. Works only while no number is locked."],
   ["Place a digit", "Select a cell, then tap a number. Tap the same number again to clear it."],
   ["Lock a digit", "Double-tap a number to lock it; every cell you then tap gets that digit. Tap it once more to unlock, or double-tap a different number to switch."],
   ["Pencil notes", "Tap Notes to switch between placing digits and pencilling notes."],
@@ -627,7 +628,8 @@ const HELP_TOUCH = [
 ];
 
 const HELP_KEYBOARD = [
-  ["Move the selection", "Arrow keys."],
+  ["Move the selection", "Arrow keys. A single click always selects just one cell."],
+  ["Select several cells", "Click and drag to paint a selection, Shift+click to add a cell, or hold Shift with the arrow keys to extend it. A digit, note, or erase then applies to every selected cell at once. Works only while no digit is locked."],
   ["Place a digit", "Press 1–9. Press the same digit again to clear the cell."],
   ["Erase", "0, Backspace, or Delete."],
   ["Pencil notes", "Press n to switch between placing digits and pencilling notes."],

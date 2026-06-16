@@ -30,7 +30,14 @@ const centerMarks = Array.from({ length: N }, () => new Set());
 const cornerMarks = Array.from({ length: N }, () => new Set());
 const solution = new Array(N).fill(0);
 
-let selected = null; // index 0..80, or null
+// Cell selection. Multi-cell selection is active whenever no digit is pen-locked
+// (activeDigit === 0), so a place / note / erase can act on every selected cell at
+// once. `selection` holds the chosen cell indices; `cursor` is the most-recently
+// touched cell -- it drives arrow-key movement and, when exactly one cell is
+// selected, the peer / same-digit highlight. A plain single tap or click always
+// collapses the selection back to that one cell (see the gesture handlers below).
+let selection = new Set(); // selected cell indices (0..80)
+let cursor = null; // anchor / last-touched cell, or null
 // Input mode is two independent pieces of state:
 //   `placing` : true -> taps place values; false -> taps pencil a note.
 //   `markKind`: which note kind (Center or Corner) marking uses -- remembered
@@ -281,14 +288,20 @@ function buildBoard() {
     cell.appendChild(centerEl);
     cell.appendChild(valueEl);
 
-    cell.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      onCellTap(i);
-    });
+    cell.addEventListener("pointerdown", (e) => onCellPointerDown(i, e));
 
     boardEl.appendChild(cell);
     cells.push(cell);
   }
+
+  // Drag-paint / release are handled at the board level so the gesture keeps
+  // running while the pointer crosses cell borders (and, with pointer capture,
+  // even when it leaves the board). The hovered cell is found by hit-testing,
+  // which works for both mouse and touch (a touch pointer is otherwise pinned to
+  // the cell it started on).
+  boardEl.addEventListener("pointermove", onBoardPointerMove);
+  boardEl.addEventListener("pointerup", onBoardPointerUp);
+  boardEl.addEventListener("pointercancel", onBoardPointerUp);
 }
 
 // ---- Peer relationship (row / col / box) for selection highlighting. ----
@@ -309,10 +322,14 @@ function digitAt(i) {
 
 // ---- Rendering ----
 function render() {
-  // The highlighted digit is the pen-locked digit if any, else whatever sits
-  // in the selected cell.
+  // Peer / same-digit highlighting is a single-cell affordance: it only makes
+  // sense when exactly one cell is selected (a multi-cell selection would smear
+  // peers all over the board). `single` is that lone cell, else null.
+  const single = selection.size === 1 ? selection.values().next().value : null;
+  // The highlighted digit is the pen-locked digit if any, else whatever sits in
+  // the single selected cell (nothing when several cells are selected).
   const highlightDigit =
-    activeDigit !== 0 ? activeDigit : selected !== null ? digitAt(selected) : 0;
+    activeDigit !== 0 ? activeDigit : single !== null ? digitAt(single) : 0;
 
   for (let i = 0; i < N; i++) {
     const cell = cells[i];
@@ -332,12 +349,13 @@ function render() {
     // Pencil marks only show on an empty cell.
     renderNotes(cell, i, d === 0);
 
-    // Highlight classes.
-    cell.classList.toggle("selected", i === selected);
-    cell.classList.toggle("peer", selected !== null && isPeer(selected, i));
+    // Highlight classes. Every selected cell gets `selected`; peer / same only
+    // light up for a lone selection.
+    cell.classList.toggle("selected", selection.has(i));
+    cell.classList.toggle("peer", single !== null && isPeer(single, i));
     cell.classList.toggle(
       "same",
-      highlightDigit !== 0 && i !== selected && d === highlightDigit
+      highlightDigit !== 0 && !selection.has(i) && d === highlightDigit
     );
   }
 }
@@ -403,9 +421,118 @@ function onSolved() {
 }
 
 // ---- Actions ----
+// Collapse the selection to a single cell (the plain tap / arrow behaviour).
 function select(i) {
-  selected = i;
+  selection = new Set([i]);
+  cursor = i;
   render();
+}
+
+// Add cells to the current selection (drag-paint, shift / double-tap add,
+// shift+arrows). The last one becomes the cursor.
+function addToSelection(...idxs) {
+  for (const i of idxs) selection.add(i);
+  if (idxs.length) cursor = idxs[idxs.length - 1];
+  render();
+}
+
+// Drop the whole selection (pen-lock takes over the highlight, hint opens, etc.).
+function clearSelection() {
+  selection = new Set();
+  cursor = null;
+}
+
+// ---- Multi-cell selection gestures (only while no digit is pen-locked) ----
+// The selection grows by dragging across cells and by additive taps. The
+// additive modifier is Shift on a keyboard; on touch, where there is no Shift, a
+// quick double-tap stands in for it. To keep "every single tap just selects one
+// cell" true while still letting a double-tap add, the first tap optimistically
+// collapses the selection to that one cell but remembers the prior selection; a
+// second tap within DOUBLE_MS restores it and adds the cell, so the double-tap
+// nets to an additive add. (Same optimistic-rollback idiom as the pad's pen-lock
+// double-tap.) Gestures: tap = select one; drag = paint a fresh selection;
+// shift-tap / double-tap = add a cell; shift-drag / double-tap-drag = additive
+// paint; shift+arrows = extend by one (see moveSelection).
+let gesturePointer = null; // pointerId of the active board gesture, or null
+let lastPaintCell = -1; // last cell the drag painted, to skip repeats
+let lastSelCell = -1; // last cell tapped, for double-tap-to-add detection
+let lastSelTime = 0;
+let preTapSelection = null; // selection before an optimistic single-select tap
+
+function onCellPointerDown(i, e) {
+  e.preventDefault();
+  if (finished) return;
+  // With a digit pen-locked a board tap places it (and a double-tap pencils the
+  // opposite); there is no multi-select in that mode.
+  if (activeDigit !== 0) {
+    onCellTap(i);
+    return;
+  }
+
+  const now = performance.now();
+  const isDouble = i === lastSelCell && now - lastSelTime < DOUBLE_MS;
+
+  gesturePointer = e.pointerId;
+  lastPaintCell = i;
+  try {
+    boardEl.setPointerCapture(e.pointerId);
+  } catch {
+    /* ignore */
+  }
+
+  if (e.shiftKey) {
+    // Held modifier: add to the existing selection straight away.
+    addToSelection(i);
+    preTapSelection = null;
+  } else if (isDouble) {
+    // Touch additive: undo the first tap's optimistic collapse, then add.
+    if (preTapSelection) selection = preTapSelection;
+    addToSelection(i);
+    preTapSelection = null;
+    lastSelCell = -1; // a third quick tap shouldn't read as another double
+  } else {
+    // Plain tap: optimistically select just this cell, keeping the prior
+    // selection in case a double-tap follows to make this additive.
+    preTapSelection = selection;
+    select(i);
+  }
+  if (!isDouble) {
+    lastSelCell = i;
+    lastSelTime = now;
+  }
+}
+
+// Drag-paint: add each newly entered cell to the selection. A drag is never a
+// tap, so it disarms double-tap detection and commits the selection (no rollback).
+function onBoardPointerMove(e) {
+  if (gesturePointer === null || e.pointerId !== gesturePointer) return;
+  const i = cellIndexAt(e.clientX, e.clientY);
+  if (i < 0 || i === lastPaintCell) return;
+  lastPaintCell = i;
+  lastSelCell = -1;
+  preTapSelection = null;
+  if (selection.has(i)) cursor = i;
+  else addToSelection(i);
+}
+
+function onBoardPointerUp(e) {
+  if (gesturePointer === null || e.pointerId !== gesturePointer) return;
+  try {
+    boardEl.releasePointerCapture(e.pointerId);
+  } catch {
+    /* ignore */
+  }
+  gesturePointer = null;
+}
+
+// The cell index under a viewport point, or -1 if the point isn't on a board
+// cell. Used instead of the event target so a touch-drag (whose pointer is pinned
+// to the cell it started on) still paints the cell actually under the finger.
+function cellIndexAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const cell = el && el.closest(".cell");
+  if (!cell || !boardEl.contains(cell)) return -1;
+  return Number(cell.dataset.idx);
 }
 
 // Cell-tap state for pen-lock double-tap detection (place <-> note).
@@ -413,17 +540,12 @@ let lastCell = -1;
 let lastCellTime = 0;
 let cellSinglePushed = false; // the last cell single-tap recorded an undo entry
 
-// Board tap. Without a pen-locked digit this just selects the cell. With one,
-// a tap places that digit (no selection highlight needed while placing), and a
-// double-tap on the same cell instead applies the opposite mode -- so if normal
-// taps place values, double-tapping pencils a mark, and vice-versa.
+// Board tap with a digit pen-locked: a tap places that digit, and a double-tap on
+// the same cell instead applies the opposite mode -- so if normal taps place
+// values, double-tapping pencils a mark, and vice-versa. Only reached while
+// locked; the unlocked path is the selection gesture above.
 function onCellTap(i) {
   if (finished) return;
-  if (activeDigit === 0) {
-    select(i);
-    return;
-  }
-
   const now = performance.now();
   const isDouble = i === lastCell && now - lastCellTime < DOUBLE_MS;
   lastCellTime = now;
@@ -446,16 +568,21 @@ function onCellTap(i) {
   render();
 }
 
-function moveSelection(dr, dc) {
-  if (selected === null) {
+// Arrow-key movement. `extend` (Shift held) grows the selection by adding the
+// cell stepped into; otherwise the selection collapses to that one cell.
+function moveSelection(dr, dc, extend) {
+  if (cursor === null) {
     select(0);
     return;
   }
-  let r = Math.floor(selected / 9) + dr;
-  let c = (selected % 9) + dc;
+  let r = Math.floor(cursor / 9) + dr;
+  let c = (cursor % 9) + dc;
   r = (r + 9) % 9;
   c = (c + 9) % 9;
-  select(r * 9 + c);
+  const ni = r * 9 + c;
+  // Extending is a multi-select action, so only while no digit is pen-locked.
+  if (extend && activeDigit === 0) addToSelection(ni);
+  else select(ni);
 }
 
 // Place / toggle a digit (or pencil mark) into a specific cell, per the global
@@ -519,9 +646,44 @@ function applyOppositeToCell(i, d) {
   }
 }
 
+// Apply a digit across the whole selection in one undoable step, with uniform
+// toggle semantics so a bulk edit is predictable: a value is removed only if
+// *every* settable cell already shows it (else it's placed in all); a note is
+// removed only if every markable cell already carries it (else added to all).
+// For a single selected cell this reduces to the same toggle applyDigitToCell did.
+function applyDigitToSelection(d) {
+  if (placing) {
+    // Values go into non-clue cells.
+    const targets = [...selection].filter((i) => given[i] === 0);
+    if (!targets.length) return;
+    const clearing = targets.every((i) => value[i] === d);
+    for (const i of targets) {
+      if (clearing) {
+        value[i] = 0;
+      } else {
+        value[i] = d;
+        centerMarks[i].clear();
+        cornerMarks[i].clear();
+      }
+    }
+    // A placed digit can't be a candidate in any peer of any filled cell.
+    if (!clearing && eliminateOn()) for (const i of targets) clearPeerMarks(i, d);
+  } else {
+    // Notes only go into empty, non-clue cells (a value would hide them).
+    const target = markKind === MODE_CORNER ? cornerMarks : centerMarks;
+    const targets = [...selection].filter((i) => given[i] === 0 && value[i] === 0);
+    if (!targets.length) return;
+    const clearing = targets.every((i) => target[i].has(d));
+    for (const i of targets) {
+      if (clearing) target[i].delete(d);
+      else target[i].add(d);
+    }
+  }
+}
+
 function inputDigit(d) {
-  if (finished || selected === null) return false;
-  const pushed = commit(() => applyDigitToCell(selected, d));
+  if (finished || selection.size === 0) return false;
+  const pushed = commit(() => applyDigitToSelection(d));
   render();
   return pushed;
 }
@@ -529,18 +691,22 @@ function inputDigit(d) {
 // Set the pen-locked digit (0 clears it) and refresh the highlight.
 function setLock(d) {
   activeDigit = d;
-  if (activeDigit !== 0) selected = null; // pen mode owns the highlight
+  if (activeDigit !== 0) clearSelection(); // pen mode owns the highlight
   updateDigitButtons();
   render();
 }
 
+// Erase the value and both note kinds from every selected (non-clue) cell, as
+// one undo step.
 function erase() {
-  if (finished || selected === null) return;
+  if (finished || selection.size === 0) return;
   commit(() => {
-    if (given[selected] !== 0) return;
-    value[selected] = 0;
-    centerMarks[selected].clear();
-    cornerMarks[selected].clear();
+    for (const i of selection) {
+      if (given[i] !== 0) continue;
+      value[i] = 0;
+      centerMarks[i].clear();
+      cornerMarks[i].clear();
+    }
   });
   render();
 }
@@ -609,7 +775,7 @@ function restart() {
     centerMarks[i] = new Set();
     cornerMarks[i] = new Set();
   }
-  selected = null;
+  clearSelection();
   activeDigit = 0;
   placing = true;
   markKind = MODE_CENTER;
@@ -621,6 +787,8 @@ function restart() {
   lastDigit = 0;
   lastCell = -1;
   lastNotesTap = 0;
+  lastSelCell = -1;
+  preTapSelection = null;
   firstTapWasLocked = false;
   digitSinglePushed = false;
   cellSinglePushed = false;
@@ -780,7 +948,7 @@ function openHint() {
   };
   // Drop any cell selection so its highlight (selected/peer/same) doesn't mix
   // with the hint's own region/cell highlights.
-  selected = null;
+  clearSelection();
   render();
   clearHighlights();
 
@@ -1326,7 +1494,7 @@ export function loadGame(g) {
   redoStack.length = 0;
   for (const s of g.history || []) history.push(snapshotFromJSON(s));
   for (const s of g.redo || []) redoStack.push(snapshotFromJSON(s));
-  selected = null;
+  clearSelection();
   activeDigit = 0;
   placing = true;
   markKind = MODE_CENTER;
@@ -1337,6 +1505,8 @@ export function loadGame(g) {
   lastDigit = 0;
   lastCell = -1;
   lastNotesTap = 0;
+  lastSelCell = -1;
+  preTapSelection = null;
   firstTapWasLocked = false;
   digitSinglePushed = false;
   cellSinglePushed = false;
@@ -1619,13 +1789,13 @@ function wireKeyboard() {
     } else if (e.key === "0" || e.key === "Backspace" || e.key === "Delete") {
       erase();
     } else if (e.key === "ArrowUp") {
-      moveSelection(-1, 0);
+      moveSelection(-1, 0, e.shiftKey);
     } else if (e.key === "ArrowDown") {
-      moveSelection(1, 0);
+      moveSelection(1, 0, e.shiftKey);
     } else if (e.key === "ArrowLeft") {
-      moveSelection(0, -1);
+      moveSelection(0, -1, e.shiftKey);
     } else if (e.key === "ArrowRight") {
-      moveSelection(0, 1);
+      moveSelection(0, 1, e.shiftKey);
     } else if (e.key === "n") {
       togglePlacing(); // place <-> mark
     } else if (e.key === "N") {
