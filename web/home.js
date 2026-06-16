@@ -617,11 +617,13 @@ const HELP_RULES = [
 const HELP_TOUCH = [
   ["Select a cell", "Tap it. A single tap always selects just that one cell."],
   ["Select several cells", "Drag across the grid to paint a selection. Double-tap a cell to add it to the selection, or double-tap then drag to add a whole region. A digit, note, or erase then applies to every selected cell at once. Works only while no number is locked."],
+  ["Clear the selection", "Tap the empty space around the board to drop the current selection."],
   ["Place a digit", "Select a cell, then tap a number. Tap the same number again to clear it."],
   ["Lock a digit", "Double-tap a number to lock it; every cell you then tap gets that digit. Tap it once more to unlock, or double-tap a different number to switch."],
   ["Pencil notes", "Tap Notes to switch between placing digits and pencilling notes."],
   ["Switch note style", "Double-tap Notes to swap between center notes and corner (Snyder) notes."],
   ["Quick opposite", "With a digit locked, double-tap a cell to do the opposite of your current mode — pencil a note while placing, or place while noting."],
+  ["Paint notes", "With a digit locked, a note gesture can sweep: press and drag to pencil that note across every cell the pointer crosses, all as one move. In Notes mode that's a single press-and-drag; while placing digits it's a double-tap-and-drag (placing a value stays one cell). The first cell sets the direction — add or clear — so cells that already match are left untouched."],
   ["Erase", "Tap Erase, or re-tap a digit you placed."],
   ["Undo / Redo", "The Undo and Redo buttons step back and forth through your moves."],
   ["Hint", "Tap Hint to see if you've made a mistake, or which technique could apply next."],
