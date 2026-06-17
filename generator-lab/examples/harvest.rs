@@ -1,17 +1,27 @@
-//! Scan a contiguous seed range for ONE spec through the W=8 SIMT warp and report what it
-//! found, so a wrapping script can quantify rarity and resume:
+//! Scan a contiguous seed range for ONE spec and report what it found, so a wrapping script
+//! can quantify rarity and resume:
 //!   - each hit's `seed puzzle` to STDOUT (seed-sorted), for the script to keep as samples;
-//!   - a parseable one-line summary to STDERR: `spec=.. base=.. attempts=.. hits=.. next=..`.
+//!   - a parseable one-line summary to STDERR: `spec=.. base=.. attempts=.. hits=.. next=..
+//!     path=simt|scalar`.
 //!
 //! `next` is the first un-scanned seed (`base + attempts`), so the script continues there and
 //! never rescans the same (often empty) range.
 //!
 //! One seed = one attempt; `--attempts N` scans `[seed, seed+N)` exactly -- which seeds yield is
-//! a pure function of the seed (lane-for-lane identical to the scalar `attempt`). Most seeds
-//! yield nothing, so a rare spec reports `hits=0` over the range and its `1 in X` rarity is
-//! then only known to exceed N. The budget is the CLI's job here; the combination sweep
-//! (all Expert singles / doubles / triples) and the rarity table live in `scripts/rarity`,
-//! which loops this one spec at a time.
+//! a pure function of the seed. Most seeds yield nothing, so a rare spec reports `hits=0` over
+//! the range and its `1 in X` rarity is then only known to exceed N. The budget is the CLI's
+//! job here.
+//!
+//! Path is chosen per spec (reported as `path=`): the W=8 SIMT warp is the default and races
+//! the whole range through one warp. But its vectorized baseline is the fused solver, which
+//! records the cheap kinds (singles, locked candidates) fired-or-not rather than by exact count,
+//! so it is sound only when [`baseline_fast_applicable`] holds (both singles, LC
+//! both-or-neither, no Forced cheap kind) -- the Expert specs. A Beginner or Intermediate spec
+//! FORCES a cheap kind (hidden-single / naked-single / locked candidates), so the warp would
+//! mis-accept; those fall back to the scalar [`attempt`], which runs the exact `LogicSolver` and
+//! yields correctly (the fused solver is fast enough to mine them by the thousand). The two
+//! seed -> puzzle maps are identical wherever the warp applies, so the choice is speed only,
+//! never which hits are recorded.
 //!
 //! With `--out PATH` it also writes a single-spec exhaustive-window fixture (the seeds
 //! `[seed, seed+N)` were all tried; the hits are the complete yielder set), for the strong
@@ -28,7 +38,9 @@ use std::path::PathBuf;
 
 use generator_lab::cli::{Toolbox, build_spec, parse_force, spec_label};
 use generator_lab::generate::warp_host::{GateStream, Pumped};
+use generator_lab::generate::{AttemptResult, attempt, baseline_fast_applicable};
 use generator_lab::harvest::Record;
+use generator_lab::rng::Rng;
 use generator_lab::spec::kinds::NAMES;
 
 struct Args {
@@ -84,17 +96,34 @@ fn main() {
     let args = Args::from_env();
     let spec = build_spec(&args.forces, args.toolbox);
 
-    // Scan the bounded range through the warp; a finite seed iterator drains to NoMorePuzzles.
-    let mut stream = GateStream::new(args.base..args.base + args.attempts, &spec);
-    let mut hits: Vec<(u64, String)> = Vec::new();
-    loop {
-        match stream.pump(4096) {
-            Pumped::Found(seed, p) => hits.push((seed, p.puzzle.to_line())),
-            Pumped::StepCountReached => {}
-            Pumped::NoMorePuzzles => break,
+    // Pick the path per spec. SIMT warp where it is sound (the default, far faster); scalar
+    // `attempt` otherwise. The two seed -> puzzle maps agree wherever the warp applies, so the
+    // recorded hits are identical either way -- only the speed differs.
+    let warp = baseline_fast_applicable(&spec);
+    let hits: Vec<(u64, String)> = if warp {
+        // Race the bounded range through the warp; a finite seed iterator drains to NoMorePuzzles.
+        let mut stream = GateStream::new(args.base..args.base + args.attempts, &spec);
+        let mut hits = Vec::new();
+        loop {
+            match stream.pump(4096) {
+                Pumped::Found(seed, p) => hits.push((seed, p.puzzle.to_line())),
+                Pumped::StepCountReached => {}
+                Pumped::NoMorePuzzles => break,
+            }
         }
-    }
-    hits.sort_by_key(|&(seed, _)| seed);
+        hits.sort_by_key(|&(seed, _)| seed);
+        hits
+    } else {
+        // Scalar fallback (forced-cheap specs the warp can't gate soundly): one independent
+        // `attempt` per seed, iterated in seed order, so `hits` is already seed-sorted.
+        let mut hits = Vec::new();
+        for seed in args.base..args.base + args.attempts {
+            if let AttemptResult::Success(p) = attempt(&mut Rng::from_seed(seed), &spec) {
+                hits.push((seed, p.puzzle.to_line()));
+            }
+        }
+        hits
+    };
 
     // stdout: the seed -> puzzle pairs, for the script to keep as fixture samples.
     let mut stdout = String::new();
@@ -106,12 +135,13 @@ fn main() {
     // stderr: the parseable resume summary. `next` = first un-scanned seed.
     let next = args.base + args.attempts;
     eprintln!(
-        "spec={} toolbox={} base={} attempts={} hits={} next={next}",
+        "spec={} toolbox={} base={} attempts={} hits={} next={next} path={}",
         args.key(),
         args.toolbox.label_short(),
         args.base,
         args.attempts,
         hits.len(),
+        if warp { "simt" } else { "scalar" },
     );
 
     // Optional single-spec exhaustive-window fixture (`[base, base+attempts)` all tried).

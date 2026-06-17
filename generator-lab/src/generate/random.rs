@@ -726,7 +726,7 @@ impl UaFilter {
 /// check would read). The production train/drill(HiddenQuad) specs satisfy this; a spec
 /// that forces a cheap kind (e.g. train(LcPointing)) must use the exact [`LogicSolver`],
 /// exactly as bb routes a forced cheap kind off its fused closure.
-pub(in crate::generate) fn baseline_fast_applicable(spec: &Spec) -> bool {
+pub fn baseline_fast_applicable(spec: &Spec) -> bool {
     const NS: KindMask = 1 << NAKED_SINGLE;
     const HS: KindMask = 1 << HIDDEN_SINGLE;
     const LCP: KindMask = 1 << LC_POINTING;

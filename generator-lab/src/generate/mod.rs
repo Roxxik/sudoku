@@ -20,8 +20,8 @@ mod random;
 pub mod warp_host;
 
 pub use random::{
-    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt, determinism_fp,
-    generate, reforce_stat, run_attempts, verify,
+    AttemptResult, GeneratedPuzzle, ReforceStat, Stats, StripView, attempt,
+    baseline_fast_applicable, determinism_fp, generate, reforce_stat, run_attempts, verify,
 };
 // Prober propagation-toolbox experiment — native-only (reuses the native scalar LC kernel).
 #[cfg(not(target_arch = "wasm32"))]
