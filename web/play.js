@@ -319,6 +319,7 @@ function buildBoard() {
   document.addEventListener("pointerdown", (e) => {
     if (!playVisible()) return;
     if (e.target.closest("#board, #playPad, #hintPanel, .topbar")) return;
+    if (activeDigit !== 0) setLock(0);
     if (selection.size === 0 && cursor === null) return;
     clearSelection();
     render();
