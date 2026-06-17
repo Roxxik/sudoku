@@ -90,13 +90,13 @@ DEFAULT_ATTEMPTS = 10_000
 def group(multiset):
     """A sorted multiset of kind names -> (key, force_args). `key` is '+'-joined NAME[:COUNT]
     (the CSV key and fixture force tokens); `force_args` is the matching --force argv."""
-    toks, fargs = [], []
+    toks, force_args = [], []
     for name, grp in itertools.groupby(multiset):
         c = sum(1 for _ in grp)
         tok = name if c == 1 else f"{name}:{c}"
         toks.append(tok)
-        fargs += ["--force", tok]
-    return "+".join(toks), fargs
+        force_args += ["--force", tok]
+    return "+".join(toks), force_args
 
 
 def size_of_key(key):
@@ -296,29 +296,29 @@ def scan(argv):
     ap.add_argument("--csv", default=None,
                     help="rarity table + resume state (default generator-lab/rarity.csv); never a "
                          "test input, so writing it cannot affect tests")
-    a = ap.parse_args(argv)
+    args = ap.parse_args(argv)
 
-    toolboxes = parse_toolboxes(a.toolbox)  # one or more of train/drill/full, deduped, in order
+    toolboxes = parse_toolboxes(args.toolbox)  # one or more of train/drill/full, deduped, in order
 
     # Resolve the per-spec attempt chunk. `chunk is None` means "fill straight to --attempt-cap"
     # (only reachable when a cap is set), otherwise it's a fixed budget added per spec this run.
-    if a.attempts is not None:
-        chunk = a.attempts
-    elif a.attempt_cap is not None:
+    if args.attempts is not None:
+        chunk = args.attempts
+    elif args.attempt_cap is not None:
         chunk = None
     else:
         chunk = DEFAULT_ATTEMPTS
 
     # z for the --target-ci precision selector's 95% CI (computed once when that filter is active).
-    ci_z = NormalDist().inv_cdf(0.975) if a.target_ci is not None else None
+    ci_z = NormalDist().inv_cdf(0.975) if args.target_ci is not None else None
 
     root = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"],
                                capture_output=True, text=True, check=True).stdout.strip())
     os.chdir(root)
-    csv_path = Path(a.csv) if a.csv else root / "generator-lab/rarity.csv"
+    csv_path = Path(args.csv) if args.csv else root / "generator-lab/rarity.csv"
     # --update-tests is the only path that touches the committed fixtures the test reads;
     # otherwise samples go to a gitignored scratch dir under target/ and tests are untouched.
-    fixdir = root / "generator-lab/tests/fixtures/harvest" if a.update_tests else root / "target/rarity-scan"
+    fixdir = root / "generator-lab/tests/fixtures/harvest" if args.update_tests else root / "target/rarity-scan"
 
     print("rarity: building harvest...", file=sys.stderr)
     subprocess.run(["cargo", "build", "--release", "-q", "-p", "generator-lab", "--example", "harvest"], check=True)
@@ -336,35 +336,35 @@ def scan(argv):
     # until the gap fills; on interrupt the still-pending (and in-flight) batches are dropped and
     # their seeds rescanned next run -- so cancelling redoes seeds, never skips them.
     progs = {}       # (toolbox, key) -> per-spec commit state
-    batch_jobs = []  # (toolbox, key, fargs, size, batch_base_seed, batch_count, batch_idx)
-    specs = select_specs(a.targets)
-    for tb in toolboxes:
-        for key, fargs in specs:
-            att, hit = state.get((tb, key), [0, 0])
-            if a.min_hits is not None and hit < a.min_hits:
+    batch_jobs = []  # (toolbox, key, force_args, size, batch_base_seed, batch_count, batch_idx)
+    specs = select_specs(args.targets)
+    for toolbox in toolboxes:
+        for key, force_args in specs:
+            att, hit = state.get((toolbox, key), [0, 0])
+            if args.min_hits is not None and hit < args.min_hits:
                 continue  # below the window's lower edge
-            if a.max_hits is not None and hit >= a.max_hits:
+            if args.max_hits is not None and hit >= args.max_hits:
                 continue  # already at/above the window's upper edge -- common enough
-            if a.target_ci is not None and rel_ci(hit, att, ci_z) <= a.target_ci / 100:
+            if args.target_ci is not None and rel_ci(hit, att, ci_z) <= args.target_ci / 100:
                 continue  # rarity already pinned to +/-target_ci% of the estimate -- precise enough
             if chunk is None:
-                eff = max(0, a.attempt_cap - att)
+                eff = max(0, args.attempt_cap - att)
             else:
-                eff = chunk if a.attempt_cap is None else min(chunk, max(0, a.attempt_cap - att))
+                eff = chunk if args.attempt_cap is None else min(chunk, max(0, args.attempt_cap - att))
             if eff <= 0:
                 continue  # already at the attempt cap; nothing to add
             size = size_of_key(key)
-            bsize = a.batch if a.batch else eff  # one whole-window batch when --batch is unset
-            lo = a.seed + att
-            progs[(tb, key)] = {"size": size, "att": att, "hit0": hit, "catt": att, "chit": hit,
+            bsize = args.batch if args.batch else eff  # one whole-window batch when --batch is unset
+            lo = args.seed + att
+            progs[(toolbox, key)] = {"size": size, "att": att, "hit0": hit, "catt": att, "chit": hit,
                                 "nextc": 0, "pending": {}, "run_hits": 0, "spairs": [],
-                                "have_samples": (tb, key) in samples, "counted_new": False}
+                                "have_samples": (toolbox, key) in samples, "counted_new": False}
             for i in range((eff + bsize - 1) // bsize):
-                batch_jobs.append((tb, key, fargs, size, lo + i * bsize, min(bsize, eff - i * bsize), i))
+                batch_jobs.append((toolbox, key, force_args, size, lo + i * bsize, min(bsize, eff - i * bsize), i))
 
     def run_one(job):
-        tb, key, fargs, size, bseed, bcount, idx = job
-        p = subprocess.run([harvest, *fargs, "--toolbox", tb, "--seed", str(bseed),
+        tb, key, force_args, size, bseed, bcount, idx = job
+        p = subprocess.run([harvest, *force_args, "--toolbox", tb, "--seed", str(bseed),
                             "--attempts", str(bcount)], capture_output=True, text=True)
         m = re.search(r"hits=(\d+)", p.stderr)
         # Only a clean exit WITH a hits= line counts; a batch killed by our Ctrl-C (or any harvest
@@ -372,30 +372,30 @@ def scan(argv):
         # a falsely-empty range.
         ok = p.returncode == 0 and m is not None
         h = int(m.group(1)) if m else 0
-        pairs = [ln.split(" ", 1) for ln in p.stdout.splitlines() if ln.strip()][: a.samples]
+        pairs = [ln.split(" ", 1) for ln in p.stdout.splitlines() if ln.strip()][: args.samples]
         return job, ok, h, pairs
 
     # Fan the batches across --jobs processes and merge as each FINISHES (as_completed, so a slow
     # batch can't stall the progress line). State is mutated only here in the main thread.
     nspecs, total = len({k for _, k in progs}), len(batch_jobs)
-    cap_note = "" if a.attempt_cap is None else f" up to cap {a.attempt_cap:,}"
-    batch_note = "" if a.batch is None else f" of <= {a.batch:,} seeds"
+    cap_note = "" if args.attempt_cap is None else f" up to cap {args.attempt_cap:,}"
+    batch_note = "" if args.batch is None else f" of <= {args.batch:,} seeds"
     tb_note = "" if len(toolboxes) == 1 else f" x {len(toolboxes)} toolboxes [{','.join(toolboxes)}]"
     print(f"rarity: scanning {nspecs} spec(s){tb_note} in {total} batch(es){batch_note} on "
-          f"{a.jobs} job(s){cap_note}...", file=sys.stderr)
+          f"{args.jobs} job(s){cap_note}...", file=sys.stderr)
     done = new_yields = found_now = 0
     interrupted = False
     t_start = last_beat = time.monotonic()
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
             futures = [ex.submit(run_one, job) for job in batch_jobs]
             try:
                 for fut in concurrent.futures.as_completed(futures):
-                    (tb, key, fargs, size, bseed, bcount, idx), ok, h, pairs = fut.result()
+                    (toolbox, key, force_args, size, bseed, bcount, idx), ok, h, pairs = fut.result()
                     done += 1
                     if not ok:
                         continue  # interrupted/failed batch -- leave it uncommitted (rescanned)
-                    pr = progs[(tb, key)]
+                    pr = progs[(toolbox, key)]
                     pr["pending"][idx] = (bcount, h, pairs)
                     # Commit the longest contiguous run of finished batches from the front, so the
                     # watermark only ever covers a gap-free prefix of the window.
@@ -406,15 +406,15 @@ def scan(argv):
                         pr["chit"] += hh
                         pr["run_hits"] += hh
                         gained += hh
-                        if not pr["have_samples"] and len(pr["spairs"]) < a.samples:
-                            pr["spairs"].extend(pp[: a.samples - len(pr["spairs"])])  # lowest seeds first
+                        if not pr["have_samples"] and len(pr["spairs"]) < args.samples:
+                            pr["spairs"].extend(pp[: args.samples - len(pr["spairs"])])  # lowest seeds first
                         pr["nextc"] += 1
                     if pr["nextc"] == c0:
                         continue  # this batch only buffered (waiting on an earlier one) -- nothing committed
-                    state[(tb, key)] = [pr["catt"], pr["chit"]]
+                    state[(toolbox, key)] = [pr["catt"], pr["chit"]]
                     if not pr["have_samples"] and pr["spairs"]:
-                        samples[(tb, key)] = list(pr["spairs"])
-                        pr["have_samples"] = len(pr["spairs"]) >= a.samples
+                        samples[(toolbox, key)] = list(pr["spairs"])
+                        pr["have_samples"] = len(pr["spairs"]) >= args.samples
                     if gained > 0:
                         found_now += gained
                         first = pr["hit0"] == 0 and not pr["counted_new"]  # first-ever yield, once
@@ -422,7 +422,7 @@ def scan(argv):
                             new_yields += 1
                             pr["counted_new"] = True
                         tag = "NEW" if first else "+"
-                        tbtag = "" if len(toolboxes) == 1 else f" [{tb}]"
+                        tbtag = "" if len(toolboxes) == 1 else f" [{toolbox}]"
                         print(f"  {tag:<4}{TIER_NAME[size]} {key}{tbtag}: +{pr['run_hits']} this run, "
                               f"{pr['chit']} total -> ~1 in {pr['catt'] // pr['chit']}", file=sys.stderr)
                     now = time.monotonic()
@@ -444,7 +444,7 @@ def scan(argv):
         write_fixtures(fixdir, samples)
 
     yielded = sum(1 for _, hit in state.values() if hit > 0)
-    dest = "COMMITTED test fixtures" if a.update_tests else f"scratch {fixdir} (tests untouched)"
+    dest = "COMMITTED test fixtures" if args.update_tests else f"scratch {fixdir} (tests untouched)"
     head = "rarity (interrupted)" if interrupted else "rarity"
     print(f"{head}: {found_now} puzzle(s) found this run, {new_yields} new yield(s); "
           f"{len(state)} spec(s), {yielded} with yield -> {csv_path}; samples -> {dest}", file=sys.stderr)
