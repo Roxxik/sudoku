@@ -144,7 +144,7 @@ function applyPreset(value) {
     if (!w) return;
     let masks;
     try {
-      masks = w.specMasksIsolated(Number(idxStr), mode === "drill");
+      masks = w.specMasks(Number(idxStr), mode === "drill");
     } catch {
       return; // bridge hiccup: leave the chips as they were
     }

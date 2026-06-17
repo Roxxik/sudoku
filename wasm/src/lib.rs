@@ -17,13 +17,9 @@
 
 use serde::Serialize;
 use sudoku_core::board::{ALL_DIGITS, UnitKind};
-use sudoku_core::{Deduction, Rng, Spec, Step, Tier, all_techniques, make_puzzle_for_spec};
+use sudoku_core::{Deduction, Step, all_techniques};
 use sudoku_core::lab;
 use wasm_bindgen::prelude::*;
-
-/// Rejection-sampling budget for generation. Easy puzzles essentially never
-/// exhaust this; harder tiers might, but those aren't wired up yet.
-const MAX_ATTEMPTS: usize = 10_000;
 
 /// A Sudoku position the UI hands to [`hint`]. Constructed from the 81 placed
 /// digits (givens plus whatever the player entered); the solver figures out the
@@ -114,74 +110,6 @@ pub fn hint(board: &Board) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(&steps).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// Generate a fresh Tier::Beginner (hidden-singles-only) puzzle. Returns
-/// `{ puzzle, solution, givens }`, the two grids as 81-char lines (`.` for an
-/// empty cell) plus the clue count.
-///
-/// `seed` comes from JS (`Rng::from_entropy` relies on `SystemTime`, which
-/// traps on wasm); pass a fresh random u64 each call. Beginner generation is
-/// fast; other tiers can be slow and aren't exposed here yet.
-#[wasm_bindgen]
-pub fn generate(seed: u64) -> Result<JsValue, JsValue> {
-    let mut rng = Rng::from_seed(seed);
-    let spec = Spec::tier(Tier::Beginner);
-    let fr = make_puzzle_for_spec(&mut rng, &spec, MAX_ATTEMPTS)
-        .ok_or_else(|| JsValue::from_str("could not generate a puzzle within the attempt budget"))?;
-    let data = PuzzleData {
-        puzzle: fr.puzzle.puzzle.to_line(),
-        solution: fr.puzzle.solution.to_line(),
-        givens: fr.puzzle.givens as u32,
-    };
-    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-/// Generate a fresh puzzle with the new `generator-lab` scalar generator (the
-/// tuned `random`-method path core re-exports via [`lab`]), instead of core's own
-/// [`make_puzzle_for_spec`]. Returns the same `{ puzzle, solution, givens }` shape
-/// as [`generate`], so the UI loads it identically.
-///
-/// `target` is a `generator-lab` technique-kind index (`lab::kinds`, e.g.
-/// `HIDDEN_SINGLE`, `NAKED_PAIR`, `HIDDEN_QUAD`, `X_WING`); `drill` selects
-/// drill-mode (target is the *hardest* technique needed) over train-mode (target
-/// may be reached, easier techniques allowed alongside). `seed` comes from JS for
-/// the same reason as [`generate`] (no entropy on wasm).
-///
-/// The frontend uses the **isolated** spec builders (`train_isolated`/
-/// `drill_isolated`): an Expert target is required against every *easier*
-/// technique across all branches, so e.g. an X-Wing puzzle can't be sidestepped
-/// with a Naked Pair. (The legacy branch-scoped `train`/`drill` are kept for an
-/// in-flight debugging effort; see `generator-lab/src/spec/mod.rs`.)
-///
-/// The native-only SIMT path is not wired here — this is the scalar generator,
-/// which is all wasm has. Harder targets can exhaust the attempt budget; that
-/// surfaces as an error the same way [`generate`] reports an empty budget.
-#[wasm_bindgen(js_name = generateLab)]
-pub fn generate_lab(seed: u64, target: u32, drill: bool) -> Result<JsValue, JsValue> {
-    let target = target as usize;
-    if target >= lab::kinds::NUM {
-        return Err(JsValue::from_str(&format!(
-            "target kind {} out of range (0..{})",
-            target,
-            lab::kinds::NUM
-        )));
-    }
-    let spec = if drill {
-        lab::Spec::drill_isolated(target)
-    } else {
-        lab::Spec::train_isolated(target)
-    };
-    let mut rng = lab::Rng::from_seed(seed);
-    let (generated, _stats) = lab::generate(&mut rng, &spec, MAX_ATTEMPTS);
-    let generated = generated
-        .ok_or_else(|| JsValue::from_str("could not generate a puzzle within the attempt budget"))?;
-    let data = PuzzleData {
-        puzzle: generated.puzzle.0.to_line(),
-        solution: generated.solution.0.to_line(),
-        givens: generated.givens as u32,
-    };
-    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
 /// Adopt an imported puzzle from its clue line alone. `line` is the `to_line()`
 /// format the app exports (81 chars, `.`/`0` empty, `1`-`9` clues; whitespace and
 /// the `|`/`-`/`+` separators are ignored). Returns the same
@@ -214,70 +142,9 @@ pub fn solve_line(line: &str) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// The player-facing curriculum taxonomy, one entry per technique kind, built
-/// straight from [`lab::kinds`] so the Home tree can't drift from the Rust
-/// source of truth (`CURRICULUM.md` / `kinds.rs`). The UI groups by `tier` then
-/// `branch` and offers Train always, Drill iff `hasDrill` (Beginner is
-/// train-only). `kindIndex` is what [`generateLab`] takes as its `target`.
-#[wasm_bindgen]
-pub fn curriculum() -> Result<JsValue, JsValue> {
-    use lab::kinds;
-    let entries: Vec<TechniqueEntry> = (0..kinds::NUM)
-        .map(|i| {
-            let tier = kinds::tier_of(i);
-            TechniqueEntry {
-                kind_index: i as u32,
-                id: kinds::NAMES[i],
-                difficulty: kinds::DIFFICULTY[i],
-                tier: tier_str(tier),
-                branch: branch_str(kinds::branch_of(i)),
-                // Train always; Drill only where it differs from Train — not
-                // Beginner, and not the easiest kind of an Expert branch (its
-                // drill is the same puzzle as its train). See `core::curriculum`.
-                has_drill: sudoku_core::curriculum::lab_kind_has_drill(i),
-            }
-        })
-        .collect();
-    serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-/// The spec's per-technique tagging for a given target/mode, as three bitmasks
-/// over `lab::kinds` indices (`1 << kind`). The UI classifies each hint:
-/// `forced` bit -> Forced; else in `baseline` -> Allowed; else in `inScope` ->
-/// Conceded; else untagged/out-of-scope. Lets the hint show Allowed+Forced and
-/// tuck Conceded+untagged behind "Show other techniques". `target` is a
-/// `lab::kinds` index; `drill` picks drill-mode over train.
+/// Returns the masks for the given spec's baseline, in-scope, and forced techniques.
 #[wasm_bindgen(js_name = specMasks)]
 pub fn spec_masks(target: u32, drill: bool) -> Result<JsValue, JsValue> {
-    let target = target as usize;
-    if target >= lab::kinds::NUM {
-        return Err(JsValue::from_str(&format!(
-            "target kind {} out of range (0..{})",
-            target,
-            lab::kinds::NUM
-        )));
-    }
-    let spec = if drill {
-        lab::Spec::drill(target)
-    } else {
-        lab::Spec::train(target)
-    };
-    let data = SpecMaskData {
-        baseline: spec.baseline_mask(),
-        in_scope: spec.in_scope_mask(),
-        forced: spec.forced_mask(),
-    };
-    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-/// Like [`specMasks`], but from the **isolated** builders
-/// (`train_isolated`/`drill_isolated`) the frontend actually generates with. The
-/// custom-spec builder presets its per-technique chips from a campaign
-/// technique's train/drill via these masks (decoded into Off/Allow/Force/Concede
-/// in `web/spec.js`), so the preset matches what generation would produce. Same
-/// three-mask shape as [`specMasks`]; `target` is a `lab::kinds` index.
-#[wasm_bindgen(js_name = specMasksIsolated)]
-pub fn spec_masks_isolated(target: u32, drill: bool) -> Result<JsValue, JsValue> {
     let target = target as usize;
     if target >= lab::kinds::NUM {
         return Err(JsValue::from_str(&format!(
@@ -297,45 +164,6 @@ pub fn spec_masks_isolated(target: u32, drill: bool) -> Result<JsValue, JsValue>
         forced: spec.forced_mask(),
     };
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-fn tier_str(t: lab::kinds::Tier) -> &'static str {
-    use lab::kinds::Tier;
-    match t {
-        Tier::Beginner => "beginner",
-        Tier::Intermediate => "intermediate",
-        Tier::Expert => "expert",
-        Tier::Master => "master",
-    }
-}
-
-fn branch_str(b: lab::kinds::Branch) -> &'static str {
-    use lab::kinds::Branch;
-    match b {
-        Branch::Trunk => "trunk",
-        Branch::Fish => "fish",
-        Branch::Subset => "subset",
-        Branch::Bivalue => "bivalue",
-    }
-}
-
-// ---- Wire shapes -----------------------------------------------------------
-// Plain mirrors of the core types, serialized to JS objects. Cells are raw
-// indices (0..81, row-major) and houses are 0-based; the UI renders R/C labels.
-
-#[derive(Serialize)]
-struct TechniqueEntry {
-    #[serde(rename = "kindIndex")]
-    kind_index: u32,
-    /// Stable kebab-case identifier (e.g. `"hidden-single"`, `"x-wing"`).
-    id: &'static str,
-    difficulty: u32,
-    /// `"beginner"`, `"intermediate"`, `"expert"`, or `"master"`.
-    tier: &'static str,
-    /// `"trunk"`, `"fish"`, `"subset"`, or `"bivalue"`.
-    branch: &'static str,
-    #[serde(rename = "hasDrill")]
-    has_drill: bool,
 }
 
 #[derive(Serialize)]

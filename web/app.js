@@ -96,7 +96,7 @@ function allowedMaskFor(req) {
     const w = wasm && wasm.bindings();
     if (!w) return null;
     try {
-      masks = w.specMasksIsolated(req.kindIndex, req.mode === "drill");
+      masks = w.specMasks(req.kindIndex, req.mode === "drill");
     } catch {
       return null;
     }
