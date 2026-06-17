@@ -46,8 +46,10 @@ let cursor = null; // anchor / last-touched cell, or null
 // The Notes button's single tap flips `placing`; its double tap switches
 // `markKind`.
 const MODE_CENTER = 1, MODE_CORNER = 2;
-let placing = true;
-let markKind = MODE_CENTER;
+const DEFAULT_MODE = MODE_CORNER;
+const DEFAULT_PLACING = false;
+let placing = DEFAULT_PLACING;
+let markKind = DEFAULT_MODE;
 let activeDigit = 0; // 1..9 when a digit is "pen-locked" (highlight mode), 0 otherwise
 
 const cells = []; // DOM nodes, index 0..80
@@ -860,8 +862,8 @@ function restart() {
   }
   clearSelection();
   activeDigit = 0;
-  placing = true;
-  markKind = MODE_CENTER;
+  placing = DEFAULT_PLACING;
+  markKind = DEFAULT_MARK_KIND;
   finished = false;
   timerBase = 0;
   runStart = performance.now();
@@ -1579,8 +1581,8 @@ export function loadGame(g) {
   for (const s of g.redo || []) redoStack.push(snapshotFromJSON(s));
   clearSelection();
   activeDigit = 0;
-  placing = true;
-  markKind = MODE_CENTER;
+  placing = DEFAULT_PLACING;
+  markKind = DEFAULT_MODE;
   finished = g.status === "solved";
   timerBase = g.elapsedMs || 0;
   runStart = null;
