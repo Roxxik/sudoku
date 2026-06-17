@@ -25,8 +25,8 @@ function store(key, on) {
 }
 
 // Whether placing a digit strikes it from peers' Center and Corner notes.
-// Default OFF -- absence of the key reads as off. Cheat mode forces it on for the
-// notes-aware hint engine, and "Apply easiest" eliminates regardless of this
+// Default OFF -- absence of the key reads as off. Governs placement in every mode;
+// "Apply easiest"/"Apply" (cheat-only buttons) eliminate regardless of this
 // setting (see play.js).
 export function eliminateCandidatesOn() {
   return stored(ELIMINATE_KEY) === "1";

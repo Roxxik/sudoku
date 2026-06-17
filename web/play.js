@@ -681,18 +681,11 @@ function toggleMark(set, d) {
   else set.add(d);
 }
 
-// Whether placing a digit should strike it from peers' Center and Corner marks.
-// Driven by the "Eliminate candidates" setting; cheat forces it on because its
-// marks-aware hint engine (see solverBoard) needs the displayed notes kept in
-// lock-step with the grid as cells fill in. ("Apply easiest" eliminates
-// regardless of either -- applyStep calls clearPeerMarks unconditionally.)
-function eliminateOn() {
-  return cheatOn() || eliminateCandidatesOn();
-}
-
 // A placed digit can't be a candidate in any peer, so strike it from their
 // pencil notes (both center and corner). Caller invokes inside a `commit`, so it
-// is one undo step with the placement.
+// is one undo step with the placement. Manual placement gates this on the
+// "Eliminate candidates" setting (eliminateCandidatesOn), independent of cheat
+// mode; "Apply easiest"/"Apply" (cheat-only buttons) call it regardless.
 function clearPeerMarks(i, d) {
   for (let j = 0; j < N; j++) {
     if (j === i || !isPeer(i, j)) continue;
@@ -709,7 +702,7 @@ function applyDigitToCell(i, d) {
     centerMarks[i].clear();
     cornerMarks[i].clear();
     // value[i] === d means we placed (not toggled off): clean the peers.
-    if (eliminateOn() && value[i] === d) clearPeerMarks(i, d);
+    if (eliminateCandidatesOn() && value[i] === d) clearPeerMarks(i, d);
   } else {
     // Pencil marks are meaningless once a value is placed.
     if (value[i] !== 0) return;
@@ -730,7 +723,7 @@ function applyOppositeToCell(i, d) {
     value[i] = value[i] === d ? 0 : d;
     centerMarks[i].clear();
     cornerMarks[i].clear();
-    if (eliminateOn() && value[i] === d) clearPeerMarks(i, d);
+    if (eliminateCandidatesOn() && value[i] === d) clearPeerMarks(i, d);
   }
 }
 
@@ -755,7 +748,8 @@ function applyDigitToSelection(d) {
       }
     }
     // A placed digit can't be a candidate in any peer of any filled cell.
-    if (!clearing && eliminateOn()) for (const i of targets) clearPeerMarks(i, d);
+    if (!clearing && eliminateCandidatesOn())
+      for (const i of targets) clearPeerMarks(i, d);
   } else {
     // Notes only go into empty, non-clue cells (a value would hide them).
     const target = markKind === MODE_CORNER ? cornerMarks : centerMarks;
