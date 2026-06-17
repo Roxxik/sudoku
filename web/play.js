@@ -328,6 +328,12 @@ function buildBoard() {
   });
 }
 
+// The box index of a cell, 0..8 in reading order.
+function boxOf(i) {
+  const r = Math.floor(i / 9), c = i % 9;
+  return Math.floor(r / 3) * 3 + Math.floor(c / 3);
+}
+
 // ---- Peer relationship (row / col / box) for selection highlighting. ----
 function isPeer(a, b) {
   if (a === b) return false;
@@ -999,26 +1005,70 @@ function toggleHintPanel() {
   else closeHint();
 }
 
-// Build a solver Board from the current grid. In cheat mode the player's center
+// Build a solver Board from the current grid. The player's center
 // pencil notes ride along as a per-cell candidate mask (bit d-1 set for each
 // noted digit), so the hint engine reasons over the *reduced* candidate set
-// instead of re-deriving it from placements alone. That is what lets "Apply
+// instead of re-deriving it from placements alone. That is also what lets "Apply
 // easiest" progress past singles: a technique elimination narrows the notes, and
 // the next hint sees the narrower set (a cell with no center notes means
 // "unspecified" -> it stays grid-derived). Corner (Snyder) notes mark where a
-// digit can go, not a full candidate set, so they are not forwarded. Off cheat we
-// pass no marks, so hints reflect the true position. Caller owns `.free()`.
+// digit can go, not a full candidate set, so they are folded into the candidates.
+// Caller owns `.free()`.
 function solverBoard(wasm) {
   const cellDigits = new Uint8Array(N);
   for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
-  if (!cheatOn()) return new wasm.Board(cellDigits);
+
+  // Per-cell corner mask + per-box union of corner marks.
+  // Snyder marks only mean anything on still-empty cells, so skip marks
+  // sitting on filled cells (they may be stale and would over-constrain).
+  const cellCorner = new Uint16Array(N);
+  const boxCornerUnion = new Uint16Array(9);
+  for (let i = 0; i < N; i++) {
+    if (digitAt(i) !== 0 || cornerMarks[i].size === 0) continue;
+    let m = 0;
+    for (const d of cornerMarks[i]) m |= 1 << (d - 1);
+    cellCorner[i] = m;
+    boxCornerUnion[boxOf(i)] |= m;
+  }
+
   const cand = new Uint16Array(N); // 0 = unspecified (keep grid-derived)
   for (let i = 0; i < N; i++) {
-    if (digitAt(i) !== 0 || centerMarks[i].size === 0) continue;
-    let m = 0;
-    for (const d of centerMarks[i]) m |= 1 << (d - 1);
-    cand[i] = m;
+    if (digitAt(i) !== 0) continue;
+
+    let mask = 0x1ff;
+    let specified = false;
+
+    // Center marks: the cell is exactly one of these.
+    if (centerMarks[i].size > 0) {
+      let cm = 0;
+      for (const d of centerMarks[i]) cm |= 1 << (d - 1);
+      mask &= cm;
+      specified = true;
+    }
+
+    // Corner (Snyder) marks: a digit pinned in this box may only live in the
+    // cells carrying its mark; "the other cells do not have this candidate."
+    const pinned = boxCornerUnion[boxOf(i)];
+    const cornerAllowed = (~pinned & 0x1ff) | cellCorner[i];
+    if (cornerAllowed !== 0x1ff) {
+      mask &= cornerAllowed;
+      specified = true;
+    }
+
+    if (!specified) {
+      cand[i] = 0; // no player info -> let the grid derive candidates
+      continue;
+    }
+
+    // Critical invariant: solution[i] must survive in the combined mask.
+    const solBit = 1 << (solution[i] - 1);
+    if ((mask & solBit) === 0) {
+      cand[i] = 0; // player marks contradict the truth -> fall back, don't lie to the solver
+    } else {
+      cand[i] = mask;
+    }
   }
+
   return new wasm.Board(cellDigits, cand);
 }
 
