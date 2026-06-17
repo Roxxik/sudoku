@@ -832,6 +832,7 @@ summary > span:first-of-type { flex: 1; }
 .cell.hl-cell { background: var(--cell-sel); }
 .cell.hl-place { background: #2f5d3a; color: #d8ffd8; }
 .cell.hl-elim { background: #5d2f35; color: #ffd8dc; }
+.cell.hl-stale { background: #5d512f; color: #ffeec0; }
 
 /* The pad sets display:flex, which overrides the bare [hidden] attribute -- so
    it stayed visible behind the hint panel. Restore hiding. */
@@ -861,6 +862,7 @@ summary > span:first-of-type { flex: 1; }
 }
 .hint-banner .banner-icon { width: 30px; height: 30px; flex: none; }
 .hint-banner.ok { color: #5fd08a; }
+.hint-banner.stale { color: #e6c34d; }
 .hint-banner.bad { color: #ff7b7b; }
 
 /* Large, stacked actions for the first layer / error stage. */

@@ -941,7 +941,7 @@ function unitCells(house) {
 
 // ---- Board highlight overlay (driven by the focused hint row) ----
 function clearHighlights() {
-  for (const cell of cells) cell.classList.remove("hl-unit", "hl-cell", "hl-place", "hl-elim");
+  for (const cell of cells) cell.classList.remove("hl-unit", "hl-cell", "hl-place", "hl-elim", "hl-stale");
 }
 
 function highlightStage(step, stage) {
@@ -988,6 +988,45 @@ function solvedErrorCells() {
   return bad;
 }
 
+// Stale marks: pencil notes (center or corner) on an empty cell that the
+// player's own board already rules out -- left behind by a later placement or
+// Snyder pin that should have struck them. Two sources, mirroring what
+// `solverBoard` reasons over:
+//   - a peer holds the digit (so it can't be a candidate here at all); or
+//   - a center mark for a digit the box's corner marks pin to *other* cells
+//     (e.g. 6 pencilled in a cell's center while two corner marks elsewhere in
+//     the box already claim the 6).
+// A corner mark is never stale by pinning -- it *is* the pin -- only by a peer
+// placement. Returns the offending cell indices. Unlike a mistake, stale marks
+// don't mean a wrong answer, just notes that need tidying.
+function staleMarkCells() {
+  const pins = cornerPins();
+  const bad = [];
+  for (let i = 0; i < N; i++) {
+    if (digitAt(i) !== 0) continue;
+    if (centerMarks[i].size === 0 && cornerMarks[i].size === 0) continue;
+    const cand = candidatesFor(i); // digits no peer has placed
+    const pinAllowed = pins.allowed(i);
+    let stale = false;
+    for (const d of centerMarks[i]) {
+      if (!cand.has(d) || (pinAllowed & (1 << (d - 1))) === 0) {
+        stale = true;
+        break;
+      }
+    }
+    if (!stale) {
+      for (const d of cornerMarks[i]) {
+        if (!cand.has(d)) {
+          stale = true;
+          break;
+        }
+      }
+    }
+    if (stale) bad.push(i);
+  }
+  return bad;
+}
+
 // ---- Panel open/close ----
 function hintTitle(text) {
   document.getElementById("hintTitle").textContent = text;
@@ -1014,13 +1053,16 @@ function toggleHintPanel() {
 // "unspecified" -> it stays grid-derived). Corner (Snyder) notes mark where a
 // digit can go, not a full candidate set, so they are folded into the candidates.
 // Caller owns `.free()`.
-function solverBoard(wasm) {
-  const cellDigits = new Uint8Array(N);
-  for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
-
-  // Per-cell corner mask + per-box union of corner marks.
-  // Snyder marks only mean anything on still-empty cells, so skip marks
-  // sitting on filled cells (they may be stale and would over-constrain).
+//
+// The Snyder (corner) pins implied by the player's notes, shared by the solver
+// bridge and the stale-mark check. A digit carried by a corner mark is "pinned"
+// to the box cells that hold its mark: it may live only there, so the other
+// cells of the box lose it as a candidate. Snyder marks only mean anything on
+// still-empty cells, so marks sitting on filled cells are skipped (they may be
+// stale and would over-constrain). `allowed(i)` is the candidate mask the pins
+// leave a cell -- 0x1ff (all digits) where nothing in its box is pinned, and a
+// cell always keeps the digits of its own corner marks.
+function cornerPins() {
   const cellCorner = new Uint16Array(N);
   const boxCornerUnion = new Uint16Array(9);
   for (let i = 0; i < N; i++) {
@@ -1030,7 +1072,18 @@ function solverBoard(wasm) {
     cellCorner[i] = m;
     boxCornerUnion[boxOf(i)] |= m;
   }
+  return {
+    allowed(i) {
+      return (~boxCornerUnion[boxOf(i)] & 0x1ff) | cellCorner[i];
+    },
+  };
+}
 
+function solverBoard(wasm) {
+  const cellDigits = new Uint8Array(N);
+  for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
+
+  const pins = cornerPins();
   const cand = new Uint16Array(N); // 0 = unspecified (keep grid-derived)
   for (let i = 0; i < N; i++) {
     if (digitAt(i) !== 0) continue;
@@ -1048,8 +1101,7 @@ function solverBoard(wasm) {
 
     // Corner (Snyder) marks: a digit pinned in this box may only live in the
     // cells carrying its mark; "the other cells do not have this candidate."
-    const pinned = boxCornerUnion[boxOf(i)];
-    const cornerAllowed = (~pinned & 0x1ff) | cellCorner[i];
+    const cornerAllowed = pins.allowed(i);
     if (cornerAllowed !== 0x1ff) {
       mask &= cornerAllowed;
       specified = true;
@@ -1131,35 +1183,51 @@ function openHint() {
     showPanel();
     return;
   }
-  // First layer: just confirm the board is fine, without revealing what's
-  // possible. Revealing drills into the technique tree.
+  // First layer: confirm the board's health (all good / stale marks) without
+  // revealing what's possible. Revealing drills into the technique tree; stale
+  // marks add a button to point them out on the board.
   const masks = specMasksFor(wasm);
+  const stale = staleMarkCells();
   hintTitle("Hint");
-  body.replaceChildren(statusStage(steps, masks));
+  body.replaceChildren(statusStage(steps, masks, stale));
   showPanel();
 }
 
-// A bold banner with an icon: a green check for "all good", a red alert for a
-// mistake. Drawn as SVG (no emoji).
-function statusBanner(ok, text) {
+// A bold banner with an icon, in one of three states: "ok" (green check, all
+// good), "stale" (yellow warning, marks left behind by a placement), "bad" (red
+// alert, an outright mistake). Drawn as SVG (no emoji); stale and bad share the
+// warning-triangle glyph and are told apart by colour.
+const BANNER_ICONS = {
+  ok: '<svg viewBox="0 0 24 24" class="banner-icon" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" d="M4 12.5l5 5 11-11"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" class="banner-icon" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M12 3l9 16H3z"/><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M12 9v4"/><circle cx="12" cy="16.4" r="1.2" fill="currentColor"/></svg>',
+};
+function statusBanner(kind, text) {
   const el = document.createElement("div");
-  el.className = "hint-banner " + (ok ? "ok" : "bad");
-  el.innerHTML = ok
-    ? '<svg viewBox="0 0 24 24" class="banner-icon" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" d="M4 12.5l5 5 11-11"/></svg>'
-    : '<svg viewBox="0 0 24 24" class="banner-icon" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M12 3l9 16H3z"/><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M12 9v4"/><circle cx="12" cy="16.4" r="1.2" fill="currentColor"/></svg>';
+  el.className = "hint-banner " + kind;
+  el.innerHTML = kind === "ok" ? BANNER_ICONS.ok : BANNER_ICONS.warn;
   const span = document.createElement("span");
   span.textContent = text;
   el.appendChild(span);
   return el;
 }
 
-// The reassurance layer: a prominent "no mistakes" banner plus large, stacked
-// actions (reveal the techniques; cheat: apply the easiest move). Applying here
-// re-renders this same layer (via openHint) so it can be spammed without leaving.
-function statusStage(steps, masks) {
+// The reassurance layer: a prominent banner reporting the board's health plus
+// large, stacked actions. Green "No mistakes so far." when the notes are clean;
+// yellow "Some pencil marks are stale." when `staleCells` is non-empty, which
+// also adds a "Show stale marks" button that paints them on the board (the same
+// affordance the error stage uses for outright mistakes). Either way "Show
+// available techniques" reveals the tree, and cheat adds "Apply easiest".
+// Applying here re-renders this same layer (via openHint) so it can be spammed
+// without leaving.
+function statusStage(steps, masks, staleCells) {
   const box = document.createElement("div");
   box.className = "hint-stage";
-  box.appendChild(statusBanner(true, "No mistakes so far."));
+  const stale = staleCells.length > 0;
+  box.appendChild(
+    stale
+      ? statusBanner("stale", "Some pencil marks are stale.")
+      : statusBanner("ok", "No mistakes so far.")
+  );
 
   const actions = document.createElement("div");
   actions.className = "hint-actions";
@@ -1169,6 +1237,20 @@ function statusStage(steps, masks) {
   reveal.textContent = "Show available techniques";
   reveal.addEventListener("click", renderTechStage);
   actions.appendChild(reveal);
+
+  // Stale marks don't block progress, so this sits alongside the techniques
+  // button rather than replacing it: tap to highlight the cells whose notes the
+  // board already rules out (yellow, mirroring the error stage's red).
+  if (stale) {
+    const show = document.createElement("button");
+    show.className = "hint-bigbtn";
+    show.textContent = "Show stale marks";
+    show.addEventListener("click", () => {
+      clearHighlights();
+      for (const c of staleCells) cells[c].classList.add("hl-stale");
+    });
+    actions.appendChild(show);
+  }
 
   if (cheatOn() && steps.length) {
     const ez = document.createElement("button");
@@ -1234,7 +1316,7 @@ function errorStage(kind, errCells) {
   box.className = "hint-stage";
   box.appendChild(
     statusBanner(
-      false,
+      "bad",
       kind === "logical"
         ? "Contradiction — a digit repeats in a row, column, or box."
         : "One of your entries doesn't match the solution."
