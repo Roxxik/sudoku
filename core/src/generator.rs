@@ -36,10 +36,10 @@ fn fill(board: &mut Board, rng: &mut Rng) -> bool {
             best = Some((i, cs, n));
         }
     }
-    let Some((cell, mask, _)) = best else {
+    let Some((cell, candidates, _)) = best else {
         return true;
     };
-    let mut digits: Vec<u8> = iter_digits(mask).collect();
+    let mut digits: Vec<u8> = iter_digits(candidates).collect();
     rng.shuffle(&mut digits);
     for d in digits {
         let backup = board.clone();

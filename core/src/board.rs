@@ -6,10 +6,10 @@ pub const ALL_DIGITS: u16 = 0x1FF;
 
 pub type Digit = u8;
 pub type CellIdx = usize;
-pub type Mask = u16;
+pub type Candidates = u16;
 
 #[inline(always)]
-pub const fn digit_to_bit(d: Digit) -> Mask {
+pub const fn digit_to_bit(d: Digit) -> Candidates {
     1u16 << (d as u16 - 1)
 }
 
@@ -31,14 +31,14 @@ pub const fn box_of(i: CellIdx) -> usize {
 /// Iterate the set digits in `mask`, lowest bit first.
 /// Yields exactly `popcount(mask)` digits — no work for clear bits.
 #[inline]
-pub fn iter_digits(mask: Mask) -> DigitIter {
+pub fn iter_digits(candidates: Candidates) -> DigitIter {
     DigitIter {
-        mask: mask & ALL_DIGITS,
+        candidates: candidates & ALL_DIGITS,
     }
 }
 
 pub struct DigitIter {
-    mask: Mask,
+    candidates: Candidates,
 }
 
 impl Iterator for DigitIter {
@@ -46,25 +46,25 @@ impl Iterator for DigitIter {
 
     #[inline]
     fn next(&mut self) -> Option<Digit> {
-        if self.mask == 0 {
+        if self.candidates == 0 {
             return None;
         }
-        let bit = self.mask & self.mask.wrapping_neg();
+        let bit = self.candidates & self.candidates.wrapping_neg();
         let d = bit.trailing_zeros() as Digit + 1;
-        self.mask &= self.mask - 1;
+        self.candidates &= self.candidates - 1;
         Some(d)
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.mask.count_ones() as usize;
+        let n = self.candidates.count_ones() as usize;
         (n, Some(n))
     }
 }
 
 #[inline(always)]
-pub fn popcount(mask: Mask) -> u32 {
-    (mask & ALL_DIGITS).count_ones()
+pub fn popcount(candidates: Candidates) -> u32 {
+    (candidates & ALL_DIGITS).count_ones()
 }
 
 pub fn cell_name(i: CellIdx) -> String {
@@ -102,7 +102,7 @@ impl std::error::Error for ParseError {}
 #[derive(Debug, Clone)]
 pub struct Board {
     cells: [Digit; CELLS],
-    candidates: [Mask; CELLS],
+    candidates: [Candidates; CELLS],
 }
 
 impl Board {
@@ -143,7 +143,7 @@ impl Board {
     }
 
     #[inline]
-    pub fn candidates(&self, i: CellIdx) -> Mask {
+    pub fn candidates(&self, i: CellIdx) -> Candidates {
         self.candidates[i]
     }
 

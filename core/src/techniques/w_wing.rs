@@ -39,9 +39,9 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
             // Try each digit as the strong-link digit.
             for (di, &link_digit) in digits.iter().enumerate() {
                 let other_digit = digits[1 - di];
-                let other_mask = digit_to_bit(other_digit);
+                let other_candidates = digit_to_bit(other_digit);
 
-                if let Some(step) = try_link(board, x, y, link_digit, other_digit, other_mask) {
+                if let Some(step) = try_link(board, x, y, link_digit, other_digit, other_candidates) {
                     if !emit(step) {
                         return;
                     }
@@ -57,7 +57,7 @@ fn try_link(
     y: usize,
     link_digit: u8,
     other_digit: u8,
-    other_mask: u16,
+    other_candidates: u16,
 ) -> Option<Step> {
     let link_bit = digit_to_bit(link_digit);
     for (unit_kind, idx, unit) in all_units() {
@@ -93,7 +93,7 @@ fn try_link(
             if !board.is_empty(c) {
                 continue;
             }
-            if board.candidates(c) & other_mask == 0 {
+            if board.candidates(c) & other_candidates == 0 {
                 continue;
             }
             if !PEERS[x].contains(&c) || !PEERS[y].contains(&c) {

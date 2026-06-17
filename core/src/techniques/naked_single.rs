@@ -8,9 +8,9 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
         if !board.is_empty(i) {
             continue;
         }
-        let mask = board.candidates(i);
-        if popcount(mask) == 1 {
-            let d = iter_digits(mask).next().unwrap();
+        let candidates = board.candidates(i);
+        if popcount(candidates) == 1 {
+            let d = iter_digits(candidates).next().unwrap();
             let step = Step {
                 technique: TechniqueKind::NakedSingle,
                 deductions: smallvec![Deduction::Place { cell: i, digit: d }],

@@ -55,7 +55,7 @@ fn find_xyz_wing_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                 return true;
             }
             let z = iter_digits(shared).next().unwrap();
-            let z_mask = shared;
+            let z_candidates = shared;
             let mut eliminations = Vec::new();
             for c in 0..CELLS {
                 if c == pivot || c == a || c == b {
@@ -64,7 +64,7 @@ fn find_xyz_wing_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                 if !board.is_empty(c) {
                     continue;
                 }
-                if board.candidates(c) & z_mask == 0 {
+                if board.candidates(c) & z_candidates == 0 {
                     continue;
                 }
                 if !peers_of_pivot.contains(&c)
@@ -129,12 +129,12 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
             if popcount(shared_with_p) != 1 {
                 continue;
             }
-            let z_mask = acands & !shared_with_p;
-            if z_mask & pcands != 0 {
+            let z_candidates = acands & !shared_with_p;
+            if z_candidates & pcands != 0 {
                 continue;
             }
             let other_pivot_digit = pcands & !shared_with_p;
-            let required_b = other_pivot_digit | z_mask;
+            let required_b = other_pivot_digit | z_candidates;
 
             for &(b, bcands) in bivalues.iter().skip(ai + 1) {
                 if b == pivot || b == a {
@@ -146,7 +146,7 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                 if bcands != required_b {
                     continue;
                 }
-                let z = iter_digits(z_mask).next().unwrap();
+                let z = iter_digits(z_candidates).next().unwrap();
                 let mut eliminations = Vec::new();
                 for c in 0..CELLS {
                     if c == pivot || c == a || c == b {
@@ -155,7 +155,7 @@ fn find_each<F: FnMut(Step) -> bool>(board: &Board, mut emit: F) {
                     if !board.is_empty(c) {
                         continue;
                     }
-                    if board.candidates(c) & z_mask == 0 {
+                    if board.candidates(c) & z_candidates == 0 {
                         continue;
                     }
                     if !PEERS[a].contains(&c) || !PEERS[b].contains(&c) {
