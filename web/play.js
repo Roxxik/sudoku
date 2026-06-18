@@ -869,7 +869,7 @@ function restart() {
   clearSelection();
   activeDigit = 0;
   placing = DEFAULT_PLACING;
-  markKind = DEFAULT_MARK_KIND;
+  markKind = DEFAULT_MODE;
   finished = false;
   timerBase = 0;
   runStart = performance.now();
@@ -988,6 +988,47 @@ function solvedErrorCells() {
   return bad;
 }
 
+// Combined player-specified candidate mask for an empty cell.
+// Returns { mask, specified }; specified is false when the player gave no info.
+function candidatesAt(i, pins) {
+  let mask = 0x1ff;
+  let specified = false;
+
+  if (centerMarks[i].size > 0) {
+    let cm = 0;
+    for (const d of centerMarks[i]) cm |= 1 << (d - 1);
+    mask &= cm;
+    specified = true;
+  }
+
+  const cornerAllowed = pins.allowed(i);
+  if (cornerAllowed !== 0x1ff) {
+    mask &= cornerAllowed;
+    specified = true;
+  }
+
+  return { mask, specified };
+}
+
+function candidatesExcludeSolution(i, candidates) {
+  const solBit = 1 << (solution[i] - 1);
+  return (candidates & solBit) === 0
+}
+
+// Wrong marks: pencil notes (center or corner) on an empty cell that the
+// solution needs are missing, the player has made an error in their deductions.
+function wrongMarkCells() {
+  const pins = cornerPins();
+  const out = [];
+  for (let i = 0; i < N; i++) {
+    if (digitAt(i) !== 0) continue;
+    const { mask, specified } = candidatesAt(i, pins);
+    if (!specified) continue;
+    if (candidatesExcludeSolution(i, mask)) out.push(i);
+  }
+  return out;
+}
+
 // Stale marks: pencil notes (center or corner) on an empty cell that the
 // player's own board already rules out -- left behind by a later placement or
 // Snyder pin that should have struck them. Two sources, mirroring what
@@ -1044,16 +1085,6 @@ function toggleHintPanel() {
   else closeHint();
 }
 
-// Build a solver Board from the current grid. The player's center
-// pencil notes ride along as a per-cell candidate mask (bit d-1 set for each
-// noted digit), so the hint engine reasons over the *reduced* candidate set
-// instead of re-deriving it from placements alone. That is also what lets "Apply
-// easiest" progress past singles: a technique elimination narrows the notes, and
-// the next hint sees the narrower set (a cell with no center notes means
-// "unspecified" -> it stays grid-derived). Corner (Snyder) notes mark where a
-// digit can go, not a full candidate set, so they are folded into the candidates.
-// Caller owns `.free()`.
-//
 // The Snyder (corner) pins implied by the player's notes, shared by the solver
 // bridge and the stale-mark check. A digit carried by a corner mark is "pinned"
 // to the box cells that hold its mark: it may live only there, so the other
@@ -1079,6 +1110,15 @@ function cornerPins() {
   };
 }
 
+// Build a solver Board from the current grid. The player's center
+// pencil notes ride along as a per-cell candidate mask (bit d-1 set for each
+// noted digit), so the hint engine reasons over the *reduced* candidate set
+// instead of re-deriving it from placements alone. That is also what lets "Apply
+// easiest" progress past singles: a technique elimination narrows the notes, and
+// the next hint sees the narrower set (a cell with no center notes means
+// "unspecified" -> it stays grid-derived). Corner (Snyder) notes mark where a
+// digit can go, not a full candidate set, so they are folded into the candidates.
+// Caller owns `.free()`.
 function solverBoard(wasm) {
   const cellDigits = new Uint8Array(N);
   for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
@@ -1089,35 +1129,22 @@ function solverBoard(wasm) {
     if (digitAt(i) !== 0) continue;
 
     let mask = 0x1ff;
-    let specified = false;
+    for (let i = 0; i < N; i++) {
+      if (digitAt(i) !== 0) continue;
 
-    // Center marks: the cell is exactly one of these.
-    if (centerMarks[i].size > 0) {
-      let cm = 0;
-      for (const d of centerMarks[i]) cm |= 1 << (d - 1);
-      mask &= cm;
-      specified = true;
-    }
+      const { mask, specified } = candidatesAt(i, pins);
 
-    // Corner (Snyder) marks: a digit pinned in this box may only live in the
-    // cells carrying its mark; "the other cells do not have this candidate."
-    const cornerAllowed = pins.allowed(i);
-    if (cornerAllowed !== 0x1ff) {
-      mask &= cornerAllowed;
-      specified = true;
-    }
+      if (!specified) {
+        cand[i] = 0; // no player info -> let the grid derive candidates
+        continue;
+      }
 
-    if (!specified) {
-      cand[i] = 0; // no player info -> let the grid derive candidates
-      continue;
-    }
-
-    // Critical invariant: solution[i] must survive in the combined mask.
-    const solBit = 1 << (solution[i] - 1);
-    if ((mask & solBit) === 0) {
-      cand[i] = 0; // player marks contradict the truth -> fall back, don't lie to the solver
-    } else {
-      cand[i] = mask;
+      // Critical invariant: solution[i] must survive in the combined mask.
+      if (candidatesExcludeSolution(i, mask)) {
+        cand[i] = 0;
+      } else {
+        cand[i] = mask;
+      }
     }
   }
 
@@ -1170,10 +1197,11 @@ function openHint() {
     } finally {
       board.free();
     }
-  } catch {
+  } catch (e) {
     hintTitle("Hint");
     note("Couldn't read the board. Check for an obvious slip.");
     showPanel();
+    console.log(e);
     return;
   }
 
@@ -1187,9 +1215,10 @@ function openHint() {
   // revealing what's possible. Revealing drills into the technique tree; stale
   // marks add a button to point them out on the board.
   const masks = specMasksFor(wasm);
+  const wrong = wrongMarkCells();
   const stale = staleMarkCells();
   hintTitle("Hint");
-  body.replaceChildren(statusStage(steps, masks, stale));
+  body.replaceChildren(statusStage(steps, masks, wrong, stale));
   showPanel();
 }
 
@@ -1219,12 +1248,15 @@ function statusBanner(kind, text) {
 // available techniques" reveals the tree, and cheat adds "Apply easiest".
 // Applying here re-renders this same layer (via openHint) so it can be spammed
 // without leaving.
-function statusStage(steps, masks, staleCells) {
+function statusStage(steps, masks, wrongCandidateCells, staleCells) {
   const box = document.createElement("div");
   box.className = "hint-stage";
   const stale = staleCells.length > 0;
+  const wrong = wrongCandidateCells.length > 0;
   box.appendChild(
-    stale
+    wrong
+      ? statusBanner("bad", "Some pencil marks exclude the correct digit.")
+      : stale
       ? statusBanner("stale", "Some pencil marks are stale.")
       : statusBanner("ok", "No mistakes so far.")
   );
@@ -1237,6 +1269,17 @@ function statusStage(steps, masks, staleCells) {
   reveal.textContent = "Show available techniques";
   reveal.addEventListener("click", renderTechStage);
   actions.appendChild(reveal);
+
+  if (wrong) {
+    const show = document.createElement("button");
+    show.className = "hint-bigbtn";
+    show.textContent = "Show wrong marks";
+    show.addEventListener("click", () => {
+      clearHighlights();
+      for (const c of wrongCandidateCells) cells[c].classList.add("hl-elim");
+    });
+    actions.appendChild(show);
+  }
 
   // Stale marks don't block progress, so this sits alongside the techniques
   // button rather than replacing it: tap to highlight the cells whose notes the
