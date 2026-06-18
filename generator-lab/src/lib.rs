@@ -48,8 +48,10 @@
 // The SIMT warp host's per-lane resumable strip attempts are compiler-generated
 // coroutines (`generate::warp_host::attempt`); the TAIT names the unnameable coroutine
 // type so the stream can hold its lanes inline (no boxing, no dyn dispatch).
-#![feature(coroutines, coroutine_trait, type_alias_impl_trait)]
-#![feature(stmt_expr_attributes)]
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    feature(coroutines, coroutine_trait, type_alias_impl_trait, stmt_expr_attributes)
+)]
 
 pub mod repr;
 pub mod cli;
