@@ -91,7 +91,7 @@ fn profile(mode: u32, attempts: usize, seed: u64) -> Phases {
             }
 
             let tb = Instant::now();
-            let outcome = FusedLogicSolver::solve_tracked(&dual, baseline);
+            let outcome = FusedLogicSolver::solve_tracked(dual.row(), baseline);
             p.baseline += tb.elapsed();
             if !outcome.solved {
                 digits.set(i, orig);

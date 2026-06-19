@@ -1,5 +1,5 @@
-//! `FusedLogicSolver` — the **fast path** of the logic solver: bb's dual-view fused
-//! band closure ported onto the [`DualSolverState`]. The performance counterpart
+//! `FusedLogicSolver` — the **fast path** of the logic solver: bb's fused band closure
+//! ported onto a single row-major [`SolverState`]. The performance counterpart
 //! of the composable [`LogicSolver`](super::LogicSolver) (the analogue of
 //! [`probe::Search`](crate::probe::Search) to the prober's `Singles`): identical
 //! verdicts, far less work — no per-cell unit scan, no popcount.
@@ -23,8 +23,8 @@
 //! gather-free column pass), so no column view is held. Together with the naked-single
 //! sieve they reach the full {singles, locked-candidates} fixpoint ([`propagate`]). When
 //! that stalls, the discrete subset ladder advances one step —
-//! reusing the *composable* [`super::techniques`] subsets, which already run on the
-//! dual grid — and the closure re-runs. This is exactly bb's `baseline_fast`.
+//! reusing the *composable* [`super::techniques`] subsets (run on a one-shot cell-major
+//! transpose) — and the closure re-runs. This is exactly bb's `baseline_fast`.
 //!
 //! ## Precondition (same as bb's fast path)
 //!
@@ -40,8 +40,16 @@
 
 use super::{Eliminate, LogicBoard, LogicSolver, Solver, techniques};
 use crate::counters::counter_block;
-use crate::repr::banded::{Band, Banding, Bands, ColMajor, DualSolverState, RowMajor};
-use crate::repr::{Branchable, CELLS, CellIdx, Digit, GridMask, Mark, Marks, Occupancy};
+use crate::repr::banded::{Band, Banding, Bands, ColMajor, RowMajor};
+use crate::repr::{
+    Branchable, CELLS, CellIdx, Digit, GridMask, Mark, Marks, Occupancy, SolverState,
+};
+
+/// The fused solver's board: the single **row-major** candidate state. Columns and
+/// box↔column LC are read off it by the in-fold column sweep ([`band_update_cols`]), so
+/// the baseline no longer carries a column-major view (the `DualSolverState`'s second
+/// banding) — the strip maintains one banding per clue clear/restore.
+type RowState = SolverState<Bands<RowMajor>>;
 use crate::scan::sieve::Sieve;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
@@ -63,12 +71,13 @@ use crate::spec::kinds::{
 // Sized `10 + NUM` so the per-kind slots `[10+k]` for k in 0..NUM always fit.
 counter_block!(FSTAT: 10 + NUM, inc = fstat_inc, add = fstat_add, snapshot = fstat_snapshot, reset = fstat_reset);
 
-/// The fused fast-path logic solver over the dual-banded grid. Stateless marker, like
-/// [`LogicSolver`](super::LogicSolver); see the module docs for its precondition.
+/// The fused fast-path logic solver over the single row-major candidate state.
+/// Stateless marker, like [`LogicSolver`](super::LogicSolver); see the module docs for
+/// its precondition.
 pub struct FusedLogicSolver;
 
-impl Solver<DualSolverState> for FusedLogicSolver {
-    fn solve_tracked(board: &DualSolverState, allowed: KindMask) -> SolveTrace {
+impl Solver<RowState> for FusedLogicSolver {
+    fn solve_tracked(board: &RowState, allowed: KindMask) -> SolveTrace {
         const NS: KindMask = 1 << NAKED_SINGLE;
         const HS: KindMask = 1 << HIDDEN_SINGLE;
         const LCP: KindMask = 1 << LC_POINTING;
@@ -90,7 +99,7 @@ impl Solver<DualSolverState> for FusedLogicSolver {
 
     /// The avoid-target walk needs per-step technique gating the fused closure can't
     /// express, and it is the cold verify path — delegate to the composable engine.
-    fn min_target_uses(board: &DualSolverState, scope: KindMask, target: KindMask) -> usize {
+    fn min_target_uses(board: &RowState, scope: KindMask, target: KindMask) -> usize {
         LogicSolver::min_target_uses(board, scope, target)
     }
 }
@@ -107,7 +116,7 @@ enum Prop {
 
 /// Solve via the gated fused closure + the discrete subset ladder, easiest-first.
 /// `LC` monomorphizes the locked-candidates step away when the baseline excludes it.
-fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> SolveTrace {
+fn fused_solve<const LC: bool>(board: &RowState, allowed: KindMask) -> SolveTrace {
     fstat_add(0, 1);
     let mut b = board.clone();
     let mut counts = [0u16; NUM];
@@ -161,7 +170,7 @@ fn fused_solve<const LC: bool>(board: &DualSolverState, allowed: KindMask) -> So
 /// `propagate_g`. Naked singles drain first (cheapest), then the row + column band
 /// sweeps; loop until a whole pass changes nothing.
 #[cfg_attr(prof_solver, inline(never))]
-fn propagate<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> Prop {
+fn propagate<const LC: bool>(b: &mut RowState, fired: &mut u32) -> Prop {
     loop {
         match drain_naked_singles(b, fired) {
             Prop::Stuck => {}
@@ -176,20 +185,20 @@ fn propagate<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> Prop {
 }
 
 /// Place every naked single in bit-parallel waves until none remain, classifying the
-/// board each pass. The depth-2 raw sieve over the row view surfaces dead cells
+/// board each pass. The depth-2 raw sieve over the row board surfaces dead cells
 /// (`unsolved & dead`), the solved verdict (`!unsolved`), and the singles
-/// (`unsolved & exactly(1)`) popcount-free; placement syncs both views. On a
-/// uniquely-solvable board naked singles are forced and never conflict, so a wave
-/// places them all without a contradiction check.
+/// (`unsolved & exactly(1)`) popcount-free. On a uniquely-solvable board naked singles
+/// are forced and never conflict, so a wave places them all without a contradiction
+/// check.
 #[cfg_attr(prof_solver, inline(never))]
-fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
+fn drain_naked_singles(b: &mut RowState, fired: &mut u32) -> Prop {
     #[cfg(feature = "count")]
     fstat_add(8, 1); // drain entries
     loop {
         #[cfg(feature = "count")]
         fstat_add(7, 1); // sieve recomputes (waves + the terminal pass)
-        let sieve = Sieve::<Bands<RowMajor>, 2>::compute_raw(b.row().candidates());
-        let unsolved = b.row().unsolved();
+        let sieve = Sieve::<Bands<RowMajor>, 2>::compute_raw(b.candidates());
+        let unsolved = b.unsolved();
         if (unsolved & sieve.dead()).any() {
             return Prop::Contradiction;
         }
@@ -206,7 +215,7 @@ fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
         // per-cell candidate scan.
         for di in 0..9 {
             let d = Digit::from_index(di);
-            let group = singles & b.row().candidates()[d];
+            let group = singles & b.candidates()[d];
             if group.any() {
                 b.place_single_group(d, group);
             }
@@ -232,11 +241,11 @@ fn drain_naked_singles(b: &mut DualSolverState, fired: &mut u32) -> Prop {
 /// a store-forward. A const index ([`Bands::band_at`]) keeps the extract a register
 /// `vpextrd`. Same memory-port win the prober's `band_hidden_singles` took.
 #[cfg_attr(prof_solver, inline(never))]
-fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
+fn band_update_rm<const LC: bool>(b: &mut RowState, fired: &mut u32) -> bool {
     let mut changed = false;
     for di in 0..9 {
         let d = Digit::from_index(di);
-        let mut live_all = b.row().candidates()[d] & b.row().unsolved();
+        let mut live_all = b.candidates()[d] & b.unsolved();
         changed |= sweep_band_rm::<0, LC>(b, &mut live_all, d, fired);
         changed |= sweep_band_rm::<1, LC>(b, &mut live_all, d, fired);
         changed |= sweep_band_rm::<2, LC>(b, &mut live_all, d, fired);
@@ -250,7 +259,7 @@ fn band_update_rm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> b
 /// `sweep_band_rm` sees it.
 #[inline(always)]
 fn sweep_band_rm<const B: usize, const LC: bool>(
-    b: &mut DualSolverState,
+    b: &mut RowState,
     live_all: &mut Bands<RowMajor>,
     d: Digit,
     fired: &mut u32,
@@ -263,7 +272,7 @@ fn sweep_band_rm<const B: usize, const LC: bool>(
             changed = true;
             *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
             drop_triplets::<RowMajor>(b, d, B, dropped);
-            *live_all = b.row().candidates()[d] & b.row().unsolved();
+            *live_all = b.candidates()[d] & b.unsolved();
             live = live_all.band_at::<B>();
         }
     }
@@ -275,7 +284,7 @@ fn sweep_band_rm<const B: usize, const LC: bool>(
             b.place(RowMajor::cell_at(B, pos), d);
             changed = true;
             *fired |= 1 << HIDDEN_SINGLE;
-            *live_all = b.row().candidates()[d] & b.row().unsolved();
+            *live_all = b.candidates()[d] & b.unsolved();
             live = live_all.band_at::<B>();
         }
     }
@@ -312,13 +321,13 @@ fn sweep_band_rm<const B: usize, const LC: bool>(
 /// (singles + LC are monotone eliminations), so [`propagate`]'s closure reaches the
 /// identical board; `changed` drives the re-run that closes any cross-effect.
 #[cfg_attr(prof_solver, inline(never))]
-fn band_update_cols<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
+fn band_update_cols<const LC: bool>(b: &mut RowState, fired: &mut u32) -> bool {
     let mut changed = false;
     for di in 0..9 {
         let d = Digit::from_index(di);
         // box↔column locked candidates, from the row view's per-band column occupancy.
         if LC {
-            let live = b.row().candidates()[d] & b.row().unsolved();
+            let live = b.candidates()[d] & b.unsolved();
             let occ = band_col_occ(live);
             for big_b in 0..3 {
                 let dropped = DROP_TRIP[pack_col_triplet_occ(occ, big_b)];
@@ -332,7 +341,7 @@ fn band_update_cols<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) ->
         // Column hidden singles, read off the post-LC board (LC may have just emptied a
         // column to a single). Broadcast the single-column mask across the three rows of
         // every band, AND the live board to recover the forced cells, place the wave.
-        let live = b.row().candidates()[d] & b.row().unsolved();
+        let live = b.candidates()[d] & b.unsolved();
         let col_single = col_hidden_singles(live);
         if col_single != 0 {
             let bc = col_single | (col_single << 9) | (col_single << 18);
@@ -390,13 +399,13 @@ fn col_hidden_singles(live: Bands<RowMajor>) -> u32 {
     ones & !twos
 }
 
-/// Clear digit `d` from every cell of each dropped triplet, in both views. A
-/// triplet `t = 3*a + g` is band-row (or column-within-stack) `a` × box-column (or
-/// box-row) `g`; its three cells sit at band positions `9*a + 3*g + j`. The
-/// [`Banding`] `B` maps each back to a cell, and [`DualSolverState::forbid`]
-/// clears it in both bandings — so the row-major and column-major triplet drops
-/// share one routine.
-fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut dropped: u32) {
+/// Clear digit `d` from every cell of each dropped triplet. A triplet `t = 3*a + g` is
+/// band-row (or column-within-stack) `a` × box-column (or box-row) `g`; its three cells
+/// sit at band positions `9*a + 3*g + j`. The [`Banding`] `B` maps each back to a cell —
+/// the **same** physical cells whether `B` is `RowMajor` (box↔row drops, from
+/// [`sweep_band_rm`]) or `ColMajor` (box↔column drops, from [`band_update_cols`]) — so
+/// both orientations of triplet drop share one routine over the single row-major board.
+fn drop_triplets<B: Banding>(b: &mut RowState, d: Digit, band: usize, mut dropped: u32) {
     while dropped != 0 {
         let t = dropped.trailing_zeros() as usize;
         dropped &= dropped - 1;
@@ -418,18 +427,18 @@ fn drop_triplets<B: Banding>(b: &mut DualSolverState, d: Digit, band: usize, mut
 ///
 /// The harder techniques are read-heavy (a fish scans 9x9 cells per digit x2
 /// orientations; the wings scan all 81 cells), and every read is a [`Marks::get`].
-/// On the digit-major [`DualSolverState`] each `get` is a 9-board candidate scan, so
+/// On the digit-major [`RowState`] each `get` is a 9-board candidate scan, so
 /// running them on it directly is dominated by that gather (profiled: ~28% of the
 /// w-wing+jellyfish generator in `get` alone). Instead transpose the stalled board
 /// **once** into a cell-major [`CellBoard`] — `get` is then an O(1) [`Mark`] load —
 /// run the ladder there, and replay the handful of eliminations the fired technique
-/// logged back onto `b` (both views). This is the scalar analogue of the SIMT
-/// baseline's `ladder_step` / `CellMarks` transpose, identical verdict and elimination
-/// set (the techniques are deterministic over the board contract; `forbid` is
-/// commutative, so the replay order is moot).
+/// logged back onto `b`. This is the scalar analogue of the SIMT baseline's
+/// `ladder_step` / `CellMarks` transpose, identical verdict and elimination set (the
+/// techniques are deterministic over the board contract; `forbid` is commutative, so
+/// the replay order is moot).
 #[cfg_attr(prof_solver, inline(never))]
-fn step_harder(b: &mut DualSolverState, allowed: KindMask) -> Option<usize> {
-    let mut cb = CellBoard::from_dual(b);
+fn step_harder(b: &mut RowState, allowed: KindMask) -> Option<usize> {
+    let mut cb = CellBoard::from_row(b);
     let k = ladder(&mut cb, allowed)?;
     for &(cell, di) in &cb.elims[..cb.n_elim] {
         b.forbid(cell as CellIdx, Digit::from_index(di as usize));
@@ -464,11 +473,10 @@ fn ladder<B: LogicBoard>(b: &mut B, allowed: KindMask) -> Option<usize> {
 
 /// Candidate-only **cell-major** scratch board for [`step_harder`]'s subset/fish/wing
 /// ladder: each cell's [`Mark`] stored directly, so a technique's per-cell scan reads
-/// it in O(1) rather than [`DualSolverState`]'s digit-major 9-board `get`. Built once
-/// per stall from the stalled board's row view ([`from_dual`](CellBoard::from_dual)),
-/// it logs the eliminations the fired technique makes so [`step_harder`] can replay
-/// just those onto the real (dual) board. The scalar twin of the SIMT baseline's
-/// `CellMarks`.
+/// it in O(1) rather than [`RowState`]'s digit-major 9-board `get`. Built once per stall
+/// from the stalled row-major board ([`from_row`](CellBoard::from_row)), it logs the
+/// eliminations the fired technique makes so [`step_harder`] can replay just those onto
+/// the real board. The scalar twin of the SIMT baseline's `CellMarks`.
 #[derive(Clone)]
 struct CellBoard {
     marks: [Mark; 81],
@@ -481,15 +489,14 @@ struct CellBoard {
 }
 
 impl CellBoard {
-    /// Transpose a stalled dual board's live candidates into per-cell marks. Walks each
+    /// Transpose a stalled board's live candidates into per-cell marks. Walks each
     /// digit's row-major live-candidate band (`candidates & unsolved`) by set bit and
     /// inserts the digit at each cell — cheaper than 81 digit-major `get`s, and the only
     /// pass that touches the slow representation. A solved cell holds no candidate in any
-    /// band, so it reads as [`Mark::EMPTY`] (matching `DualSolverState::get`); since the
-    /// closure has drained naked singles, every still-empty cell has >= 2 candidates, so
+    /// band, so it reads as [`Mark::EMPTY`] (matching `RowState::get`); since the closure
+    /// has drained naked singles, every still-empty cell has >= 2 candidates, so
     /// `is_empty` can be answered straight off the marks (see [`Occupancy`]).
-    fn from_dual(b: &DualSolverState) -> Self {
-        let row = b.row();
+    fn from_row(row: &RowState) -> Self {
         let unsolved = row.unsolved();
         let mut marks = [Mark::EMPTY; 81];
         for di in 0..9 {
@@ -585,7 +592,8 @@ const OCC3: [u8; 512] = {
 /// The triplets a band drops under the within-band locked-candidates fixpoint,
 /// keyed on its 9-bit triplet occupancy: `occ & !keep`, precomputed. Nonzero only
 /// for the rare occupancies that actually have an LC elimination. The same table
-/// serves both views (box↔row in row-major bands, box↔column in column-major).
+/// serves both orientations (box↔row off a row-major band's [`triplet_occ`], box↔column
+/// off the column occupancy [`pack_col_triplet_occ`] folds from the same row board).
 pub(crate) const DROP_TRIP: [u32; 512] = {
     let mut t = [0u32; 512];
     let mut occ = 0usize;

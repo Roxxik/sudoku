@@ -38,7 +38,7 @@
 
 use generator_lab::fill::random_solution;
 use generator_lab::probe::{Prober, Search};
-use generator_lab::repr::banded::{Bands, DualSolverState, RowMajor};
+use generator_lab::repr::banded::{Bands, RowMajor};
 use generator_lab::repr::{CELLS, Digit, DigitGrid, Marks, SolverState};
 use generator_lab::rng::Rng;
 use generator_lab::scan::Bivalue;
@@ -97,11 +97,11 @@ fn logic_solved(line: &str, baseline: KindMask) -> bool {
     LogicSolver::solve_tracked(&state, baseline).solved
 }
 
-/// Whether the fused fast-path logic solver on the dual-banded grid solves it.
+/// Whether the fused fast-path logic solver on the single row-major board solves it.
 fn fused_solved(line: &str, baseline: KindMask) -> bool {
     let grid = DigitGrid::parse(line).expect("valid line");
-    let dual = DualSolverState::from_digits(&grid);
-    FusedLogicSolver::solve_tracked(&dual, baseline).solved
+    let row = SolverState::<Bands<RowMajor>>::from_digits(&grid);
+    FusedLogicSolver::solve_tracked(&row, baseline).solved
 }
 
 fn check_spec(label: &str, spec: &Spec, attempts: usize, min_compared: usize) {

@@ -15,12 +15,11 @@
 //! `tests/equiv_warp` pins the two lane-for-lane).
 //!
 //! The candidate state is carried incrementally across the 81 strip steps exactly as
-//! bb does: a single [`DualSolverState`] plus a `clue` map, reopened/reclosed in
-//! place with [`clear_clue`](DualSolverState::clear_clue) /
-//! [`place_clue`](DualSolverState::place_clue) rather than rebuilt each step. Holding
-//! both bandings live means the uniqueness prober reads the row view and the baseline
-//! gate reads both — with **no per-gate reconstruction**, just as bb reuses one dual
-//! `BitBoard` for both gates. The lone `from_digits` is once per attempt, on the full
+//! bb does: a single board (a [`StripView`]) plus a `clue` map, reopened/reclosed in
+//! place rather than rebuilt each step. Both the uniqueness prober and the baseline gate
+//! read its row-major view — with **no per-gate reconstruction** — so the strip carries
+//! one row-major [`SolverState`] (the baseline folds columns off it; see
+//! [`FusedLogicSolver`]). The lone `from_digits` is once per attempt, on the full
 //! solution.
 
 use crate::fill::{Filled, GridCoords, byproducts, random_solution, random_solution_full};
@@ -44,14 +43,16 @@ type P = Search<Bivalue>;
 
 /// The strip's candidate-state capability — the incremental clue board the 81 removal
 /// attempts mutate in place, abstracted so each strip driver carries only the views it
-/// reads. The scalar/wasm [`attempt`] strips on the dual-banded [`DualSolverState`]
-/// (its scalar baseline gate reads both views), while the SIMT host strips on a single
-/// row-major [`SolverState`]: the warp consumes only row bands ([`StripState::export_r`]),
-/// the prober and the gate tests are row-only, and the baseline trace comes back from
-/// the warp — so maintaining a column view per clue clear/restore there would be pure
-/// waste (~half the strip's fixed band traffic). Both impls run the identical
-/// clue-survival algebra, so every gate decision — and hence the trajectory and the
-/// produced puzzles — is byte-identical across instantiations.
+/// reads. Both the scalar/wasm [`attempt`] and the SIMT host strip on a single row-major
+/// [`SolverState`]: the prober and gate tests are row-only, the warp consumes only row
+/// bands ([`StripState::export_r`]), and the scalar baseline now folds columns off the
+/// row board too (see [`FusedLogicSolver`]) — so neither path maintains a column view per
+/// clue clear/restore (it would be ~half the strip's fixed band traffic for nothing). The
+/// dual-banded [`DualSolverState`] is still a valid [`StripView`] (it carries both
+/// bandings), kept for callers that want the column view in-lane, but it is no longer the
+/// default. Every impl runs the identical clue-survival algebra, so every gate decision —
+/// and hence the trajectory and the produced puzzles — is byte-identical across
+/// instantiations.
 pub trait StripView: Marks + PartialEq {
     /// The fully-decided state (a complete grid's `from_digits`, built directly).
     fn solved() -> Self;
@@ -765,10 +766,13 @@ pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
 /// candidate source is one incrementally maintained board (`state`, a [`StripView`])
 /// + its row-major `clue` map, mutated in place
 /// across the 81 removal attempts (bb's `apply_clear`/`apply_place`) — so the uniqueness
-/// prober reads its row view (and the scalar baseline gate both views) with **no per-gate
-/// rebuild**, exactly as bb reuses one dual `BitBoard`. `digits` is the placements shadow
-/// the produced puzzle reads (and the strip's `alts==0`/`get` source `clue` can't give).
-pub(in crate::generate) struct StripState<S: StripView = DualSolverState> {
+/// prober and the scalar baseline gate both read its row-major view with **no per-gate
+/// rebuild**. The scalar [`attempt`] now strips on a single row-major [`SolverState`]
+/// (its baseline reads columns by folding the row board, not a second banding); the
+/// dual-banded [`DualSolverState`] is still a valid [`StripView`] but no longer the
+/// default. `digits` is the placements shadow the produced puzzle reads (and the strip's
+/// `alts==0`/`get` source `clue` can't give).
+pub(in crate::generate) struct StripState<S: StripView = SolverState<RM>> {
     digits: DigitGrid,
     state: S,
     clue: PerDigit<RM>,
@@ -989,18 +993,18 @@ impl<S: StripView> StripState<S> {
     }
 }
 
-/// The scalar gate resolution — only on the dual-banded instantiation, because the
-/// scalar baseline engines ([`FusedLogicSolver`]/[`LogicSolver`]) read both views.
-/// The SIMT host never calls this (its baseline trace comes from the warp), which is
-/// exactly why its strip can drop the column view.
-impl StripState<DualSolverState> {
+/// The scalar gate resolution — on the row-major instantiation: the scalar baseline
+/// engines ([`FusedLogicSolver`]/[`LogicSolver`]) now read columns by folding the row
+/// board, so a single banding suffices. The SIMT host never calls this (its baseline
+/// trace comes from the warp).
+impl StripState<SolverState<RM>> {
     /// Resolve the gates for the strip of `cell` (held `orig`) given the already-decided
     /// uniqueness verdict `nonunique`: if non-unique, revert; else run the baseline gate
     /// and either accept (updating `req_met`/`best`) or revert. `baseline` is the toolbox
     /// mask and `fast` selects the fused fast path vs the exact engine (see
     /// [`baseline_fast_applicable`]). The baseline reads the incrementally-maintained
-    /// dual state directly — no per-gate rebuild — and the solver clones it internally,
-    /// so the carried strip state is untouched.
+    /// row-major state directly — no per-gate rebuild — and the solver clones it
+    /// internally, so the carried strip state is untouched.
     pub(in crate::generate) fn resolve_gate(
         &mut self,
         cell: usize,
@@ -1014,7 +1018,7 @@ impl StripState<DualSolverState> {
             self.revert(cell, orig);
             return;
         }
-        // The baseline view is the incrementally-maintained dual state — no rebuild.
+        // The baseline view is the incrementally-maintained row-major state — no rebuild.
         let trace = if fast {
             FusedLogicSolver::solve_tracked(&self.state, baseline)
         } else {
@@ -1047,8 +1051,9 @@ pub fn attempt(rng: &mut Rng, spec: &Spec) -> AttemptResult {
     let mut positions: [usize; CELLS] = core::array::from_fn(|i| i);
     rng.shuffle(&mut positions);
 
-    // The scalar attempt strips on the dual-banded state (the default `StripView`):
-    // its baseline gate below runs the scalar engines, which read both views.
+    // The scalar attempt strips on the single row-major state (the default `StripView`):
+    // its baseline gate below runs the scalar engines, which fold columns off the row
+    // board, so no column view is maintained across the strip.
     let mut st: StripState = StripState::new_ua(&filled);
     for cell in positions {
         let Some(orig) = st.digit_at(cell) else {
