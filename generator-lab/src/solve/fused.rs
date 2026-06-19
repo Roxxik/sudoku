@@ -16,11 +16,13 @@
 //!   only — three boxes) collapses to nine bits, and [`SINGLE9`] locates a lone
 //!   candidate in one table load.
 //!
-//! Every unit is in-lane in at least one of the two bandings, so the row-major sweep
-//! ([`band_update_rm`]) covers rows + boxes + box↔row LC and the column-major sweep
-//! ([`band_update_cm`]) covers columns + box↔column LC; together with the
-//! naked-single sieve they reach the full {singles, locked-candidates} fixpoint
-//! ([`propagate`]). When that stalls, the discrete subset ladder advances one step —
+//! The row-major sweep ([`band_update_rm`]) covers rows + boxes + box↔row LC with each
+//! unit in-lane. Columns and box↔column LC do *not* need a second banding: the
+//! single-view column sweep ([`band_update_cols`]) reads them straight off the row-major
+//! board with a per-band column fold + broadcast (the scalar port of the warp kernel's
+//! gather-free column pass), so no column view is held. Together with the naked-single
+//! sieve they reach the full {singles, locked-candidates} fixpoint ([`propagate`]). When
+//! that stalls, the discrete subset ladder advances one step —
 //! reusing the *composable* [`super::techniques`] subsets, which already run on the
 //! dual grid — and the closure re-runs. This is exactly bb's `baseline_fast`.
 //!
@@ -166,7 +168,7 @@ fn propagate<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> Prop {
             terminal => return terminal,
         }
         let mut changed = band_update_rm::<LC>(b, fired);
-        changed |= band_update_cm::<LC>(b, fired);
+        changed |= band_update_cols::<LC>(b, fired);
         if !changed {
             return Prop::Stuck;
         }
@@ -280,56 +282,112 @@ fn sweep_band_rm<const B: usize, const LC: bool>(
     changed
 }
 
-/// One fused column-major sweep: the transpose of [`band_update_rm`] on the column
-/// view, giving box↔column locked candidates and hidden singles in the three
-/// columns. Boxes are already covered row-major, so only the lines (columns) are
-/// swept. Mirror of bb's `band_update_cm`. Band-unrolled like [`band_update_rm`].
+/// One **single-view** column sweep: box↔column locked candidates and hidden singles
+/// in the nine columns, computed from the **row-major** view alone — the scalar port of
+/// the warp kernel's gather-free column pass ([`solve::simt::warp_pass_full`](super::simt)).
+/// Replaces the former column-major-banded `band_update_cm`, so the column view never has
+/// to be held or kept in sync.
+///
+/// A column `c` holds its cells at bit positions `c`, `c+9`, `c+18` of each row-major
+/// band, so OR-ing a band's three 9-bit row slices ([`band_col_occ`]) gives that band's
+/// per-column occupancy, and the three bands fold to the column's total — no
+/// column-major view, no transpose.
+///
+/// **box↔column LC.** The column-major band `B`'s [`triplet_occ`] (bit `3r+k` = column
+/// `3B+r` has a candidate in box-band `k`) is exactly bit `3B+r` of row-band `k`'s
+/// column occupancy, so the three row-band occupancies feed the shared [`DROP_TRIP`]
+/// table directly once repacked into its `3r+k` layout ([`pack_col_triplet_occ`]). The
+/// dropped triplets become whole-column-segment eliminations via [`drop_triplets`]
+/// (`ColMajor` geometry — pure cell math, no column view), the same routine the
+/// column-major sweep used.
+///
+/// **column hidden singles.** Folding the occupancy with a saturating "seen-twice"
+/// companion ([`col_hidden_singles`]) gives the columns with exactly one live candidate;
+/// broadcasting that 9-bit mask across the three rows (`m | m<<9 | m<<18`) and AND-ing
+/// the live board picks the forced cells, placed as a group — the peer-conflict trick in
+/// [`place_group_with`](crate::repr::SolverState::place_group_with) folds a contradictory
+/// double-placement into a dead cell, exactly as the naked-single wave does.
+///
+/// Reordering vs the old per-(band, column) sweep with refresh is fixpoint-confluent
+/// (singles + LC are monotone eliminations), so [`propagate`]'s closure reaches the
+/// identical board; `changed` drives the re-run that closes any cross-effect.
 #[cfg_attr(prof_solver, inline(never))]
-fn band_update_cm<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
+fn band_update_cols<const LC: bool>(b: &mut DualSolverState, fired: &mut u32) -> bool {
     let mut changed = false;
     for di in 0..9 {
         let d = Digit::from_index(di);
-        let mut live_all = b.col().candidates()[d] & b.col().unsolved();
-        changed |= sweep_band_cm::<0, LC>(b, &mut live_all, d, fired);
-        changed |= sweep_band_cm::<1, LC>(b, &mut live_all, d, fired);
-        changed |= sweep_band_cm::<2, LC>(b, &mut live_all, d, fired);
+        // box↔column locked candidates, from the row view's per-band column occupancy.
+        if LC {
+            let live = b.row().candidates()[d] & b.row().unsolved();
+            let occ = band_col_occ(live);
+            for big_b in 0..3 {
+                let dropped = DROP_TRIP[pack_col_triplet_occ(occ, big_b)];
+                if dropped != 0 {
+                    *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
+                    drop_triplets::<ColMajor>(b, d, big_b, dropped);
+                    changed = true;
+                }
+            }
+        }
+        // Column hidden singles, read off the post-LC board (LC may have just emptied a
+        // column to a single). Broadcast the single-column mask across the three rows of
+        // every band, AND the live board to recover the forced cells, place the wave.
+        let live = b.row().candidates()[d] & b.row().unsolved();
+        let col_single = col_hidden_singles(live);
+        if col_single != 0 {
+            let bc = col_single | (col_single << 9) | (col_single << 18);
+            let group = live & Bands::<RowMajor>::from_band_splat(bc);
+            if group.any() {
+                *fired |= 1 << HIDDEN_SINGLE;
+                b.place_single_group(d, group);
+                changed = true;
+            }
+        }
     }
     changed
 }
 
-/// One column-major band's box↔column locked candidates + hidden singles in the three
-/// columns, band index `B` a constant ([`Bands::band_at`], register `vpextrd`). The
-/// transpose of [`sweep_band_rm`]; only the lines are swept (boxes are covered row-major).
-#[inline(always)]
-fn sweep_band_cm<const B: usize, const LC: bool>(
-    b: &mut DualSolverState,
-    live_all: &mut Bands<ColMajor>,
-    d: Digit,
-    fired: &mut u32,
-) -> bool {
-    let mut changed = false;
-    let mut live = live_all.band_at::<B>();
-    if LC {
-        let dropped = DROP_TRIP[triplet_occ(live)];
-        if dropped != 0 {
-            changed = true;
-            *fired |= (1 << LC_POINTING) | (1 << LC_CLAIMING);
-            drop_triplets::<ColMajor>(b, d, B, dropped);
-            *live_all = b.col().candidates()[d] & b.col().unsolved();
-            live = live_all.band_at::<B>();
-        }
+/// Each row-major band's per-column occupancy: a 9-bit mask (bit `c` set iff column `c`
+/// holds a live candidate somewhere in that band's three rows), one entry per band.
+#[inline]
+fn band_col_occ(live: Bands<RowMajor>) -> [u32; 3] {
+    let occ = |band: Band| (band.line(0) | band.line(1) | band.line(2)) as u32;
+    [occ(live.band_at::<0>()), occ(live.band_at::<1>()), occ(live.band_at::<2>())]
+}
+
+/// Repack the three row-band column occupancies into column-major band `B`'s 9-bit
+/// triplet occupancy in [`DROP_TRIP`]'s `3r+k` layout: bit `3r+k` (column-within-band
+/// `r`, box-band `k`) = bit `3*B+r` of row-band `k`'s occupancy. The inverse-indexed
+/// twin of [`triplet_occ`], built from the row view instead of a column-major band.
+#[inline]
+fn pack_col_triplet_occ(occ: [u32; 3], big_b: usize) -> usize {
+    let mut o = 0u32;
+    for r in 0..3 {
+        let c = 3 * big_b + r;
+        o |= ((occ[0] >> c) & 1) << (3 * r);
+        o |= ((occ[1] >> c) & 1) << (3 * r + 1);
+        o |= ((occ[2] >> c) & 1) << (3 * r + 2);
     }
-    // Only the three lines (columns of this view); boxes are covered row-major.
-    for &mask in &Band::UNIT_MASKS[..3] {
-        if let Some(pos) = live.unit_single(mask) {
-            b.place(ColMajor::cell_at(B, pos), d);
-            changed = true;
-            *fired |= 1 << HIDDEN_SINGLE;
-            *live_all = b.col().candidates()[d] & b.col().unsolved();
-            live = live_all.band_at::<B>();
-        }
-    }
-    changed
+    o as usize
+}
+
+/// The columns holding exactly one live candidate for the digit — a 9-bit mask, bit `c`
+/// set iff column `c`'s nine cells hold exactly one. Fold each band's three row slices to
+/// a saturating (≥1, ≥2) 9-bit pair, then merge the three bands with the same identity
+/// (the warp kernel's two-level column fold, scalarized).
+#[inline]
+fn col_hidden_singles(live: Bands<RowMajor>) -> u32 {
+    let band_fold = |band: Band| {
+        let (s0, s1, s2) = (band.line(0) as u32, band.line(1) as u32, band.line(2) as u32);
+        let o01 = s0 | s1;
+        (o01 | s2, (s0 & s1) | (o01 & s2)) // (≥1, ≥2) over this band's three rows
+    };
+    let (o0, t0) = band_fold(live.band_at::<0>());
+    let (o1, t1) = band_fold(live.band_at::<1>());
+    let (o2, t2) = band_fold(live.band_at::<2>());
+    let ones = o0 | o1 | o2;
+    let twos = t0 | t1 | t2 | (o0 & o1) | (o0 & o2) | (o1 & o2);
+    ones & !twos
 }
 
 /// Clear digit `d` from every cell of each dropped triplet, in both views. A

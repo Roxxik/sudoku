@@ -42,6 +42,17 @@ impl<B: Banding> Bands<B> {
         Band(self.0[i])
     }
 
+    /// Build a set from a raw 27-bit band word broadcast into all three bands (lane 3
+    /// unused). The column-broadcast the single-view column sweep needs: a 9-bit
+    /// per-column mask smeared across a band's three rows (`m | m<<9 | m<<18`) is the
+    /// same pattern in every band, so one word fills all three. Only the low 27 bits of
+    /// `w` are meaningful; the result is AND-ed against a canonical board, which clears
+    /// any junk above bit 27.
+    #[inline]
+    pub(crate) fn from_band_splat(w: u32) -> Self {
+        Bands(Simd::from_array([w, w, w, 0]), PhantomData)
+    }
+
     /// Extract band `I` (a compile-time constant) as a scalar [`Band`]. Same value as
     /// [`band`](Bands::band), but the `Index` form `self.0[i]` reads through
     /// [`as_array`](std::simd::Simd::as_array), which forces the vector to a stack slot —
