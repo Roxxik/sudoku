@@ -24,6 +24,16 @@ import * as store from "./store.js";
 import * as settings from "./settings.js";
 import { miniBoard, textColumn, copyText } from "./ui.js";
 import { TECHNIQUE_INFO } from "./techniques.js";
+import { masksFromUsages } from "./spec.js";
+import {
+  REVIEW_TIER,
+  REVIEW_LESSONS,
+  lessonUsages,
+  lessonHasDrill,
+  lessonSubtitle,
+  lessonLabel,
+  joinNames,
+} from "./review.js";
 import {
   formatDuration,
   techniqueName,
@@ -35,6 +45,7 @@ import {
 let curriculum = [];
 let showView = () => {};
 let onLaunch = () => {};
+let onLaunchSpec = () => {};
 let onResume = () => {};
 let onOpenSpec = () => {};
 let onImport = () => {};
@@ -46,6 +57,7 @@ export function initHome(opts) {
   curriculum = opts.curriculum;
   showView = opts.showView;
   onLaunch = opts.onLaunch;
+  onLaunchSpec = opts.onLaunchSpec || (() => {});
   onResume = opts.onResume;
   onOpenSpec = opts.onOpenSpec || (() => {});
   onImport = opts.onImport || (() => {});
@@ -106,14 +118,14 @@ function renderTiers(stats) {
 }
 
 // The subtitle under a tier button on the home page: a multi-branch tier (Expert)
-// lists its branch names; a single-branch tier (Beginner/Intermediate) lists its
-// technique names.
+// lists its branch names (plus the Review section it carries); a single-branch
+// tier (Beginner/Intermediate) lists its technique names.
 function tierSubtitle(tier) {
   const branches = grouped[tier];
   if (Object.keys(branches).length > 1) {
-    return BRANCH_ORDER.filter((b) => branches[b])
-      .map((b) => BRANCH_LABEL[b])
-      .join(" · ");
+    const labels = BRANCH_ORDER.filter((b) => branches[b]).map((b) => BRANCH_LABEL[b]);
+    if (tier === REVIEW_TIER) labels.push("Review");
+    return labels.join(" · ");
   }
   return techniqueNames(Object.values(branches).flat());
 }
@@ -309,6 +321,19 @@ function openBranches(tier) {
       )
     );
   }
+  // The Review section sits below the branches: mixed-technique practice once the
+  // individual techniques are known. Not a curriculum branch, so it's appended
+  // here rather than grouped (see REVIEW_LESSONS).
+  if (tier === REVIEW_TIER) {
+    grid.appendChild(
+      navButton(
+        "Review",
+        "Mixed practice — a puzzle that needs any one of a set",
+        0,
+        () => openReview(tier, () => openBranches(tier))
+      )
+    );
+  }
   const note = document.createElement("div");
   note.className = "mode-explainer";
   note.appendChild(
@@ -380,6 +405,137 @@ function openTechnique(tier, branch, t, back) {
   document.getElementById("campaignBody").replaceChildren(page);
   campaignBack = back;
   showView("campaignView");
+}
+
+// ---- Review lessons ----
+// The list of Review lessons under a tier. Each row is a nav-button to a lesson
+// page, subtitled with its techniques. `back` is the branch list that opened it.
+function openReview(tier, back) {
+  setCampaignTitle(`${TIER_LABEL[tier]} · Review`);
+  const grid = document.createElement("div");
+  grid.className = "nav-grid";
+  for (const lesson of REVIEW_LESSONS) {
+    grid.appendChild(
+      navButton(lesson.name, lessonSubtitle(lesson), 0, () =>
+        openReviewLesson(tier, lesson, () => openReview(tier, back))
+      )
+    );
+  }
+  const note = document.createElement("div");
+  note.className = "mode-explainer";
+  note.appendChild(
+    explPlain(
+      "Each lesson builds a puzzle that needs any one of its techniques, drawn evenly across the set — a mixed refresher once you know them on their own."
+    )
+  );
+  document.getElementById("campaignBody").replaceChildren(grid, note);
+  campaignBack = back;
+  showView("campaignView");
+}
+
+// A Review lesson page: a description over a Train row (always) and a Drill row
+// (when the lesson has easier Expert techniques to isolate against — every lesson
+// past the first). Each row offers Play and Play from Forced, as a technique page
+// does. `back` returns to the lesson list.
+function openReviewLesson(tier, lesson, back) {
+  setCampaignTitle(lesson.name);
+
+  const page = document.createElement("div");
+  page.className = "tech-page";
+
+  const desc = document.createElement("p");
+  desc.className = "tech-desc";
+  desc.textContent =
+    `A puzzle that needs any one of ${joinNames(lesson)}. Each new puzzle requires just ` +
+    "one of them, drawn evenly across the set, so the techniques come up in turn.";
+  page.appendChild(desc);
+
+  // Drill isolates the lesson's technique against the easier Expert ones; with
+  // nothing easier in scope (Lesson 1) there is nothing to isolate, so it's
+  // Train-only — mirroring a technique page's `hasDrill`.
+  const hasDrill = lessonHasDrill(curriculum, lesson);
+  page.appendChild(reviewModeRow(lesson, "train"));
+  if (hasDrill) page.appendChild(reviewModeRow(lesson, "drill"));
+
+  page.appendChild(reviewModeNote(hasDrill));
+
+  document.getElementById("campaignBody").replaceChildren(page);
+  campaignBack = back;
+  showView("campaignView");
+}
+
+// One Review mode (Train or Drill) as a row: its label over the start buttons.
+function reviewModeRow(lesson, mode) {
+  const row = document.createElement("div");
+  row.className = "mode-row";
+
+  const head = document.createElement("div");
+  head.className = "mode-row-head";
+  head.textContent = mode === "drill" ? "Drill" : "Train";
+  row.appendChild(head);
+
+  const btns = document.createElement("div");
+  btns.className = "mode-buttons";
+  btns.appendChild(reviewButton(lesson, mode, "Play", false));
+  btns.appendChild(reviewButton(lesson, mode, "Play from Forced", true));
+  row.appendChild(btns);
+  return row;
+}
+
+// A short note on what Train and Drill mean for a lesson, mirroring a technique
+// page's. With no Drill (Lesson 1) it explains why the split is absent.
+function reviewModeNote(hasDrill) {
+  const box = document.createElement("div");
+  box.className = "mode-explainer";
+  if (hasDrill) {
+    box.appendChild(
+      explMode("Train", "the easier review techniques, plus the basics, may also be needed to finish the puzzle.")
+    );
+    box.appendChild(
+      explMode("Drill", "only one of this lesson's techniques is required; the easier review techniques won't be needed to finish it.")
+    );
+  } else {
+    box.appendChild(
+      explPlain("Only the basics are needed besides one of this lesson's techniques, so there is no separate drill.")
+    );
+  }
+  return box;
+}
+
+// A Review start button. Unlike a technique's play button it carries no solved
+// badge: a lesson generates a `force_any` (custom) game, which isn't tracked per
+// kind. The empty sub keeps its height in line with the technique buttons.
+function reviewButton(lesson, mode, label, fromForced) {
+  const btn = document.createElement("button");
+  btn.className = "mode-btn";
+  btn.addEventListener("click", () => launchLesson(lesson, mode, fromForced));
+
+  const lab = document.createElement("span");
+  lab.className = "mb-label";
+  lab.textContent = label;
+  btn.appendChild(lab);
+
+  const sub = document.createElement("span");
+  sub.className = "mb-sub";
+  btn.appendChild(sub);
+  return btn;
+}
+
+// Launch a Review lesson through the custom-spec (`force_any`) path: allow the
+// basics, force the lesson's set as one disjunction, scope the easier Expert
+// techniques per `mode`, and hand it to the same generation flow the custom
+// builder uses. The generator pins one set member per puzzle. `fromForced` seeds
+// the board up to that technique (allowed = baseline minus the forced set), as a
+// custom forced-start does.
+function launchLesson(lesson, mode, fromForced) {
+  const usages = lessonUsages(curriculum, lesson, mode);
+  onLaunchSpec({
+    usages,
+    label: lessonLabel(lesson),
+    specMasks: masksFromUsages(usages),
+    forceAny: true,
+    fromForced,
+  });
 }
 
 // One mode (Train or Drill) as a row: its label over the start buttons. Play uses

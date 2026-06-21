@@ -301,6 +301,7 @@ function boot() {
     curriculum: CURRICULUM,
     showView,
     onLaunch: (kindIndex, mode, fromForced) => launch({ kindIndex, mode, fromForced }),
+    onLaunchSpec: (req) => launch(req),
     onResume: resume,
     onStats: goStats,
     onCustom: openCustomView,

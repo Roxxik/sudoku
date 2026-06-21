@@ -19,6 +19,7 @@ import {
   forcedIndices,
   hasForce,
 } from "./spec.js";
+import { REVIEW_LESSONS, lessonUsages, lessonHasDrill } from "./review.js";
 import { techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
 
 let curriculum = [];
@@ -38,6 +39,7 @@ let chipEls = []; // kindIndex -> chip button, for in-place updates
 let playBtn = null; // the two start buttons (Play / Play from first forced)
 let forcedBtn = null;
 let presetSel = null;
+let forceModeEl = null; // the "Require any" switch row, for programmatic refresh
 
 const USAGE_LABEL = ["Off", "Allow", "Force", "Concede"];
 const USAGE_CLASS = ["off", "allow", "force", "concede"];
@@ -154,6 +156,19 @@ function presetRow() {
     }
     sel.appendChild(og);
   }
+  // The Review lessons as force_any templates: each loads the lesson's set as one
+  // disjunction (Force + "Require any" on), scoped per mode. Drill is offered only
+  // where the lesson has easier Expert techniques to isolate against (Lesson 1
+  // doesn't, so it's Train-only), matching the campaign.
+  const reviewGroup = document.createElement("optgroup");
+  reviewGroup.label = "Expert · Review";
+  REVIEW_LESSONS.forEach((lesson, i) => {
+    reviewGroup.appendChild(option(`review:${i}:train`, `${lesson.name} — Train`));
+    if (lessonHasDrill(curriculum, lesson)) {
+      reviewGroup.appendChild(option(`review:${i}:drill`, `${lesson.name} — Drill`));
+    }
+  });
+  sel.appendChild(reviewGroup);
   sel.addEventListener("change", () => applyPreset(sel.value));
   presetSel = sel;
 
@@ -165,6 +180,15 @@ function applyPreset(value) {
   if (!value) return;
   if (value === "blank") {
     usages = new Array(NUM_KINDS).fill(OFF);
+    forceAny = false; // a blank spec forces nothing -- "all" mode is the honest state
+  } else if (value.startsWith("review:")) {
+    // A Review lesson template: the whole disjunction at once. forceAny on is what
+    // makes the Forced set a `force_any` rather than a conjunction.
+    const [, idxStr, mode] = value.split(":");
+    const lesson = REVIEW_LESSONS[Number(idxStr)];
+    if (!lesson) return;
+    usages = lessonUsages(curriculum, lesson, mode);
+    forceAny = true;
   } else {
     const [idxStr, mode] = value.split(":");
     const w = bindings();
@@ -176,9 +200,12 @@ function applyPreset(value) {
       return; // bridge hiccup: leave the chips as they were
     }
     usages = usagesFromMasks(masks);
+    forceAny = false; // a single-technique preset is a plain conjunction
   }
   saveUsages();
+  saveForceAny();
   refreshAllChips();
+  refreshForceMode();
   refreshGenerate();
 }
 
@@ -280,7 +307,14 @@ function forceModeRow() {
     row.setAttribute("aria-checked", String(forceAny));
     saveForceAny();
   });
+  forceModeEl = row;
   return row;
+}
+
+// Reflect the current `forceAny` on the switch -- used when a preset sets it
+// programmatically (the click handler updates it for direct taps).
+function refreshForceMode() {
+  if (forceModeEl) forceModeEl.setAttribute("aria-checked", String(forceAny));
 }
 
 // ---- Generate ----
