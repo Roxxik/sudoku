@@ -673,6 +673,7 @@ const HELP_TOUCH = [
   ["Lock a digit", "Double-tap a number to lock it; every cell you then tap gets that digit. Tap it once more to unlock, or double-tap a different number to switch."],
   ["Pencil notes", "Tap Notes to switch between placing digits and pencilling notes."],
   ["Switch note style", "Double-tap Notes to swap between center notes and corner (Snyder) notes."],
+  ["Convert corner notes", "Flick the Notes button upward to turn the selection's corner notes into center notes, merged on top of any center notes already there."],
   ["Quick opposite", "With a digit locked, double-tap a cell to do the opposite of your current mode — pencil a note while placing, or place while noting."],
   ["Paint notes", "With a digit locked, a note gesture can sweep: press and drag to pencil that note across every cell the pointer crosses, all as one move. In Notes mode that's a single press-and-drag; while placing digits it's a double-tap-and-drag (placing a value stays one cell). The first cell sets the direction — add or clear — so cells that already match are left untouched."],
   ["Erase", "Tap Erase, or re-tap a digit you placed."],

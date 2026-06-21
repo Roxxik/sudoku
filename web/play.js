@@ -865,12 +865,34 @@ function switchMarkKind() {
   updateNotesButton();
 }
 
+// Up-flick on the Notes button: dump every selected cell's corner marks into its
+// center marks, then clear the corners. Purely mechanical -- no candidate logic;
+// existing center marks are kept and the corners are merged on top. One undo step.
+function cornersToCenters() {
+  if (finished || selection.size === 0) return;
+  commit(() => {
+    for (const i of selection) {
+      if (given[i] !== 0) continue; // clues carry no marks
+      for (const d of cornerMarks[i]) centerMarks[i].add(d);
+      cornerMarks[i].clear();
+    }
+  });
+  render();
+}
+
 // Notes button gesture. A single tap flips place/mark; a double tap switches the
 // mark kind. Mirrors the pad's optimistic double-tap: the first tap flips placing
 // immediately, and a quick second tap reverts that flip and switches the kind
 // instead -- so a double-tap nets to "kind switched, place/mark unchanged".
 let lastNotesTap = 0;
+// Set true by an up-flick (see wireNotesFlick) so the click it also fires is
+// swallowed instead of read as a place/mark toggle.
+let notesFlicked = false;
 function onNotesTap() {
+  if (notesFlicked) {
+    notesFlicked = false; // an up-flick already converted; swallow its click
+    return;
+  }
   const now = performance.now();
   const isDouble = now - lastNotesTap < DOUBLE_MS;
   lastNotesTap = now;
@@ -881,6 +903,40 @@ function onNotesTap() {
   } else {
     togglePlacing();
   }
+}
+
+// An upward flick on the Notes button converts the selection's corner marks to
+// center marks (cornersToCenters). The press is captured so a flick that leaves
+// the button still reports its release here; on release a mostly-vertical upward
+// travel past FLICK_MIN counts as the flick and arms `notesFlicked` so the click
+// it also fires is swallowed (onNotesTap). Anything shorter falls through to the
+// normal tap/double-tap.
+const FLICK_MIN = 24; // px of upward travel to register a flick
+function wireNotesFlick() {
+  let startX = 0,
+    startY = 0,
+    flickPointer = null;
+  notesBtn.addEventListener("pointerdown", (e) => {
+    startX = e.clientX;
+    startY = e.clientY;
+    flickPointer = e.pointerId;
+    notesFlicked = false;
+    try {
+      notesBtn.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  });
+  notesBtn.addEventListener("pointerup", (e) => {
+    if (e.pointerId !== flickPointer) return;
+    flickPointer = null;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (dy <= -FLICK_MIN && Math.abs(dy) > Math.abs(dx)) {
+      notesFlicked = true; // swallow the click that follows
+      cornersToCenters();
+    }
+  });
 }
 
 // Reflect the current mode on the Notes button. In mark mode the label names the
@@ -2107,6 +2163,7 @@ function wirePad() {
   }
   document.getElementById("erase").addEventListener("click", erase);
   notesBtn.addEventListener("click", onNotesTap);
+  wireNotesFlick();
   if (undoBtn) undoBtn.addEventListener("click", undo);
   if (redoBtn) redoBtn.addEventListener("click", redo);
 }
