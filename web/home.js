@@ -696,8 +696,8 @@ const HELP_KEYBOARD = [
 
 const HELP_NOTES = [
   ["Restart is undoable", "Your whole attempt rides on the undo stack, so a single Undo brings it all back."],
-  ["Two note styles", "Center notes sit as a row in the middle of a cell; corner (Snyder) notes tuck into its corners."],
-  ["Hints read your center notes", "Only your center notes feed the hint engine. If a cell's center notes leave out a digit that's still possible, its hints can be inaccurate — keep them complete, or clear them."],
+  ["Two note styles", "Center notes sit as a row in the middle of a cell: jot every digit the cell could still take — its full candidate list. Corner (Snyder) notes tuck into the corners: within a box, pencil a digit in each cell that could still hold it, so when only two or three spots are left the pairs and pointing lines stand out. Most solving runs on center notes; corner notes are a focused tool for tracking one digit across a box."],
+  ["Hints read your notes", "Both your center and corner notes feed the hint engine — center notes as a cell's candidate list, corner notes as Snyder pins marking where a digit can still go in a box. It reasons from exactly those notes, so if a candidate is missing, or you use corner notes another way, a hint may not reflect the current state of play — it can point to a technique your real board has already passed. It never shows a wrong deduction, though: if your notes would rule out a cell's real answer, the engine ignores them there and reads candidates from the grid instead. Keep your notes complete and Snyder-style for hints that match where you actually are."],
   ["Auto-cleanup", "Placing a digit can strike it from the notes of every cell that sees it — turn this on with “Eliminate candidates” in Settings."],
   ["Play from Forced", "Starts you partway in, with clues filled up to the technique you're practising. Restart clears back to the original puzzle."],
   ["The timer pauses", "It stops while you're on another tab or in Settings, so your solve time stays honest."],
