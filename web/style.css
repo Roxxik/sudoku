@@ -193,6 +193,17 @@ html, body {
   font-size: clamp(0.4rem, calc(135cqw / var(--n, 3)), 0.82rem);
 }
 
+/* A pencil mark for the highlighted digit lights up on its own -- just the
+   matching center / corner glyph, never the whole cell. Same warm tint as a
+   .same cell; background only (no padding) so the note row doesn't reflow. */
+.cell .center-notes span.mark-same,
+.cell .corner-notes span.mark-same {
+  color: var(--accent2);
+  font-weight: 700;
+  background: var(--cell-same);
+  border-radius: 3px;
+}
+
 .cell .value { z-index: 1; }
 
 /* ---- Input pad ---- */

@@ -376,8 +376,9 @@ function render() {
       cell.classList.remove("filled");
     }
 
-    // Pencil marks only show on an empty cell.
-    renderNotes(cell, i, d === 0);
+    // Pencil marks only show on an empty cell. A mark for the highlighted digit
+    // lights up on its own (see renderNotes) -- the cell itself stays untinted.
+    renderNotes(cell, i, d === 0, highlightDigit);
 
     // Highlight classes. Every selected cell gets `selected`; peer / same only
     // light up for a lone selection.
@@ -399,24 +400,39 @@ function render() {
 const CORNER_FILL = [0, 2, 6, 8, 1, 7, 3, 5, 4];
 
 // Paint a cell's two note overlays. Center notes are the sorted candidates packed
-// into one row (`--n` drives the shrink-to-fit font). Corner notes drop into the
-// fixed slots by ascending rank. Both clear out once the cell holds a value.
-function renderNotes(cell, i, empty) {
+// into one row (`--n` drives the shrink-to-fit font), one span per digit so a
+// single mark can light up. Corner notes drop into the fixed slots by ascending
+// rank. Both clear out once the cell holds a value. A mark equal to `highlight`
+// (the currently highlighted digit, 0 for none) gets the `mark-same` class so CSS
+// tints just that glyph -- never the whole cell.
+function renderNotes(cell, i, empty, highlight) {
   const centerEl = cell.querySelector(".center-notes");
   const cornerSpans = cell.querySelectorAll(".corner-notes span");
-  for (const s of cornerSpans) s.textContent = "";
+  for (const s of cornerSpans) {
+    s.textContent = "";
+    s.classList.remove("mark-same");
+  }
   if (!empty) {
-    centerEl.textContent = "";
+    centerEl.replaceChildren();
     return;
   }
   const center = [...centerMarks[i]].sort((a, b) => a - b);
-  centerEl.textContent = center.join("");
+  centerEl.replaceChildren(
+    ...center.map((cd) => {
+      const span = document.createElement("span");
+      span.textContent = cd;
+      if (cd === highlight) span.classList.add("mark-same");
+      return span;
+    })
+  );
   centerEl.style.setProperty("--n", center.length || 1);
   const corner = [...cornerMarks[i]].sort((a, b) => a - b);
   // Use the first N fill slots, but emit digits into them in row-major order.
   const slots = CORNER_FILL.slice(0, corner.length).sort((a, b) => a - b);
   corner.forEach((cd, rank) => {
-    cornerSpans[slots[rank]].textContent = cd;
+    const span = cornerSpans[slots[rank]];
+    span.textContent = cd;
+    if (cd === highlight) span.classList.add("mark-same");
   });
 }
 
