@@ -33,6 +33,9 @@ import {
   lessonSubtitle,
   lessonLabel,
   joinNames,
+  reviewIdentity,
+  reviewTitle,
+  reviewModeLabel,
 } from "./review.js";
 import {
   formatDuration,
@@ -191,8 +194,8 @@ function cardMenu(g) {
   const list = document.createElement("ul");
   list.className = "menu-list";
   list.hidden = true;
-  // Custom games can resurface their spec; campaign/imported games can't.
-  if (g.mode === "custom" && Array.isArray(g.spec)) {
+  // Custom games can resurface their spec; campaign/imported/Review games can't.
+  if (g.mode === "custom" && Array.isArray(g.spec) && !reviewOf(g)) {
     list.appendChild(menuItemLi("Open spec", () => onOpenSpec(g.spec)));
   }
   list.appendChild(exportItemLi(g));
@@ -274,14 +277,25 @@ function closeCardMenus(except) {
 
 function continueMeta(g) {
   const time = formatDuration(g.elapsedMs);
+  const r = reviewOf(g);
+  if (r) return `${reviewTitle(r)} · ${reviewModeLabel(r)} · ${time}`;
   if (g.mode === "custom") return `Custom · ${time}`;
   const mode = g.mode === "drill" ? "Drill" : "Train";
   return `${techniqueName(idFor(g.kindIndex))} · ${mode} · ${time}`;
 }
 
-// The title for a game card: a custom game's own label, else its technique name.
+// The title for a game card: a Review lesson's name, else a custom game's own
+// label, else its technique name.
 function gameTitle(g) {
+  const r = reviewOf(g);
+  if (r) return reviewTitle(r);
   return g.mode === "custom" ? g.label || "Custom" : techniqueName(idFor(g.kindIndex));
+}
+
+// A custom game that is actually a Review lesson: its { name, mode }, else null.
+function reviewOf(g) {
+  if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
+  return reviewIdentity(curriculum, g.spec);
 }
 
 // ---- Campaign drill-down ----

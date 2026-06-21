@@ -66,6 +66,42 @@ export function lessonHasDrill(curriculum, lesson) {
   return easierExpertIds(curriculum, lesson).length > 0;
 }
 
+// Identify a stored game as a Review lesson from its usage array (`game.spec`):
+// returns { name, mode } when it matches a lesson/mode, else null. Recognizing a
+// game by its spec rather than a stored marker means games made before any marker
+// existed are still identified, and the Train/Drill mode is recovered too (the two
+// produce different specs). Callers should also require the game's `forceAny` to
+// be set — the matching spec under a plain conjunction is a different puzzle.
+export function reviewIdentity(curriculum, usages) {
+  if (!Array.isArray(usages)) return null;
+  for (const lesson of REVIEW_LESSONS) {
+    for (const mode of ["train", "drill"]) {
+      if (mode === "drill" && !lessonHasDrill(curriculum, lesson)) continue;
+      if (usagesEqual(usages, lessonUsages(curriculum, lesson, mode))) {
+        return { name: lesson.name, mode };
+      }
+    }
+  }
+  return null;
+}
+
+// "Review · Lesson 2" — the display title for a Review game (the tier is implied,
+// as it is for a technique game's "Swordfish · Train").
+export function reviewTitle(identity) {
+  return `Review · ${identity.name}`;
+}
+
+// "Train" / "Drill" for a Review game's mode segment.
+export function reviewModeLabel(identity) {
+  return identity.mode === "drill" ? "Drill" : "Train";
+}
+
+function usagesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 // The set's techniques as a " · " subtitle (matching the branch/tier subtitles).
 export function lessonSubtitle(lesson) {
   return lesson.ids.map((id) => techniqueName(id)).join(" · ");

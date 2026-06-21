@@ -11,6 +11,7 @@
 import { bindings } from "./wasm.js";
 import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
+import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
 import { copyText } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
 import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn } from "./settings.js";
@@ -2069,6 +2070,11 @@ function setTitle(g) {
   const h = document.getElementById("playTitle");
   if (!h) return;
   if (g.mode === "custom") {
+    const r = reviewOf(g);
+    if (r) {
+      h.textContent = `${reviewTitle(r)} · ${reviewModeLabel(r)}`;
+      return;
+    }
     h.textContent = g.label ? `Custom · ${g.label}` : "Custom";
     return;
   }
@@ -2100,6 +2106,17 @@ function updateSeedLine() {
 let idByKind = {};
 function curriculumIdFor(kindIndex) {
   return idByKind[kindIndex] || "";
+}
+
+// The full curriculum records (with tier/difficulty), needed to recognize a
+// Review game from its spec. Set in initPlay.
+let curriculumList = [];
+
+// A custom game that is actually a Review lesson (force_any over a lesson's set):
+// its { name, mode }, else null. Used so the title shows the lesson, not "Custom".
+function reviewOf(g) {
+  if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
+  return reviewIdentity(curriculumList, g.spec);
 }
 
 // The hint's player-facing tier comes from the step's curriculum difficulty
@@ -2488,6 +2505,7 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onS
   onHelp = help || (() => {});
   idByKind = {};
   for (const t of curriculum) idByKind[t.kindIndex] = t.id;
+  curriculumList = curriculum; // full records (tier/difficulty) for review id-ing
 
   boardEl = document.getElementById("board");
   notesBtn = document.getElementById("notes");

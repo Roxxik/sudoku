@@ -9,6 +9,7 @@
 import * as store from "./store.js";
 import { formatDuration, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
 import { miniBoard, textColumn, copyText } from "./ui.js";
+import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
 import { cheatOn } from "./cheat.js";
 
 // Per-kind stat buckets, in display order: each mode split into a plain Play and a
@@ -97,10 +98,22 @@ function historyCard(g) {
   const card = document.createElement("div");
   card.className = "hist-item";
   // A custom game isn't a single curriculum kind: title it by its spec label and
-  // mark the mode "Custom" (campaign games show their technique + Train/Drill).
+  // mark the mode "Custom" (campaign games show their technique + Train/Drill). A
+  // Review lesson is a custom game under the hood, but identifiable by its spec —
+  // show its lesson + Train/Drill rather than "Custom".
   const isCustom = g.mode === "custom";
-  const title = isCustom ? g.label || "Custom" : techniqueName(idFor(g.kindIndex));
-  const modeLabel = isCustom ? "Custom" : g.mode === "drill" ? "Drill" : "Train";
+  const review = reviewOf(g);
+  let title, modeLabel;
+  if (review) {
+    title = reviewTitle(review);
+    modeLabel = reviewModeLabel(review);
+  } else if (isCustom) {
+    title = g.label || "Custom";
+    modeLabel = "Custom";
+  } else {
+    title = techniqueName(idFor(g.kindIndex));
+    modeLabel = g.mode === "drill" ? "Drill" : "Train";
+  }
   const meta = `${modeLabel} · ${formatDuration(g.elapsedMs)} · ${solvedDate(g)}`;
   const col = textColumn(title, meta);
   if (cheatOn()) {
@@ -121,7 +134,9 @@ function historyCard(g) {
 // The card's right-hand actions: every card can copy its puzzle; a custom card
 // also offers "Open spec" to resurface its spec in the builder.
 function cardActions(g) {
-  if (g.mode !== "custom" || !Array.isArray(g.spec)) return copyButton(g);
+  // Review games read as campaign games, so they don't expose the custom-spec
+  // "Open spec" affordance even though they're a custom spec under the hood.
+  if (g.mode !== "custom" || !Array.isArray(g.spec) || reviewOf(g)) return copyButton(g);
   const wrap = document.createElement("div");
   wrap.className = "hist-actions";
   wrap.append(openSpecButton(g), copyButton(g));
@@ -164,6 +179,12 @@ function solvedDate(g) {
 
 function idFor(kindIndex) {
   return curriculum.find((t) => t.kindIndex === kindIndex)?.id || "";
+}
+
+// A custom game that is actually a Review lesson: its { name, mode }, else null.
+function reviewOf(g) {
+  if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
+  return reviewIdentity(curriculum, g.spec);
 }
 
 function summaryCard(totalSolved, totalMs) {
