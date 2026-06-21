@@ -4,8 +4,27 @@
   <meta charset="utf-8">
   <!-- Mobile-first: fit device width, no user zoom (the grid handles its own sizing). -->
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-  <meta name="theme-color" content="#1b1b1f">
+  <meta name="theme-color" content="#f3f4f7">
   <title>Sudoku</title>
+  <!-- Apply the saved colour theme before first paint, so there is no flash of
+       the wrong theme. Light is the default (no data-theme attribute); dark is
+       opt-in via data-theme="dark". The key mirrors LIGHT_MODE_KEY in
+       settings.js; window.__setTheme is reused by the Settings toggle so the DOM
+       mapping (attribute + address-bar colour) lives in exactly one place. -->
+  <script>
+    window.__setTheme = function (light) {
+      var root = document.documentElement;
+      if (light) root.removeAttribute("data-theme");
+      else root.setAttribute("data-theme", "dark");
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", light ? "#f3f4f7" : "#1b1b1f");
+    };
+    try {
+      window.__setTheme(localStorage.getItem("sudoku.settings.lightMode") !== "0");
+    } catch (e) {
+      window.__setTheme(true);
+    }
+  </script>
   <link data-trunk rel="css" href="style.css">
   <!-- Start fetching the JS module graph at parse time, in parallel, instead of
        discovering it through app.js's import waterfall. The first group paints

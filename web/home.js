@@ -520,6 +520,17 @@ export function openSettings(onBack) {
     .getElementById("settingsBody")
     .replaceChildren(
       settingToggle(
+        "Light mode",
+        "Use the light colour theme. Turn off for the dark theme.",
+        settings.lightModeOn(),
+        (on) => {
+          settings.setLightMode(on);
+          // Re-theme live. The DOM mapping lives in index.html's inline
+          // bootstrap so it runs before first paint too; reuse it here.
+          if (window.__setTheme) window.__setTheme(on);
+        }
+      ),
+      settingToggle(
         "Eliminate candidates",
         "When you place a digit, strike it from the Center and Corner notes of every cell that sees it.",
         settings.eliminateCandidatesOn(),

@@ -1,4 +1,37 @@
+/* Light theme -- the default (an absent data-theme reads as light, so the page
+   paints light before any JS runs; the dark palette is opt-in below). --accent /
+   --accent2 are shared with the dark theme so the dark text baked onto accent
+   fills (#10131a) stays legible in both. */
 :root {
+  --bg: #f3f4f7;
+  --panel: #ffffff;
+  --line: #d9dae1;
+  --line-strong: #aeb0bd;
+  --cell: #ffffff;
+  --cell-sel: #b9d0f2;
+  --cell-peer: #e7edf7;
+  --cell-same: #f7e6c2;
+  --given: #1b1b1f;
+  --user: #2563c9;
+  --mark: #6c6e7a;
+  /* The highlighted matching pencil glyph: a deep amber that reads on the light
+     --cell-same wash (plain --accent2 is too pale against it). */
+  --mark-same: #7a5200;
+  --accent: #7ab8ff;
+  --accent2: #f0b454;
+  --text: #1b1b1f;
+  /* Status colours (hint banners) and the hint-driven cell highlights. */
+  --ok: #1f9d57;
+  --warn: #a9760f;
+  --bad: #d23b3b;
+  --hl-place-bg: #c9f0d2; --hl-place-fg: #14532d;
+  --hl-elim-bg: #f6cdd2;  --hl-elim-fg: #7a1f29;
+  --hl-stale-bg: #f1e3bd; --hl-stale-fg: #6b5300;
+}
+
+/* Dark theme -- applied by the head script (and the settings toggle) when the
+   "Light mode" setting is off, via data-theme="dark" on <html>. */
+:root[data-theme="dark"] {
   --bg: #1b1b1f;
   --panel: #26262c;
   --line: #3a3a42;
@@ -10,9 +43,16 @@
   --given: #e8e8ec;
   --user: #7ab8ff;
   --mark: #9a9aa6;
+  --mark-same: #f0b454;
   --accent: #7ab8ff;
   --accent2: #f0b454;
   --text: #e8e8ec;
+  --ok: #5fd08a;
+  --warn: #e6c34d;
+  --bad: #ff7b7b;
+  --hl-place-bg: #2f5d3a; --hl-place-fg: #d8ffd8;
+  --hl-elim-bg: #5d2f35;  --hl-elim-fg: #ffd8dc;
+  --hl-stale-bg: #5d512f; --hl-stale-fg: #ffeec0;
 }
 
 * { box-sizing: border-box; }
@@ -105,7 +145,7 @@ html, body {
 }
 .menu-item:active { background: var(--cell-sel); }
 /* Destructive row (e.g. a Continue card's Remove), matching the error red. */
-.menu-item.danger { color: #ff7b7b; }
+.menu-item.danger { color: var(--bad); }
 
 /* The board is a square that scales with the viewport but caps on desktop. */
 .board {
@@ -198,7 +238,7 @@ html, body {
    .same cell; background only (no padding) so the note row doesn't reflow. */
 .cell .center-notes span.mark-same,
 .cell .corner-notes span.mark-same {
-  color: var(--accent2);
+  color: var(--mark-same);
   font-weight: 700;
   background: var(--cell-same);
   border-radius: 3px;
@@ -866,9 +906,9 @@ summary > span:first-of-type { flex: 1; }
 /* ---- Board highlights driven by the focused hint row ---- */
 .cell.hl-unit { background: var(--cell-peer); }
 .cell.hl-cell { background: var(--cell-sel); }
-.cell.hl-place { background: #2f5d3a; color: #d8ffd8; }
-.cell.hl-elim { background: #5d2f35; color: #ffd8dc; }
-.cell.hl-stale { background: #5d512f; color: #ffeec0; }
+.cell.hl-place { background: var(--hl-place-bg); color: var(--hl-place-fg); }
+.cell.hl-elim { background: var(--hl-elim-bg); color: var(--hl-elim-fg); }
+.cell.hl-stale { background: var(--hl-stale-bg); color: var(--hl-stale-fg); }
 
 /* The pad sets display:flex, which overrides the bare [hidden] attribute -- so
    it stayed visible behind the hint panel. Restore hiding. */
@@ -897,9 +937,9 @@ summary > span:first-of-type { flex: 1; }
   padding: 4px 0 2px;
 }
 .hint-banner .banner-icon { width: 30px; height: 30px; flex: none; }
-.hint-banner.ok { color: #5fd08a; }
-.hint-banner.stale { color: #e6c34d; }
-.hint-banner.bad { color: #ff7b7b; }
+.hint-banner.ok { color: var(--ok); }
+.hint-banner.stale { color: var(--warn); }
+.hint-banner.bad { color: var(--bad); }
 
 /* Large, stacked actions for the first layer / error stage. */
 .hint-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }

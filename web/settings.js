@@ -10,6 +10,9 @@ const SHOW_TIMER_KEY = "sudoku.settings.showTimer";
 const HIGHLIGHT_KEY = "sudoku.settings.highlight";
 const DISABLE_FINISHED_KEY = "sudoku.settings.disableFinishedDigits";
 const HINT_FROM_MARKS_KEY = "sudoku.settings.hintFromMarks";
+// Keep this string in sync with the inline theme bootstrap in index.html, which
+// reads it before any module loads (to paint the right theme without a flash).
+const LIGHT_MODE_KEY = "sudoku.settings.lightMode";
 
 function stored(key) {
   try {
@@ -97,4 +100,17 @@ export function hintFromMarksOn() {
 
 export function setHintFromMarks(on) {
   store(HINT_FROM_MARKS_KEY, on);
+}
+
+// The colour theme: on -> light (default), off -> dark. Default ON -- an absent
+// key reads as on, matching index.html's pre-paint bootstrap. This module only
+// owns the stored value; the DOM mapping (the data-theme attribute + address-bar
+// colour) lives in window.__setTheme, defined inline in index.html so it can run
+// before first paint. Callers that flip this should also call window.__setTheme.
+export function lightModeOn() {
+  return stored(LIGHT_MODE_KEY) !== "0";
+}
+
+export function setLightMode(on) {
+  store(LIGHT_MODE_KEY, on);
 }
