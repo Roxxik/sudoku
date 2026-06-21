@@ -541,6 +541,12 @@ export function openSettings(onBack) {
         ],
         settings.highlightMode(),
         settings.setHighlightMode
+      ),
+      settingToggle(
+        "Disable finished digits",
+        "Grey out a digit's button once all nine of it are placed.",
+        settings.disableFinishedDigitsOn(),
+        settings.setDisableFinishedDigits
       )
     );
   showView("settingsView");

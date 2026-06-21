@@ -8,6 +8,7 @@
 const ELIMINATE_KEY = "sudoku.settings.eliminateCandidates";
 const SHOW_TIMER_KEY = "sudoku.settings.showTimer";
 const HIGHLIGHT_KEY = "sudoku.settings.highlight";
+const DISABLE_FINISHED_KEY = "sudoku.settings.disableFinishedDigits";
 
 function stored(key) {
   try {
@@ -68,4 +69,16 @@ export function setHighlightMode(mode) {
   } catch {
     // Quota or privacy mode: the setting just won't persist this session.
   }
+}
+
+// Whether the input pad greys out a digit button once all nine of that digit are
+// placed. Default ON -- an absent key reads as on. When on, a finished digit
+// can't be tapped (so it also can't stay pen-locked -- the play view drops the
+// lock the moment it completes).
+export function disableFinishedDigitsOn() {
+  return stored(DISABLE_FINISHED_KEY) !== "0";
+}
+
+export function setDisableFinishedDigits(on) {
+  store(DISABLE_FINISHED_KEY, on);
 }

@@ -13,7 +13,7 @@ import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { copyText } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
-import { eliminateCandidatesOn, showTimerOn, highlightMode } from "./settings.js";
+import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn } from "./settings.js";
 
 const N = 81;
 
@@ -355,6 +355,11 @@ function digitAt(i) {
 
 // ---- Rendering ----
 function render() {
+  // Refresh the input pad first: this is where a digit completing greys out its
+  // button and (with the setting on) drops the pen-lock. The board highlight
+  // below reads activeDigit, so the lock must settle before we paint the cells.
+  updateDigitButtons();
+
   // Peer / same-digit highlighting is a single-cell affordance: it only makes
   // sense when exactly one cell is selected (a multi-cell selection would smear
   // peers all over the board). `single` is that lone cell, else null.
@@ -449,8 +454,24 @@ function renderNotes(cell, i, empty, highlight) {
 }
 
 function updateDigitButtons() {
+  // Tally how many of each digit are placed (givens + entries) so the pad can
+  // grey out a digit once all nine are down (the "Disable finished digits"
+  // setting). Cheap: one pass over the 81 cells, same order of work as render.
+  const counts = new Array(9).fill(0);
+  for (let i = 0; i < N; i++) {
+    const d = digitAt(i);
+    if (d !== 0) counts[d - 1]++;
+  }
+  const hideFinished = disableFinishedDigitsOn();
+  // If the pen-locked digit just completed, drop the lock: with the setting on
+  // its button is about to be disabled (untappable, so it could never be
+  // unlocked by hand), and a finished digit shouldn't keep painting anyway.
+  if (hideFinished && activeDigit !== 0 && counts[activeDigit - 1] >= 9) {
+    activeDigit = 0;
+  }
   for (let k = 0; k < 9; k++) {
     digitBtns[k].classList.toggle("active", activeDigit === k + 1);
+    digitBtns[k].disabled = hideFinished && counts[k] >= 9;
   }
 }
 
