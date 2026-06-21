@@ -244,6 +244,13 @@ html, body {
    tappable so it can still clear stale pencil marks of that digit. */
 .key.finished { opacity: 0.4; }
 
+/* The flick-enabled action buttons (Notes/Erase/Redo) need `none`, not
+   `manipulation`: a directional drag across the button is a flick gesture (see
+   wireFlick in play.js), so the browser must not claim the drag for scrolling.
+   With `manipulation` Chrome treats the drag as a pan, fires pointercancel
+   mid-flick, and the pointerup that recognizes the flick never arrives. */
+#notes, #erase, #redo { touch-action: none; }
+
 /* The Notes button. Its colour names the armed note kind (blue accent = Center,
    amber accent2 = Corner). In MARK mode (data-placing="false") it's filled; in
    PLACE mode it stays unfilled but carries a coloured ring, so the armed kind --
