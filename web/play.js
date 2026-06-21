@@ -502,16 +502,12 @@ function updateDigitButtons() {
     const d = digitAt(i);
     if (d !== 0) counts[d - 1]++;
   }
-  const hideFinished = disableFinishedDigitsOn();
-  // If the pen-locked digit just completed, drop the lock: with the setting on
-  // its button is about to be disabled (untappable, so it could never be
-  // unlocked by hand), and a finished digit shouldn't keep painting anyway.
-  if (hideFinished && activeDigit !== 0 && counts[activeDigit - 1] >= 9) {
-    activeDigit = 0;
-  }
+  const greyFinished = disableFinishedDigitsOn();
   for (let k = 0; k < 9; k++) {
     digitBtns[k].classList.toggle("active", activeDigit === k + 1);
-    digitBtns[k].disabled = hideFinished && counts[k] >= 9;
+    // Finished digits are only greyed, never disabled: the button stays live so
+    // it can still clear stale pencil marks of that digit (or be re-locked).
+    digitBtns[k].classList.toggle("finished", greyFinished && counts[k] >= 9);
   }
 }
 

@@ -240,6 +240,9 @@ html, body {
 .key:active { background: var(--cell-sel); }
 .key.wide { font-size: 1rem; }
 .key:disabled { opacity: 0.4; cursor: default; }
+/* A "finished" digit (all nine placed) is only greyed, never disabled: it stays
+   tappable so it can still clear stale pencil marks of that digit. */
+.key.finished { opacity: 0.4; }
 
 /* The Notes button. Its colour names the armed note kind (blue accent = Center,
    amber accent2 = Corner). In MARK mode (data-placing="false") it's filled; in
