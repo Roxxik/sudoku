@@ -7,6 +7,7 @@
 
 const ELIMINATE_KEY = "sudoku.settings.eliminateCandidates";
 const SHOW_TIMER_KEY = "sudoku.settings.showTimer";
+const HIGHLIGHT_KEY = "sudoku.settings.highlight";
 
 function stored(key) {
   try {
@@ -45,4 +46,26 @@ export function showTimerOn() {
 
 export function setShowTimer(on) {
   store(SHOW_TIMER_KEY, on);
+}
+
+// How the board highlights the active/selected digit. Peer (row/col/box)
+// highlighting is independent and always shown; this only governs the same-digit
+// highlight:
+//   "all"    -- light up matching placed cells AND matching pencil marks (default)
+//   "placed" -- light up only matching placed cells, leave the marks plain
+//   "none"   -- no same-digit highlight at all
+// Default "all" -- an unknown / absent key reads back as "all".
+export const HIGHLIGHT_MODES = ["all", "placed", "none"];
+
+export function highlightMode() {
+  const v = stored(HIGHLIGHT_KEY);
+  return HIGHLIGHT_MODES.includes(v) ? v : "all";
+}
+
+export function setHighlightMode(mode) {
+  try {
+    localStorage.setItem(HIGHLIGHT_KEY, mode);
+  } catch {
+    // Quota or privacy mode: the setting just won't persist this session.
+  }
 }

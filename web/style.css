@@ -397,10 +397,12 @@ html, body {
   border-radius: 10px;
   padding: 14px 16px;
   color: var(--text);
-  cursor: pointer;
   touch-action: manipulation;
 }
-.setting-row:active { background: var(--cell-sel); }
+/* Only the toggle (a <button>) reacts to a press; the dropdown row is a <div>
+   whose select owns its own clicks, so the row itself never tints. */
+button.setting-row { cursor: pointer; }
+button.setting-row:active { background: var(--cell-sel); }
 .setting-text { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
 .setting-name { font-size: 1.05rem; font-weight: 600; }
 .setting-desc { color: var(--mark); font-size: 0.85rem; line-height: 1.35; }
@@ -428,6 +430,19 @@ html, body {
 }
 .setting-row[aria-checked="true"] .setting-switch { background: var(--accent); }
 .setting-row[aria-checked="true"] .setting-switch::after { transform: translateX(18px); }
+
+/* The dropdown variant: a native select sitting where the switch would. */
+.setting-select {
+  flex: none;
+  max-width: 45%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
 
 /* ---- Home: campaign tree ---- */
 .campaign { display: flex; flex-direction: column; gap: 8px; }

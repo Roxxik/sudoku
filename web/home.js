@@ -530,6 +530,17 @@ export function openSettings(onBack) {
         "Show a running timer above the board while you play.",
         settings.showTimerOn(),
         settings.setShowTimer
+      ),
+      settingSelect(
+        "Highlight matching digit",
+        "When a digit is selected, light up where it already appears.",
+        [
+          ["all", "Cells and marks"],
+          ["placed", "Cells only"],
+          ["none", "None"],
+        ],
+        settings.highlightMode(),
+        settings.setHighlightMode
       )
     );
   showView("settingsView");
@@ -595,6 +606,40 @@ function settingToggle(name, desc, initial, onChange) {
     row.setAttribute("aria-checked", String(on));
     onChange(on);
   });
+  return row;
+}
+
+// A labelled row carrying a native <select> on the right, for a setting with
+// more than two choices. `options` is a list of [value, label] pairs; `initial`
+// is the stored value and `onChange` is called with the chosen value on each
+// pick. A <div> (not the <button> settingToggle uses) so the select owns its own
+// clicks rather than fighting a row-level toggle handler.
+function settingSelect(name, desc, options, initial, onChange) {
+  const row = document.createElement("div");
+  row.className = "setting-row";
+
+  const text = document.createElement("div");
+  text.className = "setting-text";
+  const title = document.createElement("span");
+  title.className = "setting-name";
+  title.textContent = name;
+  const sub = document.createElement("span");
+  sub.className = "setting-desc";
+  sub.textContent = desc;
+  text.append(title, sub);
+
+  const sel = document.createElement("select");
+  sel.className = "setting-select";
+  for (const [value, label] of options) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    if (value === initial) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener("change", () => onChange(sel.value));
+
+  row.append(text, sel);
   return row;
 }
 

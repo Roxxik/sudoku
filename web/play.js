@@ -13,7 +13,7 @@ import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { copyText } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
-import { eliminateCandidatesOn, showTimerOn } from "./settings.js";
+import { eliminateCandidatesOn, showTimerOn, highlightMode } from "./settings.js";
 
 const N = 81;
 
@@ -235,6 +235,9 @@ export function resume() {
     runStart = performance.now();
   }
   startTimer();
+  // Returning from Settings routes through here, so re-render to pick up any
+  // changed display setting (e.g. the highlight mode) on the live board.
+  render();
 }
 
 // ---- In-play timer readout ----
@@ -361,6 +364,14 @@ function render() {
   const highlightDigit =
     activeDigit !== 0 ? activeDigit : single !== null ? digitAt(single) : 0;
 
+  // The "Highlight matching digit" setting gates the same-digit highlight (peers
+  // stay independent): "all" lights placed cells and pencil marks, "placed" only
+  // placed cells, "none" neither. A 0 digit switches the respective highlight off
+  // -- no cell holds digit 0 -- so each gate is just the digit or 0.
+  const mode = highlightMode();
+  const cellHighlight = mode === "none" ? 0 : highlightDigit;
+  const markHighlight = mode === "all" ? highlightDigit : 0;
+
   for (let i = 0; i < N; i++) {
     const cell = cells[i];
     const valueEl = cell.querySelector(".value");
@@ -378,15 +389,16 @@ function render() {
 
     // Pencil marks only show on an empty cell. A mark for the highlighted digit
     // lights up on its own (see renderNotes) -- the cell itself stays untinted.
-    renderNotes(cell, i, d === 0, highlightDigit);
+    renderNotes(cell, i, d === 0, markHighlight);
 
-    // Highlight classes. Every selected cell gets `selected`; peer / same only
-    // light up for a lone selection.
+    // Highlight classes. Every selected cell gets `selected`; peer lights for a
+    // lone selection; same lights placed cells of the highlighted digit unless
+    // the setting turns it off (cellHighlight 0).
     cell.classList.toggle("selected", selection.has(i));
     cell.classList.toggle("peer", single !== null && isPeer(single, i));
     cell.classList.toggle(
       "same",
-      highlightDigit !== 0 && !selection.has(i) && d === highlightDigit
+      cellHighlight !== 0 && !selection.has(i) && d === cellHighlight
     );
   }
 }
