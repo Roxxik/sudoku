@@ -677,8 +677,8 @@ const HELP_TOUCH = [
   ["Flick to a note style", "Flick the Notes button left for corner (Snyder) notes, or right for center notes, to set which note style is active."],
   ["Quick opposite", "With a digit locked, double-tap a cell to do the opposite of your current mode — pencil a note while placing, or place while noting."],
   ["Paint notes", "With a digit locked, a note gesture can sweep: press and drag to pencil that note across every cell the pointer crosses, all as one move. In Notes mode that's a single press-and-drag; while placing digits it's a double-tap-and-drag (placing a value stays one cell). The first cell sets the direction — add or clear — so cells that already match are left untouched."],
-  ["Erase", "Tap Erase, or re-tap a digit you placed."],
-  ["Undo / Redo", "The Undo and Redo buttons step back and forth through your moves."],
+  ["Erase", "Tap Erase to clear the value and all notes from the selection, or re-tap a digit you placed. Flick Erase left to clear only corner notes, right to clear only center notes, or straight up to undo the selected cells — restoring the value and notes they had before your last change."],
+  ["Undo / Redo", "The Undo and Redo buttons step back and forth through your moves. Flick Redo straight up to redo every step at once."],
   ["Hint", "Tap Hint to see if you've made a mistake, or which technique could apply next."],
 ];
 

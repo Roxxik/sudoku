@@ -193,6 +193,28 @@ function redo() {
   render();
 }
 
+// Up-flick on Redo: replay the entire redo branch in one go. Each step still
+// lands in `history` (just like a run of single redos) so a later undo can walk
+// back through them one at a time.
+function redoAll() {
+  if (redoStack.length === 0) return;
+  while (redoStack.length > 0) {
+    history.push(snapshot());
+    applySnapshot(redoStack.pop());
+  }
+  updateHistoryButtons();
+  persist();
+  refreshTimer();
+  render();
+}
+
+// Redo button click: a flick already acted (and is swallowed); a plain tap redoes
+// one step.
+function onRedoTap() {
+  if (redoFlicked()) return;
+  redo();
+}
+
 function updateHistoryButtons() {
   if (undoBtn) undoBtn.disabled = history.length === 0;
   if (redoBtn) redoBtn.disabled = redoStack.length === 0;
@@ -851,6 +873,56 @@ function erase() {
   render();
 }
 
+// Left/right flicks on Erase: wipe just one note kind from the selection (Left =
+// corners, Right = centers, mirroring where each note sits in a cell), leaving the
+// value and the other kind alone. One undo step each.
+function eraseCorners() {
+  if (finished || selection.size === 0) return;
+  commit(() => {
+    for (const i of selection) {
+      if (given[i] !== 0) continue;
+      cornerMarks[i].clear();
+    }
+  });
+  render();
+}
+
+function eraseCenters() {
+  if (finished || selection.size === 0) return;
+  commit(() => {
+    for (const i of selection) {
+      if (given[i] !== 0) continue;
+      centerMarks[i].clear();
+    }
+  });
+  render();
+}
+
+// Up-flick on Erase: revert just the selected cells to the most recent undo
+// snapshot, restoring the value and pencil marks they held before the last
+// change -- an undo scoped to the selection (other cells are left as they are),
+// and itself one undo step. No-op when there's nothing to undo to.
+function undoSelected() {
+  if (finished || selection.size === 0 || history.length === 0) return;
+  const prev = history[history.length - 1];
+  commit(() => {
+    for (const i of selection) {
+      if (given[i] !== 0) continue;
+      value[i] = prev.v[i];
+      centerMarks[i] = new Set(prev.c[i]);
+      cornerMarks[i] = new Set(prev.n[i]);
+    }
+  });
+  render();
+}
+
+// Erase button click: a flick already acted (and is swallowed); a plain tap wipes
+// value + both note kinds from the selection.
+function onEraseTap() {
+  if (eraseFlicked()) return;
+  erase();
+}
+
 // Flip between placing values and pencilling notes (the Notes button's single
 // tap and the "n" key).
 function togglePlacing() {
@@ -885,14 +957,15 @@ function cornersToCenters() {
 // immediately, and a quick second tap reverts that flip and switches the kind
 // instead -- so a double-tap nets to "kind switched, place/mark unchanged".
 let lastNotesTap = 0;
-// Set true by an up-flick (see wireNotesFlick) so the click it also fires is
-// swallowed instead of read as a place/mark toggle.
-let notesFlicked = false;
+// Per-button flick predicates, set by wirePad once the buttons exist (see
+// wireFlick). Each reports -- and clears -- whether the last press on its button
+// was a recognized flick, so the click that press also fires is swallowed instead
+// of read as a plain tap. They no-op until wired.
+let notesFlicked = () => false;
+let eraseFlicked = () => false;
+let redoFlicked = () => false;
 function onNotesTap() {
-  if (notesFlicked) {
-    notesFlicked = false; // an up-flick already converted; swallow its click
-    return;
-  }
+  if (notesFlicked()) return; // a flick already acted; swallow its click
   const now = performance.now();
   const isDouble = now - lastNotesTap < DOUBLE_MS;
   lastNotesTap = now;
@@ -905,44 +978,68 @@ function onNotesTap() {
   }
 }
 
-// Flicks on the Notes button. The press is captured so a flick that leaves the
-// button still reports its release here; on release the dominant axis decides:
-//   straight up  -> convert the selection's corners to centers
-//   left / right -> arm that mark kind (Corner / Center), place/mark mode kept
-// Left arms Corner, Right arms Center -- mirroring where each note sits in a cell.
-// A recognized flick arms `notesFlicked` so the click it also fires is swallowed
-// (onNotesTap); a press too short to register falls through to the normal tap.
+// Directional flicks on a pad button. The press is captured so a flick that
+// slides off the button still reports its release here; on release the dominant
+// axis (>= FLICK_MIN px of travel) picks a direction and, if `handlers` gives one
+// for it ("up" / "down" / "left" / "right"), runs it. A recognized flick is
+// remembered so the click the same press also fires can be swallowed: the
+// returned predicate reports -- and clears -- whether the last press was a flick,
+// and the button's click handler calls it to fall through to the normal tap
+// otherwise. A press too short to register leaves it false.
 const FLICK_MIN = 24; // px of travel to register a flick
-function wireNotesFlick() {
+function wireFlick(btn, handlers) {
   let startX = 0,
     startY = 0,
-    flickPointer = null;
-  notesBtn.addEventListener("pointerdown", (e) => {
+    pointer = null,
+    flicked = false;
+  btn.addEventListener("pointerdown", (e) => {
     startX = e.clientX;
     startY = e.clientY;
-    flickPointer = e.pointerId;
-    notesFlicked = false;
+    pointer = e.pointerId;
+    flicked = false;
     try {
-      notesBtn.setPointerCapture(e.pointerId);
+      btn.setPointerCapture(e.pointerId);
     } catch {
       /* ignore */
     }
   });
-  notesBtn.addEventListener("pointerup", (e) => {
-    if (e.pointerId !== flickPointer) return;
-    flickPointer = null;
+  btn.addEventListener("pointerup", (e) => {
+    if (e.pointerId !== pointer) return;
+    pointer = null;
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
+    let dir = null;
     if (Math.abs(dx) >= FLICK_MIN && Math.abs(dx) > Math.abs(dy)) {
-      // Sideways: arm the matching note kind, leaving place/mark mode alone.
-      notesFlicked = true; // swallow the click that follows
-      markKind = dx < 0 ? MODE_CORNER : MODE_CENTER;
-      updateNotesButton();
-    } else if (dy <= -FLICK_MIN && Math.abs(dy) > Math.abs(dx)) {
-      // Straight up: convert corners to centers.
-      notesFlicked = true;
-      cornersToCenters();
+      dir = dx < 0 ? "left" : "right";
+    } else if (Math.abs(dy) >= FLICK_MIN && Math.abs(dy) > Math.abs(dx)) {
+      dir = dy < 0 ? "up" : "down";
     }
+    if (dir && handlers[dir]) {
+      flicked = true; // swallow the click that follows
+      handlers[dir]();
+    }
+  });
+  return () => {
+    const was = flicked;
+    flicked = false;
+    return was;
+  };
+}
+
+// Flicks on the Notes button: a sideways flick arms that mark kind (Left = Corner,
+// Right = Center, mirroring where each note sits in a cell) without touching
+// place/mark mode; a straight-up flick converts the selection's corners to centers.
+function wireNotesFlick() {
+  return wireFlick(notesBtn, {
+    left: () => {
+      markKind = MODE_CORNER;
+      updateNotesButton();
+    },
+    right: () => {
+      markKind = MODE_CENTER;
+      updateNotesButton();
+    },
+    up: cornersToCenters,
   });
 }
 
@@ -2168,11 +2265,20 @@ function wirePad() {
     digitBtns[d - 1] = btn;
     btn.addEventListener("click", () => onDigitTap(d));
   }
-  document.getElementById("erase").addEventListener("click", erase);
+  const eraseBtn = document.getElementById("erase");
+  eraseBtn.addEventListener("click", onEraseTap);
+  eraseFlicked = wireFlick(eraseBtn, {
+    left: eraseCorners, // erase corner marks only
+    right: eraseCenters, // erase center marks only
+    up: undoSelected, // restore the selection's prior value + marks
+  });
   notesBtn.addEventListener("click", onNotesTap);
-  wireNotesFlick();
+  notesFlicked = wireNotesFlick();
   if (undoBtn) undoBtn.addEventListener("click", undo);
-  if (redoBtn) redoBtn.addEventListener("click", redo);
+  if (redoBtn) {
+    redoBtn.addEventListener("click", onRedoTap);
+    redoFlicked = wireFlick(redoBtn, { up: redoAll }); // up-flick redoes the whole branch
+  }
 }
 
 // Keyboard only acts while the play view is on screen.
