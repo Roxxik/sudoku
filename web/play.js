@@ -244,18 +244,29 @@ function elapsedMs() {
   return timerBase + (runStart !== null ? performance.now() - runStart : 0);
 }
 
-// Save the player's work and the running elapsed time back to the store.
+// Save the player's work and the running elapsed time back to the store. This
+// fires on every keystroke, so it writes ONLY the game's heavy key (board +
+// timeline) -- cheap and isolated from the rest of the library. The index's
+// listing copy of elapsedMs/lastPlayedAt is refreshed less often, at pause (see
+// checkpointListing), which is enough to keep the start page current.
 function persist() {
   if (!game) return;
-  store.updateGame(game.id, {
+  store.saveProgress(game.id, {
     value: value.slice(),
     centerMarks: centerMarks.map((s) => [...s]),
     cornerMarks: cornerMarks.map((s) => [...s]),
-    elapsedMs: elapsedMs(),
-    lastPlayedAt: Date.now(),
     history: history.map(snapshotToJSON),
     redo: redoStack.map(snapshotToJSON),
+    elapsedMs: elapsedMs(),
   });
+}
+
+// Refresh the index's listing copy of the timer and last-played time so the
+// start page's Continue list (which reads only the index) shows current values.
+// Called when leaving the board (pause), not per keystroke.
+function checkpointListing() {
+  if (!game) return;
+  store.updateGame(game.id, { elapsedMs: elapsedMs(), lastPlayedAt: Date.now() });
 }
 
 // Pause the clock (folding the running span into the accumulated base) and
@@ -268,6 +279,7 @@ export function pause() {
   stopTimer();
   refreshTimer(); // freeze the readout at the paused time
   persist();
+  checkpointListing(); // refresh the start page's elapsed/last-played listing
 }
 
 // Resume the clock, unless the puzzle is already solved.
