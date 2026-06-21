@@ -737,7 +737,10 @@ pub fn baseline_fast_applicable(spec: &Spec) -> bool {
     let both_singles = baseline & NS != 0 && baseline & HS != 0;
     let lc_both_or_neither = (baseline & LCP != 0) == (baseline & LCC != 0);
     let no_forced_cheap = spec.forced_mask() & CHEAP == 0;
-    both_singles && lc_both_or_neither && no_forced_cheap
+    // A force_any set over a cheap kind reads the same exact-count requirement, so the
+    // fused path (which records cheap kinds fired-or-not, not by count) is unsound for it.
+    let no_force_any_cheap = spec.force_any_set().is_none_or(|ra| ra.kinds & CHEAP == 0);
+    both_singles && lc_both_or_neither && no_forced_cheap && no_force_any_cheap
 }
 
 /// True iff `digits` satisfies `spec`: baseline-solvable AND every Forced technique is
@@ -756,6 +759,14 @@ pub fn verify(digits: &DigitGrid, spec: &Spec) -> bool {
     let scope = spec.in_scope_mask();
     for (idx, need) in spec.forced() {
         if LogicSolver::min_target_uses(&board, scope, 1 << idx) < need as usize {
+            return false;
+        }
+    }
+    // Disjunctive forcing: the whole force_any set, taken as a single avoid-target, must
+    // be irreplaceable too — the in-scope toolbox cannot solve the board without drawing
+    // on the set at least `count` times (`min_target_uses` already takes a mask target).
+    if let Some(ra) = spec.force_any_set() {
+        if LogicSolver::min_target_uses(&board, scope, ra.kinds) < ra.count as usize {
             return false;
         }
     }

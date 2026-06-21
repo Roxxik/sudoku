@@ -3,9 +3,11 @@
 //! play-time bloat: a per-kind [`Usage`] array plus the `train`/`drill`
 //! builders, and the three masks the generator/verify gates read.
 //!
-//! `require_any` (family-level "any fish" constraints) is intentionally omitted:
-//! no spec in PoC scope uses it (train/drill(HiddenQuad) only Force a single
-//! kind). Add it when scope grows past HiddenSubset.
+//! A [`force_any`](Spec::force_any) set (the disjunctive counterpart of
+//! [`force`](Spec::force) — "the puzzle must require *some* technique from this set")
+//! is supported as a single optional slot. The yield-flavoured family `require_any`
+//! ("any fish must *appear* at least once" — a baseline-trace count, not a forcing
+//! constraint) is still omitted: no spec in scope uses it.
 //!
 //! [`kinds`] holds the shared technique taxonomy this spec is built over — the kind
 //! indices, the [`KindMask`](kinds::KindMask) set type, and the
@@ -29,15 +31,30 @@ pub enum Usage {
     Conceded,
 }
 
+/// "At least `count` total firings must be forced from `kinds`" — the disjunctive
+/// generalization of a single [`Usage::Forced`]. Instead of one named technique being
+/// irreplaceable, *some* technique in the set must be: the in-scope toolbox cannot
+/// solve the puzzle without drawing on the set at least `count` times. Verify's
+/// avoid-target walk takes the whole set as one target (`Solver::min_target_uses`
+/// already accepts a [`KindMask`]), so the disjunction needs no new solver machinery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RequireAny {
+    pub kinds: KindMask,
+    pub count: u16,
+}
+
 /// Per-technique configuration, dense array indexed by kind.
 #[derive(Clone)]
 pub struct Spec {
     usage: [Option<Usage>; NUM],
+    /// At most one disjunctive [`force_any`](Spec::force_any) set; `None` if unused. A
+    /// single slot, not a list — only one set is needed at a time.
+    force_any: Option<RequireAny>,
 }
 
 impl Spec {
     fn empty() -> Self {
-        Spec { usage: [None; NUM] }
+        Spec { usage: [None; NUM], force_any: None }
     }
 
     /// Start an explicit, empty spec and layer kinds with [`Spec::allow`] /
@@ -65,6 +82,32 @@ impl Spec {
     pub fn concede(mut self, idx: usize) -> Self {
         self.usage[idx] = Some(Usage::Conceded);
         self
+    }
+
+    /// Force *any* of a set of techniques: the produced puzzle must be unsolvable by
+    /// the in-scope toolbox without drawing on the set at least `count` times — the
+    /// disjunctive counterpart of [`force`](Self::force). Only **one** set is held at
+    /// a time, so calling this twice replaces the previous set.
+    ///
+    /// Each set member not already in scope is added `Allowed` (it must be usable for
+    /// the baseline to solve a puzzle that requires it); an existing `Forced`/`Conceded`
+    /// labeling is left untouched. `kinds` is a [`KindMask`] (`1 << idx` per member),
+    /// must be non-empty, and `count` must be at least 1.
+    pub fn force_any(mut self, kinds: KindMask, count: u16) -> Self {
+        debug_assert!(kinds != 0, "force_any needs at least one technique");
+        debug_assert!(count >= 1, "force_any count must be at least 1");
+        for idx in 0..NUM {
+            if kinds & (1 << idx) != 0 {
+                self.usage[idx].get_or_insert(Usage::Allowed);
+            }
+        }
+        self.force_any = Some(RequireAny { kinds, count });
+        self
+    }
+
+    /// The disjunctive [`force_any`](Self::force_any) set, if one is configured.
+    pub fn force_any_set(&self) -> Option<RequireAny> {
+        self.force_any
     }
 
     /// Broad-mode training for `target`: force it, and allow what the player may
@@ -284,20 +327,42 @@ impl Spec {
         })
     }
 
-    /// True iff a baseline trace with these per-kind `counts` meets every Forced
-    /// requirement — core's `requirement_met` (PoC: no `require_any`).
+    /// True iff a baseline trace with these per-kind `counts` meets every forcing
+    /// requirement: each single `Forced(n)` kind fired at least `n` times, AND — if a
+    /// [`force_any`](Self::force_any) set is configured — the set's members fired at
+    /// least `count` times in total. This is the strip loop's cheap acceptance proxy;
+    /// the cold irreplaceability truth is `verify`'s `min_target_uses` walk (which the
+    /// `force_any` set also feeds). A baseline trace that never touches the set cannot
+    /// be forced by it, so the proxy is a sound pre-filter.
     pub fn requirement_met(&self, counts: &[u16; NUM]) -> bool {
-        self.forced().all(|(idx, need)| counts[idx] >= need)
+        if !self.forced().all(|(idx, need)| counts[idx] >= need) {
+            return false;
+        }
+        if let Some(ra) = self.force_any {
+            let total: u32 = (0..NUM)
+                .filter(|&idx| ra.kinds & (1 << idx) != 0)
+                .map(|idx| counts[idx] as u32)
+                .sum();
+            if total < ra.count as u32 {
+                return false;
+            }
+        }
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::kinds::{
-        HIDDEN_PAIR, HIDDEN_SINGLE, JELLYFISH, LC_CLAIMING, NAKED_PAIR, NAKED_TRIPLE, SWORDFISH,
-        X_WING, XY_WING,
+        HIDDEN_PAIR, HIDDEN_SINGLE, JELLYFISH, LC_CLAIMING, NAKED_PAIR, NAKED_SINGLE, NAKED_TRIPLE,
+        SWORDFISH, X_WING, XY_WING,
     };
     use super::*;
+
+    /// Bitmask of a set of kind indices, for the `force_any` tests.
+    fn mask(kinds: &[usize]) -> KindMask {
+        kinds.iter().fold(0, |m, &k| m | (1 << k))
+    }
 
     fn conceded(s: &Spec, idx: usize) -> bool {
         let in_scope = (s.in_scope_mask() >> idx) & 1 == 1;
@@ -374,5 +439,67 @@ mod tests {
             assert_eq!(ti.baseline_mask(), tl.baseline_mask(), "train baseline [{t}]");
             assert_eq!(ti.forced_mask(), tl.forced_mask(), "train forced [{t}]");
         }
+    }
+
+    /// `force_any` pulls every set member into the baseline (so it is usable) and stores
+    /// the set, without forcing any single member.
+    #[test]
+    fn force_any_adds_members_and_stores_set() {
+        let fish = mask(&[X_WING, SWORDFISH, JELLYFISH]);
+        let s = Spec::explicit().allow(NAKED_SINGLE).allow(HIDDEN_SINGLE).force_any(fish, 1);
+        for k in [X_WING, SWORDFISH, JELLYFISH] {
+            assert!(in_baseline(&s, k), "force_any member {k} must be in the baseline");
+        }
+        // No single fish is Forced — the disjunction does not pin one.
+        assert_eq!(s.forced_mask(), 0, "force_any forces no single kind");
+        let ra = s.force_any_set().expect("set stored");
+        assert_eq!(ra.kinds, fish);
+        assert_eq!(ra.count, 1);
+    }
+
+    /// `force_any` leaves an existing `Forced`/`Conceded` member labeling untouched, and
+    /// a second call replaces the set (only one is held at a time).
+    #[test]
+    fn force_any_preserves_labels_and_replaces() {
+        let s = Spec::explicit()
+            .force(X_WING, 2)
+            .concede(SWORDFISH)
+            .force_any(mask(&[X_WING, SWORDFISH, JELLYFISH]), 1);
+        assert!(matches!(s.usage[X_WING], Some(Usage::Forced(2))), "X-Wing stays Forced");
+        assert!(matches!(s.usage[SWORDFISH], Some(Usage::Conceded)), "Swordfish stays Conceded");
+        assert!(matches!(s.usage[JELLYFISH], Some(Usage::Allowed)), "fresh member is Allowed");
+        // Second call replaces the set, not appends.
+        let s = s.force_any(mask(&[NAKED_PAIR, HIDDEN_PAIR]), 3);
+        let ra = s.force_any_set().unwrap();
+        assert_eq!(ra.kinds, mask(&[NAKED_PAIR, HIDDEN_PAIR]));
+        assert_eq!(ra.count, 3);
+    }
+
+    /// `requirement_met` reads the set as a single total: the disjunction is met when the
+    /// members' counts SUM to at least `count`, regardless of which member fired.
+    #[test]
+    fn force_any_requirement_counts_set_total() {
+        let s = Spec::explicit().force_any(mask(&[X_WING, SWORDFISH, JELLYFISH]), 2);
+        let mut counts = [0u16; NUM];
+        assert!(!s.requirement_met(&counts), "no fish fired");
+        counts[SWORDFISH] = 1;
+        assert!(!s.requirement_met(&counts), "one fish < required 2");
+        counts[X_WING] = 1; // 1 + 1 across the set reaches 2
+        assert!(s.requirement_met(&counts), "set total meets the count");
+    }
+
+    /// A singleton `force_any` is the disjunctive degenerate case of `force`: same
+    /// baseline/scope membership and the same `requirement_met` verdict.
+    #[test]
+    fn singleton_force_any_matches_force() {
+        let a = Spec::explicit().allow(NAKED_SINGLE).force_any(mask(&[NAKED_TRIPLE]), 1);
+        let b = Spec::explicit().allow(NAKED_SINGLE).force(NAKED_TRIPLE, 1);
+        assert_eq!(a.baseline_mask(), b.baseline_mask());
+        assert_eq!(a.in_scope_mask(), b.in_scope_mask());
+        let mut counts = [0u16; NUM];
+        assert_eq!(a.requirement_met(&counts), b.requirement_met(&counts));
+        counts[NAKED_TRIPLE] = 1;
+        assert_eq!(a.requirement_met(&counts), b.requirement_met(&counts));
+        assert!(a.requirement_met(&counts));
     }
 }
