@@ -719,6 +719,7 @@ export function openSettings(onBack) {
         "Highlight matching digit",
         "When a digit is selected, light up where it already appears.",
         [
+          ["spots", "Cells, marks, and open spots"],
           ["all", "Cells and marks"],
           ["placed", "Cells only"],
           ["none", "None"],

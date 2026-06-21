@@ -56,11 +56,14 @@ export function setShowTimer(on) {
 // How the board highlights the active/selected digit. Peer (row/col/box)
 // highlighting is independent and always shown; this only governs the same-digit
 // highlight:
+//   "spots"  -- everything "all" does, PLUS tint the empty cells where the digit
+//               can still go: board-legal (no peer holds it) and not ruled out
+//               by the player's own center / corner notes
 //   "all"    -- light up matching placed cells AND matching pencil marks (default)
 //   "placed" -- light up only matching placed cells, leave the marks plain
 //   "none"   -- no same-digit highlight at all
 // Default "all" -- an unknown / absent key reads back as "all".
-export const HIGHLIGHT_MODES = ["all", "placed", "none"];
+export const HIGHLIGHT_MODES = ["spots", "all", "placed", "none"];
 
 export function highlightMode() {
   const v = stored(HIGHLIGHT_KEY);

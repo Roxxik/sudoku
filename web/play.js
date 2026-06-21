@@ -423,12 +423,35 @@ function render() {
     activeDigit !== 0 ? activeDigit : single !== null ? digitAt(single) : 0;
 
   // The "Highlight matching digit" setting gates the same-digit highlight (peers
-  // stay independent): "all" lights placed cells and pencil marks, "placed" only
-  // placed cells, "none" neither. A 0 digit switches the respective highlight off
-  // -- no cell holds digit 0 -- so each gate is just the digit or 0.
+  // stay independent): "none" lights nothing, "placed" only placed cells, "all"
+  // also pencil marks, "spots" also the empty cells where the digit can still
+  // legally go. A 0 digit switches the respective highlight off -- no cell holds
+  // digit 0 -- so each gate is just the digit or 0.
   const mode = highlightMode();
   const cellHighlight = mode === "none" ? 0 : highlightDigit;
-  const markHighlight = mode === "all" ? highlightDigit : 0;
+  const markHighlight = mode === "all" || mode === "spots" ? highlightDigit : 0;
+  const spotHighlight = mode === "spots" ? highlightDigit : 0;
+
+  // For "spots" we tint every empty cell that could still take the highlighted
+  // digit. Two filters, both must pass. Board legality: no peer (row/col/box)
+  // already holds it -- a digit lives at most once per house, so the cells
+  // holding it are captured as the set of blocked rows / cols / boxes (one bit
+  // each) and an empty cell is open iff its row, col and box are all clear.
+  // Notes: the player's own marks must not rule it out (a center-mark set that
+  // omits the digit, or a Snyder corner pin claiming it elsewhere in the box) --
+  // reusing the same candidate machinery the hints reason over.
+  let blockedRows = 0, blockedCols = 0, blockedBoxes = 0;
+  let spotPins = null;
+  const spotBit = spotHighlight !== 0 ? 1 << (spotHighlight - 1) : 0;
+  if (spotHighlight !== 0) {
+    for (let i = 0; i < N; i++) {
+      if (digitAt(i) !== spotHighlight) continue;
+      blockedRows |= 1 << ((i / 9) | 0);
+      blockedCols |= 1 << (i % 9);
+      blockedBoxes |= 1 << boxOf(i);
+    }
+    spotPins = cornerPins();
+  }
 
   for (let i = 0; i < N; i++) {
     const cell = cells[i];
@@ -458,6 +481,23 @@ function render() {
       "same",
       cellHighlight !== 0 && !selection.has(i) && d === cellHighlight
     );
+    // An empty cell is an open spot for the highlighted digit when the board
+    // leaves room for it (row, col and box all clear) and the player's notes
+    // haven't ruled it out (see the two filters above). The mark filter only
+    // applies where the player actually specified candidates; an unmarked cell
+    // rides on board legality alone.
+    let isSpot =
+      spotHighlight !== 0 &&
+      d === 0 &&
+      !selection.has(i) &&
+      ((blockedRows >> ((i / 9) | 0)) & 1) === 0 &&
+      ((blockedCols >> (i % 9)) & 1) === 0 &&
+      ((blockedBoxes >> boxOf(i)) & 1) === 0;
+    if (isSpot) {
+      const { mask, specified } = candidatesAt(i, spotPins);
+      isSpot = !specified || (mask & spotBit) !== 0;
+    }
+    cell.classList.toggle("same-spot", isSpot);
   }
 }
 

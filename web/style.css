@@ -11,6 +11,9 @@
   --cell-sel: #b9d0f2;
   --cell-peer: #e7edf7;
   --cell-same: #f7e6c2;
+  /* Empty cells where the highlighted digit can still go (the "spots" mode): a
+     soft green, distinct from the amber --cell-same of placed matches. */
+  --cell-spot: #d7eecb;
   --given: #1b1b1f;
   --user: #2563c9;
   --mark: #6c6e7a;
@@ -40,6 +43,7 @@
   --cell-sel: #3a4d6b;
   --cell-peer: #2a3340;
   --cell-same: #4a3d2a;
+  --cell-spot: #2f4030;
   --given: #e8e8ec;
   --user: #7ab8ff;
   --mark: #9a9aa6;
@@ -195,6 +199,7 @@ html, body {
 
 .cell.peer { background: var(--cell-peer); }
 .cell.same { background: var(--cell-same); }
+.cell.same-spot { background: var(--cell-spot); }
 .cell.selected { background: var(--cell-sel); }
 
 /* Snyder (corner) notes: a 3x3 micro-grid. render fills the slots by ascending
