@@ -30,6 +30,10 @@ let onHome = () => {};
 // loadUsages/saveUsages) so a half-built spec survives both a trip Home and a
 // page reload -- the builder reopens exactly where it was left.
 let usages = loadUsages();
+// false: every Forced technique must be needed (a conjunction, the default).
+// true: fold the Forced set into one `force_any` disjunction -- the puzzle needs
+// *some* member, not all of them. Persisted alongside `usages`.
+let forceAny = loadForceAny();
 let chipEls = []; // kindIndex -> chip button, for in-place updates
 let playBtn = null; // the two start buttons (Play / Play from first forced)
 let forcedBtn = null;
@@ -42,6 +46,7 @@ const USAGE_CLASS = ["off", "allow", "force", "concede"];
 // stash the usage array under one key; a malformed/old value falls back to a
 // blank (all-Off) spec rather than bricking the page.
 const USAGES_KEY = "sudoku.custom.usages";
+const FORCE_ANY_KEY = "sudoku.custom.forceAny";
 
 function loadUsages() {
   try {
@@ -66,6 +71,22 @@ function saveUsages() {
     localStorage.setItem(USAGES_KEY, JSON.stringify(usages));
   } catch {
     // Quota or privacy mode: the spec just won't persist this session.
+  }
+}
+
+function loadForceAny() {
+  try {
+    return localStorage.getItem(FORCE_ANY_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function saveForceAny() {
+  try {
+    localStorage.setItem(FORCE_ANY_KEY, forceAny ? "1" : "0");
+  } catch {
+    // Quota or privacy mode: the toggle just won't persist this session.
   }
 }
 
@@ -95,7 +116,13 @@ export function openCustom(initial) {
 
 function renderBody() {
   const body = document.getElementById("customBody");
-  body.replaceChildren(presetRow(), explainer(), techniqueGroups(), generateButtons());
+  body.replaceChildren(
+    presetRow(),
+    explainer(),
+    techniqueGroups(),
+    forceModeRow(),
+    generateButtons()
+  );
   refreshAllChips();
   refreshGenerate();
 }
@@ -220,6 +247,42 @@ function refreshAllChips() {
   for (let i = 0; i < chipEls.length; i++) refreshChip(i);
 }
 
+// ---- All / Any forcing ----
+// A switch sitting between the technique list and the start buttons. Off (the
+// default) keeps the conjunctive meaning of Force -- every Forced technique must
+// be needed. On folds the Forced set into one `force_any` disjunction, so the
+// puzzle need only require *some* member (only meaningful with two or more
+// Forced). The choice rides the request through to gen_worker.rs.
+function forceModeRow() {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "setting-row";
+  row.setAttribute("role", "switch");
+  row.setAttribute("aria-checked", String(forceAny));
+
+  const text = document.createElement("span");
+  text.className = "setting-text";
+  const name = document.createElement("span");
+  name.className = "setting-name";
+  name.textContent = "Require any, not all";
+  const desc = document.createElement("span");
+  desc.className = "setting-desc";
+  desc.textContent =
+    "On, the puzzle needs just one of your forced techniques rather than every one of them.";
+  text.append(name, desc);
+
+  const sw = document.createElement("span");
+  sw.className = "setting-switch";
+
+  row.append(text, sw);
+  row.addEventListener("click", () => {
+    forceAny = !forceAny;
+    row.setAttribute("aria-checked", String(forceAny));
+    saveForceAny();
+  });
+  return row;
+}
+
 // ---- Generate ----
 // Two ways to start the assembled spec: Play (the minimal puzzle) and Play from
 // first forced (a head start up to the easiest Forced technique). A spec can force
@@ -256,6 +319,7 @@ function generate(fromForced) {
     usages: snapshot,
     label: labelFor(snapshot),
     specMasks: masksFromUsages(snapshot),
+    forceAny,
   };
   // "Play from first forced" advances the board with the spec's ALLOWED techniques
   // until a Forced one is needed; app.js derives that allowed set from specMasks,
@@ -264,11 +328,14 @@ function generate(fromForced) {
   onGenerate(req);
 }
 
-// A short title from the Forced techniques, e.g. "X-Wing" or "Naked Pair + X-Wing".
+// A short title from the Forced techniques. Conjunctive forcing joins with " + "
+// ("Naked Pair + X-Wing"); the any-mode disjunction joins with " or " ("Naked
+// Pair or X-Wing"), matching the relaxed requirement.
 function labelFor(u) {
   const idxs = forcedIndices(u);
   if (!idxs.length) return "Custom";
-  return idxs.map((i) => techniqueName(idFor(i))).join(" + ");
+  const names = idxs.map((i) => techniqueName(idFor(i)));
+  return names.join(forceAny ? " or " : " + ");
 }
 
 // ---- Shared bits ----

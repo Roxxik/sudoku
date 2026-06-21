@@ -174,7 +174,7 @@ async function launch(req, uncapped = false) {
   let result;
   try {
     const genReq = req.usages
-      ? { usages: req.usages, uncapped }
+      ? { usages: req.usages, uncapped, forceAny: req.forceAny }
       : { target: req.kindIndex, drill: req.mode === "drill", uncapped };
     result = await gen.generate(genReq);
   } catch (e) {
@@ -215,6 +215,7 @@ async function launch(req, uncapped = false) {
         mode: "custom",
         spec: req.usages,
         specMasks: req.specMasks,
+        forceAny: !!req.forceAny,
         label: req.label,
         puzzle: result.puzzle,
         solution: result.solution,
@@ -245,7 +246,7 @@ async function launch(req, uncapped = false) {
 function regenerate(g) {
   launch(
     g.spec
-      ? { usages: g.spec, label: g.label, specMasks: g.specMasks }
+      ? { usages: g.spec, label: g.label, specMasks: g.specMasks, forceAny: g.forceAny }
       : { kindIndex: g.kindIndex, mode: g.mode }
   );
 }

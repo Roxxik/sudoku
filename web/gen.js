@@ -57,16 +57,17 @@ function spawn() {
 // Generate one puzzle. A campaign request gives `target` (a curriculum kindIndex)
 // and `drill` (drill-mode over train); a custom-spec request gives `usages` (the
 // per-kind usage array from spec.js), which takes precedence and is sent as the
-// worker's `spec` field. `uncapped` lifts the worker's attempt budget so the
-// search runs until it succeeds or is cancelled (the page offers this after a
-// capped attempt gives up). Resolves to { puzzle, solution, givens, seed } (seed
-// is a decimal-string u64); rejects on a generation failure (capped budget
-// exhausted) or if cancelled.
-export function generate({ target, drill, usages, uncapped }) {
+// worker's `spec` field. `forceAny` (custom only) folds the Forced kinds into one
+// disjunction -- the puzzle requires some member, not every one. `uncapped` lifts
+// the worker's attempt budget so the search runs until it succeeds or is
+// cancelled (the page offers this after a capped attempt gives up). Resolves to
+// { puzzle, solution, givens, seed } (seed is a decimal-string u64); rejects on
+// a generation failure (capped budget exhausted) or if cancelled.
+export function generate({ target, drill, usages, uncapped, forceAny }) {
   if (pending) return Promise.reject(new Error("a generation is already running"));
   if (!worker) spawn();
   const msg = usages
-    ? { spec: usages, uncapped: !!uncapped }
+    ? { spec: usages, uncapped: !!uncapped, forceAny: !!forceAny }
     : { target, drill, uncapped: !!uncapped };
   return new Promise((resolve, reject) => {
     pending = { resolve, reject };

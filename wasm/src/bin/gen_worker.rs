@@ -17,12 +17,16 @@
 //! Message protocol (plain structured-clone objects, no owned wasm handles):
 //!   worker -> page, on init:        `{ ready: true }`
 //!   page   -> worker, campaign:     `{ target: <kindIndex>, drill: <bool>, uncapped: <bool> }`
-//!   page   -> worker, custom spec:  `{ spec: [<usage per kind>], uncapped: <bool> }`
+//!   page   -> worker, custom spec:  `{ spec: [<usage per kind>], forceAny: <bool>, uncapped: <bool> }`
 //!   worker -> page, on success:     `{ puzzle, solution, givens, seed, attempts }`
 //!   worker -> page, on failure:     `{ error: <string> }`
 //! A `spec` field (an array of per-kind usage codes — 0 off / 1 Allowed /
 //! 2 Forced / 3 Conceded, see `web/spec.js`) selects the custom-spec path and
-//! takes precedence over `target`/`drill`. `uncapped` (default false) lifts the
+//! takes precedence over `target`/`drill`. `forceAny` (default false) flips the
+//! Forced kinds from a conjunction (each required) to one `force_any` set, of which
+//! the generator picks a single member per puzzle from the seed and forces just that
+//! one (so the set's techniques come up evenly, not collapsed onto the easiest member).
+//! `uncapped` (default false) lifts the
 //! per-request attempt budget so a hard target keeps searching until it finds a
 //! puzzle or the page terminates us — the page offers it after a capped request
 //! gives up.
@@ -52,7 +56,7 @@ fn main() {
         // A `spec` array is the custom-spec path; otherwise it's a campaign
         // request keyed by target/drill.
         let reply = match usages_field(&data, "spec") {
-            Some(usages) => generate_custom(&usages, uncapped),
+            Some(usages) => generate_custom(&usages, bool_field(&data, "forceAny"), uncapped),
             None => {
                 let target = num_field(&data, "target").unwrap_or(-1.0);
                 let drill = bool_field(&data, "drill");
@@ -104,18 +108,33 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
 /// as every builder uses). With nothing Forced the generator just yields the
 /// minimal puzzle the Allowed toolbox solves — the page gates Generate on at
 /// least one Forced kind, so that case is not normally reached.
-fn generate_custom(usages: &[u8], uncapped: bool) -> JsValue {
+///
+/// When `force_any` is set the Forced kinds are not required individually; instead
+/// they fold into a single [`force_any`](lab::Spec::force_any) set. The generator
+/// then pins one member per puzzle (chosen from the seed) and forces exactly it, so
+/// the set's techniques come up evenly across puzzles instead of collapsing onto the
+/// easiest member. `force_any` adds each member to the baseline itself, so the loop
+/// only collects their mask.
+fn generate_custom(usages: &[u8], force_any: bool, uncapped: bool) -> JsValue {
     let mut spec = lab::Spec::explicit();
+    let mut any_mask: lab::kinds::KindMask = 0;
     for (idx, &u) in usages.iter().enumerate() {
         if idx >= lab::kinds::NUM {
             break;
         }
         spec = match u {
             1 => spec.allow(idx),
+            2 if force_any => {
+                any_mask |= 1 << idx;
+                spec // baseline membership comes from force_any below
+            }
             2 => spec.force(idx, 1),
             3 => spec.concede(idx),
             _ => spec, // 0 / unknown: leave out of scope
         };
+    }
+    if any_mask != 0 {
+        spec = spec.force_any(any_mask, 1);
     }
     run_spec(&spec, uncapped)
 }
