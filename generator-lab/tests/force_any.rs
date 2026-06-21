@@ -54,6 +54,30 @@ fn force_any_pairs_generates_puzzles_requiring_the_set() {
     assert!(got > 0, "no force_any(pairs) puzzles produced in cap (test vacuous)");
 }
 
+/// Seed-driven member pick: the generator forces ONE member chosen from the seed, so
+/// across seeds the produced `force_any({NakedPair, HiddenPair})` puzzles spread over the
+/// set instead of collapsing onto the easiest member. Over a window of seeds we must see
+/// BOTH a puzzle that genuinely requires Naked Pair and one that requires Hidden Pair
+/// (a member is "required" when the in-scope toolbox cannot solve the board without it).
+#[test]
+fn force_any_spreads_members_across_seeds() {
+    let spec = singles_lc().force_any(mask(PAIRS), 1);
+    let scope = spec.in_scope_mask();
+    let (mut seen_np, mut seen_hp) = (false, false);
+    for seed in 0..200u64 {
+        let mut rng = Rng::from_seed(seed);
+        let (Some(p), _) = generate(&mut rng, &spec, 20_000) else { continue };
+        let board = Board::from_digits(&p.puzzle.0);
+        seen_np |= LogicSolver::min_target_uses(&board, scope, 1 << NAKED_PAIR) >= 1;
+        seen_hp |= LogicSolver::min_target_uses(&board, scope, 1 << HIDDEN_PAIR) >= 1;
+        if seen_np && seen_hp {
+            break;
+        }
+    }
+    assert!(seen_np, "no Naked-Pair-required puzzle across the seed window — set not spreading");
+    assert!(seen_hp, "no Hidden-Pair-required puzzle across the seed window — set not spreading");
+}
+
 /// Forcing a single member implies the disjunction: a `force(NakedPair)` puzzle satisfies
 /// `force_any({NakedPair, HiddenPair})`, and the singleton `force_any({NakedPair})` is the
 /// same constraint as `force(NakedPair)` end-to-end.

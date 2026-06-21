@@ -1142,7 +1142,25 @@ impl Stats {
 }
 
 /// Generate until a puzzle satisfying `spec` is found or `max_attempts` is hit.
+///
+/// A [`force_any`](Spec::force_any) set is resolved to ONE concrete forced member here,
+/// drawn from the seed's RNG stream before the attempt loop. Forcing a specific member —
+/// instead of accepting whichever member the disjunction's avoid-walk happens to find
+/// irreplaceable (typically the easiest, most common one) — spreads the produced puzzles
+/// evenly across the set's techniques. The draw is per-puzzle, not per-attempt: every
+/// attempt of this puzzle targets the same member, so a low-yield member is not
+/// out-competed attempt-by-attempt by the higher-yield ones (which would re-bias the mix).
+/// Specs without a `force_any` set are untouched (no extra RNG draw, byte-identical).
 pub fn generate(rng: &mut Rng, spec: &Spec, max_attempts: usize) -> (Option<GeneratedPuzzle>, Stats) {
+    let resolved;
+    let spec = match spec.force_any_set() {
+        Some(ra) => {
+            let n = rng.range(ra.kinds.count_ones() as usize);
+            resolved = spec.force_any_member(n);
+            &resolved
+        }
+        None => spec,
+    };
     let mut stats = Stats::default();
     for _ in 0..max_attempts {
         stats.attempts += 1;

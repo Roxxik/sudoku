@@ -5,7 +5,10 @@
 //!
 //! A [`force_any`](Spec::force_any) set (the disjunctive counterpart of
 //! [`force`](Spec::force) — "the puzzle must require *some* technique from this set")
-//! is supported as a single optional slot. The yield-flavoured family `require_any`
+//! is supported as a single optional slot. The generator does not leave the choice to
+//! the solver: it pins ONE member per puzzle from the seed (see
+//! [`force_any_member`](Spec::force_any_member)), so puzzles spread evenly across the set
+//! instead of collapsing onto the easiest member. The yield-flavoured family `require_any`
 //! ("any fish must *appear* at least once" — a baseline-trace count, not a forcing
 //! constraint) is still omitted: no spec in scope uses it.
 //!
@@ -93,6 +96,13 @@ impl Spec {
     /// the baseline to solve a puzzle that requires it); an existing `Forced`/`Conceded`
     /// labeling is left untouched. `kinds` is a [`KindMask`] (`1 << idx` per member),
     /// must be non-empty, and `count` must be at least 1.
+    ///
+    /// At generate time the disjunction is not handed to the solver to satisfy however it
+    /// likes: [`generate`](crate::generate::generate) draws one member from the seed and
+    /// forces exactly it (via [`force_any_member`](Self::force_any_member)), so the set's
+    /// techniques come up evenly across seeds. The disjunctive requirement encoded here is
+    /// still the cold semantics any direct (per-attempt) consumer sees, and a single
+    /// concrete member always satisfies it.
     pub fn force_any(mut self, kinds: KindMask, count: u16) -> Self {
         debug_assert!(kinds != 0, "force_any needs at least one technique");
         debug_assert!(count >= 1, "force_any count must be at least 1");
@@ -108,6 +118,37 @@ impl Spec {
     /// The disjunctive [`force_any`](Self::force_any) set, if one is configured.
     pub fn force_any_set(&self) -> Option<RequireAny> {
         self.force_any
+    }
+
+    /// Resolve the [`force_any`](Self::force_any) disjunction to a single concrete forced
+    /// member, picked by ordinal `n`: the `n`-th set member (0-based, ascending kind index)
+    /// is marked [`Forced`](Usage::Forced) with the set's `count`, and the disjunction is
+    /// dropped. The other members keep their (Allowed) baseline labels, so the puzzle must
+    /// require *this* member even though the rest of the set is still available — a true
+    /// single-technique puzzle, not merely "needs something from the set".
+    ///
+    /// The generator calls this once per puzzle with a seed-drawn `n` (see
+    /// [`generate`](crate::generate::generate)), so a `force_any` spec produces puzzles
+    /// spread evenly across its members rather than collapsing onto whichever one the
+    /// disjunctive avoid-walk finds irreplaceable (typically the easiest, most common one).
+    /// `n` must be `< count_ones()` of the set's mask. With no `force_any` set configured
+    /// this returns `self` unchanged.
+    pub fn force_any_member(&self, n: usize) -> Spec {
+        let Some(ra) = self.force_any else {
+            return self.clone();
+        };
+        debug_assert!(n < ra.kinds.count_ones() as usize, "force_any member ordinal out of range");
+        // Select the n-th set bit (ascending kind index): clear the n lowest, the lowest
+        // remaining bit is the pick.
+        let mut m = ra.kinds;
+        for _ in 0..n {
+            m &= m - 1;
+        }
+        let idx = m.trailing_zeros() as usize;
+        let mut s = self.clone();
+        s.usage[idx] = Some(Usage::Forced(ra.count));
+        s.force_any = None;
+        s
     }
 
     /// Broad-mode training for `target`: force it, and allow what the player may
@@ -486,6 +527,28 @@ mod tests {
         assert!(!s.requirement_met(&counts), "one fish < required 2");
         counts[X_WING] = 1; // 1 + 1 across the set reaches 2
         assert!(s.requirement_met(&counts), "set total meets the count");
+    }
+
+    /// `force_any_member(n)` pins the n-th set member as `Forced` (with the set's count),
+    /// drops the disjunction, and leaves the other members in the baseline (Allowed) so the
+    /// resolved puzzle must require *that* member while the rest of the set stays available.
+    #[test]
+    fn force_any_member_pins_one_and_drops_disjunction() {
+        let fish = mask(&[X_WING, SWORDFISH, JELLYFISH]); // ascending: X_WING, SWORDFISH, JELLYFISH
+        let s = Spec::explicit().allow(NAKED_SINGLE).force_any(fish, 2);
+        let members = [X_WING, SWORDFISH, JELLYFISH];
+        for (n, &member) in members.iter().enumerate() {
+            let r = s.force_any_member(n);
+            assert!(r.force_any_set().is_none(), "disjunction dropped");
+            assert!(matches!(r.usage[member], Some(Usage::Forced(2))), "member {member} forced with set count");
+            assert_eq!(r.forced_mask(), 1 << member, "exactly the picked member is forced");
+            // The other set members stay Allowed (in the baseline, not forced).
+            for &other in &members {
+                if other != member {
+                    assert!(matches!(r.usage[other], Some(Usage::Allowed)), "other member {other} stays Allowed");
+                }
+            }
+        }
     }
 
     /// A singleton `force_any` is the disjunctive degenerate case of `force`: same
