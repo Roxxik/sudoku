@@ -9,6 +9,7 @@ const ELIMINATE_KEY = "sudoku.settings.eliminateCandidates";
 const SHOW_TIMER_KEY = "sudoku.settings.showTimer";
 const HIGHLIGHT_KEY = "sudoku.settings.highlight";
 const DISABLE_FINISHED_KEY = "sudoku.settings.disableFinishedDigits";
+const HINT_FROM_MARKS_KEY = "sudoku.settings.hintFromMarks";
 
 function stored(key) {
   try {
@@ -81,4 +82,19 @@ export function disableFinishedDigitsOn() {
 
 export function setDisableFinishedDigits(on) {
   store(DISABLE_FINISHED_KEY, on);
+}
+
+// What the hint engine reasons over:
+//   on  -- digits + marks: fold the player's Center notes (a candidate list) and
+//          Corner (Snyder) pins into each cell's candidate set, so hints follow
+//          the player's own deductions (default).
+//   off -- placed digits alone: ignore notes entirely and re-derive candidates
+//          from placements.
+// Default ON -- an absent key reads as on.
+export function hintFromMarksOn() {
+  return stored(HINT_FROM_MARKS_KEY) !== "0";
+}
+
+export function setHintFromMarks(on) {
+  store(HINT_FROM_MARKS_KEY, on);
 }

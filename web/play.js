@@ -13,7 +13,7 @@ import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { copyText } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
-import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn } from "./settings.js";
+import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn } from "./settings.js";
 
 const N = 81;
 
@@ -213,6 +213,24 @@ function redoAll() {
 function onRedoTap() {
   if (redoFlicked()) return;
   redo();
+}
+
+// Walk back through history one recorded move at a time until the live board no
+// longer trips `hasError` (or history runs out). Mirrors a run of single undos:
+// every state we leave lands in redoStack, so the whole rewind is reversible a
+// tap at a time (or all at once via Redo's up-flick). The error-hint "Undo to
+// before..." buttons use this to drop the player back to the last state that was
+// still correct -- including any moves they built on top of the slip.
+function undoToClear(hasError) {
+  if (history.length === 0 || !hasError()) return;
+  do {
+    redoStack.push(snapshot()); // remember where we are so redo can return here
+    applySnapshot(history.pop());
+  } while (history.length > 0 && hasError());
+  updateHistoryButtons();
+  persist();
+  refreshTimer(); // a rewound restart entry rewinds the clock -- show it at once
+  render();
 }
 
 function updateHistoryButtons() {
@@ -1335,30 +1353,28 @@ function cornerPins() {
   };
 }
 
-// Build a solver Board from the current grid. The player's center
-// pencil notes ride along as a per-cell candidate mask (bit d-1 set for each
-// noted digit), so the hint engine reasons over the *reduced* candidate set
-// instead of re-deriving it from placements alone. That is also what lets "Apply
-// easiest" progress past singles: a technique elimination narrows the notes, and
-// the next hint sees the narrower set (a cell with no center notes means
-// "unspecified" -> it stays grid-derived). Corner (Snyder) notes mark where a
-// digit can go, not a full candidate set, so they are folded into the candidates.
-// Caller owns `.free()`.
+// Build a solver Board from the current grid. With the "Hints use your notes"
+// setting on (the default), the player's pencil notes ride along as a per-cell
+// candidate mask (bit d-1 set for each noted digit), so the hint engine reasons
+// over the *reduced* candidate set instead of re-deriving it from placements
+// alone. That is also what lets "Apply easiest" progress past singles: a
+// technique elimination narrows the notes, and the next hint sees the narrower
+// set (a cell with no center notes means "unspecified" -> it stays grid-derived).
+// Corner (Snyder) notes mark where a digit can go, not a full candidate set, so
+// they are folded into the candidates. With the setting off the notes are
+// ignored entirely -- every cell stays unspecified and the engine derives
+// candidates from placements alone. Caller owns `.free()`.
 function solverBoard(wasm) {
   const cellDigits = new Uint8Array(N);
   for (let i = 0; i < N; i++) cellDigits[i] = digitAt(i);
 
-  const pins = cornerPins();
   const cand = new Uint16Array(N); // 0 = unspecified (keep grid-derived)
-  for (let i = 0; i < N; i++) {
-    if (digitAt(i) !== 0) continue;
-
-    let mask = 0x1ff;
+  if (hintFromMarksOn()) {
+    const pins = cornerPins();
     for (let i = 0; i < N; i++) {
       if (digitAt(i) !== 0) continue;
 
       const { mask, specified } = candidatesAt(i, pins);
-
       if (!specified) {
         cand[i] = 0; // no player info -> let the grid derive candidates
         continue;
@@ -1504,6 +1520,20 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
       for (const c of wrongCandidateCells) cells[c].classList.add("hl-elim");
     });
     actions.appendChild(show);
+
+    // Same rewind as the wrong-digit stage: drop back to the last state whose
+    // notes still admit every solution digit (re-opening the status layer so the
+    // banner falls back once the bad marks are gone).
+    if (history.length > 0) {
+      const back = document.createElement("button");
+      back.className = "hint-bigbtn";
+      back.textContent = "Undo to before the wrong mark";
+      back.addEventListener("click", () => {
+        undoToClear(() => wrongMarkCells().length > 0);
+        openHint();
+      });
+      actions.appendChild(back);
+    }
   }
 
   // Stale marks don't block progress, so this sits alongside the techniques
@@ -1612,6 +1642,25 @@ function errorStage(kind, errCells) {
     for (const c of errCells) cells[c].classList.add("hl-elim");
   });
   actions.appendChild(show);
+
+  // Rewind to the last state that was still correct, undoing the slip and
+  // anything built on top of it. Reversible via Redo, so it's offered to
+  // everyone (not just cheat): it only replays the player's own undo.
+  if (history.length > 0) {
+    const stillWrong =
+      kind === "logical"
+        ? () => logicalErrorCells().length > 0
+        : () => solvedErrorCells().length > 0;
+    const back = document.createElement("button");
+    back.className = "hint-bigbtn";
+    back.textContent = "Undo to before the mistake";
+    back.addEventListener("click", () => {
+      undoToClear(stillWrong);
+      if (finished) closeHint();
+      else openHint();
+    });
+    actions.appendChild(back);
+  }
 
   if (cheatOn()) {
     const fix = document.createElement("button");

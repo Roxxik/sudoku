@@ -547,6 +547,12 @@ export function openSettings(onBack) {
         "Grey out a digit's button once all nine of it are placed.",
         settings.disableFinishedDigitsOn(),
         settings.setDisableFinishedDigits
+      ),
+      settingToggle(
+        "Hints use your notes",
+        "Read hints from your Center and Corner notes. Off: hints derive from placed digits alone.",
+        settings.hintFromMarksOn(),
+        settings.setHintFromMarks
       )
     );
   showView("settingsView");
