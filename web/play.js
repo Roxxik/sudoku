@@ -905,13 +905,14 @@ function onNotesTap() {
   }
 }
 
-// An upward flick on the Notes button converts the selection's corner marks to
-// center marks (cornersToCenters). The press is captured so a flick that leaves
-// the button still reports its release here; on release a mostly-vertical upward
-// travel past FLICK_MIN counts as the flick and arms `notesFlicked` so the click
-// it also fires is swallowed (onNotesTap). Anything shorter falls through to the
-// normal tap/double-tap.
-const FLICK_MIN = 24; // px of upward travel to register a flick
+// Flicks on the Notes button. The press is captured so a flick that leaves the
+// button still reports its release here; on release the dominant axis decides:
+//   straight up  -> convert the selection's corners to centers
+//   left / right -> arm that mark kind (Corner / Center), place/mark mode kept
+// Left arms Corner, Right arms Center -- mirroring where each note sits in a cell.
+// A recognized flick arms `notesFlicked` so the click it also fires is swallowed
+// (onNotesTap); a press too short to register falls through to the normal tap.
+const FLICK_MIN = 24; // px of travel to register a flick
 function wireNotesFlick() {
   let startX = 0,
     startY = 0,
@@ -932,8 +933,14 @@ function wireNotesFlick() {
     flickPointer = null;
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
-    if (dy <= -FLICK_MIN && Math.abs(dy) > Math.abs(dx)) {
+    if (Math.abs(dx) >= FLICK_MIN && Math.abs(dx) > Math.abs(dy)) {
+      // Sideways: arm the matching note kind, leaving place/mark mode alone.
       notesFlicked = true; // swallow the click that follows
+      markKind = dx < 0 ? MODE_CORNER : MODE_CENTER;
+      updateNotesButton();
+    } else if (dy <= -FLICK_MIN && Math.abs(dy) > Math.abs(dx)) {
+      // Straight up: convert corners to centers.
+      notesFlicked = true;
       cornersToCenters();
     }
   });
