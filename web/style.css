@@ -823,6 +823,26 @@ summary > span:first-of-type { flex: 1; }
   font-size: 0.8rem;
   word-break: break-all;
 }
+/* The grade breakdown is short labelled terms, not one long token: wrap on
+   whitespace rather than mid-word like the seed's break-all. */
+.play-grade { word-break: normal; overflow-wrap: anywhere; }
+
+/* Difficulty grade pill on Continue / history thumbnails. Coloured text + ring on
+   a transparent fill (reads on both themes), sized to its label, left-aligned so
+   it hugs the start of the card's text column rather than stretching. */
+.grade-badge {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.grade-gentle { color: var(--ok); }
+.grade-medium { color: var(--warn); }
+.grade-spicy { color: var(--bad); }
 
 /* Reserve the best-time line so Train/Drill buttons are the same height whether
    or not a best time exists. */

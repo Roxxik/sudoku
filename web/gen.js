@@ -43,7 +43,7 @@ function spawn() {
       const err = new Error(e.data.error);
       err.retriable = !!e.data.retriable;
       p.reject(err);
-    } else p.resolve(e.data); // { puzzle, solution, givens, seed }
+    } else p.resolve(e.data); // { puzzle, solution, givens, seed, attempts, grade }
   });
 
   worker.addEventListener("error", (e) => {

@@ -36,6 +36,12 @@ pub use generator_lab::spec::{self, Spec, kinds};
 /// (`.` for an empty cell) the webapp loads.
 pub use generator_lab::repr::{DigitGrid, Puzzle, Solution};
 
+/// The per-node campaign difficulty grader. The webapp generates one puzzle at a time, so
+/// it uses the absolute single-puzzle path [`grade::grade_one`] (returns the four
+/// [`Signals`](generator_lab::grade::Signals) plus a stable gentle/medium/spicy band); the
+/// relative batch path ([`grade::grade_batch`]/[`grade::grade_node`]) is generator-lab's.
+pub use generator_lab::grade;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,7 +8,7 @@
 
 import * as store from "./store.js";
 import { formatDuration, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
-import { miniBoard, textColumn, copyText } from "./ui.js";
+import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
 import { cheatOn } from "./cheat.js";
 
@@ -116,6 +116,8 @@ function historyCard(g) {
   }
   const meta = `${modeLabel} · ${formatDuration(g.elapsedMs)} · ${solvedDate(g)}`;
   const col = textColumn(title, meta);
+  const badge = gradeBadge(g.grade);
+  if (badge) col.appendChild(badge);
   if (cheatOn()) {
     const seed = document.createElement("span");
     seed.className = "ci-meta hist-seed";

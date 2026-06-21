@@ -224,6 +224,51 @@ pub fn grade_node(
     grade_batch(&traces, bottleneck, weights, n_bands)
 }
 
+/// A single puzzle's **absolute** hardness index — the input to [`band_absolute`]. Where
+/// [`grade_batch`] ranks a whole node's batch against itself, this maps one puzzle to a
+/// stable integer with no batch, for callers that grade one puzzle at a time (the web app).
+/// It sums the two strongest, most self-interpretable signals: the longest dry run (the
+/// primary signal — a back-to-back hard-scan grind that placed nothing) and how many
+/// *extra* times beyond the first the forced technique had to fire. Scarcity and scan work
+/// have no natural absolute cut (they only mean something relative to a batch), so they feed
+/// the detailed readout but not the band. A puzzle with no bottleneck at all (a trunk-forced
+/// / Beginner node, no harder phase) is uniformly gentle: index `0`.
+pub fn hardness_index(s: &Signals) -> u32 {
+    if s.bottleneck_count == 0 {
+        return 0;
+    }
+    s.longest_dry_run + (s.bottleneck_count - 1)
+}
+
+/// Map one puzzle's [`Signals`] to a stable gentle (`0`) / medium (`1`) / spicy (`2`) band
+/// by fixed thresholds on [`hardness_index`] — the absolute, per-puzzle counterpart to
+/// [`grade_batch`]'s relative quantile cut, for one-puzzle-at-a-time callers. The cuts are
+/// the natural small-integer boundaries of the combined index (one forced firing with no dry
+/// grind is gentle; a couple of extra firings or a short grind is medium; a longer grind or
+/// many firings is spicy), not a calibrated score.
+pub fn band_absolute(s: &Signals) -> usize {
+    match hardness_index(s) {
+        0 => 0,
+        1 | 2 => 1,
+        _ => 2,
+    }
+}
+
+/// Grade a single puzzle **absolutely**: solve it with `spec`'s baseline toolbox via the
+/// instrumented [`solve_graded`], read the four [`Signals`], and cut them to a stable band
+/// with [`band_absolute`]. Returns `(signals, band)` — the band drives a per-puzzle
+/// difficulty label and the signals a detailed readout. This is the one-puzzle path (the web
+/// app, which generates one puzzle at a time); [`grade_node`] / [`grade_batch`] stay the
+/// per-node *relative* path for grading a whole batch against itself. Cold path: a single
+/// easiest-first solve off the hot generation loop.
+pub fn grade_one(spec: &Spec, puzzle: &DigitGrid) -> (Signals, usize) {
+    let baseline = spec.baseline_mask();
+    let bottleneck = bottleneck_mask(spec);
+    let trace = solve_graded(&SolverState::<Bands<RowMajor>>::from_digits(puzzle), baseline);
+    let signals = signals_of(&trace, bottleneck);
+    (signals, band_absolute(&signals))
+}
+
 /// The gentle / medium / spicy label for a band under the [`DEFAULT_BANDS`] (3) cut. For a
 /// different band count the caller should print the raw `band`/`n_bands` index instead.
 pub fn band_name3(band: usize) -> &'static str {
@@ -320,5 +365,34 @@ mod tests {
     #[test]
     fn empty_batch_grades_to_nothing() {
         assert!(grade_batch(&[], 1 << NAKED_PAIR, &Weights::default(), 3).is_empty());
+    }
+
+    /// Build [`Signals`] from `(bottleneck_count, longest_dry_run)` — the only two the
+    /// absolute band reads — leaving the rest at their defaults.
+    fn sig(bottleneck_count: u32, longest_dry_run: u32) -> Signals {
+        Signals { bottleneck_count, longest_dry_run, ..Signals::default() }
+    }
+
+    #[test]
+    fn absolute_band_thresholds() {
+        // No bottleneck at all: a Beginner/trunk node, uniformly gentle.
+        assert_eq!(band_absolute(&sig(0, 0)), 0);
+        // One forced firing, no dry grind: index 0 -> gentle.
+        assert_eq!(band_absolute(&sig(1, 0)), 0);
+        // One firing but a 2-long dry grind: index 2 -> medium.
+        assert_eq!(band_absolute(&sig(1, 2)), 1);
+        // Three firings, no grind: index 2 -> medium.
+        assert_eq!(band_absolute(&sig(3, 0)), 1);
+        // Two firings and a 2-long grind: index 3 -> spicy.
+        assert_eq!(band_absolute(&sig(2, 2)), 2);
+        // One firing but a 3-long grind: index 3 -> spicy.
+        assert_eq!(band_absolute(&sig(1, 3)), 2);
+    }
+
+    #[test]
+    fn hardness_index_ignores_dry_run_without_a_bottleneck() {
+        // longest_dry_run is over harder steps of any kind; with no bottleneck firing the
+        // puzzle is still classified gentle (no harder phase the band cares about).
+        assert_eq!(hardness_index(&sig(0, 5)), 0);
     }
 }

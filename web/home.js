@@ -22,7 +22,7 @@
 
 import * as store from "./store.js";
 import * as settings from "./settings.js";
-import { miniBoard, textColumn, copyText } from "./ui.js";
+import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { TECHNIQUE_INFO } from "./techniques.js";
 import { masksFromUsages } from "./spec.js";
 import {
@@ -167,7 +167,10 @@ function continueCard(g, title, sizeClass) {
   const main = document.createElement("button");
   main.className = "continue-item";
   main.addEventListener("click", () => onResume(g.id));
-  main.append(miniBoard(g, sizeClass), textColumn(title, continueMeta(g)));
+  const col = textColumn(title, continueMeta(g));
+  const badge = gradeBadge(g.grade);
+  if (badge) col.appendChild(badge);
+  main.append(miniBoard(g, sizeClass), col);
   card.append(main, cardMenu(g));
   return card;
 }

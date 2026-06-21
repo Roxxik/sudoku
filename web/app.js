@@ -222,6 +222,7 @@ async function launch(req, uncapped = false) {
         givens: result.givens,
         seed: result.seed,
         attempts: result.attempts,
+        grade: result.grade,
         value: startValue,
         fromForced: !!req.fromForced,
       })
@@ -233,6 +234,7 @@ async function launch(req, uncapped = false) {
         givens: result.givens,
         seed: result.seed,
         attempts: result.attempts,
+        grade: result.grade,
         value: startValue,
         fromForced: !!req.fromForced,
       });

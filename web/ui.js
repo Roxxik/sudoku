@@ -54,6 +54,28 @@ export async function copyText(text) {
   }
 }
 
+// The generator's gentle/medium/spicy difficulty bands, indexed by `grade.band`
+// (the absolute single-puzzle band the worker returns; see web/store.js).
+export const GRADE_NAMES = ["Gentle", "Medium", "Spicy"];
+
+// The band's display word for a game's `grade`, or null if ungraded (old records
+// predate grading, or the field is malformed).
+export function gradeName(grade) {
+  if (!grade || typeof grade.band !== "number") return null;
+  return GRADE_NAMES[grade.band] || null;
+}
+
+// A small coloured difficulty pill for a game's grade (green/amber/red by band),
+// or null when the game is ungraded -- callers skip appending it then.
+export function gradeBadge(grade) {
+  const name = gradeName(grade);
+  if (!name) return null;
+  const span = document.createElement("span");
+  span.className = `grade-badge grade-${name.toLowerCase()}`;
+  span.textContent = name;
+  return span;
+}
+
 // The text half of a card: a bold title over one or more muted meta lines.
 // Pass extra strings to stack additional muted lines (e.g. a debug seed).
 export function textColumn(title, ...metaLines) {

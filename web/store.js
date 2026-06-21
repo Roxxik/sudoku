@@ -49,6 +49,10 @@ function newId() {
 //         records). Kept so cheat mode can display it and reproduce the puzzle.
 //   attempts: rejection-sampling attempts the generator spent (debug only; absent
 //             on old records). Shown under cheat next to the seed.
+//   grade: { band: 0|1|2, bottleneckCount, dryFirings, longestDryRun, scanWork,
+//            scarcity: number|null } -- the generator's difficulty grade. `band`
+//            (gentle/medium/spicy) drives a thumbnail badge; the raw signals feed
+//            the cheat-mode breakdown. null on old records (predates grading).
 //   value: number[81]         player placements (0 = empty),
 //   fromForced: bool          started via "Play from Forced" (a head start was
 //                             pre-placed). Tracked separately from a plain Play in
@@ -93,6 +97,7 @@ export function createGame({
   givens,
   seed,
   attempts,
+  grade = null,
   value = null,
   fromForced = false,
 }) {
@@ -109,6 +114,7 @@ export function createGame({
     givens,
     seed: seed || null,
     attempts: attempts ?? null,
+    grade: grade || null,
     fromForced: !!fromForced,
     value: Array.isArray(value) && value.length === N ? value.slice() : new Array(N).fill(0),
     centerMarks: Array.from({ length: N }, () => []),

@@ -12,7 +12,7 @@ import { bindings } from "./wasm.js";
 import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
-import { copyText } from "./ui.js";
+import { copyText, gradeName } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
 import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn } from "./settings.js";
 
@@ -2084,22 +2084,49 @@ function setTitle(g) {
 }
 
 // Debug aid: under cheat mode, show the seed the current puzzle was generated
-// from and how many generator attempts it took, on a single line (each absent on
-// puzzles made before it was recorded). Re-run whenever the game changes
-// (loadGame) or cheat is toggled mid-game (setCheat).
+// from and how many generator attempts it took on one line, and the full
+// difficulty-grade breakdown on a second line (each line absent on puzzles made
+// before its data was recorded). Re-run whenever the game changes (loadGame) or
+// cheat is toggled mid-game (setCheat).
 function updateSeedLine() {
-  const el = document.getElementById("playSeed");
+  const show = cheatOn();
+  setDebugLine("playSeed", show && seedLineText());
+  setDebugLine("playGrade", show && gradeLineText());
+}
+
+// Set a cheat-mode debug `<p>` to `text`, or hide it when `text` is empty/false.
+function setDebugLine(id, text) {
+  const el = document.getElementById(id);
   if (!el) return;
+  el.textContent = text || "";
+  el.hidden = !text;
+}
+
+// "Seed: N · Attempts: M" for the current game, each term omitted when its field
+// wasn't recorded. Empty string when neither exists.
+function seedLineText() {
   const parts = [];
   if (game && game.seed) parts.push(`Seed: ${game.seed}`);
   if (game && game.attempts != null) parts.push(`Attempts: ${game.attempts}`);
-  if (parts.length && cheatOn()) {
-    el.textContent = parts.join(" · ");
-    el.hidden = false;
-  } else {
-    el.textContent = "";
-    el.hidden = true;
-  }
+  return parts.join(" · ");
+}
+
+// The generator's full grade breakdown: the band word plus every raw sub-tier
+// signal (the same data grade.signals_of produces). Empty string when the game
+// predates grading. Scarcity is the min eliminations at a bottleneck firing, sent
+// as null (shown "-") when the puzzle needed no harder step.
+function gradeLineText() {
+  const gr = game && game.grade;
+  if (!gr || typeof gr.band !== "number") return "";
+  const scarcity = gr.scarcity == null ? "-" : gr.scarcity;
+  return [
+    `Grade: ${gradeName(gr) || "?"}`,
+    `Dry run: ${gr.longestDryRun}`,
+    `Forced: ${gr.bottleneckCount}`,
+    `Dry firings: ${gr.dryFirings}`,
+    `Scarcity: ${scarcity}`,
+    `Scan: ${gr.scanWork}`,
+  ].join(" · ");
 }
 
 // kindIndex -> kebab id, filled in by initPlay from the curriculum.

@@ -35,6 +35,10 @@ referenced throughout the app); if you change them, update this doc.
   givens,                    // clue count
   seed,                      // decimal string of the u64 generator seed,
                              //   or null on records made before seeds existed
+  attempts,                  // generator rejection-sampling attempts, or null (old)
+  grade,                     // { band: 0|1|2, bottleneckCount, dryFirings,
+                             //   longestDryRun, scanWork, scarcity: number|null }
+                             //   difficulty grade, or null on pre-grading records
   value: number[81],         // player entries, 0 = empty
   centerMarks: number[][81], // centred "usual" pencil notes per cell
   cornerMarks: number[][81], // Snyder corner notes per cell
@@ -113,9 +117,11 @@ These are load-bearing. Several are non-obvious and were the source of real bugs
 | Solved screen | `#solvedDialog`, `#solvedTime`, `#solvedHome`, `#solvedNew` |
 | Generation overlay | `#loadingOverlay`, `#loadingText`, `#loadingRetry` (error-state "Keep searching"), `#loadingCancel` |
 | Stats | `#statsBack`, `#statsBody`, `.stats-summary`, `.stats-table`, `.stats-tier` |
-| Stats history | `.hist-list`, `.hist-item`, `.mini` (thumbnail), `.hist-seed` (cheat only), `.hist-copy` |
+| Stats history | `.hist-list`, `.hist-item`, `.mini` (thumbnail), `.grade-badge` (difficulty pill), `.hist-seed` (cheat only), `.hist-copy` |
 | Play menu | `#menuBtn`, `#menuList`, `.menu-item[data-action="restart"|"copy"|"fillCandidates"]` (fillCandidates = `#menuFill`, cheat only) |
 | Play seed (cheat) | `#playSeed` (under the board; hidden unless cheat + record has a seed) |
+| Play grade (cheat) | `#playGrade` (second line under the board; band + raw signals; hidden unless cheat + record has a grade) |
+| Continue grade | `.grade-badge` (difficulty pill on each Continue card, ungraded records omit it) |
 
 ---
 
