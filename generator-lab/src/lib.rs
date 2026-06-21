@@ -36,6 +36,10 @@
 //!   `DIFFICULTY`/`NAMES`, and the `SolveTrace` a logic solve returns).
 //! - [`fill`]: the random full-grid filler (banded-bitboard MRV search), the first
 //!   half of every attempt.
+//! - [`grade`]: the per-node, relative campaign difficulty grader — bands a node's
+//!   yielded puzzles against each other off the instrumented easiest-first solve
+//!   ([`solve::solve_graded`]). Cold path, post-validity; see
+//!   `docs/campaign-grader-plan.md`.
 //! - [`generate`]: the strip-generate pipeline on the `repr` layer (the [`probe`]
 //!   prober + [`solve`] gate). [`generate::random`] is the shipped scalar/wasm
 //!   path; [`generate::warp_host`] (native only) is the W=8 SIMT warp host that
@@ -59,6 +63,7 @@ pub(crate) mod counters;
 pub mod fill;
 pub mod fingerprint;
 pub mod generate;
+pub mod grade;
 pub mod harvest;
 pub mod probe;
 pub mod rng;

@@ -42,6 +42,9 @@ pub use logic::LogicSolver;
 /// Confluence-test surface: the reorderable harder ladder and a fixpoint solve that
 /// takes its order, for `examples/confluence.rs`.
 pub use logic::{HARD_STEPS_DEFAULT, HardStep, solve_fixpoint_with_order};
+/// Campaign difficulty grader surface (cold path): the instrumented easiest-first solve
+/// and the step trace its per-puzzle signals are derived from (see [`crate::grade`]).
+pub use logic::{CHEAP_KINDS, GradeStep, GradeTrace, solve_graded};
 
 /// Baseline-gate workload counters (`feature = "count"`), for the SIMT-baseline
 /// solver design study — read by the `baselinestat` example.

@@ -252,6 +252,151 @@ pub fn solve_fixpoint_with_order<V: LogicBoard>(
     }
 }
 
+// --- grading solve (cold path) ------------------------------------------------
+//
+// `solve_graded` is the campaign difficulty grader's instrumented easiest-first solve
+// (see `docs/campaign-grader-plan.md`). It is additive and runs ONLY on already-valid
+// yielded puzzles — firmly off the hot generation path — so it can afford the richer
+// bookkeeping `solve_tracked` deliberately omits. It mirrors `solve_tracked`'s ladder
+// exactly (same cheap closure, same `HARD_STEPS_DEFAULT` harder order), so it reaches
+// the identical `solved` verdict and the identical sequence of *harder* steps; the only
+// difference is what it records along the way.
+
+/// The cheap-closure toolbox: naked/hidden singles + both locked-candidate orientations
+/// (kind indices `0..4`). The grading solve drains these to a fixpoint between harder
+/// steps; what the closure places is the "free" progress whose presence marks a firing
+/// as *paid-off* (and whose absence makes it *dry* — signal 2). The boundary doubles as
+/// the harder-step boundary: every kind `>= NAKED_PAIR` is a harder step.
+pub const CHEAP_KINDS: KindMask =
+    (1 << NAKED_SINGLE) | (1 << HIDDEN_SINGLE) | (1 << LC_POINTING) | (1 << LC_CLAIMING);
+
+/// One harder-than-the-cheap-closure step of the grading solve, with the two facts the
+/// grader's per-step signals are defined over (the cheap closure that precedes the first
+/// step and follows every step is NOT recorded as a step — only the harder ladder is).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GradeStep {
+    /// The kind that fired (always a harder step: `>= NAKED_PAIR`).
+    pub kind: u8,
+    /// Whether the cheap closure run immediately AFTER this step placed >= 1 cell.
+    /// `false` = **dry**: the harder scan bought no placement, and another harder step
+    /// is needed before any reward (signal 2). A harder step only ever eliminates, so a
+    /// placement can come only from the following closure — this is exactly that test.
+    pub paid_off: bool,
+    /// How many candidate eliminations this firing made — the cheap first-cut proxy for
+    /// signal 3 (scarcity) the plan specifies: the number of distinct eliminations the
+    /// (first) forced firing makes at the stall. A harder step never places, so this is
+    /// just the board's candidate-population drop across the step.
+    pub elims: u16,
+}
+
+/// What [`solve_graded`] returns: the [`SolveTrace`] facts (`solved` + per-kind `counts`)
+/// plus the ordered harder-step sequence the grader's signals 2 and 3 read. The harder
+/// (`>= NAKED_PAIR`) counts and `solved` match [`LogicSolver::solve_tracked`] exactly
+/// (same path); the cheap counts may differ in tally (the closure drains in a different
+/// interleaving) but are never read by the grader.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GradeTrace {
+    pub solved: bool,
+    pub counts: [u16; NUM],
+    pub steps: Vec<GradeStep>,
+}
+
+/// Total live candidates over the board: `sum of len()` across the still-empty cells.
+/// The before/after delta across one harder step is its elimination count (a harder step
+/// only prunes candidates, never places — so occupancy is unchanged and the whole drop is
+/// eliminations).
+fn candidate_population<V: LogicBoard>(b: &V) -> u32 {
+    (0..CELLS).filter(|&c| b.is_empty(c)).map(|c| b.get(c).len()).sum()
+}
+
+/// How many cells hold a digit — the payoff yardstick: the cheap closure after a harder
+/// step paid off iff this rose.
+fn occupied_count<V: LogicBoard>(b: &V) -> usize {
+    (0..CELLS).filter(|&c| b.is_occupied(c)).count()
+}
+
+/// One firing of the cheap closure prefix (hidden single, then both locked candidates,
+/// and — only when naked single is NOT drained in waves — naked single), gated by
+/// `cheap`. Returns the fired kind, mirroring [`step_once`]'s cheap head so the grading
+/// solve walks the identical cheap closure.
+fn cheap_step_once<V: LogicBoard>(b: &mut V, cheap: KindMask, bat_singles: bool) -> Option<usize> {
+    macro_rules! try_kind {
+        ($bit:expr, $call:expr) => {
+            if cheap & (1 << $bit) != 0 && $call {
+                return Some($bit);
+            }
+        };
+    }
+    // Naked single is drained separately in waves when allowed (matching `solve_tracked`);
+    // include it here only for the rare toolbox that drained it differently.
+    if !bat_singles {
+        try_kind!(NAKED_SINGLE, techniques::naked_single(b));
+    }
+    try_kind!(HIDDEN_SINGLE, techniques::hidden_single(b));
+    try_kind!(LC_POINTING, techniques::lc_pointing(b));
+    try_kind!(LC_CLAIMING, techniques::lc_claiming(b));
+    None
+}
+
+/// Drain the cheap closure (`cheap` toolbox) to a fixpoint, tallying each firing into
+/// `counts`. Naked singles drain in waves (cheapest, the cascade after every elimination),
+/// then the hidden-single / locked-candidate prefix one firing at a time — exactly
+/// `solve_tracked`'s closure, just run to fixpoint in one call. Singles + locked candidates
+/// are confluent, so the fixpoint board is the one every easiest-first engine reaches.
+fn grade_cheap_closure<V: LogicBoard>(b: &mut V, cheap: KindMask, counts: &mut [u16; NUM]) {
+    let bat_singles = cheap & (1 << NAKED_SINGLE) != 0;
+    loop {
+        if bat_singles {
+            let n = drain_naked_singles(b);
+            if n > 0 {
+                counts[NAKED_SINGLE] = counts[NAKED_SINGLE].saturating_add(n);
+                continue;
+            }
+        }
+        match cheap_step_once(b, cheap, bat_singles) {
+            Some(k) => counts[k] = counts[k].saturating_add(1),
+            None => return,
+        }
+    }
+}
+
+/// The grading easiest-first solve: same fixpoint and harder ladder as
+/// [`LogicSolver::solve_tracked`], recording a [`GradeStep`] per harder step (the
+/// dry/payoff flag for signal 2 and the elimination count for signal 3's proxy). Cold
+/// path only — runs on a yielded puzzle, never in the strip loop.
+///
+/// Shape: drain the cheap closure to its singles + locked-candidate fixpoint, then while
+/// unsolved take ONE harder step (`HARD_STEPS_DEFAULT`, i.e. `step_once`'s tail), measure
+/// its eliminations, re-run the cheap closure, and record whether that closure placed a
+/// cell. A harder step that the closure does not reward is *dry*. `counts` tallies every
+/// firing so signals 1 (bottleneck count) and 4 (scan work) read straight off it.
+pub fn solve_graded<V: LogicBoard>(board: &V, allowed: KindMask) -> GradeTrace {
+    let mut b = board.clone();
+    let mut counts = [0u16; NUM];
+    let mut steps = Vec::new();
+    let cheap = allowed & CHEAP_KINDS;
+    // Cheap closure to the first stall (no preceding harder step, so nothing to score).
+    grade_cheap_closure(&mut b, cheap, &mut counts);
+    loop {
+        if is_solved(&b) {
+            return GradeTrace { solved: true, counts, steps };
+        }
+        let before = candidate_population(&b);
+        let Some(kind) = step_harder_ordered(&mut b, allowed, &HARD_STEPS_DEFAULT) else {
+            // Stuck: no harder step fires and the board is unsolved (baseline-unsolvable).
+            return GradeTrace { solved: false, counts, steps };
+        };
+        counts[kind] = counts[kind].saturating_add(1);
+        // A harder step only eliminates, so the candidate-population drop IS its
+        // elimination count and occupancy is unchanged until the closure runs.
+        let elims = before.saturating_sub(candidate_population(&b)).min(u16::MAX as u32) as u16;
+        let occ_before = occupied_count(&b);
+        grade_cheap_closure(&mut b, cheap, &mut counts);
+        let paid_off = occupied_count(&b) > occ_before;
+        steps.push(GradeStep { kind: kind as u8, paid_off, elims });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::repr::banded::{Bands, RowMajor};
