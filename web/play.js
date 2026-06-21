@@ -1038,34 +1038,50 @@ function wrongMarkCells() {
 //     (e.g. 6 pencilled in a cell's center while two corner marks elsewhere in
 //     the box already claim the 6).
 // A corner mark is never stale by pinning -- it *is* the pin -- only by a peer
-// placement. Returns the offending cell indices. Unlike a mistake, stale marks
-// don't mean a wrong answer, just notes that need tidying.
-function staleMarkCells() {
+// placement. Unlike a mistake, stale marks don't mean a wrong answer, just notes
+// that need tidying. Returns one `{ cell, center, corner }` entry per cell that
+// carries any stale mark, with `center`/`corner` the offending digit lists --
+// the highlight wants the cells, removal wants the exact digits.
+function staleMarkDetail() {
   const pins = cornerPins();
-  const bad = [];
+  const out = [];
   for (let i = 0; i < N; i++) {
     if (digitAt(i) !== 0) continue;
     if (centerMarks[i].size === 0 && cornerMarks[i].size === 0) continue;
     const cand = candidatesFor(i); // digits no peer has placed
     const pinAllowed = pins.allowed(i);
-    let stale = false;
+    const center = [];
+    const corner = [];
     for (const d of centerMarks[i]) {
-      if (!cand.has(d) || (pinAllowed & (1 << (d - 1))) === 0) {
-        stale = true;
-        break;
-      }
+      if (!cand.has(d) || (pinAllowed & (1 << (d - 1))) === 0) center.push(d);
     }
-    if (!stale) {
-      for (const d of cornerMarks[i]) {
-        if (!cand.has(d)) {
-          stale = true;
-          break;
-        }
-      }
+    for (const d of cornerMarks[i]) {
+      if (!cand.has(d)) corner.push(d);
     }
-    if (stale) bad.push(i);
+    if (center.length || corner.length) out.push({ cell: i, center, corner });
   }
-  return bad;
+  return out;
+}
+
+// The cells carrying any stale mark, for the "Show stale marks" highlight.
+function staleMarkCells() {
+  return staleMarkDetail().map((e) => e.cell);
+}
+
+// Strike every stale pencil mark off the board as one undoable step. Computes the
+// stale set once against the current board (matching exactly what "Show stale
+// marks" paints), so removing the corner pins and the center marks they stale out
+// happens in lockstep rather than shifting as we delete.
+function removeStaleMarks() {
+  const detail = staleMarkDetail();
+  if (!detail.length) return;
+  commit(() => {
+    for (const e of detail) {
+      for (const d of e.center) centerMarks[e.cell].delete(d);
+      for (const d of e.corner) cornerMarks[e.cell].delete(d);
+    }
+  });
+  render();
 }
 
 // ---- Panel open/close ----
@@ -1283,7 +1299,9 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
 
   // Stale marks don't block progress, so this sits alongside the techniques
   // button rather than replacing it: tap to highlight the cells whose notes the
-  // board already rules out (yellow, mirroring the error stage's red).
+  // board already rules out (yellow, mirroring the error stage's red), or strike
+  // them in one go. Removal re-opens the status layer so the banner falls back to
+  // "No mistakes so far." and the stale buttons drop away.
   if (stale) {
     const show = document.createElement("button");
     show.className = "hint-bigbtn";
@@ -1293,6 +1311,15 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
       for (const c of staleCells) cells[c].classList.add("hl-stale");
     });
     actions.appendChild(show);
+
+    const remove = document.createElement("button");
+    remove.className = "hint-bigbtn";
+    remove.textContent = "Remove stale marks";
+    remove.addEventListener("click", () => {
+      removeStaleMarks();
+      openHint();
+    });
+    actions.appendChild(remove);
   }
 
   if (cheatOn() && steps.length) {
