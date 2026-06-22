@@ -24,7 +24,7 @@ use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{DigitGrid, Marks, SolverState};
 use crate::solve::{GradeTrace, solve_graded};
 use crate::spec::Spec;
-use crate::spec::kinds::{KindMask, NAKED_PAIR, NUM};
+use crate::spec::kinds::{DIFFICULTY, KindMask, NAKED_PAIR, NUM};
 
 /// The default band count — gentle / medium / spicy, the plan's natural per-node cut.
 pub const DEFAULT_BANDS: usize = 3;
@@ -224,39 +224,102 @@ pub fn grade_node(
     grade_batch(&traces, bottleneck, weights, n_bands)
 }
 
-/// A single puzzle's **absolute** hardness index — the input to [`band_absolute`]. Where
-/// [`grade_batch`] ranks a whole node's batch against itself, this maps one puzzle to a
-/// stable integer with no batch, for callers that grade one puzzle at a time (the web app).
-/// It sums the two strongest, most self-interpretable signals: the longest dry run (the
-/// primary signal — a back-to-back hard-scan grind that placed nothing) and how many
-/// *extra* times beyond the first the forced technique had to fire. Scarcity and scan work
-/// have no natural absolute cut (they only mean something relative to a batch), so they feed
-/// the detailed readout but not the band. A puzzle with no bottleneck at all (a trunk-forced
-/// / Beginner node, no harder phase) is uniformly gentle: index `0`.
-pub fn hardness_index(s: &Signals) -> u32 {
+/// A single puzzle's **absolute** combined hardness score, the input the per-technique band
+/// cut ([`band_calibrated`]) operates on. Where [`grade_batch`] rank-normalizes a whole
+/// node's batch against itself, this maps one puzzle to a stable float with no batch, for
+/// callers that grade one puzzle at a time (the web app).
+///
+/// It is built so the band stays a *sub-tier* read — "how hard is this puzzle **for its
+/// technique**". The integer **grind** term (the longest dry run plus how many *extra* times
+/// beyond the first the forced technique fired) is the primary axis, exactly as in the
+/// relative grader. But for the cleanly single-forced UI specs that grind is almost always
+/// `0` (the forced technique fires once and a single immediately follows), so it is fused
+/// with a fractional **scarcity pressure** in `[0, 1)`: the fewer candidates the tightest
+/// bottleneck firing eliminated, the harder it was to spot. Kept strictly below `1`, scarcity
+/// only ever orders puzzles *within* the same grind level — which is what discriminates the
+/// fish nodes (X-Wing/Swordfish/Jellyfish), where grind never varies and scarcity is the only
+/// live signal. A puzzle with no bottleneck (a trunk-forced / Beginner node, no harder phase)
+/// scores `0` — uniformly gentle.
+pub fn hardness_score(s: &Signals) -> f64 {
     if s.bottleneck_count == 0 {
-        return 0;
+        return 0.0;
     }
-    s.longest_dry_run + (s.bottleneck_count - 1)
+    let grind = (s.longest_dry_run + (s.bottleneck_count - 1)) as f64;
+    // Scarcity pressure: lower min-elims = a tighter, harder stall. `1/(1+scarcity)` is in
+    // `(0, 0.5]` for any real firing (>= 1 elim), so it sub-orders within a grind level
+    // without ever bumping a puzzle into the next one. (When bottleneck_count > 0 scarcity is
+    // always finite; the `min` is just a guard against the no-firing sentinel.)
+    let pressure = 1.0 / (1.0 + s.scarcity.min(u16::MAX as u32) as f64);
+    grind + pressure
 }
 
-/// Map one puzzle's [`Signals`] to a stable gentle (`0`) / medium (`1`) / spicy (`2`) band
-/// by fixed thresholds on [`hardness_index`] — the absolute, per-puzzle counterpart to
-/// [`grade_batch`]'s relative quantile cut, for one-puzzle-at-a-time callers. The cuts are
-/// the natural small-integer boundaries of the combined index (one forced firing with no dry
-/// grind is gentle; a couple of extra firings or a short grind is medium; a longer grind or
-/// many firings is spicy), not a calibrated score.
-pub fn band_absolute(s: &Signals) -> usize {
-    match hardness_index(s) {
-        0 => 0,
-        1 | 2 => 1,
-        _ => 2,
+/// Per-technique `(gentle|medium, medium|spicy)` cut points on [`hardness_score`], indexed by
+/// kind. The band is a *sub-tier* read, so each technique is cut against its **own** score
+/// distribution: the pair is that kind's 33rd / 66th score percentile over a mined corpus of
+/// its train+drill puzzles (see `examples/grade_diag --calibrate`), so a node splits into
+/// roughly even gentle/medium/spicy thirds. Trunk kinds never key the table (a trunk-only
+/// spec has no harder bottleneck → uniformly gentle), so their entries are unused placeholders.
+///
+/// CALIBRATED, not derived — regenerate with `examples/grade_diag --calibrate` if the
+/// generator or grading solve changes. The relative [`grade_batch`] path needs no table (it
+/// normalizes per batch).
+///
+/// NOTE (interim): [`hardness_score`] is too *quantized* for clean even-thirds cuts on some
+/// techniques — `1/(1+scarcity)` only takes `{0.5, 0.33, 0.25, …}` and grind is a small
+/// integer, so puzzles tie. Worst case **xyz-wing**, whose firing eliminates almost exactly
+/// one candidate every time: its 33rd and 66th score percentiles coincide (`0.5, 0.5`), so the
+/// medium band is empty and ~96% read spicy. The fish nodes are near-binary for the same
+/// reason. These rows are the honest current cut; `docs/grader-granular-scoring.md` specifies
+/// the finer signals that fix it.
+pub const THRESHOLDS: [(f64, f64); NUM] = [
+    (0.0, 0.0),       // naked-single  (trunk, unused)
+    (0.0, 0.0),       // hidden-single (trunk, unused)
+    (0.0, 0.0),       // lc-pointing   (trunk, unused)
+    (0.0, 0.0),       // lc-claiming   (trunk, unused)
+    (0.2000, 0.3333), // naked-pair
+    (0.2000, 1.2000), // hidden-pair
+    (0.2000, 1.2000), // naked-triple
+    (0.1667, 1.2000), // hidden-triple
+    (0.1429, 1.1667), // naked-quad
+    (0.1250, 1.1250), // hidden-quad
+    (0.2000, 0.2500), // x-wing
+    (0.1429, 0.2000), // swordfish
+    (0.1111, 0.1429), // jellyfish
+    (0.3333, 0.5000), // xy-wing
+    (0.5000, 0.5000), // xyz-wing  (degenerate: see note above)
+    (0.5000, 1.3333), // w-wing
+];
+
+/// The technique whose [`THRESHOLDS`] row cuts a spec's puzzles: the hardest
+/// (highest-[`DIFFICULTY`](crate::spec::kinds::DIFFICULTY)) *harder* bottleneck kind it
+/// forces. `None` for a spec with no harder bottleneck at all (a trunk-only node) — those
+/// puzzles are uniformly gentle. For a custom multi-force / `force_any` spec this is the
+/// hardest member, so the band reads against the technique that dominates the puzzle.
+pub fn bottleneck_key(spec: &Spec) -> Option<usize> {
+    let mask = bottleneck_mask(spec);
+    (NAKED_PAIR..NUM).filter(|&k| mask & (1 << k) != 0).max_by_key(|&k| DIFFICULTY[k])
+}
+
+/// Cut one puzzle's [`Signals`] to a gentle (`0`) / medium (`1`) / spicy (`2`) band against
+/// its technique's [`THRESHOLDS`] row — the absolute, per-puzzle counterpart to
+/// [`grade_batch`]'s relative quantile cut, for one-puzzle-at-a-time callers. A trunk-only
+/// spec (no harder bottleneck) is uniformly gentle.
+pub fn band_calibrated(spec: &Spec, s: &Signals) -> usize {
+    let Some(key) = bottleneck_key(spec) else { return 0 };
+    let (lo, hi) = THRESHOLDS[key];
+    let score = hardness_score(s);
+    if score < lo {
+        0
+    } else if score < hi {
+        1
+    } else {
+        2
     }
 }
 
 /// Grade a single puzzle **absolutely**: solve it with `spec`'s baseline toolbox via the
 /// instrumented [`solve_graded`], read the four [`Signals`], and cut them to a stable band
-/// with [`band_absolute`]. Returns `(signals, band)` — the band drives a per-puzzle
+/// with [`band_calibrated`]. Returns `(signals, band)` — the band drives a per-puzzle
 /// difficulty label and the signals a detailed readout. This is the one-puzzle path (the web
 /// app, which generates one puzzle at a time); [`grade_node`] / [`grade_batch`] stay the
 /// per-node *relative* path for grading a whole batch against itself. Cold path: a single
@@ -266,7 +329,7 @@ pub fn grade_one(spec: &Spec, puzzle: &DigitGrid) -> (Signals, usize) {
     let bottleneck = bottleneck_mask(spec);
     let trace = solve_graded(&SolverState::<Bands<RowMajor>>::from_digits(puzzle), baseline);
     let signals = signals_of(&trace, bottleneck);
-    (signals, band_absolute(&signals))
+    (signals, band_calibrated(spec, &signals))
 }
 
 /// The gentle / medium / spicy label for a band under the [`DEFAULT_BANDS`] (3) cut. For a
@@ -283,7 +346,7 @@ pub fn band_name3(band: usize) -> &'static str {
 mod tests {
     use super::*;
     use crate::solve::GradeStep;
-    use crate::spec::kinds::{NAKED_PAIR, X_WING};
+    use crate::spec::kinds::{HIDDEN_SINGLE, NAKED_PAIR, X_WING};
 
     /// Build a trace from `(kind, paid_off, elims)` triples; `counts` is summed off the
     /// steps so `scan_work` is consistent (every step here is a harder step).
@@ -367,32 +430,44 @@ mod tests {
         assert!(grade_batch(&[], 1 << NAKED_PAIR, &Weights::default(), 3).is_empty());
     }
 
-    /// Build [`Signals`] from `(bottleneck_count, longest_dry_run)` — the only two the
-    /// absolute band reads — leaving the rest at their defaults.
-    fn sig(bottleneck_count: u32, longest_dry_run: u32) -> Signals {
-        Signals { bottleneck_count, longest_dry_run, ..Signals::default() }
+    /// Build [`Signals`] from the fields the absolute [`hardness_score`] reads.
+    fn sig(bottleneck_count: u32, longest_dry_run: u32, scarcity: u32) -> Signals {
+        Signals { bottleneck_count, longest_dry_run, scarcity, ..Signals::default() }
     }
 
     #[test]
-    fn absolute_band_thresholds() {
-        // No bottleneck at all: a Beginner/trunk node, uniformly gentle.
-        assert_eq!(band_absolute(&sig(0, 0)), 0);
-        // One forced firing, no dry grind: index 0 -> gentle.
-        assert_eq!(band_absolute(&sig(1, 0)), 0);
-        // One firing but a 2-long dry grind: index 2 -> medium.
-        assert_eq!(band_absolute(&sig(1, 2)), 1);
-        // Three firings, no grind: index 2 -> medium.
-        assert_eq!(band_absolute(&sig(3, 0)), 1);
-        // Two firings and a 2-long grind: index 3 -> spicy.
-        assert_eq!(band_absolute(&sig(2, 2)), 2);
-        // One firing but a 3-long grind: index 3 -> spicy.
-        assert_eq!(band_absolute(&sig(1, 3)), 2);
+    fn hardness_score_zero_without_bottleneck() {
+        // No bottleneck firing -> uniformly gentle, regardless of an incidental dry run over
+        // some other harder kind.
+        assert_eq!(hardness_score(&sig(0, 5, u32::MAX)), 0.0);
     }
 
     #[test]
-    fn hardness_index_ignores_dry_run_without_a_bottleneck() {
-        // longest_dry_run is over harder steps of any kind; with no bottleneck firing the
-        // puzzle is still classified gentle (no harder phase the band cares about).
-        assert_eq!(hardness_index(&sig(0, 5)), 0);
+    fn hardness_score_orders_grind_then_scarcity() {
+        let a = hardness_score(&sig(1, 0, 9)); // grind 0, plentiful
+        let b = hardness_score(&sig(1, 0, 1)); // grind 0, scarce -> higher
+        let c = hardness_score(&sig(2, 0, 9)); // grind 1 -> above any grind-0
+        assert!(a < b, "scarcer firing scores higher within a grind level");
+        assert!(b < c, "one more firing outranks any scarcity tiebreak");
+        // Scarcity only ever sub-orders: it never bumps a puzzle a whole grind level.
+        assert!(b < 1.0 && c >= 1.0);
+    }
+
+    #[test]
+    fn band_calibrated_trunk_is_gentle() {
+        // A trunk-only spec has no harder bottleneck -> no threshold row -> gentle.
+        let spec = Spec::explicit().force(HIDDEN_SINGLE, 1);
+        assert_eq!(bottleneck_key(&spec), None);
+        assert_eq!(band_calibrated(&spec, &sig(1, 0, 1)), 0);
+    }
+
+    #[test]
+    fn band_calibrated_cuts_by_technique_threshold() {
+        // The x-wing row is (0.20, 0.25); pressure = 1/(1+scarcity).
+        let spec = Spec::train_isolated(X_WING);
+        assert_eq!(bottleneck_key(&spec), Some(X_WING));
+        assert_eq!(band_calibrated(&spec, &sig(1, 0, 9)), 0, "pressure 0.10 < 0.20 -> gentle");
+        assert_eq!(band_calibrated(&spec, &sig(1, 0, 4)), 1, "pressure 0.20 in [0.20,0.25) -> medium");
+        assert_eq!(band_calibrated(&spec, &sig(2, 0, 9)), 2, "grind 1 -> score >= 1.0 -> spicy");
     }
 }
