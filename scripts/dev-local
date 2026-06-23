@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# scripts/dev-local -- one command for the full local backend flow: an ephemeral
+# local Cloudflare Worker + local D1, with the Trunk frontend served and wired to
+# POST solves at that worker. No source edits per run -- the backend endpoint/key
+# are injected into the build via env vars, and the worker reads its CORS origin +
+# API key from worker/.dev.vars.
+#
+#   scripts/dev-local            # serve on 127.0.0.1 (this machine only)
+#   scripts/dev-local --lan      # serve on 0.0.0.0 so phones / other LAN devices can reach it
+#
+# The local D1 database persists under worker/.wrangler/ (gitignored), so solves
+# accumulate across runs. Reset it by deleting that dir:  rm -rf worker/.wrangler
+#
+# Env overrides: LAN_IP=...  SUDOKU_API_KEY=...  DEV_COMPAT_DATE=...  WORKER_PORT=...
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+worker="$root/worker"
+web="$root/web"
+
+lan=0
+[ "${1:-}" = "--lan" ] && lan=1
+
+# Fixed local-only API key -- not a real secret (the prototype key is public in
+# the bundle anyway); it only has to match between the worker and the frontend.
+api_key="${SUDOKU_API_KEY:-local-dev-key}"
+worker_port="${WORKER_PORT:-8787}"
+
+# `wrangler dev` runs the worker on the locally-bundled runtime, which lags the
+# date in wrangler.toml (that date targets Cloudflare's prod edge). Pin local to a
+# date the bundled runtime supports; the worker uses no date-gated features.
+compat_date="${DEV_COMPAT_DATE:-2026-06-05}"
+
+# Where the *browser* reaches the worker. A LAN device can't use localhost, so on
+# --lan use this machine's LAN IP and bind all interfaces; otherwise loopback.
+if [ "$lan" = 1 ]; then
+  host="${LAN_IP:-$(ip -4 route get 1 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')}"
+  [ -n "$host" ] || host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$host" ] || { echo "dev-local: could not detect LAN IP; set LAN_IP=..." >&2; exit 1; }
+  bind=0.0.0.0
+else
+  host=127.0.0.1
+  bind=127.0.0.1
+fi
+endpoint="http://$host:$worker_port/solves"
+
+# Local worker vars (gitignored). ALLOW_ORIGIN=* accepts any localhost/LAN origin
+# in dev; the worker falls back to the locked production origin when this is unset.
+printf 'API_KEY=%s\nALLOW_ORIGIN=*\n' "$api_key" > "$worker/.dev.vars"
+
+# Ensure the local D1 table exists (idempotent: CREATE TABLE IF NOT EXISTS). This
+# writes to the same worker/.wrangler state that `wrangler dev` reads.
+( cd "$worker" && wrangler d1 execute sudoku --local --file schema.sql >/dev/null )
+
+# Start the local worker in the background; kill it whenever this script exits.
+mkdir -p "$worker/.wrangler"
+worker_log="$worker/.wrangler/dev.log"
+( cd "$worker" && wrangler dev --ip "$bind" --port "$worker_port" \
+    --compatibility-date "$compat_date" ) >"$worker_log" 2>&1 &
+worker_pid=$!
+trap 'kill "$worker_pid" 2>/dev/null' EXIT INT TERM
+
+# Wait for the worker to answer, or surface its startup error and bail.
+ready=0
+for _ in $(seq 1 40); do
+  if curl -s -o /dev/null "http://127.0.0.1:$worker_port/"; then ready=1; break; fi
+  kill -0 "$worker_pid" 2>/dev/null || break
+  sleep 0.5
+done
+if [ "$ready" != 1 ]; then
+  echo "dev-local: worker failed to start; last log lines:" >&2
+  tail -20 "$worker_log" >&2
+  exit 1
+fi
+
+echo "dev-local: worker   $endpoint"
+echo "dev-local: database $worker/.wrangler  (rm -rf to reset)"
+echo "dev-local: frontend http://$host:8080  (serving on $bind)"
+
+# `trunk serve` canonicalizes its [watch] ignore paths at startup and aborts if
+# one doesn't exist yet -- but those files are written by pre_build hooks that run
+# *after* the watcher is set up, so a clean checkout has none. Pre-create any
+# missing ones as empty placeholders; the hooks overwrite them with real content
+# on the first build (they stay ignored, so the rewrite doesn't loop the watcher).
+for f in curriculum.js version.js backend-config.js; do
+  [ -e "$web/$f" ] || : > "$web/$f"
+done
+
+# Build + serve the frontend with the backend endpoint/key injected. The Trunk
+# pre_build hook bakes these into web/backend-config.js (gitignored). trunk serve
+# blocks in the foreground; on exit the trap above stops the worker.
+export SUDOKU_BACKEND_ENDPOINT="$endpoint"
+export SUDOKU_API_KEY="$api_key"
+cd "$web" && trunk serve --address "$bind"

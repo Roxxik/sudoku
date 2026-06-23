@@ -5,4 +5,7 @@ compatibility_date = "2026-06-23"
 [[d1_databases]]
 binding = "DB"
 database_name = "sudoku"
-database_id = ""   # filled in after `wrangler d1 create sudoku`
+# Non-empty so `wrangler dev`/`--local` (scripts/dev-local) work against a local
+# SQLite without any account. Replace with the real id from `wrangler d1 create
+# sudoku` before `wrangler deploy` / any `--remote` command.
+database_id = "local-dev-placeholder"

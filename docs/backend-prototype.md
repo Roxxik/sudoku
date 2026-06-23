@@ -238,8 +238,12 @@ turning the dump into a real database is one line when wanted (`sqlite3 sudoku.s
 5. `ALLOW_ORIGIN` in `src/index.js` is `https://roxxik.github.io` (the confirmed Pages origin).
 6. Wire the `onSolved()` call, `trunk build`, push to master → Pages redeploys.
 
-Local loop: `wrangler dev` (with `--local` D1) and a `curl` POST to smoke-test the contract
-before deploying.
+Local loop, full stack: **`scripts/dev-local`** (`--lan` to serve on `0.0.0.0` for phones on the
+LAN) starts an ephemeral local Worker + local D1 and `trunk serve`s the frontend wired to post at
+it — no source edits, the endpoint/key are injected via build env vars and the Worker's CORS
+origin/key come from a gitignored `worker/.dev.vars`. The local D1 persists under
+`worker/.wrangler/` (gitignored); `rm -rf worker/.wrangler` to reset. For a worker-only smoke
+test, `wrangler dev` plus a `curl` POST still works.
 
 ## Updating the deployed worker
 

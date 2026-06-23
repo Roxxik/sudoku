@@ -8,12 +8,14 @@
 // as client_version so a row can be traced to the exact frontend that wrote it.
 import VERSION from "./version.js";
 
-// Filled in after `wrangler deploy` and `wrangler secret put API_KEY`. Both are
-// public in the shipped bundle by necessity: there is no server-side render to
-// inject them, and the secret only buys a speed bump against drive-by bots (a
-// human with devtools can read it). Treat the table as public-writable.
-const ENDPOINT = "https://sudoku-backend.<subdomain>.workers.dev/solves";
-const API_KEY  = "<paste-the-same-secret>";
+// Worker endpoint + shared key, generated into the gitignored backend-config.js
+// by a Trunk pre_build hook (see Trunk.toml). Defaults are the production
+// placeholders; SUDOKU_BACKEND_ENDPOINT / SUDOKU_API_KEY in the build env
+// override them, so scripts/dev-local retargets the build at a local worker with
+// no source edit. Both are public in the shipped bundle by necessity: there is
+// no server-side render to inject them, and the key only buys a speed bump
+// against drive-by bots (a human with devtools can read it). Public-writable.
+import { ENDPOINT, API_KEY } from "./backend-config.js";
 
 // True until the constants above are replaced with the deployed values. While
 // unconfigured we skip the POST entirely so the prototype doesn't fire a doomed

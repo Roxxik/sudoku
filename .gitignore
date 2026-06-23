@@ -13,9 +13,16 @@ generator-lab/web/results.jsonl
 # Python bytecode caches (e.g. the grader-tuning analysis scripts).
 __pycache__/
 # Pregenerated at build by Trunk pre_build hooks: curriculum from lab::kinds,
-# version from the git commit (web/version.js -> backend client_version).
+# version from the git commit (web/version.js -> backend client_version), and the
+# backend endpoint/key (web/backend-config.js, retargetable per build env).
 /web/curriculum.js
 /web/version.js
+/web/backend-config.js
+
+# Local backend dev (scripts/dev-local): the wrangler-dev secret file and the
+# persisted local D1 state. Delete /worker/.wrangler to reset the local database.
+/worker/.dev.vars
+/worker/.wrangler/
 
 # External Sudoku datasets for grader tuning (large; fetched, not versioned).
 /datasets

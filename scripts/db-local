@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# scripts/db-local -- query the local dev D1 solve log (the database scripts/dev-local
+# writes under worker/.wrangler). A thin wrapper over `wrangler d1 execute sudoku
+# --local` so you don't retype the boilerplate.
+#
+#   scripts/db-local                    # 10 most recent solves (puzzle/solution trimmed)
+#   scripts/db-local --head [n]         # n most recent (default 10)
+#   scripts/db-local --count            # row count
+#   scripts/db-local --full [--head n]  # don't trim puzzle/solution
+#   scripts/db-local --query "<sql>"    # run arbitrary SQL, output untouched
+#
+# --head/--count abbreviate puzzle & solution to "abcd<>wxyz" by default; --full
+# shows them whole. Trimming applies only to these built-in modes, never --query.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+worker="$root/worker"
+
+usage() {
+  cat >&2 <<'EOF'
+db-local -- query the local dev D1 solve log (worker/.wrangler, from scripts/dev-local).
+
+  scripts/db-local                     10 most recent solves (puzzle/solution trimmed)
+  scripts/db-local --head [n]          n most recent (default 10)
+  scripts/db-local --count             row count
+  scripts/db-local --full [--head n]   don't trim puzzle/solution
+  scripts/db-local --query "<sql>"     run arbitrary SQL, output untouched
+EOF
+  exit "${1:-0}"
+}
+
+mode=head
+n=10
+full=0
+query=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --count) mode=count ;;
+    --full)  full=1 ;;
+    --head)
+      mode=head
+      # Optional count: consume the next arg only if it's a positive integer.
+      if [ "${2:-}" ] && printf '%s' "$2" | grep -qE '^[0-9]+$'; then n="$2"; shift; fi
+      ;;
+    --query)
+      mode=query
+      query="${2:-}"
+      [ -n "$query" ] || { echo "db-local: --query needs a SQL string" >&2; exit 2; }
+      shift
+      ;;
+    -h|--help) usage 0 ;;
+    *) echo "db-local: unknown argument: $1" >&2; usage 2 ;;
+  esac
+  shift
+done
+
+# Trim the two 81-char grid columns to "first4<>last4" unless --full is set.
+if [ "$full" = 1 ]; then
+  cols='*'
+else
+  cols="id, client_id, seed,
+    substr(puzzle,1,4)||'<>'||substr(puzzle,-4)     AS puzzle,
+    substr(solution,1,4)||'<>'||substr(solution,-4) AS solution,
+    solve_ms, client_version, created_at"
+fi
+
+case "$mode" in
+  count) sql="SELECT count(*) AS n FROM solves;" ;;
+  query) sql="$query" ;;
+  head)  sql="SELECT $cols FROM solves ORDER BY id DESC LIMIT $n;" ;;
+esac
+
+[ -d "$worker/.wrangler" ] || \
+  echo "db-local: no local DB yet at worker/.wrangler -- run scripts/dev-local and solve a puzzle first." >&2
+
+# --json keeps stdout to the result array only (no wrangler banner), so it pipes
+# cleanly into jq etc.
+cd "$worker" && exec wrangler d1 execute sudoku --local --json --command "$sql"

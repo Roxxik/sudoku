@@ -34,6 +34,20 @@ command_arguments = [
   "if v=$(git rev-parse --short HEAD 2>/dev/null); then git diff --quiet HEAD 2>/dev/null || v=\"$v-dirty\"; else v=unknown; fi; printf 'export default \"%s\";\\n' \"$v\" > version.js",
 ]
 
+# Bake the backend endpoint + shared key into a gitignored ES module so the build
+# can be retargeted (local dev vs production) WITHOUT editing source. The defaults
+# are the production placeholders (backend.js then no-ops -- see its CONFIGURED
+# guard); SUDOKU_BACKEND_ENDPOINT / SUDOKU_API_KEY in the build env override them
+# (scripts/dev-local points them at the local worker). Same generated-module
+# pattern as version.js / curriculum.js above.
+[[hooks]]
+stage = "pre_build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "printf 'export const ENDPOINT = \"%s\";\\nexport const API_KEY = \"%s\";\\n' \"${SUDOKU_BACKEND_ENDPOINT:-https://sudoku-backend.<subdomain>.workers.dev/solves}\" \"${SUDOKU_API_KEY:-<paste-the-same-secret>}\" > backend-config.js",
+]
+
 # Rebuild when the frontend OR the Rust sources behind the wasm bridge change.
 # Watch the whole web/ dir (recursive) so newly added assets are picked up with
 # no edit here; core and wasm live outside web/ so add their paths too.
@@ -53,5 +67,6 @@ watch = [
 ignore = [
   "curriculum.js",
   "version.js",
+  "backend-config.js",
   "dist",
 ]

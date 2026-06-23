@@ -4,18 +4,23 @@
 
 // The app is served from GitHub Pages at https://roxxik.github.io/sudoku/.
 // CORS matches scheme + host only (the /sudoku path is not part of the origin),
-// and is locked to that one origin rather than "*".
+// and is locked to that one origin rather than "*". Overridable per request via
+// the ALLOW_ORIGIN var (see fetch) -- local dev needs a different origin.
 const ALLOW_ORIGIN = "https://roxxik.github.io";
-
-function cors(resp) {
-  resp.headers.set("Access-Control-Allow-Origin", ALLOW_ORIGIN);
-  resp.headers.set("Vary", "Origin");
-  return resp;
-}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // CORS origin: the locked production origin above by default, overridden by
+    // the ALLOW_ORIGIN var when set -- scripts/dev-local sets "*" so any
+    // localhost/LAN origin is accepted in dev. Vary: Origin keeps caches honest.
+    const allowOrigin = env.ALLOW_ORIGIN || ALLOW_ORIGIN;
+    const cors = (resp) => {
+      resp.headers.set("Access-Control-Allow-Origin", allowOrigin);
+      resp.headers.set("Vary", "Origin");
+      return resp;
+    };
 
     if (request.method === "OPTIONS") {
       // CORS preflight for the cross-origin POST from Pages.
