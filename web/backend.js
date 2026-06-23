@@ -36,10 +36,23 @@ import { ENDPOINT, API_KEY } from "./backend-config.js";
 // while staying available for debugging prod.
 import { cheatOn } from "./cheat.js";
 
+// The user's explicit opt-in to data sharing (Settings -> Share play data),
+// default OFF. Posting is gated on this on TOP of CONFIGURED, so an opted-out
+// user -- the default -- never enqueues or sends anything: no data leaves the
+// device. settings.js is DOM-free, so importing it here is safe.
+import { dataSharingOn } from "./settings.js";
+
 // True until the constants above are replaced with the deployed values. While
 // unconfigured we skip the POST entirely so the prototype doesn't fire a doomed
 // request (and log a console error) on every solve before the backend exists.
 const CONFIGURED = !ENDPOINT.includes("<subdomain>") && !API_KEY.includes("<paste");
+
+// Posting requires BOTH a configured backend AND the user's opt-in. Checked at
+// every enqueue and every flush, so flipping the setting off stops sends at once
+// and a never-opted-in user queues nothing.
+function postingEnabled() {
+  return CONFIGURED && dataSharingOn();
+}
 
 // The failure-capture endpoint is the solve endpoint's sibling on the same
 // worker: /solves -> /errors, same key. Derived here so the generated
@@ -142,7 +155,7 @@ let flushAgain = false;
 //   5xx              -> transient server error -> keep for retry, capture once.
 //   network reject   -> offline/unreachable -> keep for retry, don't report.
 async function flushOutbox() {
-  if (!CONFIGURED) return;
+  if (!postingEnabled()) return;
   if (flushing) { flushAgain = true; return; }
   const batch = loadOutbox();
   if (!batch.length) return;
@@ -186,8 +199,8 @@ async function flushOutbox() {
 // affect the solve flow, so this never throws and never awaits into the UI.
 // `solve` is { solve_id, seed, puzzle, solution, solve_ms }.
 export function recordSolve(solve) {
-  if (!CONFIGURED) {
-    if (cheatOn()) console.log("[backend] solve not recorded: backend not configured");
+  if (!postingEnabled()) {
+    if (cheatOn()) console.log(`[backend] solve not recorded: ${CONFIGURED ? "sharing off" : "backend not configured"}`);
     return;
   }
   const entry = { ...solve, client_version: VERSION };
@@ -272,7 +285,7 @@ let flushMovesAgain = false;
 //                       constantly, so a persistent 5xx would spam /errors; just keep.
 //   network reject   -> offline/unreachable -> keep for retry, don't report.
 async function flushMoveOutbox() {
-  if (!CONFIGURED) return;
+  if (!postingEnabled()) return;
   if (flushingMoves) { flushMovesAgain = true; return; }
   const batch = loadMoveOutbox();
   if (!batch.length) return;
@@ -319,8 +332,8 @@ async function flushMoveOutbox() {
 // awaits into the UI. `log` is { solve_id, puzzle, seed, solved, events } where
 // `events` is the full timeline array (tracker.snapshot()).
 export function recordMoves(log) {
-  if (!CONFIGURED) {
-    if (cheatOn()) console.log("[backend] moves not recorded: backend not configured");
+  if (!postingEnabled()) {
+    if (cheatOn()) console.log(`[backend] moves not recorded: ${CONFIGURED ? "sharing off" : "backend not configured"}`);
     return;
   }
   const events = Array.isArray(log && log.events) ? log.events : [];
@@ -343,6 +356,15 @@ export function recordMoves(log) {
   outbox.push(entry);
   saveMoveOutbox(outbox.length > MOVE_OUTBOX_MAX ? outbox.slice(outbox.length - MOVE_OUTBOX_MAX) : outbox);
   flushMoveOutbox();
+}
+
+// Forget everything queued for upload. Called when the user opts OUT of sharing
+// (Settings -> Share play data) so "off" leaves nothing pending on the device --
+// not even a stale snapshot from a session when sharing was on. Best-effort and
+// quota-safe like the other writes; clearing the queues never affects play.
+export function clearOutboxes() {
+  try { localStorage.removeItem(OUTBOX_KEY); } catch {}
+  try { localStorage.removeItem(MOVE_OUTBOX_KEY); } catch {}
 }
 
 // Retry triggers beyond the lazy next-solve/next-sync flush: drain both queues when

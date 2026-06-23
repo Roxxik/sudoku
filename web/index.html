@@ -113,6 +113,7 @@
             <li><button class="menu-item" data-action="help">How to play</button></li>
             <li><button class="menu-item" data-action="import">Import puzzle</button></li>
             <li><button class="menu-item" data-action="settings">Settings</button></li>
+            <li><button class="menu-item" data-action="privacy">Privacy</button></li>
           </ul>
         </div>
       </header>
@@ -306,6 +307,22 @@
         <span class="iconbtn" aria-hidden="true"></span>
       </header>
       <div id="helpBody"></div>
+    </section>
+
+    <!-- ============================= PRIVACY ========================== -->
+    <!-- Plain-language data disclaimer. Body filled by home.js (openPrivacy);
+         reached from the home menu. Mirrors the help view's structure. -->
+    <section id="privacyView" class="view" hidden>
+      <header class="topbar">
+        <button id="privacyBack" class="iconbtn" aria-label="Back">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="2" d="M15 5l-7 7 7 7"/>
+          </svg>
+        </button>
+        <h1>Privacy</h1>
+        <span class="iconbtn" aria-hidden="true"></span>
+      </header>
+      <div id="privacyBody"></div>
     </section>
   </main>
 

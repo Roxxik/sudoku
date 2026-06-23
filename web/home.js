@@ -22,6 +22,8 @@
 
 import * as store from "./store.js";
 import * as settings from "./settings.js";
+// Opting out of data sharing drops any upload queue (see openSettings).
+import { clearOutboxes } from "./backend.js";
 import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { TECHNIQUE_INFO } from "./techniques.js";
 import { masksFromUsages } from "./spec.js";
@@ -70,6 +72,7 @@ export function initHome(opts) {
   document.getElementById("customBtn").addEventListener("click", opts.onCustom);
   document.getElementById("settingsBack").addEventListener("click", () => settingsReturn());
   document.getElementById("helpBack").addEventListener("click", () => helpReturn());
+  document.getElementById("privacyBack").addEventListener("click", () => privacyReturn());
   wireHomeMenu();
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
@@ -738,6 +741,16 @@ export function openSettings(onBack) {
         "Read hints from your Center and Corner notes. Off: hints derive from placed digits alone.",
         settings.hintFromMarksOn(),
         settings.setHintFromMarks
+      ),
+      settingToggle(
+        "Share play data",
+        "Help improve the puzzles by sending your solve times and the moves you make while solving. Off by default; nothing leaves your device while it's off. No account and no personal data — see Privacy in the menu.",
+        settings.dataSharingOn(),
+        (on) => {
+          settings.setDataSharing(on);
+          // Opting out leaves nothing pending: drop anything already queued for upload.
+          if (!on) clearOutboxes();
+        }
       )
     );
   showView("settingsView");
@@ -765,6 +778,7 @@ function wireHomeMenu() {
     if (item.dataset.action === "settings") openSettings();
     else if (item.dataset.action === "import") onImport();
     else if (item.dataset.action === "help") openHelp(showHome);
+    else if (item.dataset.action === "privacy") openPrivacy(showHome);
     close();
   });
   const homeVisible = () => !document.getElementById("homeView").hidden;
@@ -905,6 +919,31 @@ export function openHelp(onBack) {
       helpSection(touch ? "Controls" : "Keyboard", touch ? HELP_TOUCH : HELP_KEYBOARD)
     );
   showView("helpView");
+}
+
+// Where the privacy back button returns to -- mirrors helpReturn.
+let privacyReturn = showHome;
+
+// The privacy disclaimer, rendered with the same titled-list helper as Help.
+// Keep this in step with what backend.js actually uploads (recordSolve /
+// recordMoves) and with the "Share play data" setting (settings.js): the page is
+// the user-facing promise that gating backs up. Plain-language for now -- a small,
+// friends-only app -- to be reworded when it grows.
+const PRIVACY = [
+  ["Off by default", "Nothing about your play leaves this device unless you turn on “Share play data” in Settings. It is a pure opt-in: off until you choose otherwise, and turning it back off drops anything still waiting to be sent."],
+  ["What is shared", "Only when you opt in, and only your solve times and the actions you take while solving — the same move history that already powers your hints and stats. Nothing more."],
+  ["What is never collected", "No IP address, no name or email, no account, and not even an anonymous per-user id. What is sent cannot be tied back to you or your device."],
+  ["Why it is collected", "Purely to make the puzzles and the difficulty grading better. The data is used only to improve this app — it is not sold or shared with anyone else."],
+  ["Data minimality", "Only the bare minimum needed for that. If a piece of information is not needed to improve the app, it is not collected in the first place."],
+  ["A small project", "This is a little app shared among friends."],
+];
+
+export function openPrivacy(onBack) {
+  privacyReturn = onBack || showHome;
+  document
+    .getElementById("privacyBody")
+    .replaceChildren(helpSection("Privacy", PRIVACY));
+  showView("privacyView");
 }
 
 // A titled definition list: each row pairs an action with how to do it.

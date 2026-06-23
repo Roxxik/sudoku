@@ -10,6 +10,7 @@ const SHOW_TIMER_KEY = "sudoku.settings.showTimer";
 const HIGHLIGHT_KEY = "sudoku.settings.highlight";
 const DISABLE_FINISHED_KEY = "sudoku.settings.disableFinishedDigits";
 const HINT_FROM_MARKS_KEY = "sudoku.settings.hintFromMarks";
+const SHARE_DATA_KEY = "sudoku.settings.shareData";
 // Keep this string in sync with the inline theme bootstrap in index.html, which
 // reads it before any module loads (to paint the right theme without a flash).
 const LIGHT_MODE_KEY = "sudoku.settings.lightMode";
@@ -103,6 +104,20 @@ export function hintFromMarksOn() {
 
 export function setHintFromMarks(on) {
   store(HINT_FROM_MARKS_KEY, on);
+}
+
+// Whether the app may upload your play data -- your solve times and the actions
+// you take while solving -- to help improve the puzzles. Default OFF: a pure
+// opt-in, so an absent key reads as off. When off, nothing is enqueued OR sent
+// (backend.js gates every post on this), so no data leaves the device. What it
+// uploads carries no IP, no personal data, and no per-user id; see the Privacy
+// page (home.js openPrivacy).
+export function dataSharingOn() {
+  return stored(SHARE_DATA_KEY) === "1";
+}
+
+export function setDataSharing(on) {
+  store(SHARE_DATA_KEY, on);
 }
 
 // The colour theme: on -> light (default), off -> dark. Default ON -- an absent

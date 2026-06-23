@@ -16,7 +16,7 @@ let wasm, gen, play, stats, custom;
 let heavyReady;
 
 // ---- View routing ----
-const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView", "settingsView", "helpView"];
+const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView", "settingsView", "helpView", "privacyView"];
 
 function showView(id) {
   for (const v of VIEWS) {
