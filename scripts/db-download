@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# scripts/db-download -- download the remote D1 "sudoku" DB as a SQL dump.
+#   scripts/db-download [outfile]      (default: sudoku-dump.sql at repo root)
+#
+# SQL dump (not a binary .sqlite) because it's simpler and the format is easy to
+# change later: turn it into a real database with `sqlite3 sudoku.sqlite < dump.sql`.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+out="${1:-$root/sudoku-dump.sql}"
+( cd "$root/worker" && wrangler d1 export sudoku --remote --output "$out" )
+echo "wrote $out"

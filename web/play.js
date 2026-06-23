@@ -10,6 +10,7 @@
 
 import { bindings } from "./wasm.js";
 import * as store from "./store.js";
+import * as backend from "./backend.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
 import { copyText, gradeName, gradeBadge } from "./ui.js";
@@ -584,6 +585,14 @@ function onSolved() {
     status: "solved",
     solvedAt: Date.now(),
     elapsedMs: finalMs,
+  });
+  // Append this solve to the backend log (fire-and-forget; offline/slow-safe).
+  backend.recordSolve({
+    client_id: crypto.randomUUID(),
+    seed: game.seed,            // may be null on old records
+    puzzle: game.puzzle,
+    solution: game.solution,
+    solve_ms: finalMs,
   });
   showSolved(finalMs);
 }
