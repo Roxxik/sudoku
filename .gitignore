@@ -12,8 +12,10 @@ generator-lab/web/results.jsonl
 .claude/
 # Python bytecode caches (e.g. the grader-tuning analysis scripts).
 __pycache__/
-# Pregenerated at build by the Trunk pre_build hook (from lab::kinds).
+# Pregenerated at build by Trunk pre_build hooks: curriculum from lab::kinds,
+# version from the git commit (web/version.js -> backend client_version).
 /web/curriculum.js
+/web/version.js
 
 # External Sudoku datasets for grader tuning (large; fetched, not versioned).
 /datasets

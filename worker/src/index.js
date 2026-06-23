@@ -42,10 +42,10 @@ export default {
     // INSERT OR IGNORE keyed on the per-solve client_id makes a re-sent solve
     // (the deferred offline-retry case) an idempotent no-op.
     const stmt = env.DB.prepare(
-      "INSERT OR IGNORE INTO solves (client_id, seed, puzzle, solution, solve_ms) VALUES (?,?,?,?,?)"
+      "INSERT OR IGNORE INTO solves (client_id, seed, puzzle, solution, solve_ms, client_version) VALUES (?,?,?,?,?,?)"
     );
     const res = await env.DB.batch(
-      solves.map((s) => stmt.bind(s.client_id, s.seed ?? null, s.puzzle, s.solution, s.solve_ms))
+      solves.map((s) => stmt.bind(s.client_id, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.client_version))
     );
     const inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
     return cors(new Response(JSON.stringify({ inserted }), {
@@ -59,5 +59,6 @@ function valid(s) {
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
     && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)
-    && (s.seed == null || typeof s.seed === "string");
+    && (s.seed == null || typeof s.seed === "string")
+    && typeof s.client_version === "string" && s.client_version.length > 0;
 }

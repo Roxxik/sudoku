@@ -8,5 +8,6 @@ CREATE TABLE IF NOT EXISTS solves (
   puzzle     TEXT    NOT NULL,          -- 81 chars, '.' = empty
   solution   TEXT    NOT NULL,          -- 81 chars
   solve_ms   INTEGER NOT NULL,          -- final elapsedMs
+  client_version TEXT    NOT NULL,       -- frontend build: short git commit, '-dirty' if built from a modified tree
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );

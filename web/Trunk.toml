@@ -20,6 +20,20 @@ command_arguments = [
   "printf 'export default %s;\\n' \"$(cargo run --quiet --manifest-path ../core/Cargo.toml --example gen_curriculum)\" > curriculum.js",
 ]
 
+# Stamp the build with its source commit so every recorded solve carries the
+# exact client version (web/backend.js -> the backend's client_version column).
+# Same generated-gitignored-ES-module pattern as curriculum.js above. The hash
+# is the short HEAD; '-dirty' is appended when built from a modified working
+# tree (tracked changes vs HEAD). One mechanism locally and in CI, where the
+# checkout is the deployed commit. Falls back to "unknown" outside a git repo.
+[[hooks]]
+stage = "pre_build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "if v=$(git rev-parse --short HEAD 2>/dev/null); then git diff --quiet HEAD 2>/dev/null || v=\"$v-dirty\"; else v=unknown; fi; printf 'export default \"%s\";\\n' \"$v\" > version.js",
+]
+
 # Rebuild when the frontend OR the Rust sources behind the wasm bridge change.
 # Watch the whole web/ dir (recursive) so newly added assets are picked up with
 # no edit here; core and wasm live outside web/ so add their paths too.
@@ -38,5 +52,6 @@ watch = [
 ]
 ignore = [
   "curriculum.js",
+  "version.js",
   "dist",
 ]
