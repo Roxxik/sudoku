@@ -431,11 +431,19 @@ Two reads:
    prediction realised in full. This is the single largest remaining lift in the plan, and it needed no
    new constants (the logistic center/scale/LC weight are untouched), only a less-biased estimator of
    the *same* frontier quantity.
-2. **Production is untouched and the change is reproducible.** Like the rest of Stage 4 it lives on the
-   spec-free path only ([`grade_puzzle`](../generator-lab/src/grade.rs), example-only); the spec-based
-   `grade_one`/`rating` path the web app's `gen_worker` calls is byte-identical. The per-puzzle RNG seed
+2. **Reproducible, and now wired into production for the trunk nodes.** The per-puzzle RNG seed
    ([`trunk_seed`](../generator-lab/src/grade.rs), FNV-1a of the grid) makes the averaged rating a pure,
-   reproducible function of the puzzle — the same property the deterministic fill had.
+   reproducible function of the puzzle (native == wasm — the RNG is u64/u128-domain), the same property
+   the deterministic fill had. The frontier rating was first built spec-free
+   ([`grade_puzzle`](../generator-lab/src/grade.rs)) for this calibration; now that it is human-validated,
+   it is also [`grade_one`](../generator-lab/src/grade.rs)'s rating for a **trunk spec** — one whose
+   hardest forced kind is below a naked pair, i.e. the campaign's singles / locked-candidate nodes
+   ([`bottleneck_key`](../generator-lab/src/grade.rs) `None`), which `rating` used to flat-`0`. So those
+   nodes get a real within-node sub-order in the web app via [`trunk_rating_runs`](../generator-lab/src/grade.rs).
+   **Non-trunk specs (every per-technique node, naked pair and up) are byte-identical** — `grade_one`
+   still routes them through the unchanged `GRANULAR_*` path; only the `None`-bottleneck branch changed.
+   The signals-only [`rating`](../generator-lab/src/grade.rs)/[`band_calibrated`](../generator-lab/src/grade.rs)
+   (no puzzle to profile) keep their documented trunk-is-flat-`0` behaviour.
 
 ## 5. The plan (per-spec; beat the bar; one change at a time)
 

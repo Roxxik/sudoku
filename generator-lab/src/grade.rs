@@ -952,12 +952,22 @@ pub fn band_calibrated(spec: &Spec, s: &Signals) -> usize {
 /// breakdown). This is the one-puzzle path (the web app, which generates one puzzle at a time);
 /// [`grade_node`] / [`grade_batch`] stay the per-node *relative* path. Cold path: a single
 /// easiest-first solve off the hot generation loop.
+///
+/// A **trunk** spec — one whose hardest forced kind is below a naked pair (the campaign's singles /
+/// locked-candidate nodes, [`bottleneck_key`] `None`) — has no bottleneck for [`rating`] to score,
+/// so [`rating`] returns the flat `0`. Here, where the puzzle is in hand, it is graded on its
+/// fill-path frontier instead ([`trunk_rating_runs`], the production analogue of [`grade_puzzle`]'s
+/// trunk branch — Stage 2 + the §4.8 averaging), giving those nodes a real within-node sub-order.
 pub fn grade_one(spec: &Spec, puzzle: &DigitGrid) -> (Signals, f64) {
     let baseline = spec.baseline_mask();
     let bottleneck = bottleneck_mask(spec);
     let trace = solve_graded(&SolverState::<Bands<RowMajor>>::from_digits(puzzle), baseline);
     let signals = signals_of(&trace, bottleneck);
-    (signals, rating(spec, &signals))
+    let r = match bottleneck_key(spec) {
+        Some(_) => rating(spec, &signals),
+        None => trunk_rating_runs(puzzle, TRUNK_DEP_RUNS),
+    };
+    (signals, r)
 }
 
 // --- G1: spec-free grading (docs/grader-external-calibration.md §3) -------------------------
@@ -1406,6 +1416,23 @@ mod tests {
         assert_eq!(bottleneck_key(&spec), None);
         assert_eq!(rating(&spec, &sig(1, 0, 1)), 0.0);
         assert_eq!(band_calibrated(&spec, &sig(1, 0, 1)), 0);
+    }
+
+    #[test]
+    fn grade_one_trunk_spec_gets_continuous_rating() {
+        // The production path: a trunk spec (forces only a locked candidate — no kind >= naked pair,
+        // so bottleneck_key is None) used to rate flat 0 via `rating`. grade_one now grades the
+        // campaign's singles/LC node on its fill-path frontier -> a continuous (0,1) within-node
+        // rating, while the signals-only `rating`/`band_calibrated` (no puzzle) stay flat 0.
+        use crate::spec::kinds::LC_POINTING;
+        let spec = Spec::train_isolated(LC_POINTING);
+        assert_eq!(bottleneck_key(&spec), None, "a locked-candidate spec is a trunk spec");
+        let classic = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
+        let grid = DigitGrid::parse(classic).unwrap();
+        let (_signals, r) = grade_one(&spec, &grid);
+        assert!(r > 0.0 && r < 1.0, "trunk spec now rates continuously in (0,1), not flat 0");
+        // The signals-only path is unchanged (it has no puzzle to profile).
+        assert_eq!(rating(&spec, &_signals), 0.0, "rating(spec, signals) stays flat 0 for a trunk spec");
     }
 
     #[test]
