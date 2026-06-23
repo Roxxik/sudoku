@@ -160,11 +160,11 @@ fn run_spec(spec: &lab::Spec, uncapped: bool) -> JsValue {
             // the successful attempt). Persisted for the cheat-mode display; well
             // within a JS Number.
             let _ = Reflect::set(&obj, &"attempts".into(), &(stats.attempts as f64).into());
-            // Difficulty grade: the absolute gentle/medium/spicy band shown on the
-            // page's thumbnails, plus the raw sub-tier signals for the cheat-mode
-            // breakdown. A cold easiest-first solve off the hot generation loop.
-            let (signals, band) = lab::grade::grade_one(spec, &g.puzzle.0);
-            set_grade(&obj, &signals, band);
+            // Difficulty grade: the absolute Tier-C continuous rating (in [0,1]) shown on
+            // the page's thumbnails as a 5-band sub-tier read, plus the raw signals for the
+            // cheat-mode breakdown. A cold easiest-first solve off the hot generation loop.
+            let (signals, rating) = lab::grade::grade_one(spec, &g.puzzle.0);
+            set_grade(&obj, &signals, rating);
             obj.into()
         }
         // Budget exhaustion is the one failure worth retrying uncapped: a hard or
@@ -210,16 +210,25 @@ fn set_str(obj: &Object, key: &str, value: &str) {
 /// raw sub-tier signals the cheat-mode breakdown spells out. `scarcity` is `u32::MAX`
 /// when the puzzle needed no harder step (no bottleneck); it goes out as JS `null` then
 /// so the page renders a dash rather than a meaningless sentinel.
-fn set_grade(reply: &Object, signals: &lab::grade::Signals, band: usize) {
+fn set_grade(reply: &Object, signals: &lab::grade::Signals, rating: f64) {
     let grade = Object::new();
     let set_num = |key: &str, value: f64| {
         let _ = Reflect::set(&grade, &key.into(), &value.into());
     };
-    set_num("band", band as f64);
+    // Tier-C output: the continuous within-technique rating in [0,1], the 5-band cut of it
+    // (`band` 0..=4), and the band count so the UI need not hardcode it.
+    set_num("rating", rating);
+    set_num("bands", lab::grade::UI_BANDS as f64);
+    set_num("band", lab::grade::band_of_rating(rating, lab::grade::UI_BANDS) as f64);
+    // Raw sub-tier signals for the cheat-mode breakdown — including the granular stall signals
+    // (`open`, `alts`) that now drive the grade.
     set_num("bottleneckCount", signals.bottleneck_count as f64);
     set_num("dryFirings", signals.dry_firings as f64);
     set_num("longestDryRun", signals.longest_dry_run as f64);
     set_num("scanWork", signals.scan_work as f64);
+    set_num("open", signals.open as f64);
+    set_num("alts", signals.alts as f64);
+    set_num("camo", signals.camo as f64);
     let scarcity = if signals.scarcity == u32::MAX {
         JsValue::NULL
     } else {

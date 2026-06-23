@@ -103,6 +103,15 @@ html, body {
   letter-spacing: 0.02em;
 }
 
+/* The play view appends the difficulty pill into the title (web/play.js
+   updateDifficulty) so it sits inline after the title text rather than on its own
+   row. Vertically centre it against the large title and drop the card-context
+   margin-top the badge carries by default. */
+#playTitle .grade-badge {
+  margin: 0 0 0 8px;
+  vertical-align: middle;
+}
+
 .iconbtn {
   background: transparent;
   border: none;
@@ -832,6 +841,7 @@ summary > span:first-of-type { flex: 1; }
    whitespace rather than mid-word like the seed's break-all. */
 .play-grade { word-break: normal; overflow-wrap: anywhere; }
 
+
 /* Difficulty grade pill on Continue / history thumbnails. Coloured text + ring on
    a transparent fill (reads on both themes), sized to its label, left-aligned so
    it hugs the start of the card's text column rather than stretching. */
@@ -845,9 +855,29 @@ summary > span:first-of-type { flex: 1; }
   font-weight: 600;
   line-height: 1.5;
 }
-.grade-gentle { color: var(--ok); }
-.grade-medium { color: var(--warn); }
-.grade-spicy { color: var(--bad); }
+/* Five-band heat scale keyed on the band index (see ui.js gradeBadge). Bands 0-3
+   ride a green->red gradient in four even steps (the two middle steps blend the
+   adjacent theme colours so the ramp holds on both themes). The hardest band
+   breaks OUT of the gradient as a solid black "off the scale" pill rather than
+   just more red. */
+.grade-b0 { color: var(--ok); }
+.grade-b1 { color: color-mix(in srgb, var(--ok) 50%, var(--warn)); }
+.grade-b2 { color: color-mix(in srgb, var(--warn) 50%, var(--bad)); }
+.grade-b3 { color: var(--bad); }
+/* Black, filled (the others are transparent outline pills) -- the maximum read.
+   Black on the light card pops on its own. On dark a black fill would vanish, so
+   it keeps the black but gains a light text colour and a grey ring (the dark-theme
+   override below) so it still reads as the ominous one rather than disappearing. */
+.grade-b4 {
+  color: #fff;
+  background: #111;
+  border-color: #111;
+}
+:root[data-theme="dark"] .grade-b4 {
+  color: var(--text);
+  background: #000;
+  border-color: var(--line-strong);
+}
 
 /* Reserve the best-time line so Train/Drill buttons are the same height whether
    or not a best time exists. */

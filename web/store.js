@@ -151,10 +151,14 @@ function newId() {
 //         records). Kept so cheat mode can display it and reproduce the puzzle.
 //   attempts: rejection-sampling attempts the generator spent (debug only; absent
 //             on old records). Shown under cheat next to the seed.
-//   grade: { band: 0|1|2, bottleneckCount, dryFirings, longestDryRun, scanWork,
-//            scarcity: number|null } -- the generator's difficulty grade. `band`
-//            (gentle/medium/spicy) drives a thumbnail badge; the raw signals feed
-//            the cheat-mode breakdown. null on old records (predates grading).
+//   grade: { rating: 0..1, bands, band: 0..4, bottleneckCount, dryFirings,
+//            longestDryRun, scanWork, open, alts, camo, scarcity: number|null } --
+//            the generator's difficulty grade. `rating` is the continuous within-
+//            technique score; `band` is its 5-band cut (drives the thumbnail badge
+//            and the play-view difficulty pill). The raw signals feed the cheat-mode
+//            breakdown (`camo` is the Tier-E near-miss count). null on old records
+//            (predates grading); pre-5-band records have band 0..2 and lack
+//            rating/bands/open/alts.
 //   value: number[81]         player placements (0 = empty),       [heavy]
 //   fromForced: bool          started via "Play from Forced" (a head start was
 //                             pre-placed). Tracked separately from a plain Play in

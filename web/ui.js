@@ -54,9 +54,12 @@ export async function copyText(text) {
   }
 }
 
-// The generator's gentle/medium/spicy difficulty bands, indexed by `grade.band`
-// (the absolute single-puzzle band the worker returns; see web/store.js).
-export const GRADE_NAMES = ["Gentle", "Medium", "Spicy"];
+// The generator's difficulty sub-tier names, indexed by `grade.band` (0..4 -- the
+// absolute single-puzzle band the worker cuts from its continuous `rating`; see
+// web/store.js). These are a *within-technique* sub-rating along one heat axis: the
+// card already names the technique, so the lowest band ("Mild") means the mild end
+// of that technique, not that the puzzle is easy.
+export const GRADE_NAMES = ["Mild", "Medium", "Hot", "Spicy", "Fiery"];
 
 // The band's display word for a game's `grade`, or null if ungraded (old records
 // predate grading, or the field is malformed).
@@ -65,13 +68,14 @@ export function gradeName(grade) {
   return GRADE_NAMES[grade.band] || null;
 }
 
-// A small coloured difficulty pill for a game's grade (green/amber/red by band),
-// or null when the game is ungraded -- callers skip appending it then.
+// A small coloured difficulty pill for a game's grade (a green->red ramp by band),
+// or null when the game is ungraded -- callers skip appending it then. The colour
+// class is keyed on the band index (grade-b0..b4), independent of the name words.
 export function gradeBadge(grade) {
   const name = gradeName(grade);
   if (!name) return null;
   const span = document.createElement("span");
-  span.className = `grade-badge grade-${name.toLowerCase()}`;
+  span.className = `grade-badge grade-b${grade.band}`;
   span.textContent = name;
   return span;
 }

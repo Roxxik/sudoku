@@ -12,7 +12,7 @@ import { bindings } from "./wasm.js";
 import * as store from "./store.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
-import { copyText, gradeName } from "./ui.js";
+import { copyText, gradeName, gradeBadge } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
 import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn } from "./settings.js";
 
@@ -2107,6 +2107,7 @@ export function loadGame(g) {
 
   updateNotesButton();
   setTitle(g);
+  updateDifficulty();
   updateSeedLine();
   updateDigitButtons();
   updateHistoryButtons();
@@ -2133,6 +2134,21 @@ function setTitle(g) {
   const name = techniqueName(curriculumIdFor(g.kindIndex));
   const mode = g.mode === "drill" ? "Drill" : "Train";
   h.textContent = `${name} · ${mode}`;
+}
+
+// The difficulty pill shown inline in the play title: the band the generator
+// graded this puzzle into (the within-technique sub-tier). Appended after the
+// title text (setTitle has already set that). Absent on ungraded games (custom /
+// review builds, or records that predate grading).
+function updateDifficulty() {
+  const h = document.getElementById("playTitle");
+  if (!h) return;
+  // Drop a pill left by a previous load before re-deriving (setTitle's textContent
+  // write already clears it in the normal flow; this keeps it safe if called alone).
+  const old = h.querySelector(".grade-badge");
+  if (old) old.remove();
+  const badge = game && gradeBadge(game.grade);
+  if (badge) h.appendChild(badge);
 }
 
 // Debug aid: under cheat mode, show the seed the current puzzle was generated
@@ -2163,22 +2179,33 @@ function seedLineText() {
   return parts.join(" · ");
 }
 
-// The generator's full grade breakdown: the band word plus every raw sub-tier
-// signal (the same data grade.signals_of produces). Empty string when the game
+// The generator's full grade breakdown: the band word, the continuous rating it
+// was cut from, plus every raw sub-tier signal (the same data grade.signals_of
+// produces, including the granular `open`/`alts` stall signals and the Tier-E
+// `camo` near-miss count that now drive the grade). Empty string when the game
 // predates grading. Scarcity is the min eliminations at a bottleneck firing, sent
-// as null (shown "-") when the puzzle needed no harder step.
+// as null (shown "-") when the puzzle needed no harder step; `open`/`alts`/`camo`
+// are absent on records made before they were added, shown "-" then too.
 function gradeLineText() {
   const gr = game && game.grade;
   if (!gr || typeof gr.band !== "number") return "";
   const scarcity = gr.scarcity == null ? "-" : gr.scarcity;
-  return [
-    `Grade: ${gradeName(gr) || "?"}`,
+  const open = gr.open == null ? "-" : gr.open;
+  const alts = gr.alts == null ? "-" : gr.alts;
+  const camo = gr.camo == null ? "-" : gr.camo;
+  const parts = [`Grade: ${gradeName(gr) || "?"}`];
+  if (typeof gr.rating === "number") parts.push(`Rating: ${Math.round(gr.rating * 100)}%`);
+  parts.push(
     `Dry run: ${gr.longestDryRun}`,
     `Forced: ${gr.bottleneckCount}`,
     `Dry firings: ${gr.dryFirings}`,
     `Scarcity: ${scarcity}`,
+    `Open: ${open}`,
+    `Alts: ${alts}`,
+    `Camo: ${camo}`,
     `Scan: ${gr.scanWork}`,
-  ].join(" · ");
+  );
+  return parts.join(" · ");
 }
 
 // kindIndex -> kebab id, filled in by initPlay from the curriculum.
