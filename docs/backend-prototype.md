@@ -241,6 +241,79 @@ turning the dump into a real database is one line when wanted (`sqlite3 sudoku.s
 Local loop: `wrangler dev` (with `--local` D1) and a `curl` POST to smoke-test the contract
 before deploying.
 
+## Updating the deployed worker
+
+The worker deploy is **manual** and **separate from the frontend**. The frontend auto-deploys
+on every push to master ([`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) →
+GitHub Pages); the worker has **no CI** and is pushed by hand with `wrangler`. Automating it
+would mean storing a Cloudflare API token as a repo secret and adding a `wrangler-action` job —
+deferred, not needed to iterate.
+
+That decoupling is a feature, not a gap: **always deploy the worker before the frontend that
+depends on the change**, so an old, cached, or offline client never reaches a server that no
+longer understands it (see *Backwards compatibility* below).
+
+Three kinds of change, three workflows:
+
+**1. Worker code only** (handler logic, validation, CORS) — no schema, no contract change:
+
+```bash
+cd worker && wrangler deploy
+```
+
+Live in seconds, atomically. Roll back with `wrangler deployments list` then
+`wrangler rollback [id]`. No frontend rebuild needed.
+
+**2. Schema change** (new column, index, or table). Use D1's **tracked migrations** rather than
+ad-hoc `d1 execute`, so applied state is recorded (in the `d1_migrations` table) and re-runs are
+no-ops:
+
+```bash
+cd worker
+wrangler d1 migrations create sudoku add_client_version   # -> migrations/0002_add_client_version.sql
+#   edit that file, e.g.:  ALTER TABLE solves ADD COLUMN client_version TEXT;
+wrangler d1 migrations apply sudoku --local               # dev DB first
+wrangler d1 migrations apply sudoku --remote              # then prod
+```
+
+Migrations are **forward-only and additive by rule**: `ADD COLUMN` (nullable or with a default),
+`CREATE TABLE`, `CREATE INDEX`. Never `DROP`/rename a column an existing client still writes.
+D1 has no transactional DDL rollback, so a bad migration is fixed by a *new* forward migration,
+not a revert. Apply the migration, then `wrangler deploy` the code that reads/writes the new
+column.
+
+> The initial table currently ships as `schema.sql` applied with `wrangler d1 execute --file`
+> (setup step 2). To bring it under migration tracking, move it to `migrations/0001_init.sql`
+> and run `wrangler d1 migrations apply`; until then, treat `schema.sql` as migration 0001 by hand.
+
+**3. Request/response contract change** (the shape `web/backend.js` sends or expects back). This
+is the one that needs care because of cached/offline clients. Order of operations is fixed:
+deploy a worker that accepts **both** the old and new shapes, *then* ship the frontend that uses
+the new shape. Never the reverse. See *Backwards compatibility*.
+
+## Backwards compatibility
+
+The frontend is a static bundle on GitHub Pages with **no service worker**. The content-hashed
+assets (wasm, CSS) are cache-busted per build; the plain ES modules copied as-is (`play.js`,
+`backend.js`, …) keep stable names and ride Pages' `Cache-Control: max-age=600` + ETag, so an
+*online* returning visitor is at most ~10 minutes stale. A genuinely **offline / long-lived
+tab** runs whatever bundle it loaded — arbitrarily old. So the server must assume a client can
+POST an **old payload shape at any time**.
+
+The load-bearing guarantee is therefore one rule, not a version handshake:
+
+- **Additive-only contract.** New request fields are optional with a server default; never remove
+  a field, never repurpose a field's meaning, never tighten validation on an existing field. The
+  `valid()` check only ever *gains* `(s.newField == null || …)` clauses. Under this rule every old
+  client keeps working forever with no coordination.
+
+`client_id` + `INSERT OR IGNORE` already make re-sends idempotent, so the deferred offline outbox
+composes with this for free.
+
+> A client-version field + a "your app is out of date, refresh" nudge is a *separate* concern
+> (frontend freshness, not wire compatibility) and is left open for discussion — see the design
+> notes, not built here.
+
 ## Deferred (and why each is cheap to add on top of this)
 
 - **Offline outbox + retry.** A localStorage queue appended in `onSolved()`, flushed on the
