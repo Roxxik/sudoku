@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Normalize the external human-difficulty Sudoku datasets into a uniform, per-group
+extract that a difficulty-grader tuning harness can read directly.
+
+Why these datasets exist. They are the external HUMAN difficulty reference (the "F2"
+reference the grader docs -- docs/grader-continuous-scoring.md sec 6 -- deferred as
+optional). The whole Tier A-E grader calibrates against the project's OWN relative
+grader (grade_batch), so it only ever proves it agrees with itself; these sources break
+that loop with real human signal (solve times, completion rates, human-set difficulty
+labels). Crucially their labels are comparable ONLY within a source -- often only within
+one sub-scale of a source -- so they restore RANK within a group, never an absolute
+value and never an order across groups.
+
+What this script emits, under datasets/normalized/ (gitignored, like all of datasets/):
+  catalog.json     -- every group + its metadata (kind, ordinal ladder, n, file, ...)
+  <group>.csv      -- one row per puzzle: puzzle,label_value,label_raw,weight
+
+Conventions held across EVERY group, so a harness parses one way:
+  - puzzle:      81-char row-major, '.' = blank (core::Board::parse compatible)
+  - label_value: numeric, HIGHER = HARDER. Ordinal groups use the level index
+                 (ascending = harder); continuous groups use the raw human metric.
+  - weight:      per-row confidence (player count for the solve-time group; 1 elsewhere)
+  - A "group" is one partial order. Rank is defined WITHIN a group ONLY -- never compare
+    label_value across groups (different datasets / scales / metrics are incomparable).
+
+Toolbox caveat (not enforced here, it is the harness's job): the grader's toolbox is
+currently below chains, so puzzles that REQUIRE chains/forcing are unsolvable by its cold
+solve and ungradeable. The hardest labels (armane Extreme Sudoku entirely; the
+Diabolical / Fiendish tiers elsewhere) may therefore have near-zero coverage until chains
+land. A harness should compute rank agreement over the solvable subset per group.
+
+Re-run after re-fetching datasets:  scripts/datasets-normalize
+"""
+
+import csv
+import json
+import re
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+DATA = REPO / "datasets"
+OUT = DATA / "normalized"
+
+DIGITS = set("123456789.")
+
+
+def norm_puzzle(s: str) -> str:
+    """81-char row-major, blanks as '.' (some sources use '0')."""
+    s = s.strip().replace("0", ".")
+    if len(s) != 81 or any(c not in DIGITS for c in s):
+        raise ValueError(f"bad puzzle string ({len(s)} chars): {s!r}")
+    return s
+
+
+# --- readers: each yields (puzzle, label_value, label_raw, weight) ---------------
+
+
+def read_armane(subdir: str, levels: list[str]):
+    """One ordinal group per website. label_value = ascending level index."""
+    base = DATA / "armane-v-difficulty" / subdir
+    for idx, level in enumerate(levels):
+        path = base / f"{level}.txt"
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # line format: "<MM-DD-YY> : <81-digit string>"
+            puzzle = line.split(":", 1)[1]
+            yield norm_puzzle(puzzle), idx, level, 1
+
+
+def read_synnwang_csv(col: str):
+    """csv 20240415.csv: continuous human-difficulty channel D_TO or D_TR."""
+    path = DATA / "synnwang-difficulty" / "20240415.csv"
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            val = float(row[col])
+            yield norm_puzzle(row["Sudoku Puzzle"]), val, row[col], 1
+
+
+def read_synnwang_solve_time():
+    """xls (saved as csv) sudoku_records_20250407.csv, headerless 4 cols:
+    [game_id, puzzle, player_count, avg_solve_seconds]. label = avg seconds;
+    weight = player_count (more players = a more trustworthy mean)."""
+    path = DATA / "synnwang-difficulty" / "sudoku_records_20250407.csv"
+    with open(path) as f:
+        for row in csv.reader(f):
+            _id, puzzle, players, seconds = row
+            yield norm_puzzle(puzzle), int(seconds), seconds, int(players)
+
+
+def read_sakana():
+    """Nikoli parquet: difficulty is the NHK id-suffix class e<m<h (easy/medium/hard).
+    The h1/h2/h3 digit is a within-month index, not a finer level, so it is ignored."""
+    import pyarrow.parquet as pq
+
+    order = {"e": 0, "m": 1, "h": 2}
+    raw = {"e": "easy", "m": "medium", "h": "hard"}
+    df = pq.read_table(
+        DATA / "sakana-nikoli" / "data" / "test-00000-of-00001.parquet",
+        columns=["puzzle_id", "initial_board"],
+    ).to_pandas()
+    dropped = []
+    for pid, board in zip(df.puzzle_id, df.initial_board):
+        m = re.match(r"^nhk\d{4}([emh])\d*(?:-\d+)?$", pid)
+        cls = m.group(1) if m else ("e" if pid == "170714_sd_easy" else None)
+        if cls is None:
+            dropped.append(pid)  # e.g. nhk170929sd: no e/m/h class -> not orderable
+            continue
+        yield norm_puzzle(board), order[cls], raw[cls], 1
+    if dropped:
+        print(f"  sakana/nhk: dropped {len(dropped)} id(s) with no e/m/h class: {dropped}")
+
+
+# --- group registry --------------------------------------------------------------
+
+GROUPS = [
+    {
+        "id": "armane/org.uk",
+        "dataset": "armane-v-difficulty",
+        "source": "https://www.sudoku.org.uk/ (via github.com/ArmanE-V/Sudoku-Difficulty)",
+        "scheme": "Sudoku.org.uk site difficulty label",
+        "label_kind": "ordinal",
+        "label_origin": "human (website-assigned difficulty)",
+        "levels": ["Gentle", "Moderate", "Tough", "Diabolical"],
+        "notes": "60 puzzles per level; coarse ordinal (large tie classes).",
+        "reader": lambda: read_armane("Sudoku.org.uk", ["Gentle", "Moderate", "Tough", "Diabolical"]),
+    },
+    {
+        "id": "armane/extreme",
+        "dataset": "armane-v-difficulty",
+        "source": "https://www.extremesudoku.info/ (via github.com/ArmanE-V/Sudoku-Difficulty)",
+        "scheme": "Extreme Sudoku site difficulty label",
+        "label_kind": "ordinal",
+        "label_origin": "human (website-assigned difficulty)",
+        "levels": ["Evil", "Excessive", "Egregious", "Excruciating", "Extreme"],
+        "notes": "60 per level. Order is the site's listed (ascending) order. WHOLE GROUP "
+                 "likely needs techniques above the current below-chains toolbox -> expect "
+                 "near-zero grader coverage for now.",
+        "reader": lambda: read_armane("Extreme Sudoku", ["Evil", "Excessive", "Egregious", "Excruciating", "Extreme"]),
+    },
+    {
+        "id": "armane/sotd",
+        "dataset": "armane-v-difficulty",
+        "source": "https://www.sudokuoftheday.com/ (via github.com/ArmanE-V/Sudoku-Difficulty)",
+        "scheme": "Sudoku of the Day site difficulty label",
+        "label_kind": "ordinal",
+        "label_origin": "human (website-assigned difficulty)",
+        "levels": ["Beginner", "Easy", "Medium", "Tricky", "Fiendish", "Diabolical"],
+        "notes": "60 per level. Tricky/Fiendish/Diabolical tiers may need above-toolbox "
+                 "techniques -> reduced grader coverage.",
+        "reader": lambda: read_armane("Sudoku of the Day", ["Beginner", "Easy", "Medium", "Tricky", "Fiendish", "Diabolical"]),
+    },
+    {
+        "id": "synnwang/D_TO",
+        "dataset": "synnwang-difficulty",
+        "source": "github.com/synnwang/sudoku_dataset_difficulty (Cloud Sudoku app, IEEE Access 2024)",
+        "scheme": "D_TO: time-only human-difficulty score",
+        "label_kind": "continuous",
+        "label_origin": "human (per-puzzle solve-time metric)",
+        "notes": "344 puzzles; near-total order. Same puzzles as synnwang/D_TR (second "
+                 "channel) and a subset of synnwang/solve_time.",
+        "reader": lambda: read_synnwang_csv("D_TO"),
+    },
+    {
+        "id": "synnwang/D_TR",
+        "dataset": "synnwang-difficulty",
+        "source": "github.com/synnwang/sudoku_dataset_difficulty (Cloud Sudoku app, IEEE Access 2024)",
+        "scheme": "D_TR: time + completion-rate human-difficulty score",
+        "label_kind": "continuous",
+        "label_origin": "human (per-puzzle solve-time + completion metric)",
+        "notes": "344 puzzles; near-total order. Same puzzles as synnwang/D_TO.",
+        "reader": lambda: read_synnwang_csv("D_TR"),
+    },
+    {
+        "id": "synnwang/solve_time",
+        "dataset": "synnwang-difficulty",
+        "source": "github.com/synnwang/sudoku_dataset_difficulty (Cloud Sudoku app, IEEE Access 2024)",
+        "scheme": "average human solve time, in seconds",
+        "label_kind": "continuous",
+        "label_origin": "human (mean solve time across players)",
+        "weight": "player_count (number of human solves the mean is over; higher = more trustworthy)",
+        "notes": "1533 puzzles; near-total order. label_value = mean solve seconds, weight = "
+                 "player count. The 344 synnwang/D_TO+D_TR puzzles are a labelled subset of this.",
+        "reader": read_synnwang_solve_time,
+    },
+    {
+        "id": "sakana/nhk",
+        "dataset": "sakana-nikoli",
+        "source": "huggingface.co/datasets/SakanaAI/sudoku-bench-nikoli",
+        "scheme": "Nikoli NHK id-suffix difficulty class (e/m/h)",
+        "label_kind": "ordinal",
+        "label_origin": "human (Nikoli hand-set, difficulty class in puzzle_id)",
+        "levels": ["easy", "medium", "hard"],
+        "notes": "Human-set (non-algorithmic solve paths). Class from the puzzle_id suffix "
+                 "e<m<h; h1/h2/h3 digit is a within-month index, ignored. 1 id with no class "
+                 "(nhk170929sd) dropped.",
+        "reader": read_sakana,
+    },
+]
+
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    catalog_groups = []
+    for g in GROUPS:
+        rows = list(g["reader"]())
+        fname = g["id"].replace("/", "__") + ".csv"
+        with open(OUT / fname, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["puzzle", "label_value", "label_raw", "weight"])
+            w.writerows(rows)
+        entry = {k: v for k, v in g.items() if k != "reader"}
+        entry["n"] = len(rows)
+        entry["file"] = fname
+        catalog_groups.append(entry)
+        print(f"  {g['id']:24s} n={len(rows):>5}  -> normalized/{fname}")
+
+    catalog = {
+        "description": "External human-difficulty Sudoku datasets, normalized for grader "
+                       "tuning. Each group is one partial order; rank is defined WITHIN a "
+                       "group only -- never compare label_value across groups.",
+        "puzzle_format": "81-char row-major, '.' = blank (core::Board::parse compatible)",
+        "label_orientation": "higher label_value = harder",
+        "row_schema": ["puzzle", "label_value", "label_raw", "weight"],
+        "generated_by": "scripts/datasets-normalize",
+        "groups": catalog_groups,
+    }
+    with open(OUT / "catalog.json", "w") as f:
+        json.dump(catalog, f, indent=2)
+    print(f"\nwrote {len(catalog_groups)} groups + catalog.json under {OUT.relative_to(REPO)}/")
+
+
+if __name__ == "__main__":
+    main()
