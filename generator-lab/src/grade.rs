@@ -24,7 +24,7 @@ use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{DigitGrid, Marks, SolverState};
 use crate::solve::{GradeTrace, solve_graded};
 use crate::spec::Spec;
-use crate::spec::kinds::{DIFFICULTY, KindMask, NAKED_PAIR, NUM};
+use crate::spec::kinds::{Branch, DIFFICULTY, KindMask, NAKED_PAIR, NUM, XYZ_WING, branch_of};
 
 /// The default band count — gentle / medium / spicy, the plan's natural per-node cut.
 pub const DEFAULT_BANDS: usize = 3;
@@ -33,7 +33,7 @@ pub const DEFAULT_BANDS: usize = 3;
 /// in the *raw* direction the trace produces them; [`grade_batch`] applies the
 /// harder-direction orientation when it ranks (only [`scarcity`](Self::scarcity) is "lower
 /// is harder").
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Signals {
     /// **Signal 1** — how many times the node's forced technique `T` must fire on the
     /// easiest-first path. One forced firing then singles-to-the-end is far gentler than
@@ -55,6 +55,65 @@ pub struct Signals {
     /// scan-work term. Lowest weight; breaks ties between puzzles matching on 1-3. Higher
     /// is harder.
     pub scan_work: u32,
+    /// **S5 (open)** — live-candidate population at the *tightest* bottleneck (the
+    /// fewest-elim firing, the one [`scarcity`](Self::scarcity) is taken over). The primary
+    /// *continuous* signal of `docs/grader-granular-scoring.md`: ~40..200, so it discriminates
+    /// where the integer signals tie. `0` when the puzzle had no bottleneck. Orientation is
+    /// per-branch and calibrated (see [`granular_score`]).
+    pub open: u32,
+    /// **S6 (depth)** — cells already placed when the *first* bottleneck fires. `0` with no
+    /// bottleneck. Continuous (0..81); a late first stall means the cheap closure carried the
+    /// solver a long way before the technique was needed.
+    pub depth: u32,
+    /// **S8 (cascade)** — cells the cheap closure placed immediately after the *tightest*
+    /// bottleneck firing (the magnitude of the dry/payoff flag). `0` with no bottleneck.
+    /// Higher = a longer unlock = gentler, so it is oriented "lower is harder" at score time.
+    pub cascade: u32,
+    /// **S3' (elim sum)** — total eliminations summed over *all* bottleneck firings. With the
+    /// [`bottleneck_count`](Self::bottleneck_count) it gives the mean, a finer refinement of
+    /// `min`-only [`scarcity`](Self::scarcity) for the multi-firing (subset) nodes. `0` with no
+    /// bottleneck. (For the single-forced UI specs `mean == min == scarcity`.)
+    pub elim_sum: u32,
+    /// **S7 (alts)** — productive deduction instances across the allowed harder toolbox at the
+    /// *tightest* stall (Tier B: the honest scarcity, the `live`-style count). Fewer = a tighter
+    /// needle hunt = harder; stays live where `elims`/`scarcity` is structurally pinned (wings).
+    /// `0` with no bottleneck (no stall to count at).
+    pub alts: u32,
+
+    // --- Tier D: trajectory features (`docs/grader-continuous-scoring.md` §4) -------------
+    // Aggregates over the WHOLE bottleneck-firing sequence, not just the tightest/first stall.
+    // For a single-firing puzzle each reduces to (a monotone reparam of) its tightest-stall
+    // counterpart, so Tier A/B/C behaviour is recoverable; they only add resolution on the
+    // multi-firing nodes (subset drills, the wings) the single-stall reduction is lossiest on.
+    /// **D1 (tight integral)** — `Σ 1/(1 + alts_i)` over the bottleneck firings: total
+    /// stuck-ness across the solve, not just the worst stall. Distinguishes one-hard-stall from
+    /// many-medium-stalls puzzles that share a tightest [`alts`](Self::alts). `0` with no
+    /// bottleneck. Higher = harder (more, tighter stalls).
+    pub tight_integral: f64,
+    /// **D2 (open sum)** — `Σ open_i` over the bottleneck firings: the total candidate
+    /// population the solver scanned over the solve. Its mean (`open_sum / bottleneck_count`,
+    /// taken in [`raw_granular`]) generalises the single-stall [`open`](Self::open). `0` with no
+    /// bottleneck.
+    pub open_sum: u32,
+    /// **D3 (depth-weighted tightness)** — `Σ depth_i / (1 + alts_i)`: each stall's tightness
+    /// weighted by how deep it fired — a hard stall after 60 placements is felt more than one at
+    /// 25. `0` with no bottleneck. Higher = harder.
+    pub depth_tight_integral: f64,
+    /// **D4 (payoff jaggedness)** — number of dry→payoff transitions over the harder ladder: how
+    /// often a dry grind was finally broken by a placement. A stop-start solve (stall, unlock,
+    /// re-stall) reads harder than one smooth descent. `0` for a single firing that pays off at
+    /// once. ([`longest_dry_run`](Self::longest_dry_run) is the other half of the §4 D4 shape.)
+    pub payoff_transitions: u32,
+
+    // --- Tier E: spotting-cost signals (`docs/grader-continuous-scoring.md` §5) -----------
+    /// **E1 (camo)** — near-miss camouflage at the *tightest* bottleneck: the number of
+    /// pattern-shaped look-alikes the solver examines and rejects there (`examined - alts`, the
+    /// structurally-valid-but-dead instances of [`GradeStep`](crate::solve::GradeStep)). The
+    /// human *spotting* cost the deduction signals miss: many look-alikes per real pattern = a
+    /// harder needle hunt. Stays live where `alts`/`elims` is structurally pinned (the wings
+    /// always fire ~1 productive pattern, but the dead-wing count genuinely varies) — the
+    /// principled cure for the wing residual. `0` with no bottleneck. Higher = harder.
+    pub camo: u32,
 }
 
 /// The relative weights of the four signals in the combined order. Rough by design — the
@@ -104,13 +163,42 @@ pub fn bottleneck_mask(spec: &Spec) -> KindMask {
 pub fn signals_of(trace: &GradeTrace, bottleneck: KindMask) -> Signals {
     let mut s = Signals { scarcity: u32::MAX, ..Signals::default() };
     let mut cur_run = 0u32;
+    let mut seen_bottleneck = false;
     for step in &trace.steps {
         let is_bottleneck = bottleneck & (1 << step.kind) != 0;
         if is_bottleneck {
             s.bottleneck_count += 1;
-            s.scarcity = s.scarcity.min(step.elims as u32);
+            s.elim_sum = s.elim_sum.saturating_add(step.elims as u32);
+            // depth read at the FIRST bottleneck firing.
+            if !seen_bottleneck {
+                s.depth = step.depth as u32;
+                seen_bottleneck = true;
+            }
+            // `open`/`cascade`/`alts`/`camo` (S5/S8/S7/E1) are read at the TIGHTEST bottleneck —
+            // the same fewest-elim firing `scarcity` is taken over (ties keep the first such
+            // firing). `camo` = the dead near-misses (`examined - alts`) at that stall.
+            if (step.elims as u32) < s.scarcity {
+                s.scarcity = step.elims as u32;
+                s.open = step.open;
+                s.cascade = step.cascade as u32;
+                s.alts = step.alts;
+                s.camo = step.examined.saturating_sub(step.alts);
+            }
+            // Tier D trajectory integrals — accumulated over EVERY bottleneck firing, not just
+            // the tightest. Tightness `1/(1+alts)` is in `(0, 1]`; depth-weighted likewise scaled
+            // by the fill-depth. (`open_sum` mean is taken later in `raw_granular`.)
+            let tightness = 1.0 / (1.0 + step.alts as f64);
+            s.tight_integral += tightness;
+            s.open_sum = s.open_sum.saturating_add(step.open);
+            s.depth_tight_integral += step.depth as f64 * tightness;
         }
         if step.paid_off {
+            // A dry grind (>= 1 consecutive no-reward harder step) was just broken by a
+            // placement: a stop-start transition (D4). Scoped to the harder ladder, like the
+            // dry-run length, since the grind is felt regardless of which technique caused it.
+            if cur_run > 0 {
+                s.payoff_transitions += 1;
+            }
             cur_run = 0;
         } else {
             cur_run += 1;
@@ -164,8 +252,17 @@ pub fn grade_batch(
     weights: &Weights,
     n_bands: usize,
 ) -> Vec<Graded> {
-    let n_bands = n_bands.max(1);
     let signals: Vec<Signals> = traces.iter().map(|t| signals_of(t, bottleneck)).collect();
+    grade_signals(&signals, weights, n_bands)
+}
+
+/// The relative grade over a batch of already-computed [`Signals`] — the meat of
+/// [`grade_batch`], split out so callers that already hold the signals (the calibration
+/// harness, which reads them off a cache) can compute the same relative score/band without
+/// re-solving. Rank-normalizes each signal across the batch, weighted-sums per [`Weights`],
+/// and quantile-cuts into `n_bands`. Aligned to the input order.
+pub fn grade_signals(signals: &[Signals], weights: &Weights, n_bands: usize) -> Vec<Graded> {
+    let n_bands = n_bands.max(1);
     let n = signals.len();
     if n == 0 {
         return Vec::new();
@@ -173,11 +270,11 @@ pub fn grade_batch(
 
     // Per-signal hardness ranks. The two dry components are averaged into one "dry" rank
     // so signal 2 stays a single weighted term; scarcity is inverted (lower = harder).
-    let count_r = percentile_ranks(&col(&signals, |s| s.bottleneck_count as f64));
-    let dryf_r = percentile_ranks(&col(&signals, |s| s.dry_firings as f64));
-    let dryr_r = percentile_ranks(&col(&signals, |s| s.longest_dry_run as f64));
-    let scar_r = percentile_ranks(&col(&signals, |s| s.scarcity as f64));
-    let scan_r = percentile_ranks(&col(&signals, |s| s.scan_work as f64));
+    let count_r = percentile_ranks(&col(signals, |s| s.bottleneck_count as f64));
+    let dryf_r = percentile_ranks(&col(signals, |s| s.dry_firings as f64));
+    let dryr_r = percentile_ranks(&col(signals, |s| s.longest_dry_run as f64));
+    let scar_r = percentile_ranks(&col(signals, |s| s.scarcity as f64));
+    let scan_r = percentile_ranks(&col(signals, |s| s.scan_work as f64));
 
     let mut graded: Vec<Graded> = (0..n)
         .map(|i| {
@@ -253,6 +350,391 @@ pub fn hardness_score(s: &Signals) -> f64 {
     grind + pressure
 }
 
+// --- granular per-branch score (docs/grader-granular-scoring.md, Tier A) ------------------
+//
+// [`hardness_score`] is too quantized to band cleanly on the branch-pinned techniques: where a
+// technique's elimination count is structurally fixed (every wing kills ~1 candidate) the score
+// lands on a handful of values and the even-thirds cut collapses (xyz-wing: p33 == p66, medium
+// band empty). The cure is a continuous sub-order term: the integer `grind` stays the dominant
+// axis, but within a grind level puzzles are spread by the *stall-state* signals (`open`,
+// `cascade`, `depth`, mean `elims`) that stay live even when `elims` is pinned. Each is mapped
+// through a per-technique logistic so the blend is a weighted average in `(0, 1)` — strictly
+// below 1, so it never crosses a grind step. Mean/scale/sign are calibration DATA
+// ([`TechNorm::calibrate`] over a mined corpus), exactly as `THRESHOLDS` is.
+
+/// A logistic squash to `(0, 1)`: maps a z-score to a smooth, monotone, bounded rank proxy.
+fn logistic(z: f64) -> f64 {
+    1.0 / (1.0 + (-z).exp())
+}
+
+/// Minimum |rank correlation| with the reference for a signal to earn a place in the blend. Below
+/// this its orientation is within sampling noise of zero and flips between calibration samples,
+/// which reorders the score and destabilizes the rating; such signals are dropped (weight 0). Set
+/// comfortably above the ~`1/sqrt(n)` noise of the ~75-puzzle split-half calibrations the
+/// stability check uses (≈0.12), so a kept signal has a *determined* direction. Every signal's
+/// orientation is data-driven (the spec's §8: do not assume direction) — this only gates whether
+/// the direction is real enough to act on. See [`TechNorm::calibrate`].
+const CORR_FLOOR: f64 = 0.20;
+
+/// Per-signal normalization: a calibrated `(mean, scale)` z-score, an orientation `sign`
+/// (`+1` if a higher raw value is *harder* for this technique, `-1` if lower is), and the
+/// branch `weight` this signal carries in the blend. A signal that is constant within a
+/// technique (`scale` ~ 0) gets `weight == 0` so it cannot pull the blend toward `0.5`.
+#[derive(Clone, Copy, Debug)]
+pub struct SigNorm {
+    pub mean: f64,
+    pub scale: f64,
+    pub sign: f64,
+    pub weight: f64,
+}
+
+impl SigNorm {
+    /// The signal's logistic contribution for raw value `x` (in `(0, 1)`), oriented so
+    /// higher = harder.
+    fn rank(&self, x: f64) -> f64 {
+        logistic(self.sign * (x - self.mean) / self.scale)
+    }
+}
+
+/// The per-technique calibration for the granular signals: the 5 tightest-stall ones (`open` S5,
+/// `cascade` S8, `depth` S6, mean `elims` S3', the Tier-B honest scarcity `alts` S7), the 4
+/// Tier-D trajectory features (`tight`, `open_mean`, `depth_tight`, `transitions`), and the
+/// Tier-E spotting signal (`camo`, E1 near-miss camouflage). Built once over a mined corpus
+/// ([`calibrate`](Self::calibrate)) and baked, then read by [`granular_score`].
+#[derive(Clone, Copy, Debug)]
+pub struct TechNorm {
+    pub open: SigNorm,
+    pub cascade: SigNorm,
+    pub depth: SigNorm,
+    pub elim: SigNorm,
+    pub alts: SigNorm,
+    // Tier D trajectory signals (see [`Signals`]): `tight` = D1 `Σ 1/(1+alts)`, `open_mean` = D2
+    // mean `open`, `depth_tight` = D3 depth-weighted tightness, `transitions` = D4 jaggedness.
+    pub tight: SigNorm,
+    pub open_mean: SigNorm,
+    pub depth_tight: SigNorm,
+    pub transitions: SigNorm,
+    // Tier E spotting signal (see [`Signals`]): `camo` = E1 near-miss camouflage.
+    pub camo: SigNorm,
+}
+
+/// The number of signals a [`TechNorm`] blends: the 5 tightest-stall signals (Tier A/B), the 4
+/// Tier-D trajectory features, and the Tier-E spotting signal. `raw_granular`/`branch_weights`/
+/// [`TechNorm`] all walk in this order: open, cascade, depth, mean-elims, alts, tight (D1),
+/// mean-open (D2), depth-tight (D3), transitions (D4), camo (E1).
+const NSIG: usize = 10;
+
+/// The raw granular signal values of `s`, in the [`TechNorm`] field order. The means collapse to
+/// the single firing's value for the single-forced UI specs (`elim_mean == scarcity`,
+/// `open_mean == open`, `tight == 1/(1+alts)`), so the trajectory features only diverge from the
+/// tightest-stall ones on the multi-firing nodes.
+fn raw_granular(s: &Signals) -> [f64; NSIG] {
+    let n = s.bottleneck_count;
+    let elim_mean = if n > 0 { s.elim_sum as f64 / n as f64 } else { 0.0 };
+    let open_mean = if n > 0 { s.open_sum as f64 / n as f64 } else { 0.0 };
+    [
+        s.open as f64,
+        s.cascade as f64,
+        s.depth as f64,
+        elim_mean,
+        s.alts as f64,
+        s.tight_integral,
+        open_mean,
+        s.depth_tight_integral,
+        s.payoff_transitions as f64,
+        s.camo as f64,
+    ]
+}
+
+/// The base branch weights of the granular signals, in [`raw_granular`] order. Priority is
+/// fixed per branch (the spec's §5 table); calibration only sets each signal's mean/scale/sign,
+/// never these. The 5 tightest-stall signals: every branch leans on `alts` (the honest scarcity)
+/// — `Subset` pairs it with mean-`elims` (real elim spread, several firings); `Fish` pairs it with
+/// `open` (grind ≡ 0, elims secondary); `Bivalue` leads on it with `open` (its `elims` is pinned
+/// ~1, so `alts` is the only live scarcity). The 4 Tier-D trajectory features are weighted ONLY
+/// for `Subset` (the most multi-firing branch, where the measured win lands); `Fish` is ~always
+/// single-firing and `Bivalue`'s degenerate reference makes them unstable, so both keep them at 0
+/// and score exactly as before Tier D (see [`Self`](branch_weights) body + the doc §8.3). The
+/// Tier-E spotting signal `camo` is weighted ONLY for `Bivalue`: it is the principled cure for the
+/// wing residual (the deduction signals are pinned there, but the dead-look-alike count varies and
+/// is reproducible), and the subsets/fish already PASS, so they keep it 0 and score as before.
+fn branch_weights(branch: Branch) -> [f64; NSIG] {
+    match branch {
+        // tightest-stall (Tier A/B):          | Tier-D trajectory:                    | Tier-E:
+        // open  cascade depth elim  alts       | tight open_mean depth_tight transitions| camo
+        //
+        // Subset fires the bottleneck most (subset drills 30-38% multi), so it leans hardest on
+        // the trajectory features; `tight` (the multi-stall generalisation of `alts`) and the
+        // depth-weighted integral carry the within-node multi-firing structure the tightest-stall
+        // reduction throws away.
+        Branch::Subset => [0.20, 0.05, 0.05, 0.35, 0.30, 0.10, 0.05, 0.05, 0.05, 0.00],
+        // Fish is ~always single-firing (1-4% multi), so the trajectory features reduce to the
+        // tightest-stall ones; their weight is left at 0 so Fish scores EXACTLY as before Tier D.
+        Branch::Fish => [0.15, 0.05, 0.05, 0.45, 0.30, 0.00, 0.00, 0.00, 0.00, 0.00],
+        // Wings multi-fire 13-31%, BUT their relative reference is itself near-degenerate (`elim`
+        // pinned ~1, the known wing residual), so the deduction-cost trajectory (Tier D) is
+        // withheld here. The Tier-E spotting signal `camo` is NOT a branch base — it destabilises
+        // the wings that already pass §2.3, so it is applied per technique via [`camo_weight`]
+        // (xyz-wing only); the branch base leaves it 0. The rest stay as Tier A/B set them.
+        Branch::Bivalue => [0.30, 0.15, 0.10, 0.00, 0.45, 0.00, 0.00, 0.00, 0.00, 0.00],
+        Branch::Trunk => [0.0; NSIG], // never keys the score (no bottleneck)
+    }
+}
+
+/// The index of the Tier-E `camo` signal in the [`raw_granular`] / [`branch_weights`] vector.
+const CAMO_IDX: usize = 9;
+
+/// Per-technique **E1 camouflage** weight, overriding the [`branch_weights`] base at [`CAMO_IDX`].
+/// Camo is a *spotting*-cost signal, and the deduction signals already clear the §2.3 split-half
+/// stability gate for every technique except **xyz-wing** (0.85 < 0.90 — the residual, exactly as
+/// it was the gate for the 3-band cut). Camo cures it (0.85 → 0.92 at weight 0.40) because the
+/// dead-look-alike count is reproducible where `alts`/`elims` is pinned. It is withheld everywhere
+/// else: xy-wing (split-half 1.00) and w-wing (0.90, its camo is strongly train/drill-split)
+/// already pass and camo only destabilises them, and the subsets/fish never needed it — so all
+/// keep camo 0 and score byte-identical to pre-E. (This is the one per-technique weight override
+/// the spec's Tier-F1 systematises; the granular doc set the precedent with the Fish elim override.)
+fn camo_weight(kind: usize) -> f64 {
+    match kind {
+        XYZ_WING => 0.40,
+        _ => 0.0,
+    }
+}
+
+impl TechNorm {
+    /// The blended continuous sub-order in `(0, 1)`: the weight-normalized average of the
+    /// signals' logistic ranks. Strictly `< 1` (every term is `< 1` and the weights sum to
+    /// what they sum to), so [`granular_score`] never lets it cross a `grind` step. Falls back
+    /// to `0.5` only if every signal was constant (no live weight) — a fully degenerate node.
+    fn blend(&self, s: &Signals) -> f64 {
+        let raw = raw_granular(s);
+        let sigs = [
+            &self.open,
+            &self.cascade,
+            &self.depth,
+            &self.elim,
+            &self.alts,
+            &self.tight,
+            &self.open_mean,
+            &self.depth_tight,
+            &self.transitions,
+            &self.camo,
+        ];
+        let mut acc = 0.0;
+        let mut wsum = 0.0;
+        for (sig, &x) in sigs.iter().zip(raw.iter()) {
+            if sig.weight > 0.0 {
+                acc += sig.weight * sig.rank(x);
+                wsum += sig.weight;
+            }
+        }
+        if wsum > 0.0 { acc / wsum } else { 0.5 }
+    }
+
+    /// Calibrate the signals for technique `kind` from a corpus `sample` and the matching
+    /// relative-grade reference `rel` (e.g. [`grade_signals`] scores over the same sample):
+    /// each signal's `(mean, scale)` is the sample mean/stddev, its `sign` is the sign of its
+    /// (rank) correlation with `rel` (so higher normalized = harder, matching the relative
+    /// grader), and its `weight` is the [`branch_weights`] base for `kind`'s branch — with the
+    /// per-technique [`camo_weight`] override — zeroed when the signal is constant or its
+    /// orientation is undetermined. `rel` must be aligned to `sample`.
+    pub fn calibrate(kind: usize, sample: &[Signals], rel: &[f64]) -> TechNorm {
+        let mut w = branch_weights(branch_of(kind));
+        w[CAMO_IDX] = camo_weight(kind);
+        let cols: [Vec<f64>; NSIG] = {
+            let mut c: [Vec<f64>; NSIG] = core::array::from_fn(|_| Vec::new());
+            for s in sample {
+                let raw = raw_granular(s);
+                for k in 0..NSIG {
+                    c[k].push(raw[k]);
+                }
+            }
+            c
+        };
+        let build = |k: usize| -> SigNorm {
+            let (mean, sd) = mean_std(&cols[k]);
+            let corr = rank_corr(&cols[k], rel);
+            // Keep a signal only if it varies AND its orientation is *determined* — its
+            // correlation with the reference clears the noise floor. A signal below the floor has
+            // a sign that flips between calibration samples (it reorders the score and
+            // destabilizes the rating), so it is dropped (weight 0).
+            let live = sd >= 1e-9 && corr.abs() >= CORR_FLOOR;
+            let sign = if corr >= 0.0 { 1.0 } else { -1.0 };
+            SigNorm { mean, scale: sd.max(1e-9), sign, weight: if live { w[k] } else { 0.0 } }
+        };
+        TechNorm {
+            open: build(0),
+            cascade: build(1),
+            depth: build(2),
+            elim: build(3),
+            alts: build(4),
+            tight: build(5),
+            open_mean: build(6),
+            depth_tight: build(7),
+            transitions: build(8),
+            camo: build(9),
+        }
+    }
+}
+
+/// One puzzle's **granular absolute** score: the integer `grind` backbone plus the continuous
+/// `(0, 1)` sub-order blended off the stall signals via the technique's [`TechNorm`]. Same
+/// shape and same dominant axis as [`hardness_score`] — `grind` still leads wherever it varies
+/// — but the sub-order is now genuinely continuous, so the even-thirds cut no longer collapses
+/// on the branch-pinned techniques (xyz-wing/fish). A puzzle with no bottleneck scores `0`.
+pub fn granular_score(s: &Signals, norm: &TechNorm) -> f64 {
+    if s.bottleneck_count == 0 {
+        return 0.0;
+    }
+    let grind = (s.longest_dry_run + (s.bottleneck_count - 1)) as f64;
+    grind + norm.blend(s)
+}
+
+// --- Tier C: continuous within-technique rating (docs/grader-continuous-scoring.md) ---------
+//
+// The 3-band cut discarded everything finer than thirds. Tier C keeps the full resolution of the
+// continuous [`granular_score`] by mapping it through a per-technique **CDF**: a small monotone
+// breakpoint table (the score at 0/10/.../100 percentiles of the calibration pool). The puzzle's
+// `rating` is its percentile within its technique, in `[0, 1]` — a continuous read. Because the
+// rating is (by construction) ~uniform on the calibration distribution, cutting it into `n` equal
+// slices ([`band_of_rating`]) yields ~even n-tiles for ANY `n`, so the band count is now a runtime
+// choice (the UI takes 5), not a per-n calibration table.
+
+/// Number of CDF breakpoints baked per technique: the score at percentiles 0, 10, …, 100.
+pub const CDF_ANCHORS: usize = 11;
+
+/// The per-technique CDF breakpoints of `scores`: anchor `i` is the `i/10` quantile (so
+/// `[0]` = min, `[10]` = max), monotone non-decreasing. The inverse of [`rating_from_cdf`];
+/// baked into [`GRANULAR_CDF`] and recomputed by the calibration workbench from the same pool.
+pub fn cdf_of(scores: &[f64]) -> [f64; CDF_ANCHORS] {
+    let mut v = scores.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mut anchors = [0.0; CDF_ANCHORS];
+    if v.is_empty() {
+        return anchors;
+    }
+    for (i, a) in anchors.iter_mut().enumerate() {
+        let p = i as f64 / (CDF_ANCHORS - 1) as f64;
+        *a = v[((p * v.len() as f64) as usize).min(v.len() - 1)];
+    }
+    anchors
+}
+
+/// Map a raw [`granular_score`] to its `[0, 1]` percentile against a technique's `cdf`
+/// breakpoints (piecewise-linear inverse-CDF). Clamps below the min to `0.0` and above the max
+/// to `1.0`; flat CDF segments (ties) contribute no width. Monotone non-decreasing in `score`.
+pub fn rating_from_cdf(score: f64, cdf: &[f64; CDF_ANCHORS]) -> f64 {
+    let last = CDF_ANCHORS - 1;
+    if score <= cdf[0] {
+        return 0.0;
+    }
+    if score >= cdf[last] {
+        return 1.0;
+    }
+    for i in 0..last {
+        if score < cdf[i + 1] {
+            let span = cdf[i + 1] - cdf[i];
+            let frac = if span > 0.0 { (score - cdf[i]) / span } else { 0.0 };
+            return (i as f64 + frac) / last as f64;
+        }
+    }
+    1.0
+}
+
+/// Cut a `[0, 1]` rating into one of `n_bands` equal slices (`0` = gentlest,
+/// `n_bands - 1` = spiciest). `floor(rating · n)`, clamped. Even n-tiles for any `n` because the
+/// rating is a per-technique percentile.
+pub fn band_of_rating(rating: f64, n_bands: usize) -> usize {
+    let n = n_bands.max(1);
+    ((rating * n as f64) as usize).min(n - 1)
+}
+
+// --- BAKED granular calibration (regenerate via `grade_diag --calibrate`) ------------------
+//
+// Per-technique [`TechNorm`] (signal mean/scale/sign/weight) and the granular-score CDF the
+// [`rating`] reads against, mined over the pooled train+drill corpus. CALIBRATED, not derived —
+// rerun `examples/grade_diag --calibrate` and repaste both arrays if the generator or the grading
+// solve changes. Trunk rows (kinds < `NAKED_PAIR`) are unused placeholders: a trunk-only spec has
+// no bottleneck key, so [`rating`] short-circuits to `0` before indexing these.
+
+pub const GRANULAR_NORM: [TechNorm; NUM] = [
+    /* naked-single   */ TechNorm { open: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, cascade: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, elim: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, alts: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, open_mean: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth_tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, transitions: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, camo: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 } },
+    /* hidden-single  */ TechNorm { open: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, cascade: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, elim: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, alts: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, open_mean: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth_tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, transitions: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, camo: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 } },
+    /* lc-pointing    */ TechNorm { open: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, cascade: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, elim: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, alts: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, open_mean: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth_tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, transitions: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, camo: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 } },
+    /* lc-claiming    */ TechNorm { open: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, cascade: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, elim: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, alts: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, open_mean: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth_tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, transitions: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, camo: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 } },
+    /* naked-pair     */ TechNorm { open: SigNorm { mean: 122.020, scale: 37.346, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 32.027, scale: 18.211, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 40.180, scale: 8.299, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 3.427, scale: 1.431, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 2.180, scale: 1.084, sign: 1.0, weight: 0.30 }, tight: SigNorm { mean: 0.471, scale: 0.242, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 121.508, scale: 36.748, sign: -1.0, weight: 0.05 }, depth_tight: SigNorm { mean: 19.393, scale: 11.321, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.167, scale: 0.373, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 4.120, scale: 3.568, sign: 1.0, weight: 0.00 } },
+    /* hidden-pair    */ TechNorm { open: SigNorm { mean: 133.503, scale: 33.937, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 32.980, scale: 18.853, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 37.057, scale: 7.101, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 3.802, scale: 1.454, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 2.450, scale: 1.260, sign: 1.0, weight: 0.30 }, tight: SigNorm { mean: 0.446, scale: 0.213, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 133.679, scale: 33.161, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 16.828, scale: 8.526, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.340, scale: 0.521, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 5.727, scale: 5.799, sign: 1.0, weight: 0.00 } },
+    /* naked-triple   */ TechNorm { open: SigNorm { mean: 131.797, scale: 31.252, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 35.393, scale: 16.992, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 37.557, scale: 6.600, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 4.734, scale: 1.660, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.390, scale: 0.747, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.559, scale: 0.241, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 132.241, scale: 31.005, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 21.071, scale: 9.267, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.360, scale: 0.520, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 8.773, scale: 8.169, sign: 1.0, weight: 0.00 } },
+    /* hidden-triple  */ TechNorm { open: SigNorm { mean: 140.130, scale: 30.149, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 34.957, scale: 18.766, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 35.850, scale: 5.783, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 5.341, scale: 1.770, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.303, scale: 0.609, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.563, scale: 0.218, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 139.855, scale: 28.716, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 20.326, scale: 8.161, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.397, scale: 0.509, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 10.280, scale: 9.496, sign: 1.0, weight: 0.00 } },
+    /* naked-quad     */ TechNorm { open: SigNorm { mean: 142.050, scale: 31.492, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 35.520, scale: 18.554, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 35.397, scale: 6.152, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 6.138, scale: 2.045, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.147, scale: 0.446, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.577, scale: 0.216, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 142.796, scale: 30.788, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 20.428, scale: 7.888, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.430, scale: 0.521, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 13.630, scale: 11.366, sign: 1.0, weight: 0.00 } },
+    /* hidden-quad    */ TechNorm { open: SigNorm { mean: 139.457, scale: 27.912, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 36.773, scale: 17.365, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 36.130, scale: 5.584, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 7.182, scale: 2.089, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.053, scale: 0.253, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.567, scale: 0.172, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 139.794, scale: 27.366, sign: -1.0, weight: 0.05 }, depth_tight: SigNorm { mean: 20.569, scale: 7.130, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.393, scale: 0.546, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 16.983, scale: 14.357, sign: 1.0, weight: 0.00 } },
+    /* x-wing         */ TechNorm { open: SigNorm { mean: 108.707, scale: 37.764, sign: -1.0, weight: 0.15 }, cascade: SigNorm { mean: 36.807, scale: 9.083, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 43.913, scale: 8.577, sign: 1.0, weight: 0.05 }, elim: SigNorm { mean: 3.773, scale: 1.465, sign: -1.0, weight: 0.45 }, alts: SigNorm { mean: 1.347, scale: 0.577, sign: 1.0, weight: 0.30 }, tight: SigNorm { mean: 0.451, scale: 0.089, sign: -1.0, weight: 0.00 }, open_mean: SigNorm { mean: 108.710, scale: 37.768, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 19.642, scale: 4.924, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.013, scale: 0.115, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 3.507, scale: 2.884, sign: 1.0, weight: 0.00 } },
+    /* swordfish      */ TechNorm { open: SigNorm { mean: 110.897, scale: 31.398, sign: -1.0, weight: 0.15 }, cascade: SigNorm { mean: 37.107, scale: 8.338, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 43.157, scale: 6.755, sign: 1.0, weight: 0.05 }, elim: SigNorm { mean: 5.308, scale: 2.062, sign: -1.0, weight: 0.45 }, alts: SigNorm { mean: 1.607, scale: 0.540, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.407, scale: 0.091, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 110.855, scale: 31.385, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 17.649, scale: 4.953, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.033, scale: 0.180, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 4.153, scale: 3.459, sign: -1.0, weight: 0.00 } },
+    /* jellyfish      */ TechNorm { open: SigNorm { mean: 111.217, scale: 23.297, sign: -1.0, weight: 0.15 }, cascade: SigNorm { mean: 37.453, scale: 6.036, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 43.173, scale: 4.757, sign: 1.0, weight: 0.05 }, elim: SigNorm { mean: 7.095, scale: 2.119, sign: -1.0, weight: 0.45 }, alts: SigNorm { mean: 1.947, scale: 0.265, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.349, scale: 0.060, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 111.283, scale: 23.278, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 15.100, scale: 3.145, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.090, scale: 0.286, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 5.520, scale: 4.524, sign: 1.0, weight: 0.00 } },
+    /* xy-wing        */ TechNorm { open: SigNorm { mean: 75.327, scale: 30.878, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 24.660, scale: 12.449, sign: -1.0, weight: 0.15 }, depth: SigNorm { mean: 51.000, scale: 8.955, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.668, scale: 0.731, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 1.773, scale: 1.108, sign: 1.0, weight: 0.45 }, tight: SigNorm { mean: 0.528, scale: 0.281, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 75.446, scale: 30.059, sign: 1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 26.652, scale: 13.169, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.127, scale: 0.352, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 7.120, scale: 5.552, sign: 1.0, weight: 0.00 } },
+    /* xyz-wing       */ TechNorm { open: SigNorm { mean: 82.563, scale: 29.472, sign: 1.0, weight: 0.00 }, cascade: SigNorm { mean: 25.033, scale: 13.867, sign: -1.0, weight: 0.15 }, depth: SigNorm { mean: 49.467, scale: 8.071, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.063, scale: 0.225, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 1.360, scale: 0.563, sign: 1.0, weight: 0.45 }, tight: SigNorm { mean: 0.511, scale: 0.166, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 82.055, scale: 29.489, sign: 1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 25.312, scale: 9.103, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.253, scale: 0.450, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 6.070, scale: 4.650, sign: 1.0, weight: 0.40 } },
+    /* w-wing         */ TechNorm { open: SigNorm { mean: 73.240, scale: 30.810, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 22.067, scale: 13.296, sign: -1.0, weight: 0.15 }, depth: SigNorm { mean: 52.177, scale: 8.884, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.639, scale: 0.813, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 3.313, scale: 2.809, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.425, scale: 0.264, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 73.079, scale: 29.353, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 21.839, scale: 13.399, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.317, scale: 0.519, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 9.237, scale: 10.235, sign: 1.0, weight: 0.00 } },
+];
+
+pub const GRANULAR_CDF: [[f64; CDF_ANCHORS]; NUM] = [
+    [0.0; CDF_ANCHORS], // naked-single (trunk/unused)
+    [0.0; CDF_ANCHORS], // hidden-single (trunk/unused)
+    [0.0; CDF_ANCHORS], // lc-pointing (trunk/unused)
+    [0.0; CDF_ANCHORS], // lc-claiming (trunk/unused)
+    [0.249, 0.349, 0.399, 0.426, 0.471, 0.515, 0.566, 0.621, 1.569, 2.667, 5.639], // naked-pair
+    [0.254, 0.337, 0.400, 0.432, 0.481, 0.534, 0.596, 1.524, 2.550, 3.434, 6.786], // hidden-pair
+    [0.162, 0.303, 0.405, 0.479, 0.568, 0.637, 1.409, 1.565, 1.729, 2.649, 6.493], // naked-triple
+    [0.177, 0.277, 0.355, 0.471, 0.503, 0.627, 1.473, 1.611, 2.502, 2.787, 5.813], // hidden-triple
+    [0.185, 0.312, 0.385, 0.467, 0.546, 0.672, 1.497, 1.625, 2.424, 2.719, 4.861], // naked-quad
+    [0.151, 0.315, 0.398, 0.472, 0.515, 0.590, 1.363, 1.559, 1.700, 2.628, 5.739], // hidden-quad
+    [0.200, 0.299, 0.351, 0.388, 0.443, 0.507, 0.553, 0.581, 0.645, 0.718, 2.603], // x-wing
+    [0.095, 0.266, 0.362, 0.403, 0.462, 0.496, 0.565, 0.619, 0.695, 0.787, 2.769], // swordfish
+    [0.102, 0.273, 0.351, 0.385, 0.446, 0.515, 0.586, 0.661, 0.757, 0.881, 2.793], // jellyfish
+    [0.273, 0.317, 0.343, 0.373, 0.402, 0.485, 0.537, 0.640, 1.329, 2.633, 10.967], // xy-wing
+    [0.261, 0.326, 0.345, 0.383, 0.437, 0.517, 0.576, 0.737, 1.611, 2.668, 4.461], // xyz-wing
+    [0.124, 0.245, 0.321, 0.408, 0.482, 0.557, 0.630, 1.427, 2.321, 3.840, 9.840], // w-wing
+];
+
+/// One puzzle's **continuous within-technique rating** in `[0, 1]` — the Tier C output
+/// (`docs/grader-continuous-scoring.md`): its percentile against its technique's baked
+/// [`GRANULAR_CDF`], read off the [`granular_score`] under the baked [`GRANULAR_NORM`]. A
+/// trunk-only spec (no harder bottleneck) rates `0.0` — uniformly easiest. The band the UI shows
+/// is just [`band_of_rating`] of this (3, 5, … slices — the count is the caller's choice).
+pub fn rating(spec: &Spec, s: &Signals) -> f64 {
+    let Some(key) = bottleneck_key(spec) else { return 0.0 };
+    let score = granular_score(s, &GRANULAR_NORM[key]);
+    rating_from_cdf(score, &GRANULAR_CDF[key])
+}
+
+/// Sample mean and population standard deviation of `xs` (`(0.0, 0.0)` if empty).
+fn mean_std(xs: &[f64]) -> (f64, f64) {
+    let n = xs.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mean = xs.iter().sum::<f64>() / n as f64;
+    let var = xs.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+    (mean, var.sqrt())
+}
+
+/// Spearman-style rank correlation of `xs` against `ys` (both aligned, same length): Pearson
+/// correlation of their fractional [`percentile_ranks`]. In `[-1, 1]`; `0.0` if either is
+/// constant or lengths differ. Used only to fix each signal's orientation (its sign), so the
+/// magnitude is incidental — only the sign is read.
+fn rank_corr(xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.len() != ys.len() || xs.len() < 2 {
+        return 0.0;
+    }
+    let rx = percentile_ranks(xs);
+    let ry = percentile_ranks(ys);
+    let (mx, sx) = mean_std(&rx);
+    let (my, sy) = mean_std(&ry);
+    if sx < 1e-12 || sy < 1e-12 {
+        return 0.0;
+    }
+    let cov = rx.iter().zip(&ry).map(|(&a, &b)| (a - mx) * (b - my)).sum::<f64>() / rx.len() as f64;
+    cov / (sx * sy)
+}
+
 /// Per-technique `(gentle|medium, medium|spicy)` cut points on [`hardness_score`], indexed by
 /// kind. The band is a *sub-tier* read, so each technique is cut against its **own** score
 /// distribution: the pair is that kind's 33rd / 66th score percentile over a mined corpus of
@@ -300,11 +782,10 @@ pub fn bottleneck_key(spec: &Spec) -> Option<usize> {
     (NAKED_PAIR..NUM).filter(|&k| mask & (1 << k) != 0).max_by_key(|&k| DIFFICULTY[k])
 }
 
-/// Cut one puzzle's [`Signals`] to a gentle (`0`) / medium (`1`) / spicy (`2`) band against
-/// its technique's [`THRESHOLDS`] row — the absolute, per-puzzle counterpart to
-/// [`grade_batch`]'s relative quantile cut, for one-puzzle-at-a-time callers. A trunk-only
-/// spec (no harder bottleneck) is uniformly gentle.
-pub fn band_calibrated(spec: &Spec, s: &Signals) -> usize {
+/// The **coarse** (interim) per-puzzle 3-band cut: [`hardness_score`] against the technique's
+/// [`THRESHOLDS`] row. Superseded by the granular [`band_calibrated`]; kept as the reference the
+/// calibration workbench's OLD column reports against. A trunk-only spec is uniformly gentle.
+pub fn band_coarse(spec: &Spec, s: &Signals) -> usize {
     let Some(key) = bottleneck_key(spec) else { return 0 };
     let (lo, hi) = THRESHOLDS[key];
     let score = hardness_score(s);
@@ -317,19 +798,28 @@ pub fn band_calibrated(spec: &Spec, s: &Signals) -> usize {
     }
 }
 
+/// Cut one puzzle's [`Signals`] to a gentle (`0`) / medium (`1`) / spicy (`2`) band — the
+/// [`DEFAULT_BANDS`] (3) slicing of the continuous [`rating`], for one-puzzle-at-a-time callers.
+/// The absolute, per-puzzle counterpart to [`grade_batch`]'s relative quantile cut; a trunk-only
+/// spec (no harder bottleneck) is uniformly gentle. For a finer split (the UI's 5 bands) take
+/// [`band_of_rating`] of [`rating`] directly.
+pub fn band_calibrated(spec: &Spec, s: &Signals) -> usize {
+    band_of_rating(rating(spec, s), DEFAULT_BANDS)
+}
+
 /// Grade a single puzzle **absolutely**: solve it with `spec`'s baseline toolbox via the
-/// instrumented [`solve_graded`], read the four [`Signals`], and cut them to a stable band
-/// with [`band_calibrated`]. Returns `(signals, band)` — the band drives a per-puzzle
-/// difficulty label and the signals a detailed readout. This is the one-puzzle path (the web
-/// app, which generates one puzzle at a time); [`grade_node`] / [`grade_batch`] stay the
-/// per-node *relative* path for grading a whole batch against itself. Cold path: a single
+/// instrumented [`solve_graded`], read the [`Signals`], and map them to the continuous Tier-C
+/// [`rating`] in `[0, 1]`. Returns `(signals, rating)` — the rating drives the per-puzzle
+/// difficulty read (the UI cuts it into bands with [`band_of_rating`]; signals are the detailed
+/// breakdown). This is the one-puzzle path (the web app, which generates one puzzle at a time);
+/// [`grade_node`] / [`grade_batch`] stay the per-node *relative* path. Cold path: a single
 /// easiest-first solve off the hot generation loop.
-pub fn grade_one(spec: &Spec, puzzle: &DigitGrid) -> (Signals, usize) {
+pub fn grade_one(spec: &Spec, puzzle: &DigitGrid) -> (Signals, f64) {
     let baseline = spec.baseline_mask();
     let bottleneck = bottleneck_mask(spec);
     let trace = solve_graded(&SolverState::<Bands<RowMajor>>::from_digits(puzzle), baseline);
     let signals = signals_of(&trace, bottleneck);
-    (signals, band_calibrated(spec, &signals))
+    (signals, rating(spec, &signals))
 }
 
 /// The gentle / medium / spicy label for a band under the [`DEFAULT_BANDS`] (3) cut. For a
@@ -342,11 +832,26 @@ pub fn band_name3(band: usize) -> &'static str {
     }
 }
 
+/// The band count the web UI shows, cutting [`rating`] into even fifths via [`band_of_rating`].
+pub const UI_BANDS: usize = 5;
+
+/// A suggested label per band under the [`UI_BANDS`] (5) cut (`0` = gentlest). The UI owns the
+/// final wording; this is a sensible default that extends the 3-band gentle/medium/spicy poles.
+pub fn band_name5(band: usize) -> &'static str {
+    match band {
+        0 => "gentle",
+        1 => "mild",
+        2 => "medium",
+        3 => "spicy",
+        _ => "fiery",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::solve::GradeStep;
-    use crate::spec::kinds::{HIDDEN_SINGLE, NAKED_PAIR, X_WING};
+    use crate::spec::kinds::{HIDDEN_SINGLE, NAKED_PAIR, X_WING, XYZ_WING};
 
     /// Build a trace from `(kind, paid_off, elims)` triples; `counts` is summed off the
     /// steps so `scan_work` is consistent (every step here is a harder step).
@@ -356,7 +861,7 @@ mod tests {
             .iter()
             .map(|&(kind, paid_off, elims)| {
                 counts[kind] += 1;
-                GradeStep { kind: kind as u8, paid_off, elims }
+                GradeStep { kind: kind as u8, paid_off, elims, ..GradeStep::default() }
             })
             .collect();
         GradeTrace { solved, counts, steps }
@@ -455,19 +960,193 @@ mod tests {
 
     #[test]
     fn band_calibrated_trunk_is_gentle() {
-        // A trunk-only spec has no harder bottleneck -> no threshold row -> gentle.
+        // A trunk-only spec has no harder bottleneck -> rating 0 -> gentlest band.
         let spec = Spec::explicit().force(HIDDEN_SINGLE, 1);
         assert_eq!(bottleneck_key(&spec), None);
+        assert_eq!(rating(&spec, &sig(1, 0, 1)), 0.0);
         assert_eq!(band_calibrated(&spec, &sig(1, 0, 1)), 0);
     }
 
     #[test]
-    fn band_calibrated_cuts_by_technique_threshold() {
-        // The x-wing row is (0.20, 0.25); pressure = 1/(1+scarcity).
+    fn band_coarse_cuts_by_technique_threshold() {
+        // The (kept) coarse path: x-wing THRESHOLDS row (0.20, 0.25), pressure = 1/(1+scarcity).
         let spec = Spec::train_isolated(X_WING);
         assert_eq!(bottleneck_key(&spec), Some(X_WING));
-        assert_eq!(band_calibrated(&spec, &sig(1, 0, 9)), 0, "pressure 0.10 < 0.20 -> gentle");
-        assert_eq!(band_calibrated(&spec, &sig(1, 0, 4)), 1, "pressure 0.20 in [0.20,0.25) -> medium");
-        assert_eq!(band_calibrated(&spec, &sig(2, 0, 9)), 2, "grind 1 -> score >= 1.0 -> spicy");
+        assert_eq!(band_coarse(&spec, &sig(1, 0, 9)), 0, "pressure 0.10 < 0.20 -> gentle");
+        assert_eq!(band_coarse(&spec, &sig(1, 0, 4)), 1, "pressure 0.20 in [0.20,0.25) -> medium");
+        assert_eq!(band_coarse(&spec, &sig(2, 0, 9)), 2, "grind 1 -> score >= 1.0 -> spicy");
+    }
+
+    // --- Tier C: continuous rating -----------------------------------------------------
+
+    #[test]
+    fn rating_from_cdf_interpolates_and_clamps() {
+        // A linear CDF 0..10: a score maps to its own /10 percentile, clamped at the ends.
+        let cdf: [f64; CDF_ANCHORS] = core::array::from_fn(|i| i as f64);
+        assert_eq!(rating_from_cdf(-1.0, &cdf), 0.0, "below min clamps to 0");
+        assert_eq!(rating_from_cdf(11.0, &cdf), 1.0, "above max clamps to 1");
+        assert!((rating_from_cdf(5.0, &cdf) - 0.5).abs() < 1e-9, "midpoint -> 0.5");
+        assert!(rating_from_cdf(2.5, &cdf) < rating_from_cdf(7.5, &cdf), "monotone in score");
+    }
+
+    #[test]
+    fn band_of_rating_partitions_into_n() {
+        assert_eq!(band_of_rating(0.0, 5), 0);
+        assert_eq!(band_of_rating(0.19, 5), 0);
+        assert_eq!(band_of_rating(0.20, 5), 1);
+        assert_eq!(band_of_rating(0.99, 5), 4);
+        assert_eq!(band_of_rating(1.0, 5), 4, "rating 1.0 stays in the top band");
+    }
+
+    /// Full [`Signals`] for an X-Wing stall (the granular fields the rating reads).
+    fn xwing_sig(open: u32, elim: u32, alts: u32) -> Signals {
+        Signals {
+            bottleneck_count: 1,
+            longest_dry_run: 0,
+            scarcity: elim,
+            open,
+            elim_sum: elim,
+            alts,
+            ..Signals::default()
+        }
+    }
+
+    #[test]
+    fn rating_is_bounded_and_orders_by_scarcity() {
+        // Against the baked x-wing calibration, the rating is in [0,1] and a scarcer stall
+        // (fewer eliminations — the dominant fish signal, oriented lower = harder) rates higher.
+        let spec = Spec::train_isolated(X_WING);
+        let plentiful = rating(&spec, &xwing_sig(110, 8, 1));
+        let scarce = rating(&spec, &xwing_sig(110, 1, 1));
+        assert!((0.0..=1.0).contains(&plentiful) && (0.0..=1.0).contains(&scarce));
+        assert!(scarce >= plentiful, "fewer eliminations = harder = higher rating");
+        // The 5-band UI cut of the rating stays in range.
+        assert!(band_of_rating(scarce, UI_BANDS) < UI_BANDS);
+    }
+
+    #[test]
+    fn xyz_wing_rating_rises_with_camo() {
+        // Tier E: camo (E1 near-miss camouflage) is weighted only for xyz-wing (the §2.3 residual).
+        // Against the baked xyz-wing calibration, two stalls equal in every deduction signal but
+        // differing in camo must order by it — more dead look-alikes = harder to spot = higher.
+        let spec = Spec::drill_isolated(XYZ_WING);
+        assert_eq!(bottleneck_key(&spec), Some(XYZ_WING));
+        let stall = |camo| Signals {
+            bottleneck_count: 1,
+            longest_dry_run: 0,
+            scarcity: 1,
+            open: 82,
+            cascade: 25,
+            elim_sum: 1,
+            alts: 1,
+            camo,
+            ..Signals::default()
+        };
+        let few = rating(&spec, &stall(2));
+        let many = rating(&spec, &stall(14));
+        assert!((0.0..=1.0).contains(&few) && (0.0..=1.0).contains(&many));
+        assert!(many > few, "more near-miss camouflage = harder = higher xyz-wing rating");
+    }
+
+    // --- granular score (Tier A) -------------------------------------------------------
+
+    /// Build a trace from `(kind, paid_off, elims, open, depth, cascade, alts, examined)`
+    /// 8-tuples — the full per-step record the granular signals reduce from.
+    fn trace_full(steps: &[(usize, bool, u16, u32, u16, u16, u32, u32)]) -> GradeTrace {
+        let mut counts = [0u16; NUM];
+        let steps = steps
+            .iter()
+            .map(|&(kind, paid_off, elims, open, depth, cascade, alts, examined)| {
+                counts[kind] += 1;
+                GradeStep { kind: kind as u8, paid_off, elims, open, depth, cascade, alts, examined }
+            })
+            .collect();
+        GradeTrace { solved: true, counts, steps }
+    }
+
+    #[test]
+    fn signals_of_reads_tightest_open_and_first_depth() {
+        // Two X-Wing firings: first looser (5 elims, open 120, depth 30, alts 7, examined 9),
+        // second tighter (2 elims, open 90, depth 40, alts 2, examined 6). `open`/`cascade`/`alts`
+        // and `camo` come from the TIGHTEST (fewest-elim) firing; `depth` from the FIRST.
+        let t =
+            trace_full(&[(X_WING, true, 5, 120, 30, 4, 7, 9), (X_WING, true, 2, 90, 40, 1, 2, 6)]);
+        let s = signals_of(&t, 1 << X_WING);
+        assert_eq!(s.scarcity, 2, "tightest = fewest elims");
+        assert_eq!(s.open, 90, "open read at the tightest firing");
+        assert_eq!(s.cascade, 1, "cascade read at the tightest firing");
+        assert_eq!(s.alts, 2, "alts read at the tightest firing");
+        assert_eq!(s.camo, 4, "camo = examined - alts at the tightest firing (6 - 2)");
+        assert_eq!(s.depth, 30, "depth read at the first firing");
+        assert_eq!(s.elim_sum, 7, "elim_sum sums all firings");
+    }
+
+    /// A [`TechNorm`] driven by a single live signal (`open`, higher = harder), the others off.
+    fn open_only_norm() -> TechNorm {
+        let off = SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 };
+        TechNorm {
+            open: SigNorm { mean: 100.0, scale: 10.0, sign: 1.0, weight: 1.0 },
+            cascade: off,
+            depth: off,
+            elim: off,
+            alts: off,
+            tight: off,
+            open_mean: off,
+            depth_tight: off,
+            transitions: off,
+            camo: off,
+        }
+    }
+
+    fn sig_open(bottleneck_count: u32, longest_dry_run: u32, open: u32) -> Signals {
+        Signals { bottleneck_count, longest_dry_run, open, ..Signals::default() }
+    }
+
+    #[test]
+    fn granular_score_zero_without_bottleneck() {
+        assert_eq!(granular_score(&sig_open(0, 5, 150), &open_only_norm()), 0.0);
+    }
+
+    #[test]
+    fn granular_blend_stays_within_grind_level() {
+        // The continuous blend is strictly in (0, 1), so grind is never crossed: a grind-0
+        // puzzle (however busy) stays below any grind-1 puzzle (however sparse).
+        let busy0 = granular_score(&sig_open(1, 0, 200), &open_only_norm()); // grind 0
+        let sparse1 = granular_score(&sig_open(2, 0, 10), &open_only_norm()); // grind 1
+        assert!(busy0 < 1.0, "grind-0 score stays below 1");
+        assert!(sparse1 >= 1.0, "grind-1 score is at least 1");
+        assert!(busy0 < sparse1, "one more firing outranks any continuous sub-order");
+    }
+
+    #[test]
+    fn granular_score_monotone_in_open() {
+        // Within a grind level, a higher `open` (sign +1) scores strictly higher.
+        let lo = granular_score(&sig_open(1, 0, 80), &open_only_norm());
+        let hi = granular_score(&sig_open(1, 0, 120), &open_only_norm());
+        assert!(lo < hi, "higher open => harder under sign +1");
+    }
+
+    #[test]
+    fn calibrate_orients_signs_and_drops_constant_signals() {
+        // Four puzzles, relative hardness ascending. `open`/`depth` rise with it (-> sign +1),
+        // `elim` falls with it (scarcer = harder -> sign -1), `cascade` is constant (-> dropped).
+        let mk = |open, elim, cascade, depth| Signals {
+            bottleneck_count: 1,
+            open,
+            elim_sum: elim,
+            cascade,
+            depth,
+            ..Signals::default()
+        };
+        let sample =
+            [mk(10, 40, 5, 10), mk(20, 30, 5, 20), mk(30, 20, 5, 30), mk(40, 10, 5, 40)];
+        let rel = [0.0, 1.0, 2.0, 3.0];
+        let norm = TechNorm::calibrate(NAKED_PAIR, &sample, &rel);
+        assert_eq!(norm.open.sign, 1.0, "open rises with hardness");
+        assert_eq!(norm.elim.sign, -1.0, "scarcer (fewer elims) is harder");
+        assert_eq!(norm.depth.sign, 1.0);
+        // Subset branch weights: open 0.30, depth 0.10, elim 0.50 (live); cascade dropped.
+        assert!(norm.open.weight > 0.0 && norm.elim.weight > 0.0 && norm.depth.weight > 0.0);
+        assert_eq!(norm.cascade.weight, 0.0, "a constant signal carries no weight");
     }
 }

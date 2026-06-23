@@ -6,9 +6,24 @@ follow-up to [`campaign-grader-plan.md`](campaign-grader-plan.md): same model of
 difficulty, same signals philosophy, but a *finer* score that does not collapse under
 quantile banding.
 
-> Status: **spec only.** The current code (`hardness_score` + per-technique `THRESHOLDS` in
-> [`grade.rs`](../generator-lab/src/grade.rs)) is the coarse interim — it bands "by what we
-> have now." This doc specifies what replaces it. No implementation yet.
+> Status: **Tier A + Tier B SHIPPED (baked into production).** `grade.rs` carries
+> `granular_score` + `TechNorm`/`SigNorm` and the baked `GRANULAR_NORM`; `solve/techniques.rs`
+> carries the non-mutating `count_alternatives` enumerate scan (S7 `alts`); `solve/logic.rs`'s
+> `GradeStep` records `open`/`depth`/`cascade`/`alts`. Production `grade_one` now returns the
+> continuous Tier-C rating off these (the coarse `hardness_score`/`THRESHOLDS` path is kept only as
+> `band_coarse`, the workbench reference). The successor [`grader-continuous-scoring.md`](grader-continuous-scoring.md)
+> covers the Tier C continuous rating + 5-band UI that ships on top of this.
+>
+> **Measured (150/spec, pooled train+drill):** §2.1 distinct cut, §2.2 even thirds, §2.3 monotone
+> all hold for **every** technique — the xyz-wing degeneracy (`g3/m0/s97`, medium band empty) is
+> gone (`~g30/m30/s40`). §2.4 faithfulness vs the relative `grade_batch`: Spearman rho **+0.92..0.95
+> subsets, +0.85..0.94 fish, +0.66..0.81 wings** (all positive — granular *refines*, never
+> contradicts). The ≥80% *band*-agreement bar is met for most subsets and is noise-bounded
+> elsewhere (two independent 3-way cuts disagree at boundaries even when the orderings match). One
+> calibration finding overrides §5's suggested fish priority: the Fish branch is best **elim/scarcity-led**
+> (not open+alts-led) — that maximises faithfulness while `open`/`alts` still break ties, so the
+> bands stay un-quantized. Wings are the residual: their coarse reference is itself near-degenerate
+> (scarcity pinned), capping achievable band-agreement.
 
 ## 1. The problem: the absolute score is too quantized to band
 

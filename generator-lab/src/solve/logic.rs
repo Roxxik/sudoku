@@ -270,10 +270,13 @@ pub fn solve_fixpoint_with_order<V: LogicBoard>(
 pub const CHEAP_KINDS: KindMask =
     (1 << NAKED_SINGLE) | (1 << HIDDEN_SINGLE) | (1 << LC_POINTING) | (1 << LC_CLAIMING);
 
-/// One harder-than-the-cheap-closure step of the grading solve, with the two facts the
-/// grader's per-step signals are defined over (the cheap closure that precedes the first
-/// step and follows every step is NOT recorded as a step — only the harder ladder is).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// One harder-than-the-cheap-closure step of the grading solve, with the per-step facts the
+/// grader's signals are defined over (the cheap closure that precedes the first step and
+/// follows every step is NOT recorded as a step — only the harder ladder is). The `open` /
+/// `depth` / `cascade` trio are the *granular* stall signals (`docs/grader-granular-scoring.md`,
+/// S5/S6/S8): continuous reads off the stall state that stay live even when a technique's
+/// elimination count is structurally pinned (the wings always kill ~1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GradeStep {
     /// The kind that fired (always a harder step: `>= NAKED_PAIR`).
     pub kind: u8,
@@ -287,6 +290,32 @@ pub struct GradeStep {
     /// (first) forced firing makes at the stall. A harder step never places, so this is
     /// just the board's candidate-population drop across the step.
     pub elims: u16,
+    /// **S5 (open)** — the live-candidate population on the board the instant this step had
+    /// to fire ([`candidate_population`] *before* the step). The size of the search space at
+    /// the stall: ~40..200, effectively continuous, so it discriminates puzzles a pinned
+    /// `elims` cannot. A sparse board (few candidates left) is a different hunt from a busy one.
+    pub open: u32,
+    /// **S6 (depth)** — how many cells are already placed when this step fires
+    /// ([`occupied_count`], unchanged by a harder step). A late stall means the cheap closure
+    /// carried the solver a long way first; an early one means the puzzle resists immediately.
+    pub depth: u16,
+    /// **S8 (cascade)** — how many cells the cheap closure placed *immediately after* this
+    /// step (the occupancy delta `paid_off` thresholds at >= 1; this is its magnitude). A
+    /// firing that unlocks a long single-cascade is gentler than one that re-stalls at once.
+    pub cascade: u16,
+    /// **S7 (alts)** — total productive deduction instances across the allowed harder toolbox
+    /// at this stall ([`count_alternatives`](super::techniques::count_alternatives)), counted
+    /// non-mutating before the step fires. The honest scarcity: fewer alternatives = a tighter
+    /// needle hunt = harder, and it stays live where `elims` is structurally pinned (the wings
+    /// always kill ~1, but the number of eligible patterns still varies).
+    pub alts: u32,
+    /// **E1 (examined)** — total *structurally-valid* deduction instances across the allowed
+    /// harder toolbox at this stall — pattern-shaped groups the solver must look at, productive
+    /// or not (the `examined` half of [`count_alternatives`](super::techniques::count_alternatives)).
+    /// `examined - alts` is the **near-miss camouflage** (`docs/grader-continuous-scoring.md` §5):
+    /// look-alike patterns a solver spots and discards because they remove nothing — the spotting
+    /// cost that stays live where `alts` is pinned (the wing residual).
+    pub examined: u32,
 }
 
 /// What [`solve_graded`] returns: the [`SolveTrace`] facts (`solved` + per-kind `counts`)
@@ -382,6 +411,10 @@ pub fn solve_graded<V: LogicBoard>(board: &V, allowed: KindMask) -> GradeTrace {
             return GradeTrace { solved: true, counts, steps };
         }
         let before = candidate_population(&b);
+        // S7 + E1: count the productive AND the total structurally-valid (examined) deductions
+        // the toolbox offers at this stall BEFORE taking the forced step (non-mutating, so the
+        // count reflects the stall, not the aftermath). `examined - productive` is the camouflage.
+        let alts = techniques::count_alternatives(&b, allowed);
         let Some(kind) = step_harder_ordered(&mut b, allowed, &HARD_STEPS_DEFAULT) else {
             // Stuck: no harder step fires and the board is unsolved (baseline-unsolvable).
             return GradeTrace { solved: false, counts, steps };
@@ -390,10 +423,23 @@ pub fn solve_graded<V: LogicBoard>(board: &V, allowed: KindMask) -> GradeTrace {
         // A harder step only eliminates, so the candidate-population drop IS its
         // elimination count and occupancy is unchanged until the closure runs.
         let elims = before.saturating_sub(candidate_population(&b)).min(u16::MAX as u32) as u16;
+        // Occupancy is invariant across the harder step (it only prunes), so this is both
+        // the stall fill-depth (S6) and the payoff baseline for the cascade below.
         let occ_before = occupied_count(&b);
         grade_cheap_closure(&mut b, cheap, &mut counts);
-        let paid_off = occupied_count(&b) > occ_before;
-        steps.push(GradeStep { kind: kind as u8, paid_off, elims });
+        let occ_after = occupied_count(&b);
+        let paid_off = occ_after > occ_before;
+        let cascade = (occ_after - occ_before).min(u16::MAX as usize) as u16;
+        steps.push(GradeStep {
+            kind: kind as u8,
+            paid_off,
+            elims,
+            open: before,
+            depth: occ_before.min(u16::MAX as usize) as u16,
+            cascade,
+            alts: alts.productive,
+            examined: alts.examined,
+        });
     }
 }
 

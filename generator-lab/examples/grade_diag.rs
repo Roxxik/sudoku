@@ -10,9 +10,16 @@
 //! up to `--jobs` threads (default 4). Grading then loads the cache and reports the band
 //! distribution + raw signal ranges per spec.
 //!
-//! With `--calibrate` it also prints a paste-ready `THRESHOLDS` table: per technique, the
-//! 33rd/66th `hardness_score` percentile over its pooled train+drill puzzles (the even-thirds
-//! sub-tier cut points).
+//! It reports, per node, the OLD coarse band split ([`band_calibrated`]/[`hardness_score`])
+//! beside the NEW granular split ([`granular_score`], `docs/grader-granular-scoring.md` Tier A:
+//! the continuous `open`/`cascade`/`depth` stall signals), plus a per-technique ACCEPTANCE
+//! block (distinct p33/p66 cut, even-thirds tolerance, faithfulness vs the relative
+//! [`grade_signals`] grader on a held-out half) so a change can be measured against the spec's
+//! acceptance criteria without re-mining.
+//!
+//! With `--calibrate` it also prints the paste-ready granular calibration: per technique the
+//! [`TechNorm`] literal (mean/scale/sign/weight per signal) and the `(p33, p66)` granular cut
+//! points, both pooled over train+drill.
 //!
 //! Usage: cargo run --release -p generator-lab --example grade_diag -- \
 //!          [--count N=300] [--jobs J=4] [--cache DIR] [--calibrate]
@@ -25,11 +32,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::generate::{AttemptResult, attempt, baseline_fast_applicable};
-use generator_lab::grade::{Signals, band_calibrated, grade_one, hardness_score};
+use generator_lab::grade::{
+    CDF_ANCHORS, SigNorm, Signals, TechNorm, Weights, band_coarse, band_of_rating, cdf_of,
+    grade_one, grade_signals, granular_score, rating_from_cdf,
+};
 use generator_lab::repr::DigitGrid;
 use generator_lab::rng::Rng;
 use generator_lab::spec::Spec;
-use generator_lab::spec::kinds::{self, NAMES};
+use generator_lab::spec::kinds::{self, NAMES, NUM};
 
 /// A campaign node: its mode (train/drill) and target kind. The spec is rebuilt on demand
 /// (the isolated builders the UI uses), so only these two identify the cache file.
@@ -153,21 +163,95 @@ fn signals_of_cache(node: Node, cache: &Cache, n: usize) -> Vec<Signals> {
         .collect()
 }
 
-/// Format one spec's band distribution + raw signal ranges.
-fn report(node: Node, sigs: &[Signals]) -> String {
+/// One technique's granular calibration (Tier C): the per-signal [`TechNorm`] and the
+/// per-technique granular-score CDF, both over the pooled train+drill sample. The CDF turns a raw
+/// score into a continuous `[0, 1]` within-technique percentile ([`rating_of`]).
+struct Calib {
+    norm: TechNorm,
+    cdf: [f64; CDF_ANCHORS],
+}
+
+/// Calibrate one technique `kind` from its pooled `sigs`: orient + scale the [`TechNorm`] against
+/// the relative [`grade_signals`] reference (the absolute path stands in for the same ordering),
+/// then build the granular-score CDF the rating reads against. The kind keys the per-technique
+/// `camo` weight override inside [`TechNorm::calibrate`].
+fn calibrate_target(kind: usize, sigs: &[Signals]) -> Calib {
+    let rel = grade_signals(sigs, &Weights::default(), 3);
+    let rel_scores: Vec<f64> = rel.iter().map(|g| g.score).collect();
+    let norm = TechNorm::calibrate(kind, sigs, &rel_scores);
+    let scores: Vec<f64> = sigs.iter().map(|s| granular_score(s, &norm)).collect();
+    Calib { norm, cdf: cdf_of(&scores) }
+}
+
+/// One puzzle's continuous `[0, 1]` within-technique rating under a calibration.
+fn rating_of(calib: &Calib, s: &Signals) -> f64 {
+    rating_from_cdf(granular_score(s, &calib.norm), &calib.cdf)
+}
+
+/// Fractional (tie-averaged) ranks of `xs`, in `[0, 1)` — the same mid-rank rule the grader
+/// uses, for a tie-robust correlation diagnostic.
+fn frac_ranks(xs: &[f64]) -> Vec<f64> {
+    let n = xs.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| xs[a].partial_cmp(&xs[b]).unwrap());
+    let mut r = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && xs[order[j]] == xs[order[i]] {
+            j += 1;
+        }
+        let p = (i as f64 + 0.5 * (j - i) as f64) / n as f64;
+        for &k in &order[i..j] {
+            r[k] = p;
+        }
+        i = j;
+    }
+    r
+}
+
+/// Spearman rank correlation of `xs` vs `ys` (Pearson on their fractional ranks). A cleaner
+/// faithfulness read than band-agreement: it measures whether the two orderings agree, free of
+/// the noise two independent 3-way cuts add at their boundaries.
+fn spearman(xs: &[f64], ys: &[f64]) -> f64 {
+    let (rx, ry) = (frac_ranks(xs), frac_ranks(ys));
+    let n = rx.len() as f64;
+    let (mx, my) = (rx.iter().sum::<f64>() / n, ry.iter().sum::<f64>() / n);
+    let mut cov = 0.0;
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+    for (a, b) in rx.iter().zip(&ry) {
+        cov += (a - mx) * (b - my);
+        vx += (a - mx).powi(2);
+        vy += (b - my).powi(2);
+    }
+    if vx < 1e-12 || vy < 1e-12 { 0.0 } else { cov / (vx * vy).sqrt() }
+}
+
+/// The UI band count we ship Tier C with (the user's 5-band ask).
+const UI_BANDS: usize = 5;
+
+/// Format one spec's OLD (coarse 3-band) vs NEW (granular Tier-C 5-band) split + signal ranges.
+/// The granular split applies the target's pooled [`Calib`] (train and drill read against the same
+/// pooled calibration, so drill reads spicier and train gentler within the technique — intended).
+/// `bcount(avg .. multi ..%)` is the bottleneck multi-firing rate — the Tier-D driver: trajectory
+/// features only diverge from the tightest-stall ones where the node fires the bottleneck > once.
+fn report(node: Node, sigs: &[Signals], calib: &Calib) -> String {
     let spec = node.spec();
     let label = node.label();
     if sigs.is_empty() {
         return format!("{label:<28} no puzzles");
     }
     let count = sigs.len();
-    let mut bands = [0usize; 3];
-    for s in sigs {
-        bands[band_calibrated(&spec, s).min(2)] += 1;
-    }
-    let max_by = |f: fn(&Signals) -> u32| sigs.iter().map(f).max().unwrap();
-    let avg_by = |f: fn(&Signals) -> u32| sigs.iter().map(|s| f(s) as f64).sum::<f64>() / count as f64;
     let pct = |c: usize| 100.0 * c as f64 / count as f64;
+    let avg_by = |f: fn(&Signals) -> u32| sigs.iter().map(|s| f(s) as f64).sum::<f64>() / count as f64;
+
+    let mut old = [0usize; 3];
+    let mut new = [0usize; UI_BANDS];
+    for s in sigs {
+        old[band_coarse(&spec, s).min(2)] += 1;
+        new[band_of_rating(rating_of(calib, s), UI_BANDS)] += 1;
+    }
     let scarce_vals: Vec<f64> =
         sigs.iter().filter(|s| s.scarcity != u32::MAX).map(|s| s.scarcity as f64).collect();
     let scarce_avg = if scarce_vals.is_empty() {
@@ -175,44 +259,139 @@ fn report(node: Node, sigs: &[Signals]) -> String {
     } else {
         scarce_vals.iter().sum::<f64>() / scarce_vals.len() as f64
     };
-    let score_max = sigs.iter().map(|s| hardness_score(s)).fold(0.0_f64, f64::max);
-    let score_avg = sigs.iter().map(|s| hardness_score(s)).sum::<f64>() / count as f64;
+    let new_str: Vec<String> = new.iter().map(|&c| format!("{:>3.0}", pct(c))).collect();
+    let multi = 100.0 * sigs.iter().filter(|s| s.bottleneck_count > 1).count() as f64 / count as f64;
     format!(
-        "{label:<28} n={count:<4} gentle={:>3.0}% medium={:>3.0}% spicy={:>3.0}% | \
-         bott(avg {:.2} max {}) dryRun(avg {:.2} max {}) dryF(avg {:.2} max {}) \
-         scarce(avg {:.1}) scan(avg {:.1} max {}) score(avg {:.2} max {:.2})",
-        pct(bands[0]), pct(bands[1]), pct(bands[2]),
-        avg_by(|s| s.bottleneck_count), max_by(|s| s.bottleneck_count),
-        avg_by(|s| s.longest_dry_run), max_by(|s| s.longest_dry_run),
-        avg_by(|s| s.dry_firings), max_by(|s| s.dry_firings),
-        scarce_avg,
-        avg_by(|s| s.scan_work), max_by(|s| s.scan_work),
-        score_avg, score_max,
+        "{label:<24} n={count:<4} OLD3 g{:>3.0} m{:>3.0} s{:>3.0} | NEW5 [{}] | \
+         bcount(avg {:.2} multi {:>3.0}%) open(avg {:.0}) casc(avg {:.1}) depth(avg {:.0}) scarce(avg {:.1}) alts(avg {:.1}) camo(avg {:.1})",
+        pct(old[0]), pct(old[1]), pct(old[2]),
+        new_str.join(" "),
+        avg_by(|s| s.bottleneck_count), multi,
+        avg_by(|s| s.open), avg_by(|s| s.cascade), avg_by(|s| s.depth), scarce_avg,
+        avg_by(|s| s.alts), avg_by(|s| s.camo),
     )
 }
 
-/// Print the paste-ready `THRESHOLDS` rows: per target, the 33rd/66th `hardness_score`
-/// percentile over its pooled train+drill signals, plus the band split those cuts produce.
-fn calibrate(targets: &[usize], nodes: &[Node], results: &[Mutex<Vec<Signals>>]) {
-    println!("=== CALIBRATION (paste into grade::THRESHOLDS; pooled train+drill, even thirds) ===");
-    for &t in targets {
-        let mut scores: Vec<f64> = nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, nd)| nd.target == t)
-            .flat_map(|(i, _)| results[i].lock().unwrap().iter().map(hardness_score).collect::<Vec<_>>())
-            .collect();
-        if scores.is_empty() {
-            continue;
-        }
-        scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let q = |p: f64| scores[((p * scores.len() as f64) as usize).min(scores.len() - 1)];
-        let (lo, hi) = (q(1.0 / 3.0), q(2.0 / 3.0));
-        let g = scores.iter().filter(|&&s| s < lo).count();
-        let m = scores.iter().filter(|&&s| s >= lo && s < hi).count();
-        let sp = scores.iter().filter(|&&s| s >= hi).count();
-        println!("    ({lo:.4}, {hi:.4}), // {:<14} -> g{g} m{m} s{sp} (n={})", NAMES[t], scores.len());
+/// One technique's ACCEPTANCE line: the Tier-C resolution + faithfulness checks
+/// (`docs/grader-continuous-scoring.md` §2). `sigs` is the pooled train+drill sample.
+/// - `levels` = number of non-empty `1/R` rating buckets (effective resolution, target ≥ 10);
+/// - `even5` = each of the 5 UI bands within 20% ± 8;
+/// - `stable` = split-half Spearman of the rating against itself (A-calibrated vs B-calibrated
+///   on the shared pool), the granularity analogue of "distinct cut" (target ≥ 0.90);
+/// - `rho` = Spearman of the granular score vs the relative grader (faithfulness, target ≥ 0.85).
+fn acceptance(t: usize, sigs: &[Signals]) -> String {
+    const R: usize = 10;
+    let full = calibrate_target(t, sigs);
+    let n = sigs.len();
+    let ratings: Vec<f64> = sigs.iter().map(|s| rating_of(&full, s)).collect();
+
+    // Effective resolution: how many 1/R rating buckets are populated.
+    let mut buckets = [false; R];
+    for &r in &ratings {
+        buckets[band_of_rating(r, R)] = true;
     }
+    let levels = buckets.iter().filter(|&&b| b).count();
+
+    // 5-band evenness.
+    let mut bands = [0usize; UI_BANDS];
+    for &r in &ratings {
+        bands[band_of_rating(r, UI_BANDS)] += 1;
+    }
+    let pct = |c: usize| 100.0 * c as f64 / n.max(1) as f64;
+    let even5 = (0..UI_BANDS).all(|b| (pct(bands[b]) - 100.0 / UI_BANDS as f64).abs() <= 8.0);
+
+    // Rank stability: calibrate on each half, rate the WHOLE pool with each, correlate the two
+    // ratings. A reproducible ordering (not sampling noise) keeps this near 1.
+    let a: Vec<Signals> = sigs.iter().step_by(2).copied().collect();
+    let b: Vec<Signals> = sigs.iter().skip(1).step_by(2).copied().collect();
+    let stable = if a.len() >= 10 && b.len() >= 10 {
+        let (ca, cb) = (calibrate_target(t, &a), calibrate_target(t, &b));
+        let ra: Vec<f64> = sigs.iter().map(|s| rating_of(&ca, s)).collect();
+        let rb: Vec<f64> = sigs.iter().map(|s| rating_of(&cb, s)).collect();
+        spearman(&ra, &rb)
+    } else {
+        f64::NAN
+    };
+
+    // Faithfulness: Spearman of the granular score vs the relative grader over the pool.
+    let gran: Vec<f64> = sigs.iter().map(|s| granular_score(s, &full.norm)).collect();
+    let rel_all = grade_signals(sigs, &Weights::default(), 3);
+    let rho = spearman(&gran, &rel_all.iter().map(|g| g.score).collect::<Vec<_>>());
+
+    let pass = levels >= R && even5 && stable >= 0.90 && rho >= 0.85;
+    let band_str: Vec<String> = bands.iter().map(|&c| format!("{:>2.0}", pct(c))).collect();
+    format!(
+        "{:<14} levels={:>2}/{} [{}] even5={} stable={:+.2} rho={:+.2} {}",
+        NAMES[t],
+        levels,
+        R,
+        band_str.join(" "),
+        if even5 { "ok " } else { "BAD" },
+        stable,
+        rho,
+        if pass { "PASS" } else { "----" },
+    )
+}
+
+/// Print the paste-ready Tier-C calibration: the full `GRANULAR_NORM` (per-technique [`TechNorm`])
+/// and `GRANULAR_CDF` (per-technique granular-score percentile breakpoints) arrays, both indexed
+/// by kind over all `NUM` rows (trunk + any uncalibrated kind = an unused placeholder), so the
+/// output drops verbatim into `grade.rs`. Pooled train+drill.
+fn calibrate(targets: &[usize], pooled: &[Vec<Signals>]) {
+    let fmt_sig = |s: &SigNorm| {
+        format!(
+            "SigNorm {{ mean: {:.3}, scale: {:.3}, sign: {:.1}, weight: {:.2} }}",
+            s.mean, s.scale, s.sign, s.weight
+        )
+    };
+    // kind -> its calibration (only the harder targets are calibrated).
+    let mut by_kind: Vec<Option<Calib>> = (0..NUM).map(|_| None).collect();
+    for (i, &t) in targets.iter().enumerate() {
+        if !pooled[i].is_empty() {
+            by_kind[t] = Some(calibrate_target(t, &pooled[i]));
+        }
+    }
+    let placeholder = "SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }";
+
+    println!("=== CALIBRATION (paste into grade.rs; pooled train+drill) ===");
+    println!("pub const GRANULAR_NORM: [TechNorm; NUM] = [");
+    for k in 0..NUM {
+        match &by_kind[k] {
+            Some(c) => println!(
+                "    /* {:<14} */ TechNorm {{ open: {}, cascade: {}, depth: {}, elim: {}, alts: {}, \
+                 tight: {}, open_mean: {}, depth_tight: {}, transitions: {}, camo: {} }},",
+                NAMES[k],
+                fmt_sig(&c.norm.open),
+                fmt_sig(&c.norm.cascade),
+                fmt_sig(&c.norm.depth),
+                fmt_sig(&c.norm.elim),
+                fmt_sig(&c.norm.alts),
+                fmt_sig(&c.norm.tight),
+                fmt_sig(&c.norm.open_mean),
+                fmt_sig(&c.norm.depth_tight),
+                fmt_sig(&c.norm.transitions),
+                fmt_sig(&c.norm.camo),
+            ),
+            None => println!(
+                "    /* {:<14} */ TechNorm {{ open: {p}, cascade: {p}, depth: {p}, elim: {p}, alts: {p}, \
+                 tight: {p}, open_mean: {p}, depth_tight: {p}, transitions: {p}, camo: {p} }},",
+                NAMES[k],
+                p = placeholder,
+            ),
+        }
+    }
+    println!("];");
+    println!("pub const GRANULAR_CDF: [[f64; CDF_ANCHORS]; NUM] = [");
+    for k in 0..NUM {
+        match &by_kind[k] {
+            Some(c) => {
+                let anchors: Vec<String> = c.cdf.iter().map(|x| format!("{x:.3}")).collect();
+                println!("    [{}], // {}", anchors.join(", "), NAMES[k]);
+            }
+            None => println!("    [0.0; CDF_ANCHORS], // {} (trunk/unused)", NAMES[k]),
+        }
+    }
+    println!("];");
 }
 
 fn arg_val(flag: &str) -> Option<String> {
@@ -273,21 +452,46 @@ fn main() {
     });
     eprintln!("grade_diag: mined/graded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    // Phase 2: per-spec band distribution (train block, then drill block).
-    println!("=== TRAIN (isolated) ===");
+    // Lift the per-node signals out of the mutexes, then pool train+drill per target and
+    // calibrate each technique's granular norm + thirds cut over that pool.
+    let node_sigs: Vec<Vec<Signals>> = results.iter().map(|m| m.lock().unwrap().clone()).collect();
+    let pooled: Vec<Vec<Signals>> = targets
+        .iter()
+        .enumerate()
+        .map(|(ti, _)| {
+            let mut v = node_sigs[ti].clone(); // train block
+            v.extend(node_sigs[targets.len() + ti].iter().copied()); // drill block
+            v
+        })
+        .collect();
+    let calibs: Vec<Calib> =
+        targets.iter().enumerate().map(|(ti, &t)| calibrate_target(t, &pooled[ti])).collect();
+    // target kind -> its index in `targets`, so a node can find its pooled calibration.
+    let calib_of = |target: usize| targets.iter().position(|&t| t == target).unwrap();
+
+    // Phase 2: per-spec OLD vs NEW band distribution (train block, then drill block).
+    println!("=== TRAIN (isolated) — OLD = coarse hardness_score | NEW = granular ===");
     for (i, nd) in nodes.iter().enumerate() {
         if !nd.drill {
-            println!("{}", report(*nd, &results[i].lock().unwrap()));
+            println!("{}", report(*nd, &node_sigs[i], &calibs[calib_of(nd.target)]));
         }
     }
     println!("=== DRILL (isolated) ===");
     for (i, nd) in nodes.iter().enumerate() {
         if nd.drill {
-            println!("{}", report(*nd, &results[i].lock().unwrap()));
+            println!("{}", report(*nd, &node_sigs[i], &calibs[calib_of(nd.target)]));
+        }
+    }
+
+    // Acceptance (docs/grader-granular-scoring.md §2): per technique, pooled train+drill.
+    println!("=== ACCEPTANCE (granular, pooled train+drill) ===");
+    for (ti, &t) in targets.iter().enumerate() {
+        if !pooled[ti].is_empty() {
+            println!("{}", acceptance(t, &pooled[ti]));
         }
     }
 
     if arg_flag("--calibrate") {
-        calibrate(targets, &nodes, &results);
+        calibrate(targets, &pooled);
     }
 }

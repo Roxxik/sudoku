@@ -18,7 +18,10 @@
 use super::LogicBoard;
 use crate::repr::{CELLS, CellIdx, Digit, Mark, PEER_MASK, UNITS};
 use super::combinations::for_each_combination;
-use crate::spec::kinds::{JELLYFISH, KindMask, SWORDFISH, W_WING, X_WING, XYZ_WING, XY_WING};
+use crate::spec::kinds::{
+    HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_TRIPLE, JELLYFISH, KindMask, NAKED_PAIR, NAKED_QUAD,
+    NAKED_TRIPLE, SWORDFISH, W_WING, X_WING, XYZ_WING, XY_WING,
+};
 
 /// Whether cell `s` sees cell `c` (shares a row, column, or box) — one bit test on
 /// the precomputed peer mask, the wing family's hot "is a peer of" check (replacing a
@@ -1213,4 +1216,393 @@ fn w_wing_link<V: LogicBoard>(
         }
     }
     false
+}
+
+// --- Tier B: non-mutating "count all productive instances" scan (the grader's `alts`) -----
+//
+// `docs/grader-granular-scoring.md` S7: at a stall, how many distinct productive deductions the
+// whole allowed (harder) toolbox offers — the honest scarcity that stays live where the
+// elimination count is structurally pinned (every wing kills ~1 candidate, but the board may
+// hold one eligible wing pattern or several; one is a needle hunt, several you stumble onto).
+// Lower = harder.
+//
+// These MIRROR the first-applicable bodies above but never mutate and never short-circuit: each
+// counts every configuration that WOULD eliminate >= 1 candidate on the current board. They
+// deliberately do NOT reuse the perf-tuned solving bodies (which return at the first firing and
+// mutate `v`) — the solve/generator byte-identical fingerprint stays untouched. Cold path only
+// (one grading solve per yielded puzzle), so the full enumeration is affordable.
+
+/// Whether eliminating `d` from the common empty peers of `must_see` (minus `exclude`) would
+/// remove at least one candidate — the read-only twin of [`eliminate_common_peers`].
+fn any_common_peer_elim<V: LogicBoard>(
+    v: &V,
+    exclude: &[CellIdx],
+    must_see: &[CellIdx],
+    d: Digit,
+) -> bool {
+    let mut common = u128::MAX;
+    for &s in must_see {
+        debug_assert!(s < CELLS, "cell index {s} out of range");
+        // SAFETY: s is a CellIdx (0..81 by construction).
+        unsafe { core::hint::assert_unchecked(s < CELLS) };
+        common &= PEER_MASK[s];
+    }
+    for &e in exclude {
+        common &= !(1u128 << e);
+    }
+    while common != 0 {
+        let c = common.trailing_zeros() as CellIdx;
+        common &= common - 1;
+        if v.is_empty(c) && v.get(c).contains(d) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Naked subsets of `size` in one unit's marks (read-only twin of [`naked_unit`]) as
+/// `(productive, examined)`: `examined` is every size-cell combo whose candidate union is
+/// exactly `size` digits (a subset-shaped group); `productive` is the subset of those that also
+/// share a candidate with some other cell of the unit (so it would eliminate). `examined -
+/// productive` is the **E1 near-miss camouflage** (`docs/grader-continuous-scoring.md` §5): a
+/// look-alike subset that the solver examines and then discards because it removes nothing.
+fn count_naked_unit(marks: &[Mark; 9], size: usize) -> (u32, u32) {
+    let mut cand = [0usize; 9];
+    let mut n = 0;
+    for i in 0..9 {
+        let len = marks[i].len() as usize;
+        if (2..=size).contains(&len) {
+            cand[n] = i;
+            n += 1;
+        }
+    }
+    if n < size {
+        return (0, 0);
+    }
+    let (mut prod, mut exam) = (0u32, 0u32);
+    for_each_combination(&cand[..n], size, |combo| {
+        let union = combo.iter().fold(Mark::EMPTY, |acc, &k| acc | marks[k]);
+        if union.len() as usize == size {
+            exam += 1;
+            let productive =
+                (0..9).any(|i| !combo.contains(&i) && !(marks[i] & union).is_empty());
+            prod += productive as u32;
+        }
+        true // never short-circuit — examine every subset-shaped combo
+    });
+    (prod, exam)
+}
+
+/// Naked subsets of `size` across all 27 units, as `(productive, examined)` summed.
+fn count_naked<V: LogicBoard>(v: &V, size: usize) -> (u32, u32) {
+    UNITS.iter().fold((0, 0), |(p, e), unit| {
+        let marks: [Mark; 9] = core::array::from_fn(|i| v.get(unit[i]));
+        let (up, ue) = count_naked_unit(&marks, size);
+        (p + up, e + ue)
+    })
+}
+
+/// Hidden subsets of `size` in one unit (read-only twin of [`hidden_unit`]) as
+/// `(productive, examined)`: `examined` is every size-digit combo confined to exactly `size`
+/// cells (a hidden-subset-shaped cover); `productive` is the subset of those where some OTHER
+/// present digit still occupies a cover cell (so it would eliminate). `examined - productive`
+/// is the **E1 camouflage**: a cover-shaped group that eliminates nothing.
+fn count_hidden_unit(positions: &[u16; 9], size: usize) -> (u32, u32) {
+    let mut digits = [0usize; 9];
+    let mut n = 0;
+    let mut present = 0u16;
+    for di in 0..9 {
+        let pc = positions[di].count_ones() as usize;
+        present |= ((pc != 0) as u16) << di;
+        if (2..=size).contains(&pc) {
+            digits[n] = di;
+            n += 1;
+        }
+    }
+    if n < size {
+        return (0, 0);
+    }
+    let (mut prod, mut exam) = (0u32, 0u32);
+    for_each_combination(&digits[..n], size, |combo| {
+        let union: u16 = combo.iter().map(|&di| positions[di]).fold(0, |a, x| a | x);
+        if union.count_ones() as usize == size {
+            exam += 1;
+            let combo_mask: u16 = combo.iter().fold(0, |a, &di| a | (1 << di));
+            let mut elig = present & !combo_mask;
+            let mut productive = false;
+            while elig != 0 {
+                let di = elig.trailing_zeros() as usize;
+                elig &= elig - 1;
+                if positions[di] & union != 0 {
+                    productive = true;
+                    break;
+                }
+            }
+            prod += productive as u32;
+        }
+        true
+    });
+    (prod, exam)
+}
+
+/// Hidden subsets of `size` across all 27 units, as `(productive, examined)` summed.
+fn count_hidden<V: LogicBoard>(v: &V, size: usize) -> (u32, u32) {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    for unit in &UNITS {
+        let mut positions = [0u16; 9];
+        for i in 0..9 {
+            for d in v.get(unit[i]).iter() {
+                positions[d.index()] |= 1 << i;
+            }
+        }
+        let (up, ue) = count_hidden_unit(&positions, size);
+        prod += up;
+        exam += ue;
+    }
+    (prod, exam)
+}
+
+/// Basic fish of `size` (read-only twin of [`fish_sized`]'s search) as `(productive, examined)`:
+/// `examined` is every (digit, orientation, size-base-line cover) whose candidate positions
+/// union to exactly `size` cross-lines (a fish-shaped cover); `productive` is the subset that
+/// also leaves a candidate in some non-cover base line (so it would eliminate). `examined -
+/// productive` is the **E1 camouflage**: a fish cover that misses the elimination.
+fn count_fish(size: usize, fp: &FishPositions) -> (u32, u32) {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    for di in 0..9 {
+        for o in 0..2 {
+            let positions = &fp.pos[o][di];
+            let mut posv = [0u16; 9];
+            let mut basebit = [0u16; 9];
+            let mut n = 0;
+            for b in 0..9 {
+                let pc = positions[b].count_ones() as usize;
+                if (2..=size).contains(&pc) {
+                    posv[n] = positions[b];
+                    basebit[n] = 1 << b;
+                    n += 1;
+                }
+            }
+            if n < size {
+                continue;
+            }
+            let idx: [usize; 9] = core::array::from_fn(|i| i);
+            for_each_combination(&idx[..n], size, |combo| {
+                let mut union = 0u16;
+                let mut base_mask = 0u16;
+                for &k in combo {
+                    union |= posv[k];
+                    base_mask |= basebit[k];
+                }
+                if union.count_ones() as usize == size {
+                    exam += 1;
+                    let productive =
+                        (0..9).any(|y| base_mask & (1 << y) == 0 && positions[y] & union != 0);
+                    prod += productive as u32;
+                }
+                true
+            });
+        }
+    }
+    (prod, exam)
+}
+
+/// XY-Wings (read-only twin of [`xy_wing`]) as `(productive, examined)`: `examined` is every
+/// geometrically valid (pivot, {X,Z}-wing, {Y,Z}-wing) triple (both wings seeing the pivot);
+/// `productive` is the subset whose deduced `Z` actually leaves a common peer. `examined -
+/// productive` is the **E1 camouflage** — wing-shaped triples a solver must spot and reject
+/// because they eliminate nothing; the dominant spotting cost where `productive` is pinned ~1.
+fn count_xy_wing<V: LogicBoard>(
+    v: &V,
+    bivalues: &[(CellIdx, Mark)],
+    buckets: &BivalueBuckets,
+) -> (u32, u32) {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    for &(pivot, pcands) in bivalues {
+        let bits = pcands.bits();
+        let x_bit = bits & bits.wrapping_neg();
+        let y_bit = bits & (bits - 1);
+        let mut zbits = !bits & Mark::ALL.bits();
+        while zbits != 0 {
+            let z_bit = zbits & zbits.wrapping_neg();
+            zbits &= zbits - 1;
+            let zd = Digit::from_index(z_bit.trailing_zeros() as usize);
+            let bz = buckets.with_mask(y_bit | z_bit);
+            if bz.is_empty() {
+                continue;
+            }
+            for &a in buckets.with_mask(x_bit | z_bit) {
+                if !sees(pivot, a) {
+                    continue;
+                }
+                for &b in bz {
+                    if sees(pivot, b) {
+                        exam += 1;
+                        prod += any_common_peer_elim(v, &[pivot, a, b], &[a, b], zd) as u32;
+                    }
+                }
+            }
+        }
+    }
+    (prod, exam)
+}
+
+/// XYZ-Wings (read-only twin of [`xyz_wing`]) as `(productive, examined)`: `examined` is every
+/// geometrically valid (trivalue pivot, two bivalue wings) whose one shared digit `Z` and union
+/// match the pivot; `productive` is the subset whose `Z` actually leaves a common peer.
+/// `examined - productive` is the **E1 camouflage**.
+fn count_xyz_wing<V: LogicBoard>(
+    v: &V,
+    bivalues: &[(CellIdx, Mark)],
+    trivalues: &[(CellIdx, Mark)],
+) -> (u32, u32) {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    let mut wingbuf = [(0usize, Mark::EMPTY); CELLS];
+    for &(pivot, pcands) in trivalues {
+        let mut nw = 0;
+        for &(c, cands) in bivalues {
+            if sees(pivot, c) && cands.without(pcands).is_empty() {
+                wingbuf[nw] = (c, cands);
+                nw += 1;
+            }
+        }
+        if nw < 2 {
+            continue;
+        }
+        for_each_combination(&wingbuf[..nw], 2, |combo| {
+            let (a, acands) = combo[0];
+            let (b, bcands) = combo[1];
+            let shared = acands & bcands;
+            if shared.len() == 1 && (acands | bcands) == pcands {
+                exam += 1;
+                let zd = shared.iter().next().expect("one shared digit");
+                prod += any_common_peer_elim(v, &[pivot, a, b], &[pivot, a, b], zd) as u32;
+            }
+            true
+        });
+    }
+    (prod, exam)
+}
+
+/// W-Wing strong links for the cell pair `(x, y)` on digit `link` (read-only twin of
+/// [`w_wing_link`]) as `(productive, examined)`; `other` is the eliminated digit. `examined` is
+/// every conjugate pair forming a valid strong-link bridge (ends seeing `x` and `y`);
+/// `productive` is the subset that actually eliminates `other`. `examined - productive` is the
+/// **E1 camouflage**.
+fn count_w_wing_link<V: LogicBoard>(
+    v: &V,
+    conj: &ConjugatePairs,
+    x: CellIdx,
+    y: CellIdx,
+    link: Digit,
+    other: Digit,
+) -> (u32, u32) {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    for &(c1, c2) in conj.for_digit(link) {
+        if c1 == x || c1 == y || c2 == x || c2 == y {
+            continue;
+        }
+        let ends = if sees(c1, x) && sees(c2, y) {
+            Some((c1, c2))
+        } else if sees(c1, y) && sees(c2, x) {
+            Some((c2, c1))
+        } else {
+            None
+        };
+        let Some((cx, cy)) = ends else { continue };
+        exam += 1;
+        prod += any_common_peer_elim(v, &[x, y, cx, cy], &[x, y], other) as u32;
+    }
+    (prod, exam)
+}
+
+/// W-Wings (read-only twin of [`w_wing`]) as `(productive, examined)` summed over strong links.
+fn count_w_wing<V: LogicBoard>(v: &V, buckets: &BivalueBuckets) -> (u32, u32) {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    let mut conj: Option<ConjugatePairs> = None;
+    for slot in 0..36 {
+        let bucket = buckets.run(slot);
+        if bucket.len() < 2 {
+            continue;
+        }
+        let mask = SLOT_TO_MASK[slot];
+        let d0 = Digit::from_index(mask.trailing_zeros() as usize);
+        let d1 = Digit::from_index((mask & (mask - 1)).trailing_zeros() as usize);
+        for (i, &x) in bucket.iter().enumerate() {
+            for &y in &bucket[i + 1..] {
+                if sees(x, y) {
+                    continue;
+                }
+                let conj = conj.get_or_insert_with(|| ConjugatePairs::scan(v));
+                let (p0, e0) = count_w_wing_link(v, conj, x, y, d0, d1);
+                let (p1, e1) = count_w_wing_link(v, conj, x, y, d1, d0);
+                prod += p0 + p1;
+                exam += e0 + e1;
+            }
+        }
+    }
+    (prod, exam)
+}
+
+/// The toolbox-wide deduction tally [`count_alternatives`] returns: `productive` instances that
+/// would eliminate (the S7 `alts` honest scarcity) and the total `examined` structurally-valid
+/// instances. Their difference `examined - productive` is the **E1 near-miss camouflage**
+/// (`docs/grader-continuous-scoring.md` §5): pattern-shaped look-alikes a solver must spot and
+/// discard because they remove nothing — the spotting cost that stays live where `productive` is
+/// structurally pinned (the wings always fire ~1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct AltCount {
+    pub productive: u32,
+    pub examined: u32,
+}
+
+/// **S7 `alts` + E1 camouflage**: across the allowed HARDER toolbox at the current (stall) board,
+/// the `productive` deduction instances (lower = a tighter, harder-to-spot stall) and the total
+/// `examined` structurally-valid ones, counted WITHOUT mutating. The grader records both at each
+/// harder step and reduces the tightest stall's values. Cheap (trunk) kinds are excluded — they
+/// are drained to a fixpoint before any harder step, so they offer nothing at a stall.
+pub(super) fn count_alternatives<V: LogicBoard>(v: &V, allowed: KindMask) -> AltCount {
+    let (mut prod, mut exam) = (0u32, 0u32);
+    let mut add = |(p, e): (u32, u32)| {
+        prod += p;
+        exam += e;
+    };
+    for (bit, size) in [(NAKED_PAIR, 2usize), (NAKED_TRIPLE, 3), (NAKED_QUAD, 4)] {
+        if allowed & (1 << bit) != 0 {
+            add(count_naked(v, size));
+        }
+    }
+    for (bit, size) in [(HIDDEN_PAIR, 2usize), (HIDDEN_TRIPLE, 3), (HIDDEN_QUAD, 4)] {
+        if allowed & (1 << bit) != 0 {
+            add(count_hidden(v, size));
+        }
+    }
+    if allowed & ANY_FISH != 0 {
+        let fp = FishPositions::scan(v);
+        for (bit, size) in [(X_WING, 2usize), (SWORDFISH, 3), (JELLYFISH, 4)] {
+            if allowed & (1 << bit) != 0 {
+                add(count_fish(size, &fp));
+            }
+        }
+    }
+    const ANY_WING: KindMask = (1 << XY_WING) | (1 << XYZ_WING) | (1 << W_WING);
+    if allowed & ANY_WING != 0 {
+        const BUCKETED: KindMask = (1 << XY_WING) | (1 << W_WING);
+        let mut bivbuf = [(0usize, Mark::EMPTY); CELLS];
+        let nb = cells_with_n_candidates(v, 2, &mut bivbuf);
+        let bivalues = &bivbuf[..nb];
+        let buckets = (allowed & BUCKETED != 0).then(|| BivalueBuckets::build(bivalues));
+        if allowed & (1 << XY_WING) != 0 {
+            add(count_xy_wing(v, bivalues, buckets.as_ref().expect("built")));
+        }
+        if allowed & (1 << XYZ_WING) != 0 {
+            let mut tribuf = [(0usize, Mark::EMPTY); CELLS];
+            let nt = cells_with_n_candidates(v, 3, &mut tribuf);
+            add(count_xyz_wing(v, bivalues, &tribuf[..nt]));
+        }
+        if allowed & (1 << W_WING) != 0 {
+            add(count_w_wing(v, buckets.as_ref().expect("built")));
+        }
+    }
+    AltCount { productive: prod, examined: exam }
 }
