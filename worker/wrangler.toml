@@ -1,11 +1,12 @@
-name = "sudoku-backend"
+name = "backend"
 main = "src/index.js"
 compatibility_date = "2026-06-23"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "sudoku"
-# Non-empty so `wrangler dev`/`--local` (scripts/dev-local) work against a local
-# SQLite without any account. Replace with the real id from `wrangler d1 create
-# sudoku` before `wrangler deploy` / any `--remote` command.
-database_id = "local-dev-placeholder"
+# Production D1 id, used by `wrangler deploy` / any `--remote` command. Not a
+# credential -- account auth is still required to reach the database. `wrangler
+# dev`/--local ignores it and uses a local SQLite keyed by database_name, so
+# scripts/dev-local needs no account.
+database_id = "2aa2db0c-1a2c-447d-be32-6853804c2f5e"

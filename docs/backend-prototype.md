@@ -74,7 +74,7 @@ worker/
 
 ```toml
 # worker/wrangler.toml
-name = "sudoku-backend"
+name = "backend"
 main = "src/index.js"
 compatibility_date = "2026-06-23"
 
@@ -178,7 +178,7 @@ A new module, plus one call in the existing solve hook. No other client changes.
 
 ```js
 // web/backend.js  (new)
-const ENDPOINT = "https://sudoku-backend.<subdomain>.workers.dev/solves"; // from `wrangler deploy`
+const ENDPOINT = "https://backend.<subdomain>.workers.dev/solves"; // from `wrangler deploy`
 const API_KEY  = "<paste-the-same-secret>"; // public in the bundle by necessity (see doc)
 
 // Fire-and-forget: an offline or failed POST must never affect the solve flow, so this never

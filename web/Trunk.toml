@@ -47,7 +47,7 @@ stage = "pre_build"
 command = "sh"
 command_arguments = [
   "-c",
-  "printf 'export const ENDPOINT = \"%s\";\\nexport const API_KEY = \"%s\";\\n' \"${SUDOKU_BACKEND_ENDPOINT:-https://sudoku-backend.nitz-stefan.workers.dev/solves}\" \"${SUDOKU_API_KEY:-<paste-the-same-secret>}\" > backend-config.js",
+  "printf 'export const ENDPOINT = \"%s\";\\nexport const API_KEY = \"%s\";\\n' \"${SUDOKU_BACKEND_ENDPOINT:-https://backend.sudoku-app.workers.dev/solves}\" \"${SUDOKU_API_KEY:-<paste-the-same-secret>}\" > backend-config.js",
 ]
 
 # Rebuild when the frontend OR the Rust sources behind the wasm bridge change.
