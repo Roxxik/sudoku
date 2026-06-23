@@ -17,6 +17,12 @@ import VERSION from "./version.js";
 // against drive-by bots (a human with devtools can read it). Public-writable.
 import { ENDPOINT, API_KEY } from "./backend-config.js";
 
+// Per-POST console logging is gated on cheat/debug mode (cheat.js): on by default
+// on private/dev hosts (localhost + LAN, so dev-local logs for free) and off on
+// the public site unless explicitly flipped on -- keeps end users' consoles quiet
+// while staying available for debugging prod.
+import { cheatOn } from "./cheat.js";
+
 // True until the constants above are replaced with the deployed values. While
 // unconfigured we skip the POST entirely so the prototype doesn't fire a doomed
 // request (and log a console error) on every solve before the backend exists.
@@ -28,13 +34,30 @@ const CONFIGURED = !ENDPOINT.includes("<subdomain>") && !API_KEY.includes("<past
 // dialog triggers. `solve` is { client_id, seed, puzzle, solution, solve_ms };
 // client_version is stamped here so the call site stays domain-only.
 export function recordSolve(solve) {
-  if (!CONFIGURED) return;
+  const debug = cheatOn();
+  if (!CONFIGURED) {
+    if (debug) console.log("[backend] solve not recorded: backend not configured");
+    return;
+  }
   try {
     fetch(ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": API_KEY },
       body: JSON.stringify({ solves: [{ ...solve, client_version: VERSION }] }),
       keepalive: true,
-    }).catch(() => {});
-  } catch {}
+    })
+      .then(async (resp) => {
+        // Read the body and log only under debug; production stays silent.
+        if (!debug) return;
+        let body = "";
+        try { body = await resp.text(); } catch {}
+        console.log(`[backend] solve POST -> ${resp.status} ${body}`.trimEnd());
+      })
+      .catch((err) => {
+        // Still swallowed -- never affects the solve flow; only surfaced in debug.
+        if (debug) console.warn("[backend] solve POST failed:", err);
+      });
+  } catch (err) {
+    if (debug) console.warn("[backend] solve POST threw:", err);
+  }
 }
