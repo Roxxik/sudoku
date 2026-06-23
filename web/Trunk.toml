@@ -35,17 +35,19 @@ command_arguments = [
 ]
 
 # Bake the backend endpoint + shared key into a gitignored ES module so the build
-# can be retargeted (local dev vs production) WITHOUT editing source. The defaults
-# are the production placeholders (backend.js then no-ops -- see its CONFIGURED
-# guard); SUDOKU_BACKEND_ENDPOINT / SUDOKU_API_KEY in the build env override them
-# (scripts/dev-local points them at the local worker). Same generated-module
-# pattern as version.js / curriculum.js above.
+# can be retargeted (local dev vs production) WITHOUT editing source, and so the
+# key is never committed. The ENDPOINT default is the production worker URL (a
+# non-secret); the API_KEY default stays a placeholder, so backend.js no-ops via
+# its CONFIGURED guard until a real key is supplied. The real key is injected only
+# at deploy time from the SUDOKU_API_KEY GitHub Actions secret (see
+# .github/workflows/deploy.yml); scripts/dev-local overrides both env vars to
+# point at the local worker. Same generated-module pattern as version.js above.
 [[hooks]]
 stage = "pre_build"
 command = "sh"
 command_arguments = [
   "-c",
-  "printf 'export const ENDPOINT = \"%s\";\\nexport const API_KEY = \"%s\";\\n' \"${SUDOKU_BACKEND_ENDPOINT:-https://sudoku-backend.<subdomain>.workers.dev/solves}\" \"${SUDOKU_API_KEY:-<paste-the-same-secret>}\" > backend-config.js",
+  "printf 'export const ENDPOINT = \"%s\";\\nexport const API_KEY = \"%s\";\\n' \"${SUDOKU_BACKEND_ENDPOINT:-https://sudoku-backend.nitz-stefan.workers.dev/solves}\" \"${SUDOKU_API_KEY:-<paste-the-same-secret>}\" > backend-config.js",
 ]
 
 # Rebuild when the frontend OR the Rust sources behind the wasm bridge change.

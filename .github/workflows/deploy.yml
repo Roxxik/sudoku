@@ -38,6 +38,13 @@ jobs:
 
       - name: Build web
         working-directory: ./web
+        # The solve-log shared key, kept out of git and injected here. The Trunk
+        # pre_build hook bakes it into web/backend-config.js; the endpoint default
+        # is the production worker URL in web/Trunk.toml. NB it is public in the
+        # shipped bundle by necessity (no server-side render) -- this only keeps it
+        # out of the repo / lets it rotate without a commit, not secret from users.
+        env:
+          SUDOKU_API_KEY: ${{ secrets.SUDOKU_API_KEY }}
         run: trunk build --release --public-url "/${{ github.event.repository.name }}/"
 
       - name: Upload Pages artifact
