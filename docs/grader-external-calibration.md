@@ -11,13 +11,19 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > **dropped.** The grader's output stays what it is today — a **per-spec, within-technique** rating.
 > The external data is for making that per-spec rating *better*, not for building a portable scalar.
 
-> Status: **Stage 0 BUILT & MEASURED (2026-06-23); Stages 1-4 not started.** Landed: the spec-free
-> grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, needed to bucket a spec-less
-> dataset puzzle into its inferred technique) and a first
-> [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) diagnostic harness. The
-> grading path itself is unchanged. The headline findings (§4) are: **coverage is high, the grader's
-> per-spec rating disagrees badly with humans, the worst case is the trunk node (no resolution at
-> all), and the Pelánek baseline currently beats us on every group.** No tuning yet.
+> Status: **Stages 0-1 BUILT & MEASURED (2026-06-23); Stages 2-4 not started.** Landed: the
+> spec-free grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, Stage 0) and the
+> reworked [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) harness — Stage 1,
+> the **corrected per-technique-bucket scoreboard** (§4.4): it buckets each group's covered puzzles by
+> inferred bottleneck (incl. the trunk bucket), reports our `rating` vs human and Pelánek vs human
+> PER BUCKET, and aggregates n-weighted within a group, **never pooled across techniques**. Pelánek's
+> per-puzzle metrics are cached (`--cache`, keyed by the puzzle, invalidated only by `--runs`/`--k`/
+> `--model-seed`) so re-runs are instant; `--no-pelanek` skips the bar for fast iteration. The
+> grading path itself is unchanged; no tuning yet. The headline findings (§4): **coverage is high;
+> our per-spec rating is flat (rating 0) in the trunk bucket that holds most of the data, pinning our
+> within-bucket aggregate to ~0 on every group that has a trunk; the one trunk-free group
+> (`armane/extreme`) is the only one where we have signal — and there we already match/beat Pelánek;
+> everywhere else Pelánek's Dependency carries the bar via the trunk.**
 
 ## 1. The problem: the grader only ever agreed with itself
 
@@ -133,7 +139,7 @@ chains tiers we cannot reach.
 
 The first `datasets_correlate` measured a *cross-technique* ordering (the dropped global number,
 `DIFFICULTY[T] + rating_T`). We keep it only as evidence that the cross-technique self-reference was
-bad; the corrected **per-technique-bucket** measurement is Stage 1.
+bad; the corrected **per-technique-bucket** measurement is **§4.4 (Stage 1, now built)**.
 
 | group | our (cross-tech) | Pelánek Refutation | Pelánek Dependency (|·|) |
 |---|---|---|---|
@@ -161,14 +167,57 @@ Spearman; the ordinal rows mix tau-b vs Spearman so the gap is slightly overstat
 3. **Ordinal order is directionally right but coarse.** Every ordinal group is monotone in
    mean-rating-per-level; the room is resolution, not direction.
 
+### 4.4 Stage 1 — the corrected board (per-technique bucket, measured 2026-06-23)
+
+The reworked [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) (`--jobs 12`,
+Pelánek `runs=30 k=25`, full groups). Per group: the **n-weighted aggregate over buckets** of our
+`rating` vs human and of the Pelánek bar (`max(|refut|, |dep|)`), with the trunk share of the covered
+puzzles. A flat / single-level bucket counts as `0` ranking power but is shown, never hidden;
+single-level buckets (no within-bucket order to test) are excluded from the aggregate.
+
+| group | covered | trunk / covered | our agg | Pelánek bar | gap (ours − bar) |
+|---|---|---|---|---|---|
+| `synnwang/solve_time` | 98% | 1448/1502 (96%) | **+0.002** | 0.584 (dep) | **−0.582** |
+| `synnwang/D_TO` | 99% | 329/340 (97%) | −0.009 | 0.714 (dep) | −0.723 |
+| `synnwang/D_TR` | 99% | 329/340 (97%) | −0.002 | 0.625 (dep) | −0.627 |
+| `armane/org.uk` | 86% | 156/206 (76%) | −0.009 | 0.376 (dep) | −0.385 |
+| `armane/sotd` | 89% | 206/321 (64%) | +0.041 | 0.385 (dep) | −0.344 |
+| `sakana/nhk` | 100% | 57/99 (only trunk is testable) | +0.000 | 0.364 (dep) | −0.364 |
+| `armane/extreme` | 99% | **no trunk** | **+0.105** | 0.052 (refut) | **+0.053** |
+
+Three reads, all sharpenings of §4.3:
+
+1. **The trunk flatness IS the score on every trunk-bearing group.** Our rating is a constant `0` in
+   the trunk bucket, which is 96-97% of the continuous data and 58-76% of the easier ordinal groups,
+   so the n-weighted aggregate is pinned to ~0 (the per-technique buckets that *do* have signal are
+   too thin to move it). This is §4.3.1, now quantified bucket-by-bucket. Closing the trunk (Stage 2)
+   is worth essentially the entire continuous-group gap.
+2. **`armane/extreme` is the control: no trunk bucket → we have signal, and there we beat the bar.**
+   Every `extreme` puzzle needs at least a hidden-pair, so it has no flat-trunk mass; our within-bucket
+   rating reaches **+0.105** while Pelánek's refutation/dependency are weak in that hard, narrow range
+   (bar 0.052). The dropped cross-technique number (§4.2) hid this entirely — the grader is not
+   uniformly worse than Pelánek, it is worse *exactly where it is flat*.
+3. **Pelánek's bar is carried by Dependency in the trunk** (|0.45-0.72|): precisely the singles-only
+   resolution our trunk bucket lacks, and precisely what Stage 2 must reproduce off the trace.
+
+The non-trunk per-technique buckets are thin (most `n < 25`) and span a narrow human-label range, so
+their per-bucket rho is noisy and many are single-level (reported `n/a`) — the restricted-range
+deflation of §7. The board is reproducible instantly from the cache; it is the baseline Stages 2-4
+are judged against.
+
 ## 5. The plan (per-spec; beat the bar; one change at a time)
 
-**Stage 1 — the corrected scoreboard (per-technique bucket).** Rework `datasets_correlate` to bucket
-each group's covered puzzles by inferred `key` (incl. the trunk bucket) and report, **per bucket**:
-coverage, our `rating`-vs-human rank correlation, and Pelánek-vs-human on the same bucket (the bar),
-aggregated per group (weighted by bucket n), never pooled across techniques. This is the board every
-later stage is judged on. Drop the cross-technique global baseline. Continuous groups use Spearman,
-ordinal use tau-b/AUC; report n per bucket (thin buckets stated, not hidden).
+**Stage 1 — the corrected scoreboard (per-technique bucket). DONE (2026-06-23) — see §4.4.**
+Reworked `datasets_correlate` to bucket each group's covered puzzles by inferred `key` (incl. the
+trunk bucket) and report, **per bucket**: n + coverage, our `rating`-vs-human rank correlation, and
+Pelánek-vs-human on the same bucket (the bar), aggregated per group (n-weighted over buckets, a
+flat/undefined bucket = `0` ranking power with its n still counted), never pooled across techniques.
+This is the board every later stage is judged on. The cross-technique global baseline is dropped.
+Continuous groups use weighted Spearman, ordinal use Kendall tau-b; n is reported per bucket (thin
+buckets stated, not hidden; single-level buckets — no within-bucket order — shown as `n/a` and
+excluded from the aggregate). Pelánek is mined once into a per-puzzle cache (`--cache`).
+
+    cargo run --release -p generator-lab --example datasets_correlate -- --jobs 12 [--no-pelanek]
 
 **Stage 2 — close the trunk gap (highest leverage).** Give the **trunk node** a real within-spec
 sub-order so it is not flat `0`. The signal must vary when no harder kind fires — candidates already in
