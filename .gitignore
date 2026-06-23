@@ -10,5 +10,10 @@ generator-lab/web/generator_lab.wasm
 generator-lab/web/results.jsonl
 
 .claude/
+# Python bytecode caches (e.g. the grader-tuning analysis scripts).
+__pycache__/
 # Pregenerated at build by the Trunk pre_build hook (from lab::kinds).
 /web/curriculum.js
+
+# External Sudoku datasets for grader tuning (large; fetched, not versioned).
+/datasets
