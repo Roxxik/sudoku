@@ -822,6 +822,70 @@ pub fn grade_one(spec: &Spec, puzzle: &DigitGrid) -> (Signals, f64) {
     (signals, rating(spec, &signals))
 }
 
+// --- G1: spec-free grading (docs/grader-external-calibration.md §3) -------------------------
+//
+// Every grade above keys on a `Spec` (it tells us the forced technique and the baseline
+// toolbox). An external dataset puzzle is a bare 81-char string with no spec, so it cannot use
+// that path. [`grade_puzzle`] infers the bottleneck *off the solve* instead of off the spec:
+// solve with the full toolbox, take the hardest harder-kind that actually fired as the
+// bottleneck, and read the same within-technique [`rating`] against that kind's baked tables.
+
+/// Every technique kind allowed at once — the toolbox [`grade_puzzle`] solves a spec-less
+/// dataset puzzle with (all `NUM` bits set). Distinct from a [`Spec`]'s [`baseline_mask`](Spec::baseline_mask),
+/// which scopes the toolbox to a curriculum node; a natural puzzle is unconstrained, so we let
+/// every technique fire and read which one ended up the bottleneck.
+pub const FULL_TOOLBOX: KindMask = (1 << NUM) - 1;
+
+/// One spec-less puzzle's grade: the [`Signals`] read off its full-toolbox solve, the
+/// **inferred** bottleneck technique, and the within-technique [`rating`]. Returned by
+/// [`grade_puzzle`].
+#[derive(Clone, Copy, Debug)]
+pub struct PuzzleGrade {
+    pub signals: Signals,
+    /// The bottleneck technique inferred from the solve — the hardest ([`DIFFICULTY`])
+    /// harder-than-trunk kind that fired. `None` for a puzzle the cheap closure solved on its
+    /// own (no harder kind fired); such a puzzle is uniformly easiest ([`rating`](Self::rating) 0).
+    pub key: Option<usize>,
+    /// The within-technique rating in `[0, 1]` against the inferred technique's baked
+    /// calibration ([`GRANULAR_NORM`]/[`GRANULAR_CDF`]). `0.0` for a trunk-only puzzle.
+    pub rating: f64,
+}
+
+/// Grade a **spec-less** puzzle (an external dataset entry) by inferring its bottleneck from the
+/// solve rather than from a [`Spec`] (the G1 gap of `docs/grader-external-calibration.md`). Solve
+/// with the [`FULL_TOOLBOX`]; the bottleneck is the hardest harder-than-trunk kind that fired, the
+/// spec-less analogue of [`bottleneck_key`]'s "hardest forced member". The same featurizer and the
+/// same baked per-technique tables grade it — only *which* kind is the bottleneck is read off the
+/// trace.
+///
+/// `None` when the full-toolbox cold solve does not finish: the puzzle needs a technique above the
+/// toolbox (chains), so it is **ungradeable** — that is a finding (the coverage gap), not an error.
+///
+/// CAVEAT (the G1 distribution shift, must be measured): the baked tables were mined from
+/// *isolated* train/drill specs that force one technique and forbid easier same-branch ones. A
+/// natural puzzle solved with the full toolbox produces a different signal distribution at the same
+/// inferred bottleneck, so this rating is an approximation until that shift is quantified.
+pub fn grade_puzzle(puzzle: &DigitGrid) -> Option<PuzzleGrade> {
+    let trace = solve_graded(&SolverState::<Bands<RowMajor>>::from_digits(puzzle), FULL_TOOLBOX);
+    if !trace.solved {
+        return None; // needs above-toolbox logic (chains): ungradeable.
+    }
+    // Hardest harder-than-trunk kind that fired — read off the counts, not the spec.
+    let key = (NAKED_PAIR..NUM)
+        .filter(|&k| trace.counts[k] > 0)
+        .max_by_key(|&k| DIFFICULTY[k]);
+    match key {
+        Some(k) => {
+            let signals = signals_of(&trace, 1 << k);
+            let rating = rating_from_cdf(granular_score(&signals, &GRANULAR_NORM[k]), &GRANULAR_CDF[k]);
+            Some(PuzzleGrade { signals, key: Some(k), rating })
+        }
+        // No harder kind fired: the cheap closure solved it. Uniformly easiest, like a
+        // trunk-only spec under [`rating`].
+        None => Some(PuzzleGrade { signals: signals_of(&trace, 0), key: None, rating: 0.0 }),
+    }
+}
+
 /// The gentle / medium / spicy label for a band under the [`DEFAULT_BANDS`] (3) cut. For a
 /// different band count the caller should print the raw `band`/`n_bands` index instead.
 pub fn band_name3(band: usize) -> &'static str {
@@ -1124,6 +1188,35 @@ mod tests {
         let lo = granular_score(&sig_open(1, 0, 80), &open_only_norm());
         let hi = granular_score(&sig_open(1, 0, 120), &open_only_norm());
         assert!(lo < hi, "higher open => harder under sign +1");
+    }
+
+    // --- G1: spec-free grading ---------------------------------------------------------
+
+    #[test]
+    fn grade_puzzle_none_when_unsolvable_by_toolbox() {
+        // An empty grid: no single or harder technique can fire (every cell holds all 9
+        // candidates), so the full-toolbox solve stalls at once and never finishes -> ungradeable.
+        assert!(grade_puzzle(&DigitGrid::EMPTY).is_none());
+    }
+
+    #[test]
+    fn grade_puzzle_infers_bottleneck_and_rates_in_range() {
+        // A puzzle the generator built to need a naked pair: grade it spec-free. The full-toolbox
+        // solve must finish, infer some harder bottleneck, and rate within [0, 1].
+        use crate::generate::{AttemptResult, attempt};
+        use crate::rng::Rng;
+        let spec = Spec::train(NAKED_PAIR);
+        let mut graded = false;
+        for seed in 0..2000u64 {
+            if let AttemptResult::Success(p) = attempt(&mut Rng::from_seed(seed), &spec) {
+                let g = grade_puzzle(&p.puzzle.0).expect("a baseline-solvable puzzle grades");
+                assert!(g.key.is_some(), "a naked-pair puzzle needs a harder kind");
+                assert!((0.0..=1.0).contains(&g.rating));
+                graded = true;
+                break;
+            }
+        }
+        assert!(graded, "the generator should yield a naked-pair puzzle within the seed budget");
     }
 
     #[test]
