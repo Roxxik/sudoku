@@ -1,44 +1,50 @@
-# Grader — external human calibration (breaking the self-reference)
+# Grader — external human calibration (per-spec gradings, Pelánek as the bar)
 
-The plan for tuning the difficulty grader against the **external human-difficulty datasets**
-now in [`datasets/normalized/`](../datasets/README.md) — the concrete realisation of the "F2"
-reference that [`grader-continuous-scoring.md`](grader-continuous-scoring.md) §6 deferred while it
-was hypothetical. The data has landed; this doc says how to use it.
+The plan for making the **per-spec difficulty gradings** the grader already produces agree with
+**human** difficulty, using the external human-difficulty datasets in
+[`datasets/normalized/`](../datasets/README.md) (the concrete realisation of the "F2" reference that
+[`grader-continuous-scoring.md`](grader-continuous-scoring.md) §6 deferred) and the freshly merged
+[`pelanek`](../generator-lab/src/pelanek.rs) implementation as the **benchmark to beat**.
 
-> Status: **Stage 0 BUILT & MEASURED (2026-06-23); Stages 1-3 not started.** The spec-free
-> grading path ([`grade_puzzle`](../generator-lab/src/grade.rs), the G1 gap) and the
-> [`datasets-correlate`](../generator-lab/examples/datasets_correlate.rs) diagnostic harness are
-> landed; the grading path itself is unchanged (Stage 0 is read-only). No signal re-orientation,
-> no global-number fit, no recalibration yet. The Stage-0 baseline table + findings are in §5; the
-> headline is **the G1 distribution shift is real and severe**, so the Stage-2 natural-puzzle
-> re-mine is now *required*, not optional. The data was arranged and normalised first
-> ([[project_grader_external_datasets]]).
+> **Scope decision (2026-06-23, user): no global number.** Earlier drafts proposed a cross-puzzle
+> "global" difficulty scalar (the C2/G2 number) that orders puzzles *across* techniques. That is
+> **dropped.** The grader's output stays what it is today — a **per-spec, within-technique** rating.
+> The external data is for making that per-spec rating *better*, not for building a portable scalar.
 
-## 1. The problem: the grader only agrees with itself
+> Status: **Stage 0 BUILT & MEASURED (2026-06-23); Stages 1-4 not started.** Landed: the spec-free
+> grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, needed to bucket a spec-less
+> dataset puzzle into its inferred technique) and a first
+> [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) diagnostic harness. The
+> grading path itself is unchanged. The headline findings (§4) are: **coverage is high, the grader's
+> per-spec rating disagrees badly with humans, the worst case is the trunk node (no resolution at
+> all), and the Pelánek baseline currently beats us on every group.** No tuning yet.
 
-The Tier A–E grader is internally consistent and has never been compared to a human. Concretely,
-the self-reference is wired into two places:
+## 1. The problem: the grader only ever agreed with itself
+
+The Tier A-E grader is internally consistent and, until now, had never been compared to a human. The
+self-reference is wired in two places:
 
 - **Calibration.** [`TechNorm::calibrate(kind, sample, rel)`](../generator-lab/src/grade.rs) sets
-  every signal's **sign** (orientation) and keeps/drops its **weight** from `rank_corr(signal,
-  rel)` — and `rel` is the project's own relative grader,
-  [`grade_signals`](../generator-lab/src/grade.rs) ≈ [`grade_batch`](../generator-lab/src/grade.rs).
-  So a signal is oriented "harder" by whether it agrees with `grade_batch`, not with a human.
+  every signal's **sign** and keeps/drops its **weight** from `rank_corr(signal, rel)` — and `rel`
+  is the project's own relative grader, [`grade_signals`](../generator-lab/src/grade.rs) ≈
+  [`grade_batch`](../generator-lab/src/grade.rs). A signal is oriented "harder" by whether it agrees
+  with `grade_batch`, not with a human.
 - **Acceptance.** The §2.4 faithfulness gate in [`grader-continuous-scoring.md`](grader-continuous-scoring.md)
-  is *Spearman rho vs `grade_batch` ≥ 0.85*. "Faithful" is defined as "agrees with `grade_batch`."
+  is *Spearman rho vs `grade_batch` ≥ 0.85* — "faithful" means "agrees with `grade_batch`."
 
-And `grade_batch` itself is a hand-weighted heuristic — [`Weights::default`](../generator-lab/src/grade.rs)
-= dry `0.40` / count `0.25` / scarcity `0.20` / scan `0.15` over four signals, picked by eye, never
-validated. So the whole stack proves only that it agrees with one unvalidated ancestor heuristic.
-Every refinement since (the granular blend, the CDF rating, the trajectory and camo signals) inherits
-that ancestor as its ground truth. That is the "self-referential in a bad way."
+And `grade_batch` is itself a hand-weighted heuristic ([`Weights::default`](../generator-lab/src/grade.rs)
+= dry `0.40` / count `0.25` / scarcity `0.20` / scan `0.15`, picked by eye, never validated). So the
+whole stack proves only that it agrees with one unvalidated ancestor heuristic. The known symptom is
+already noted in the code: `alts` "calibrates to sign `+1` … not the intuitive `−1`," resolved in
+favour of `grade_batch` because *"the project's standard IS faithfulness to grade_batch."* That is
+exactly the question only an external reference can settle. **Stage 0 settled it: the grader's per-spec
+rating disagrees badly with humans (§4).**
 
-The known symptom is already in the code: the doc notes `alts` "calibrates to sign `+1` (more-alts ↔
-tighter-firing in-corpus), not the intuitive `−1`," and the project resolved the conflict in favour of
-`grade_batch` because *"the project's standard IS faithfulness to grade_batch."* That is exactly the
-question only an external reference can settle. The datasets are that reference.
+## 2. The two new anchors, and the one hard rule
 
-## 2. What the data gives us, and the one rule it imposes
+Two things exist now that did not when the grader was built.
+
+### 2.1 The human datasets — the ground truth (F2)
 
 [`datasets/normalized/`](../datasets/README.md) holds **real human signal**: solve times, completion
 rates, and human-set difficulty labels. Seven **groups** (`catalog.json`), each one self-consistent
@@ -51,255 +57,192 @@ harder**:
 | `synnwang/D_TO`, `D_TR` | continuous | 344 | time-only / time+completion difficulty metric |
 | `armane/org.uk` | ordinal (4 lvl) | 240 | Gentle < Moderate < Tough < Diabolical |
 | `armane/sotd` | ordinal (6 lvl) | 360 | Beginner < … < Diabolical |
-| `armane/extreme` | ordinal (5 lvl) | 300 | Evil < … < Extreme (expect ~0 coverage, all above-toolbox) |
+| `armane/extreme` | ordinal (5 lvl) | 300 | Evil < … < Extreme |
 | `sakana/nhk` | ordinal (3 lvl) | 99 | Nikoli hand-set easy / medium / hard |
 
-**The one hard rule: rank is defined WITHIN a group only.** Labels are never comparable across groups
-(different scales, metrics, populations). Every correlation, every fit, every acceptance number is
-computed per group and only *then* aggregated (mean of per-group scores, never a pooled regression over
-rows). Cross-group pooling is the one mistake that silently re-introduces a fake absolute scale.
+The human label is the **only** thing we ever tune toward.
 
-**Precedent (the yardstick).** Pelánek 2014 ([`docs/pelanek-2014-sisus-refutation-dependency.md`](pelanek-2014-sisus-refutation-dependency.md))
-correlates computed Sudoku difficulty metrics against *mean human solve time* — the same target as
-`synnwang/solve_time` — and reports Pearson **r = 0.68 / 0.83** for his best (refutation/dependency)
-metrics. That is the realistic band to aim for and to read our numbers against; a cold below-chains
-grader on a restricted-range subset will likely land at the low end, and that is informative, not a
-failure.
+### 2.2 Pelánek (2014) — the bar to beat
 
-## 3. Two architectural gaps before the data is usable
+[`pelanek`](../generator-lab/src/pelanek.rs) implements the Pelánek 2014 SiSuS model and its two
+computed metrics — **Refutation sum** (step complexity) and **Dependency** (frontier width;
+*inverse* — bigger = easier). Pelánek correlated these against *mean human solve time* and reported
+Pearson **r = 0.68 / 0.83** (the same target as `synnwang/solve_time`). It is **search-based, not
+technique-named**: it grades any uniquely-solvable puzzle (no toolbox/coverage limit) and produces a
+continuous number even for singles-only puzzles (via Dependency).
 
-The current grader cannot grade a dataset puzzle at all. Two things must be built first.
+**Pelánek is the benchmark, not a tuning target.** It is a *computed* heuristic, so calibrating our
+grader to *match Pelánek* would re-create the exact self-reference of §1 — just swapping `grade_batch`
+for another proxy. We never tune *to* Pelánek. We measure our per-spec grader against the **human**
+data, and Pelánek's human-correlation is the bar we want to **match or beat**. Stage 0 shows that bar
+is currently well above us (§4).
 
-### G1 — spec-free grading (infer the bottleneck from the solve, not from a `Spec`)
+### 2.3 The one hard rule: rank is defined WITHIN a bucket only
 
-Every entry point keys on a `Spec`: [`bottleneck_key(spec)`](../generator-lab/src/grade.rs),
-[`bottleneck_mask(spec)`](../generator-lab/src/grade.rs), and
-[`grade_one(spec, puzzle)`](../generator-lab/src/grade.rs) which solves with `spec.baseline_mask()`.
-A dataset puzzle is a bare 81-char string with no spec. Add a spec-free path:
+Labels are never comparable across groups (different scales, populations). And because the grader is
+**per-spec**, the relevant bucket is finer than the group: a puzzle's rating only means "hard *for its
+technique*", so an `x-wing` rating and a `jellyfish` rating are not comparable either. Every
+correlation is therefore computed **per (group × inferred-technique) bucket** and aggregated only
+*then* (mean of per-bucket scores, weighted by n). **No pooling across techniques, ever** — that is
+the same prohibition that makes the global number unnecessary: there is no single axis to pool onto.
 
-```
-grade_puzzle(puzzle) -> Option<(Signals, f64 rating)>
-  trace   = solve_graded(puzzle, FULL_TOOLBOX)         // all 16 kinds allowed
-  key     = argmax_{k >= NAKED_PAIR, counts[k] > 0} DIFFICULTY[k]   // hardest harder-kind that fired
-            -> None if the cold solve did not finish   // needs chains: UNGRADEABLE
-            -> rating 0 (trunk-only) if no harder kind fired at all
-  signals = signals_of(trace, 1 << key)                // same featurizer, inferred bottleneck mask
-  rating  = rating_from_cdf(granular_score(signals, NORM[key]), CDF[key])
-```
+## 3. The one architectural piece this needs (G1, built)
 
-This mirrors [`bottleneck_key`](../generator-lab/src/grade.rs)'s "hardest member" choice, but reads it
-off the trace instead of the spec. It reuses `signals_of` / `granular_score` / the baked tables
-unchanged — the only new logic is *which* kind is the bottleneck and *which* toolbox solved it.
+The grader's per-spec entry points key on a `Spec`: [`bottleneck_key(spec)`](../generator-lab/src/grade.rs),
+[`grade_one(spec, puzzle)`](../generator-lab/src/grade.rs). A dataset puzzle is a bare 81-char string
+with no spec. To grade it per-spec we must infer *which* technique node it belongs to.
 
-**BUILT** as [`grade_puzzle(puzzle) -> Option<PuzzleGrade>`](../generator-lab/src/grade.rs)
-(`PuzzleGrade { signals, key: Option<usize>, rating }`, `key = None` = trunk-only): `None` exactly
-when the [`FULL_TOOLBOX`](../generator-lab/src/grade.rs) cold solve does not finish (ungradeable).
-Additive — the spec-keyed [`grade_one`](../generator-lab/src/grade.rs) path is untouched.
-
-**Distribution-shift caveat (must be measured, not assumed).** The baked
-[`GRANULAR_NORM`/`GRANULAR_CDF`](../generator-lab/src/grade.rs) were mined from *isolated*
-train/drill specs that force exactly one technique and forbid easier same-branch ones. A natural
-dataset puzzle solved with the full toolbox produces a *different* signal distribution at the same
-inferred bottleneck (more techniques in play, different context). So `grade_puzzle` against the
-isolated-mined tables is an approximation. Stage 0 validates whether the shift is material; if it is,
-Stage 2 re-mines a "natural-puzzle" calibration pool (the gradeable dataset puzzles themselves,
-holdout-split) and bakes a second `NORM`/`CDF` for the spec-free path. One change at a time.
-
-**MEASURED (Stage 0, §5): the shift is severe.** The isolated tables assume every puzzle *has* a
-forced hard bottleneck; natural puzzles do not, so the rating pins at the extremes — ~96% of the
-`synnwang` puzzles are **trunk-only** (singles + locked candidates solve them, no harder kind fires)
-and rate a flat `0`, while `armane/extreme` rates a mean `0.83` with 26% clamped at `1`. The
-re-mine is therefore *required*. It also exposes a deeper gap the re-mine alone won't close: the
-grader has **no resolution within the trunk-only range**, yet that is exactly where the whole
-`synnwang` corpus (mean human solve time 130-6192 s, all "easy" by technique) lives — so ranking
-those at all needs a finer easy-range signal (e.g. singles/LC fill-path depth) even when no harder
-kind fires.
-
-### G2 — a cross-technique axis (the global number C2, now anchored)
-
-The grader's output is a **within-technique** percentile ([`rating`](../generator-lab/src/grade.rs)):
-an x-wing at `0.6` and a jellyfish at `0.6` carry no shared meaning. The dataset labels mix techniques
-on one human scale, so to correlate against them we need a number that orders puzzles *across*
-techniques. That is exactly the optional global number C2 deferred in
-[`grader-continuous-scoring.md`](grader-continuous-scoring.md) §5.2:
+**BUILT — [`grade_puzzle(puzzle) -> Option<PuzzleGrade>`](../generator-lab/src/grade.rs)**
+(`PuzzleGrade { signals, key: Option<usize>, rating }`):
 
 ```
-global(puzzle) = base_T + span_T · rating_T(puzzle)        // T = inferred bottleneck technique
+grade_puzzle(puzzle):
+  trace  = solve_graded(puzzle, FULL_TOOLBOX)            // all 16 kinds allowed
+  key    = argmax_{k >= NAKED_PAIR, counts[k] > 0} DIFFICULTY[k]   // hardest harder-kind that FIRED
+           -> None  if the cold solve did not finish     // needs chains: UNGRADEABLE
+           -> key=None (trunk bucket) if no harder kind fired
+  rating = rating_from_cdf(granular_score(signals_of(trace, 1<<key), NORM[key]), CDF[key])
 ```
 
-C2 was deferred "for lack of an anchor." The datasets *are* the anchor: fit `base_T` / `span_T` so the
-global order matches the **human** label within each group (§5), not the branch-pooled `grade_batch`
-the §5.2 draft proposed. This is the single highest-leverage use of the data, because cross-technique
-is precisely where `grade_batch` has *nothing* to say (it is a per-batch relative cut) and where the
-human labels *do* span techniques.
+`key` is the **inferred bottleneck** — the spec-less analogue of `bottleneck_key`'s "hardest forced
+member", read off the trace instead of the spec. It is what assigns a dataset puzzle to its
+technique bucket and selects which per-technique baked table grades it. `key = None` is the **trunk
+bucket** (singles + locked candidates solved it — no harder kind fired). Additive — `grade_one` is
+untouched.
 
-## 4. Metrics (per group, over the solvable subset)
+**The former G2 "global number" is removed** (the §2 scope decision). `grade_puzzle` returns only the
+per-technique rating; nothing combines techniques onto one axis.
 
-- **Coverage first, always reported.** Per group: fraction of puzzles `grade_puzzle` can finish cold.
-  The hard ordinal tiers (`armane/extreme` entirely, Diabolical/Fiendish elsewhere) will be near-zero
-  until chains land. Coverage is a *finding* — it quantifies the chains gap — and it bounds every other
-  number (a 0.8 rho over 5% of a group is weak evidence). Never silently drop the uncovered tail; log
-  it.
-- **Continuous groups** (`synnwang/*`): **weighted Spearman rho** of `global` vs `label_value`, weight
-  = `weight` (player count for `solve_time`; the others are 1). Pearson on ranks ≈ Pelánek's r, so it
-  is directly comparable to the 0.68/0.83 yardstick.
-- **Ordinal groups** (`armane/*`, `sakana/nhk`): big tie classes, so use a tie-aware rank measure —
-  **Kendall tau-b** (or Somers' D with the level as dependent) of `global` vs the level index — plus
-  the readable diagnostic: **mean/median `global` per level must be monotone non-decreasing**, and the
-  adjacent-level AUC (P[random higher-level puzzle scores above a random lower-level one]) > 0.5.
-- **Aggregate** per-group numbers by averaging (optionally weighted by gradeable n), **never** by
-  pooling rows across groups (the §2 rule).
+## 4. Stage 0 results — how bad is it (measured 2026-06-23)
 
-## 5. Staged plan (validate before tuning, one change at a time)
+Two harnesses: [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) (our grader)
+and [`pelanek --dataset`](../generator-lab/examples/pelanek.rs) (the bar). All numbers are rank
+correlations of the *computed* difficulty against the *human* label, within a group.
 
-**Stage 0 — measure the self-reference (diagnostic, zero tuning).** Build `grade_puzzle` (G1) and a
-`datasets-correlate` harness (an example alongside [`grade_diag`](../generator-lab/examples/grade_diag.rs))
-that reads `datasets/normalized/`, grades the solvable subset of each group with the *existing baked
-tables*, and prints coverage + the §4 metrics per group. This answers the actual question — *how badly
-does the current grader disagree with humans?* — and exposes the G1 distribution shift. No code in the
-grading path changes. Output is a table the rest of the plan is judged against.
+### 4.1 Coverage (the chains gap — far smaller than feared)
 
-### Stage 0 results (measured 2026-06-23)
+The cold below-chains toolbox finishes **86-100% of every group**, including **99% of `armane/extreme`**
+(the doc previously predicted ~0). The chains gap bites only the very top ordinal tier — `org.uk`
+Diabolical 29/60 (48%), `sotd` Diabolical 21/60 (35%). The site "extreme/evil" labels mostly do **not**
+require chains; they overstate logical depth relative to this toolbox. (Sanity-checked the other way:
+genuine AI-Escargot-class puzzles return `None`, so coverage is real, not a false-`solved` bug.)
+Pelánek has **no coverage gap** — it search-grades every uniquely-solvable puzzle, including the
+chains tiers we cannot reach.
 
-Run: `cargo run --release -p generator-lab --example datasets_correlate`. `global = DIFFICULTY[T] +
-rating_T` (the un-fit C2 baseline of §3-G2: the project's own per-technique difficulty as `base_T`,
-`span_T = 1`). Rank computed WITHIN each group only.
+### 4.2 Our per-spec grader vs the human label (the cross-technique baseline, now deprioritised)
 
-| group | kind | n | covered | correlation vs human | rating shift |
-|---|---|---|---:|---|---|
-| `synnwang/solve_time` | continuous | 1533 | 98% | wSpearman **+0.215** | 96% trunk (rating≈0) |
-| `synnwang/D_TO` | continuous | 344 | 99% | wSpearman **+0.262** | 97% trunk |
-| `synnwang/D_TR` | continuous | 344 | 99% | wSpearman **+0.270** | 97% trunk |
-| `armane/org.uk` | ordinal (4) | 240 | 86% | tau-b **+0.330**, monotone, AUC 0.69 | mean 0.17, 76% trunk |
-| `armane/sotd` | ordinal (6) | 360 | 89% | tau-b **+0.443**, monotone, AUC 0.71 | mean 0.25, 64% trunk |
-| `sakana/nhk` | ordinal (3) | 99 | 100% | tau-b **+0.388**, monotone, AUC 0.71 | mean 0.28, 58% trunk |
-| `armane/extreme` | ordinal (5) | 300 | 99% | tau-b **+0.154**, monotone, AUC 0.56 | mean 0.83, 26% at 1 |
+The first `datasets_correlate` measured a *cross-technique* ordering (the dropped global number,
+`DIFFICULTY[T] + rating_T`). We keep it only as evidence that the cross-technique self-reference was
+bad; the corrected **per-technique-bucket** measurement is Stage 1.
 
-Four findings, in order of consequence:
+| group | our (cross-tech) | Pelánek Refutation | Pelánek Dependency (|·|) |
+|---|---|---|---|
+| `synnwang/solve_time` | Spearman **+0.215** | +0.320 | **0.644** |
+| `armane/org.uk` | tau-b +0.330 | Spearman **+0.781** | 0.765 |
+| `armane/sotd` | tau-b +0.443 | Spearman **+0.758** | 0.766 |
 
-1. **Coverage is HIGH, not near-zero — the §2/§7 "below chains" prediction was wrong.** The toolbox
-   (singles + LC + subsets + fish + wings) finishes 86-100% of *every* group, including **99% of
-   `armane/extreme`** (predicted ~0). The chains gap bites only at the very top ordinal tier:
-   `org.uk` Diabolical 29/60 (48%), `sotd` Diabolical 21/60 (35%). The site "extreme/evil" labels
-   mostly do **not** require chains — they overstate logical depth relative to this toolbox. (Sanity-
-   checked the other way: genuinely chains-hard puzzles — AI-Escargot-class — return `None`, so the
-   coverage is real, not a false-`solved` bug.)
+(Pelánek numbers are small subsamples — 100-150 puzzles, 8-12 runs — so directional, not final; a full
+run at the paper's 30 runs would firm them. `synnwang` is the clean apples-to-apples row, both
+Spearman; the ordinal rows mix tau-b vs Spearman so the gap is slightly overstated but still large.)
+**Pelánek beats us on every group, by a lot, and covers more.** That is the bar.
 
-2. **The G1 distribution shift is severe → Stage 2's re-mine is required.** The baked CDF was mined on
-   isolated specs that *force* a hard technique, so it assumes every puzzle has a hard bottleneck.
-   Natural puzzles pin at the extremes: `synnwang` is **~96% trunk-only** (rating flat 0),
-   `armane/extreme` rates mean **0.83** with 26% clamped at 1. The isolated tables do not fit the
-   natural distribution.
+### 4.3 The findings that drive the plan
 
-3. **Continuous rho ≈ 0.22-0.27, far under Pelánek's 0.68/0.83 — but it is the trunk-pinning
-   artifact, not (yet) a verdict on the signals.** With 96% of `synnwang` tied at `global = 0` the
-   order has almost no resolution to correlate; the corpus lives in the easy range the grader
-   flattens. The deeper gap: the grader has **no within-trunk resolution at all**, yet `synnwang`'s
-   human solve time (130-6192 s, all "easy" by technique) varies entirely *inside* that range. Ranking
-   it needs an easy-range signal (singles/LC fill-path depth) even when no harder kind fires — a new
-   work item the data surfaced, beyond the §3-G2 plan.
+1. **The grader has no resolution in the trunk range — and that is where most data lives.** ~96% of
+   `synnwang` is **trunk-only** (singles + locked candidates solve it, no harder kind fires); the
+   grader rates every one a flat `0`. No fit can rank a constant column, which is why our `synnwang`
+   correlation is near-floor. The **trunk bucket is the largest *and* the worst-graded** — closing it
+   is the single highest-leverage per-spec improvement, and it is exactly where Pelánek's Dependency
+   metric earns its |0.64| (it varies on singles-only puzzles; ours does not).
+2. **The baked tables do not fit natural puzzles (the G1 distribution shift).** The CDF was mined on
+   *isolated* specs that *force* a hard technique, so it assumes every puzzle has a hard bottleneck.
+   Natural puzzles pin at the extremes — `synnwang` ~96% trunk (rating 0), `armane/extreme` mean
+   rating 0.83 with 26% clamped at 1. So a natural-puzzle re-mine of `NORM`/`CDF` is required.
+3. **Ordinal order is directionally right but coarse.** Every ordinal group is monotone in
+   mean-rating-per-level; the room is resolution, not direction.
 
-4. **Ordinal order is directionally correct.** Every ordinal group is **monotone in mean-`global`-
-   per-level** and tau-b is positive, rising with how much the labels track our toolbox's depth
-   (`sotd` +0.44 > `nhk` +0.39 > `org.uk` +0.33 > `extreme` +0.15, the last weakest because its labels
-   barely track below-chains depth). So the cross-technique `DIFFICULTY`-anchored baseline already
-   sorts the human levels the right way on average — the room is in resolution, which is what Stages
-   1-2 add.
+## 5. The plan (per-spec; beat the bar; one change at a time)
 
-**Next steps (re-prioritised by the Stage-0 findings).**
+**Stage 1 — the corrected scoreboard (per-technique bucket).** Rework `datasets_correlate` to bucket
+each group's covered puzzles by inferred `key` (incl. the trunk bucket) and report, **per bucket**:
+coverage, our `rating`-vs-human rank correlation, and Pelánek-vs-human on the same bucket (the bar),
+aggregated per group (weighted by bucket n), never pooled across techniques. This is the board every
+later stage is judged on. Drop the cross-technique global baseline. Continuous groups use Spearman,
+ordinal use tau-b/AUC; report n per bucket (thin buckets stated, not hidden).
 
-- **NEW prerequisite — within-trunk resolution (gates the continuous groups).** Finding 3 shows the
-  `synnwang` corpus is ~96% trunk-only, where the grader emits a flat `0`. No global-number fit can
-  rank a flat column. Before Stage 2 can help `synnwang`, the grader needs an *easy-range* signal that
-  varies when no harder kind fires — candidates already in the trace: the singles/LC **fill-path
-  depth** (how long the cheap closure took, where it stalled-and-resumed), the LC firing count, the
-  candidate-population profile. This is outside the original §3-G2 plan and is the single
-  highest-leverage change for the continuous groups; do it as its own measured step, then re-run
-  Stage 0. (The ordinal groups are less affected — their hardness spans technique tiers, which
-  `global` already captures.)
-- **Stage 1 (signal signs) is data-thin and should target the dense buckets only.** The gradeable
-  non-trunk puzzles concentrate in a few kinds (subsets, `xy`/`w-wing`); only those buckets can
-  re-adjudicate a sign (the `alts ±1` conflict) against the human label. Everywhere else keep the
-  `grade_batch` fallback — exactly as the stage already says, now confirmed by the bucket counts.
-- **Stage 2 re-mine is confirmed required** (not conditional). Fit `base_T`/`span_T` and re-mine the
-  natural-puzzle `NORM`/`CDF`, holdout-split per group.
-- **Use the ordinal groups as the near-term acceptance target.** They already validate directionally
-  (monotone, positive tau-b) and are not trunk-dominated, so tau-b / AUC lift is the cleanest signal
-  that a change helped — the continuous groups stay noisy until the within-trunk gap is closed.
+**Stage 2 — close the trunk gap (highest leverage).** Give the **trunk node** a real within-spec
+sub-order so it is not flat `0`. The signal must vary when no harder kind fires — candidates already in
+the trace: singles/LC **fill-path depth** (how far the cheap closure went, where it stalled and
+resumed), the LC firing count, the candidate-population profile. (Pelánek's *Dependency* is the
+human-validated proof such a signal exists; we build our own off the trace rather than tune to it.)
+Measure against the trunk-bucket human label — `synnwang` is mostly trunk, so the data is dense here.
+One change, measured against Stage 1.
 
-**Stage 1 — adjudicate signal orientation with the human reference.** Where a technique bucket has
-enough gradeable dataset puzzles, recompute each signal's sign from `rank_corr(signal, human_label)`
-instead of `rank_corr(signal, grade_batch)`. The first thing to settle is the known `alts` conflict
-(§1): does the human reference orient it `+1` or `−1`? Re-bake [`TechNorm::calibrate`](../generator-lab/src/grade.rs)'s
-`rel` argument from human labels for the buckets that support it; keep `grade_batch` as the fallback
-`rel` for buckets too thin to fit (most within-technique buckets will be thin — that is expected, and
-the cross-technique fit in Stage 2 is where the data is dense). Measure the within-technique rho and
-split-half stability do not regress (the C/D/E gains are kept; this only re-orients, it does not
-re-weight).
+**Stage 3 — adjudicate signal orientation with the human reference.** In the **dense** technique
+buckets only, recompute each signal's sign from `rank_corr(signal, human_label)` instead of
+`rank_corr(signal, grade_batch)`. First settle the known `alts` conflict (§1): does the human
+reference orient it `+1` or `−1`? Re-bake [`TechNorm::calibrate`](../generator-lab/src/grade.rs)'s
+`rel` from human labels where the bucket supports it; keep `grade_batch` as the fallback `rel` for
+thin buckets (most will be thin — Stage 0 confirms the data concentrates in trunk + a few kinds).
+Check the within-technique split-half stability does not regress (the C/D/E gains are kept; this
+re-orients, it does not re-weight).
 
-**Stage 2 — fit and anchor the global number (G2 + the natural-puzzle re-mine if Stage 0 demands it).**
-Fit `base_T` / `span_T` to minimise within-group rank loss against the human labels (a monotone /
-isotonic fit, summed over groups, never pooling labels). Holdout-validate: fit on half each group,
-score the other half, report held-out rho/tau. If Stage 0 found the distribution shift material, this
-is also where the spec-free `NORM`/`CDF` is re-mined over the natural-puzzle pool and baked as a second
-table. Ship the global number as a **separate, optional** read — the UI badge stays the within-technique
-sub-tier (the standing decision in [`grader-granular-scoring.md`](grader-granular-scoring.md)); the
-global number feeds sorting / a daily-difficulty curve / cross-puzzle comparison.
+**Stage 4 — natural-puzzle re-mine + optional per-technique re-weight.** Re-mine the `NORM`/`CDF` over
+the gradeable dataset puzzles themselves (holdout-split per bucket), curing the §4.3.2 distribution
+shift, and bake it as the spec-free path's table. Then, only where a bucket is large enough, fit
+per-technique weight vectors by monotone-constrained regression against the human label,
+holdout-gated (accept only weights whose held-out human rho beats the per-bucket baseline — small
+buckets overfit instantly). Heaviest step; may simply lack the data in most buckets — do not force it.
 
-**Stage 3 — optional per-technique re-weighting (F1 against the human ref).** Only if Stages 1–2 leave
-a residual a technique bucket is large enough to fix: fit per-technique weight vectors by
-monotone-constrained regression against the human label, holdout-gated (accept only weights whose
-held-out rho beats the per-branch baseline — small buckets overfit instantly). This is the heaviest
-step and may simply not have the data within most technique buckets; do not force it.
-
-Re-use the resumable [`grade_diag`](../generator-lab/examples/grade_diag.rs) mining cache machinery so
-the dataset solves are computed once and recalibration is instant.
+Re-use the resumable [`grade_diag`](../generator-lab/examples/grade_diag.rs) mining-cache machinery so
+the (slow, especially for Pelánek) dataset solves are computed once and recalibration is instant.
 
 ## 6. Acceptance criteria
 
 1. **Coverage reported, tuning on the solvable subset only**, the uncovered tail logged per group.
-2. **Continuous groups:** weighted Spearman rho of `global` vs human improves on the Stage-0 baseline
-   and is read against the Pelánek 0.68/0.83 band (with the restricted-range caveat stated, not hidden).
-3. **Ordinal groups:** monotone mean-`global`-per-level and Kendall tau-b improve on Stage-0.
-4. **Held-out:** every fitted number (signs, `base_T`/`span_T`, any weights) is validated on a group
-   half it was not fit on; report held-out, not in-sample, numbers.
-5. **No regression of the internal grade:** within-technique split-half stability (≥ 0.90, §2.3) and
-   the C/D/E gains survive — the human anchor sits on top of the within-technique rating, it does not
-   replace it.
-6. **No cross-group pooling** anywhere — per-group metrics aggregated only by averaging.
+2. **Per-technique-bucket human correlation improves on the Stage-0 baseline** and **closes the gap to
+   Pelánek** (the §2.2 bar), reported per group and aggregated — never pooled across techniques.
+3. **The trunk bucket is no longer flat:** it has resolution and a positive human correlation (the
+   §4.3.1 fix).
+4. **Held-out:** every fitted number (signs, any weights, the re-mined `NORM`/`CDF`) is validated on a
+   bucket half it was not fit on; report held-out, not in-sample, numbers.
+5. **No regression of the internal grade:** within-technique split-half stability (≥ 0.90) and the
+   C/D/E gains survive — the human anchor sits on top of the within-technique rating.
+6. **No cross-technique pooling and no global number** — per-bucket metrics, aggregated by averaging.
 
 ## 7. Risks and honest limits
 
-- **The toolbox caps coverage — but far less than feared (Stage 0 measured 86-100%, §5).** The fear
-  was that the hard human tiers would be ungradeable below chains; in fact only the very top ordinal
-  tier loses coverage, and the rest is easy-to-medium. So the real limit is the *opposite*: the
-  gradeable corpus is concentrated in the easy range, where the grader has the least resolution (the
-  trunk-pinning of finding 3). The hardest puzzles still stay out of reach until chains land; state the
-  gradeable range with every number.
-- **Restricted range deflates correlation.** Dropping the hard tail compresses the difficulty range, so
-  rho will read lower than Pelánek's full-range numbers even if the grader is good on what it covers.
-  Report coverage alongside rho so the two are read together.
-- **Thin within-technique buckets.** Most of the data's power is *cross-technique* (Stage 2). Within a
-  single technique a group may have too few gradeable puzzles to re-orient or re-weight reliably — hence
-  the `grade_batch` fallback and the holdout gates. Do not manufacture per-technique fits the data
-  cannot support.
+- **The toolbox caps *our* coverage — but far less than feared (86-100%, §4.1).** Only the top ordinal
+  tier loses coverage; the rest is easy-to-medium. The real limit is the *opposite*: the gradeable
+  corpus is concentrated in the easy range, where the grader has the least resolution (§4.3.1). Pelánek
+  has no such gap, which is part of why it is the bar. State the gradeable range with every number.
+- **Thin within-technique buckets.** Most of the data is trunk + a few kinds, so most per-technique
+  buckets are thin. Hence the `grade_batch` fallback and the holdout gates. Do not manufacture
+  per-technique fits the data cannot support; the trunk bucket (Stage 2) and the few dense kinds are
+  where the real signal is.
+- **Restricted range deflates correlation within a bucket.** A single technique's puzzles span a
+  narrow difficulty range, so within-bucket rho reads lower than a full-range number. Report n and
+  coverage alongside every rho.
 - **The human label is itself noisy / population-specific.** `synnwang` is one app's player base;
-  `armane` is per-site editorial labels. Treat each as one partial order, weight by confidence where it
-  exists (`player_count`), and never collapse them into a single ground truth.
+  `armane` is per-site editorial labels. Treat each as one partial order, weight by confidence where
+  it exists (`player_count`), and never collapse them into a single ground truth.
+- **Pelánek is expensive.** It is randomized rollouts (30 runs, refutation per stuck cell), so the
+  hard groups cost orders of magnitude more than our toolbox solve. Keep the `--limit`/`--runs` knobs
+  and the mine-once cache if Pelánek ever enters a tuning loop (it is the bar, so it is graded once
+  and cached, not re-run per change).
 
 ## 8. Relation to other docs and memory
 
-- [`grader-continuous-scoring.md`](grader-continuous-scoring.md) — §6 F2 / §5.2 C2: this doc is their
-  concrete realisation now the data exists. The within-technique Tiers C/D/E it ships are the backbone
-  this plan anchors externally; it does not undo them.
-- [`grader-granular-scoring.md`](grader-granular-scoring.md) — the within-technique 3-band cut; the
-  standing decision that the UI badge stays a sub-tier read (the global number is separate) holds here.
+- [`grader-continuous-scoring.md`](grader-continuous-scoring.md) — the within-technique Tiers C/D/E
+  this plan anchors externally. **Its §5.2 optional global number C2 is now explicitly dropped** (§2
+  scope decision); the rest (the per-technique rating) is the backbone this plan improves.
+- [`grader-granular-scoring.md`](grader-granular-scoring.md) — the within-technique sub-tier cut; the
+  standing decision that the UI badge stays a per-spec sub-tier read holds (and there is now no
+  competing global read).
 - [`campaign-grader-plan.md`](campaign-grader-plan.md) — the relative `grade_batch` grader, i.e. the
   *self-reference* this plan replaces as the calibration target (kept only as the thin-bucket fallback).
-- [`pelanek-2014-sisus-refutation-dependency.md`](pelanek-2014-sisus-refutation-dependency.md) — the
-  methodological precedent: correlate computed difficulty against human solve time; the 0.68/0.83
-  yardstick.
-- [`datasets/README.md`](../datasets/README.md) + `datasets/normalized/catalog.json` — the data shape
-  this plan consumes (read `normalized/` only, never the raw sources).
-</content>
-</invoke>
+- [`pelanek-2014-sisus-refutation-dependency.md`](pelanek-2014-sisus-refutation-dependency.md) +
+  [`pelanek.rs`](../generator-lab/src/pelanek.rs) — the **bar to beat**: a search-based, human-validated
+  computed metric. We measure ourselves against it on the human data; we never tune to it.
+- [`datasets/README.md`](../datasets/README.md) + `datasets/normalized/catalog.json` — the data this
+  plan consumes (read `normalized/` only, never the raw sources).
