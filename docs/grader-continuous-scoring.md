@@ -236,11 +236,15 @@ mean/scale/sign. To extract resolution:
   **monotone-constrained** least squares / isotonic regression so signal orientation can't invert
   and §2.2 (monotonicity) is structural. **Holdout-validate** — per-technique weights overfit
   ~150-puzzle samples easily; accept only weights whose holdout rho beats the per-branch baseline.
-- **F2 — external reference (optional, bigger).** Calibrate against a continuous human-difficulty
-  reference (e.g. SudokuExplainer-style scores), giving the global number (§5.2) a real anchor
-  instead of self-consistency with `grade_batch`. This is the only part that reaches outside the
-  repo's own signals; gate it behind whether such a reference can be produced cheaply for the
-  corpus. Without it, the grader is internally consistent but its *absolute* scale is conventional.
+- **F2 — external reference (the real fix). NOW CONCRETE — see
+  [`grader-external-calibration.md`](grader-external-calibration.md).** Calibrate against a continuous
+  human-difficulty reference, anchoring the per-spec gradings on humans instead of self-consistency
+  with `grade_batch`. This is the only part that reaches outside the repo's own signals. The human data
+  has since landed in [`datasets/normalized/`](../datasets/README.md) (solve times, completion rates,
+  human-set labels), so F2 is no longer hypothetical: its plan — spec-free grading, per-technique-bucket
+  human correlation with Pelánek as the bar to beat, the staging and acceptance — is broken out into its
+  own doc. (That doc's 2026-06-23 scope decision **drops the §5.2 global number**: the grading stays
+  per-spec.) Without it the grader is internally consistent but its *absolute* scale is conventional.
 
 Keep the `grind` integer backbone and the `(0,1)` squash throughout — F changes how the
 sub-order is blended, never that `grind` dominates where it varies.
@@ -298,6 +302,11 @@ no re-mining is needed unless the generator or the grading solve changes.
   (Tier A/B, landed). This doc keeps that score as its backbone and adds resolution on top.
 - [`campaign-grader-plan.md`](campaign-grader-plan.md) — the per-node **relative** grader; still the
   faithfulness reference (§2.4) and the calibration target for F1.
+- [`grader-external-calibration.md`](grader-external-calibration.md) — the concrete F2 plan: tune the
+  per-spec gradings against the external human-difficulty datasets
+  ([`datasets/normalized/`](../datasets/README.md)), breaking the `grade_batch` self-reference, with
+  Pelánek as the bar to beat. Realises §6 F2; its 2026-06-23 scope decision **drops §5.2's optional
+  global number** (the grading stays per-spec).
 - [`GENERATION-RULES.md`](../GENERATION-RULES.md) — the path-quantified grader; the ceiling this doc
   deliberately does not cross.
 </content>
