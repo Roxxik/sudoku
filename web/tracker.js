@@ -3,10 +3,12 @@
 // Move tracking for the play view. Records a timeline of the player's actions --
 // placements, notes, erases, undo/redo, hint interactions, cheat actions,
 // setting changes, pauses -- so the difficulty grader has richer data than the
-// solved time alone. This is FRONTEND-ONLY: the log lives in localStorage under
-// its own per-game key (see store.loadTrack/saveTrack) and is never sent
-// anywhere. It records no device info or identifier beyond the game's own random
-// id; it is data capture for grading, not user tracking.
+// solved time alone. The log lives in localStorage under its own per-game key
+// (see store.loadTrack/saveTrack) and is also synced to the backend so the grader
+// can learn from real play -- including where people stall on puzzles they never
+// finish (play.js -> backend.recordMoves -> the worker's /moves endpoint, keyed by
+// the game's solve_id). It records no device info or identifier beyond the game's
+// own random ids: this is anonymous data capture for grading, not user tracking.
 //
 // Each event is { t, type, ...data } where `t` is the solve-elapsed time in ms
 // (pauses excluded -- the same clock that produces the solved time), the axis
@@ -73,6 +75,14 @@ export function dropLast() {
   events.pop();
   dirty = true;
   scheduleFlush();
+}
+
+// The current in-memory timeline (a shallow copy so callers can't mutate it).
+// The backend sync (play.js -> backend.recordMoves) reads this rather than the
+// localStorage copy: the in-memory array is the source of truth during a session,
+// and a sync may fire between debounced flushes. Empty before a session begins.
+export function snapshot() {
+  return events.slice();
 }
 
 function scheduleFlush() {

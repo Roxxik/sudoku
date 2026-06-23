@@ -22,3 +22,26 @@ CREATE TABLE IF NOT EXISTS client_errors (
   payload    TEXT    NOT NULL,           -- raw JSON the client POSTed; unvalidated
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- The player's move timeline for one puzzle, synced periodically DURING play and
+-- on close -- not just at solve -- so an abandoned or in-progress puzzle still
+-- shows where people stalled. One row per puzzle, keyed by the same solve_id the
+-- solves row uses (minted client-side at game creation); a row may exist here
+-- with NO matching solves row (puzzle never finished). Whole-timeline snapshot
+-- upsert: each sync replaces `events` with the latest full log, so a missed sync
+-- is fully recovered by the next and re-sends are idempotent. The upsert is
+-- guarded on event_count (see the worker) so an out-of-order/stale snapshot can
+-- never shorten the stored log. puzzle/seed are duplicated out of the timeline's
+-- opening `session` event so an unsolved puzzle is analyzable without a join.
+CREATE TABLE IF NOT EXISTS move_logs (
+  solve_id    TEXT    PRIMARY KEY,        -- joins solves.solve_id; minted at game creation
+  puzzle      TEXT    NOT NULL,           -- 81 chars, '.' = empty
+  seed        TEXT,                       -- decimal u64 string; NULL on pre-seed puzzles
+  solved      INTEGER NOT NULL,           -- 0 in-progress/abandoned, 1 once a 'solved' event exists
+  event_count INTEGER NOT NULL,           -- length of the events array; the upsert monotonicity guard
+  last_t      INTEGER NOT NULL,           -- last event's solve-elapsed ms (progress without parsing events)
+  events      TEXT    NOT NULL,           -- JSON array of the full move timeline
+  client_version TEXT NOT NULL,           -- frontend build that wrote this snapshot
+  created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);

@@ -13,6 +13,12 @@ const ALLOW_ORIGIN = "https://roxxik.github.io";
 // dump -- a real failed batch (outbox is client-capped) sits well under it.
 const MAX_ERROR_BYTES = 64 * 1024;
 
+// Cap on one move-log timeline's serialized events. A real solve runs a few
+// hundred events (tens of KB); this is the public-writable /moves endpoint's
+// guard against a single oversized blob. A log over the cap fails validation
+// (400s the batch) rather than truncating the timeline silently.
+const MAX_LOG_BYTES = 512 * 1024;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -57,6 +63,51 @@ export default {
       }));
     }
 
+    // Move-timeline sync. One row per puzzle keyed by solve_id, whole-snapshot
+    // upsert: the incoming events array REPLACES the stored one, guarded so a
+    // shorter (stale/out-of-order) snapshot can't shrink it. Synced periodically
+    // mid-solve and on close, so abandoned puzzles land too -- a row here may have
+    // no matching /solves row. Same key gate and batch shape as /solves.
+    if (url.pathname === "/moves") {
+      if (request.method !== "POST") return cors(new Response("method", { status: 405 }));
+      if (request.headers.get("x-api-key") !== env.API_KEY)
+        return cors(new Response("unauthorized", { status: 401 }));
+
+      let mbody;
+      try { mbody = await request.json(); } catch { return cors(new Response("bad json", { status: 400 })); }
+      const logs = mbody && Array.isArray(mbody.logs) ? mbody.logs : null;
+      if (!logs || !logs.every(validLog)) return cors(new Response("bad logs", { status: 400 }));
+
+      // The WHERE on the conflict path is the monotonicity guard: an upsert whose
+      // events array is no longer than the stored one is a no-op, so a retry that
+      // races a fresher snapshot can't roll the timeline back. event_count is taken
+      // from the array length (not the client field) so the guard can't be fooled
+      // by a mismatched count. solved/last_t still ride the same snapshot.
+      let upserted = 0;
+      if (logs.length) {
+        const stmt = env.DB.prepare(
+          `INSERT INTO move_logs (solve_id, puzzle, seed, solved, event_count, last_t, events, client_version)
+             VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(solve_id) DO UPDATE SET
+             puzzle = excluded.puzzle, seed = excluded.seed, solved = excluded.solved,
+             event_count = excluded.event_count, last_t = excluded.last_t,
+             events = excluded.events, client_version = excluded.client_version,
+             updated_at = datetime('now')
+           WHERE excluded.event_count >= move_logs.event_count`
+        );
+        const res = await env.DB.batch(
+          logs.map((s) => stmt.bind(
+            s.solve_id, s.puzzle, s.seed ?? null, s.solved ? 1 : 0,
+            s.events.length, s.last_t, JSON.stringify(s.events), s.client_version
+          ))
+        );
+        upserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+      }
+      return cors(new Response(JSON.stringify({ upserted }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }));
+    }
+
     if (url.pathname !== "/solves") return cors(new Response("not found", { status: 404 }));
     if (request.method !== "POST")  return cors(new Response("method", { status: 405 }));
     if (request.headers.get("x-api-key") !== env.API_KEY)
@@ -94,4 +145,18 @@ function valid(s) {
     && Number.isInteger(s.solve_ms)
     && (s.seed == null || typeof s.seed === "string")
     && typeof s.client_version === "string" && s.client_version.length > 0;
+}
+
+// Shape check for a /moves entry. `events` is the raw timeline array (the worker
+// stringifies it for storage); `solved` is coerced to 0/1 at bind time, so any
+// truthy/falsy value is accepted here. event_count is recomputed server-side, so
+// it isn't validated. Rejects a timeline whose serialized form exceeds the cap.
+function validLog(s) {
+  return s && typeof s.solve_id === "string" && s.solve_id.length > 0
+    && typeof s.puzzle === "string" && s.puzzle.length === 81
+    && (s.seed == null || typeof s.seed === "string")
+    && Array.isArray(s.events)
+    && Number.isInteger(s.last_t)
+    && typeof s.client_version === "string" && s.client_version.length > 0
+    && JSON.stringify(s.events).length <= MAX_LOG_BYTES;
 }

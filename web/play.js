@@ -312,6 +312,50 @@ function checkpointListing() {
   store.updateGame(game.id, { elapsedMs: elapsedMs(), lastPlayedAt: Date.now() });
 }
 
+// ---- Backend move-log sync ----
+// Push the current move timeline to the backend (fire-and-forget; offline-safe via
+// backend.js's coalescing outbox). Synced at COARSE points only -- a genuine pause,
+// a periodic tick during active play, on close, and on solve -- never per keystroke,
+// so an in-progress or abandoned puzzle is captured server-side, not just the final
+// solve. No-op without a stable solve_id (old records) or a meaningful timeline (the
+// lone opening `session` event isn't worth syncing).
+// Event count of the last snapshot we handed to the backend, so the periodic tick
+// can skip an idle interval (clock running, no new moves) instead of re-uploading
+// an unchanged timeline. Every appended action grows the count and an optimistic
+// rollback pops it back, so equal count means equal content. Reset per game in
+// loadGame. The lifecycle/solve syncs pass force=true and never consult it.
+let lastSyncCount = -1;
+function syncMoves(solved, { force = true } = {}) {
+  if (!game || !game.solve_id) return;
+  const events = tracker.snapshot();
+  if (events.length < 2) return;
+  if (!force && events.length === lastSyncCount) return; // periodic tick, nothing new
+  lastSyncCount = events.length;
+  backend.recordMoves({
+    solve_id: game.solve_id,
+    puzzle: game.puzzle,
+    seed: game.seed || null,
+    solved: !!solved,
+    events,
+  });
+}
+
+// A periodic sync while the clock runs, so a long unsolved sitting lands progress
+// server-side between the lifecycle syncs. Started on resume, stopped on pause.
+let moveSyncTick = null;
+const MOVE_SYNC_INTERVAL_MS = 30000;
+function startMoveSync() {
+  if (moveSyncTick === null) {
+    moveSyncTick = setInterval(() => { if (!finished) syncMoves(false, { force: false }); }, MOVE_SYNC_INTERVAL_MS);
+  }
+}
+function stopMoveSync() {
+  if (moveSyncTick !== null) {
+    clearInterval(moveSyncTick);
+    moveSyncTick = null;
+  }
+}
+
 // Pause the clock (folding the running span into the accumulated base) and
 // checkpoint. Called when leaving the view or hiding the tab.
 export function pause() {
@@ -329,6 +373,11 @@ export function pause() {
   // never loses the tail of the timeline.
   if (wasRunning) tracker.track("pause");
   tracker.flush();
+  // Stop the periodic sync and push the current timeline once on the way out. The
+  // solved path syncs explicitly in onSolved (with the final `solved` event), so
+  // skip it here to avoid a redundant upload.
+  stopMoveSync();
+  if (wasRunning && !finished) syncMoves(false);
 }
 
 // Resume the clock, unless the puzzle is already solved.
@@ -342,7 +391,10 @@ export function resume() {
   // changed display setting (e.g. the highlight mode) on the live board -- and
   // diff those settings to record any that changed while away.
   trackSettingChanges();
-  if (started) tracker.track("resume");
+  if (started) {
+    tracker.track("resume");
+    startMoveSync();
+  }
   render();
 }
 
@@ -644,13 +696,19 @@ function onSolved() {
     elapsedMs: finalMs,
   });
   // Append this solve to the backend log (fire-and-forget; offline/slow-safe).
+  // Reuse the game's stable solve_id (minted at creation) so this row joins the
+  // move-log rows already synced mid-solve; old records without one get a one-off.
   backend.recordSolve({
-    solve_id: crypto.randomUUID(),
+    solve_id: game.solve_id || crypto.randomUUID(),
     seed: game.seed,            // may be null on old records
     puzzle: game.puzzle,
     solution: game.solution,
     solve_ms: finalMs,
   });
+  // Final move-timeline sync, now that the `solved` event is in the log. The
+  // pause() above stopped the periodic sync and skipped its own (finished) sync,
+  // so this is the one upload that carries solved:true.
+  syncMoves(true);
   showSolved(finalMs);
 }
 
@@ -2257,6 +2315,7 @@ function showSolved(finalMs) {
 export function loadGame(g) {
   closeHint();
   game = g;
+  lastSyncCount = -1; // new game's timeline -> forget the previous game's sync mark
   parseLine(g.puzzle, given);
   parseLine(g.solution, solution);
   for (let i = 0; i < N; i++) {
@@ -2820,6 +2879,15 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onS
 
   // Stamp every tracked event with the solve-elapsed clock (pauses excluded).
   tracker.setClock(elapsedMs);
+
+  // Last-chance move-log sync on a hard unload (tab close, navigation). The
+  // app's visibilitychange handler already pauses-and-syncs when the tab hides,
+  // which covers most leaves; this belt-and-suspenders catches a direct unload
+  // that skips it. The upload uses keepalive (see backend.js) so it survives the
+  // teardown; the server upsert makes the overlap with the pause sync idempotent.
+  window.addEventListener("pagehide", () => {
+    if (game && !finished) syncMoves(false);
+  });
 
   boardEl = document.getElementById("board");
   notesBtn = document.getElementById("notes");

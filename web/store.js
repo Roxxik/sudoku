@@ -188,6 +188,9 @@ function newId() {
 // A game record, as seen by the rest of the app (getGame merges the two tiers):
 // {
 //   id, kindIndex, mode: "train"|"drill"|"custom",   (Beginner uses "train")
+//   solve_id: stable per-puzzle backend id minted at creation (the join key
+//             between the solves row and the move_logs row); absent on old records
+//             (onSolved mints a one-off id for those).
 //   puzzle, solution: 81-char lines ('.' = empty),
 //   givens: clue count,
 //   seed: decimal string of the u64 generator seed (debug only; absent on old
@@ -254,6 +257,10 @@ export function createGame({
   // Light listing entry.
   const meta = {
     id,
+    // Stable per-puzzle id for the backend, minted up front (not at solve time)
+    // so mid-solve move-log syncs and the eventual solve row share one key. See
+    // backend.recordMoves / recordSolve.
+    solve_id: newId(),
     kindIndex,
     mode,
     spec,

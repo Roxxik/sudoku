@@ -13,7 +13,9 @@ Plus one script to download the database. Nothing else.
 **In:** one write endpoint (`POST /solves`), a D1 table, a fire-and-forget client call from
 the solve hook, a shared-secret header, locked CORS, and a download script. Plus (built on
 top, see *Offline outbox + failure capture*): a localStorage retry queue and a schemaless
-`POST /errors` capture endpoint backed by a second table.
+`POST /errors` capture endpoint backed by a second table. And (see *Move-log sync*): a
+`POST /moves` endpoint + table that captures the player's move timeline during play, not just
+at solve, keyed by the same `solve_id`.
 
 **Out (deferred, each noted at the end):** the later auth scheme, custom domain / hosting the
 frontend on Cloudflare Pages, any read/query/stats endpoint, binary `.sqlite` export, rate
@@ -57,11 +59,13 @@ CREATE TABLE IF NOT EXISTS solves (
 );
 ```
 
-`solve_id` is a fresh `crypto.randomUUID()` minted **per solve** (not the game id — a game can
-be restarted and re-solved, so the game id is not unique per solve). Inserts use
-`INSERT OR IGNORE`, so an offline-retry that re-sends an already-stored solve is a no-op.
-This is the only reason `solve_id` exists: it makes the offline outbox a frontend-only change
-with no schema churn.
+`solve_id` is a per-puzzle id minted on the client **at game creation** (`store.createGame`),
+not the game id. Inserts use `INSERT OR IGNORE`, so an offline-retry that re-sends an
+already-stored solve is a no-op. Minting it up front (rather than per solve) does two jobs: it
+keeps the offline outbox a frontend-only change with no schema churn, and — because it's stable
+for the whole life of the puzzle — it is the **join key** between the solve row and the
+move-log rows synced *during* play (see *Move-log sync* below). Old game records predate the
+field; `onSolved` falls back to a one-off `crypto.randomUUID()` for those (no move history).
 
 A second, deliberately schemaless table captures client-side upload failures (see *Offline
 outbox + failure capture*). It stores one unvalidated JSON blob per failed attempt — the very
@@ -73,6 +77,27 @@ CREATE TABLE IF NOT EXISTS client_errors (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   payload    TEXT    NOT NULL,           -- raw JSON the client POSTed; unvalidated
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+A third table holds the player's **move timeline** for one puzzle — synced periodically during
+play and on close, not just at solve, so an abandoned or in-progress puzzle still shows where
+people stall. One row per puzzle, keyed by `solve_id` (so it joins `solves`, or stands alone
+when the puzzle was never finished); a whole-timeline snapshot upsert (the `events` array
+replaces the stored one) guarded so a stale snapshot can't shrink it. See *Move-log sync*.
+
+```sql
+CREATE TABLE IF NOT EXISTS move_logs (
+  solve_id    TEXT    PRIMARY KEY,        -- joins solves.solve_id; minted at game creation
+  puzzle      TEXT    NOT NULL,           -- 81 chars (out of the timeline's `session` event)
+  seed        TEXT,                       -- decimal u64 string; NULL on pre-seed puzzles
+  solved      INTEGER NOT NULL,           -- 0 in-progress/abandoned, 1 once solved
+  event_count INTEGER NOT NULL,           -- events array length; the upsert monotonicity guard
+  last_t      INTEGER NOT NULL,           -- last event's solve-elapsed ms (progress at a glance)
+  events      TEXT    NOT NULL,           -- JSON array of the full move timeline
+  client_version TEXT NOT NULL,
+  created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
@@ -273,6 +298,53 @@ POST /errors
 ```
 
 The captured rows ride down with the existing `scripts/db-download` SQL dump — no new tooling.
+
+## Move-log sync
+
+The grader wants more than the final time: it wants the *path* — and, crucially, the paths of
+puzzles people **never finish**, where they stalled. So the move timeline (`tracker.js`, the
+`sudoku.track.<id>` localStorage log) is now uploaded too, not just the solve.
+
+**Shape — whole-snapshot upsert, keyed by `solve_id`.** Each sync sends the *entire* current
+timeline as one JSON array; the worker upserts it into `move_logs` (`ON CONFLICT(solve_id) DO
+UPDATE`). Snapshots (not per-event rows or deltas) keep the client trivial and every upload
+self-contained: a missed sync is fully recovered by the next. The upsert's `WHERE
+excluded.event_count >= move_logs.event_count` is a **monotonicity guard** — an out-of-order or
+stale retry whose timeline is shorter than what's stored is a no-op, so it can never roll the
+log back. `event_count` is taken from the array length server-side, so it can't be faked by a
+mismatched field. A row can exist here with **no** matching `solves` row (puzzle abandoned);
+`puzzle`/`seed` are duplicated out of the timeline's opening `session` event so such a row is
+analyzable without a join.
+
+**When it syncs (`play.js`):** a genuine pause (which the app's `visibilitychange→hidden`
+handler already triggers when the tab hides), a **periodic tick** every 30 s while the clock
+runs, a `pagehide` last-chance on hard unload, and once on solve (carrying the final `solved`
+event, `solved:1`). Coarse points only — never per keystroke.
+
+**Outbox — coalescing by `solve_id`.** A second localStorage outbox mirrors the solve outbox
+but, because a move log is a growing snapshot re-sent many times, it **coalesces**: enqueuing a
+newer snapshot for a `solve_id` drops the one already queued, bounding the queue to one entry
+per puzzle in flight (capped at 50 puzzles). Same retry triggers as solves (`online`, load) and
+the same failure-status policy, with two differences: a 4xx capture sends a **compact summary**
+(`solve_id`/`event_count`/`last_t`, not the full timelines — they'd blow the 64 KB `/errors`
+cap), and a 5xx is kept-for-retry **without** a once-report (move logs re-sync constantly, so a
+persistent 5xx would spam `/errors`). Post-delivery cleanup compares event counts, not just
+`solve_id`, so a snapshot that grew mid-flush survives.
+
+```
+POST /moves
+  headers: content-type: application/json, x-api-key: <secret>
+  body:    { "logs": [ { solve_id, puzzle, seed, solved, last_t, events: [...], client_version }, ... ] }
+  200:     { "upserted": <n> }   // n = rows actually written (guard may no-op some)
+  400:     bad json / a log failing validation / events serialized over 512 KB
+  401:     bad/missing x-api-key
+  405:     method other than POST/OPTIONS
+```
+
+**Privacy.** The timeline carries only move data, settings, and the game's own random ids — no
+device info or identifier (the `user_agent` that `/errors` records is *not* sent here). A
+user-facing privacy notice and a possible future opt-in ("use my solve data to improve
+grading") are tracked separately.
 
 ## Download script
 
