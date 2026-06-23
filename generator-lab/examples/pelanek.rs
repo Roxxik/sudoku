@@ -16,7 +16,9 @@
 //!   `label_value` = harder) and report the Pearson and Spearman correlation of each
 //!   metric against the human label — the faithfulness check against the paper's
 //!   headline r ≈ 0.68 (refutation) / 0.67 (dependency). Dependency is inverse, so
-//!   its correlation is expected to be negative.
+//!   its correlation is expected to be negative. `--limit N` subsamples N puzzles
+//!   spread evenly across the whole file (the CSVs are grouped by level, so a first-N
+//!   prefix would be one constant-label block).
 //!
 //!     cargo run --release -p generator-lab --example pelanek -- \
 //!         --dataset ../../datasets/normalized/synnwang__solve_time.csv [--limit 300] [--runs 30]
@@ -111,19 +113,29 @@ fn run_dataset(path: &str, model_seed: u64, opts: &Opts) {
         }
     };
 
-    // Parse rows: header `puzzle,label_value,label_raw,weight`, then data.
-    let mut samples: Vec<(DigitGrid, f64)> = Vec::new();
+    // Parse every data row (header `puzzle,label_value,label_raw,weight`).
+    let mut all: Vec<(DigitGrid, f64)> = Vec::new();
     let mut skipped = 0usize;
-    for line in text.lines().skip(1).take(limit) {
+    for line in text.lines().skip(1) {
         let mut cols = line.split(',');
         let (Some(puz), Some(lab)) = (cols.next(), cols.next()) else {
             continue; // blank / malformed line
         };
         match (DigitGrid::parse(puz), lab.trim().parse::<f64>()) {
-            (Some(grid), Ok(label)) => samples.push((grid, label)),
+            (Some(grid), Ok(label)) => all.push((grid, label)),
             _ => skipped += 1,
         }
     }
+
+    // `--limit N` subsamples N puzzles spread EVENLY across the whole file, not the
+    // first N rows: the normalized CSVs are grouped by difficulty level, so a prefix
+    // would be one constant-label block (a degenerate, useless correlation). An even
+    // stride keeps the bounded run spanning every level.
+    let samples: Vec<(DigitGrid, f64)> = if limit < all.len() {
+        (0..limit).map(|i| all[i * all.len() / limit].clone()).collect()
+    } else {
+        all
+    };
 
     if samples.is_empty() {
         eprintln!("pelanek: no usable rows in {path:?}");
