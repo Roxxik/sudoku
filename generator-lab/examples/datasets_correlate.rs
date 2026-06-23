@@ -36,61 +36,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use generator_lab::datasets::{Group, Row, load_group};
 use generator_lab::grade::{PuzzleGrade, grade_puzzle};
 use generator_lab::pelanek::{Opts, grade_puzzle as pelanek_grade};
 use generator_lab::repr::DigitGrid;
 use generator_lab::spec::kinds::NAMES;
-
-/// One dataset row: the puzzle, the human label (numeric, higher = harder), and the per-row
-/// confidence weight (player count for `synnwang/solve_time`, `1` elsewhere).
-#[derive(Clone)]
-struct Row {
-    puzzle: String,
-    label_value: f64,
-    weight: f64,
-}
-
-/// One normalised group (`<group>.csv`): its id, whether the human label is continuous or an
-/// ordinal level index, and the rows.
-struct Group {
-    id: String,
-    ordinal: bool,
-    rows: Vec<Row>,
-}
-
-/// Parse one `normalized/<group>.csv`. Group id = file stem with `__` -> `/`. The label kind is
-/// read off the data: an ordinal group's `label_raw` is a level name (non-numeric), a continuous
-/// group's is the numeric metric. Columns: `puzzle,label_value,label_raw,weight`.
-fn load_group(path: &Path) -> Option<Group> {
-    let text = fs::read_to_string(path).ok()?;
-    let stem = path.file_stem()?.to_str()?;
-    let id = stem.replacen("__", "/", 1);
-    let mut lines = text.lines();
-    lines.next()?; // header
-    let mut rows = Vec::new();
-    let mut ordinal = false;
-    let mut first = true;
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        let puzzle = parts[0].trim().to_string();
-        let label_value: f64 = parts[1].trim().parse().ok()?;
-        let label_raw = parts[2].trim();
-        let weight: f64 = parts[3].trim().parse().unwrap_or(1.0);
-        if first {
-            // Ordinal iff the raw label is a level *name*, not the numeric metric.
-            ordinal = label_raw.parse::<f64>().is_err();
-            first = false;
-        }
-        rows.push(Row { puzzle, label_value, weight });
-    }
-    Some(Group { id, ordinal, rows })
-}
 
 // --- rank-correlation primitives ----------------------------------------------------------------
 

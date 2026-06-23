@@ -64,6 +64,10 @@
 pub mod repr;
 pub mod cli;
 pub(crate) mod counters;
+/// Native-only loader for the external human-difficulty datasets (the Stage-3 calibration workbench
+/// reads them off disk); the wasm build has no filesystem and never calibrates.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod datasets;
 pub mod fill;
 pub mod fingerprint;
 pub mod generate;

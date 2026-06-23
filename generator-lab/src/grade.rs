@@ -373,8 +373,10 @@ fn logistic(z: f64) -> f64 {
 /// comfortably above the ~`1/sqrt(n)` noise of the ~75-puzzle split-half calibrations the
 /// stability check uses (≈0.12), so a kept signal has a *determined* direction. Every signal's
 /// orientation is data-driven (the spec's §8: do not assume direction) — this only gates whether
-/// the direction is real enough to act on. See [`TechNorm::calibrate`].
-const CORR_FLOOR: f64 = 0.20;
+/// the direction is real enough to act on. See [`TechNorm::calibrate`]. Also the Stage-3
+/// per-signal gate: a signal is re-oriented from the human label only when its human correlation
+/// clears this floor ([`TechNorm::reoriented`]).
+pub const CORR_FLOOR: f64 = 0.20;
 
 /// Per-signal normalization: a calibrated `(mean, scale)` z-score, an orientation `sign`
 /// (`+1` if a higher raw value is *harder* for this technique, `-1` if lower is), and the
@@ -423,6 +425,11 @@ pub struct TechNorm {
 /// [`TechNorm`] all walk in this order: open, cascade, depth, mean-elims, alts, tight (D1),
 /// mean-open (D2), depth-tight (D3), transitions (D4), camo (E1).
 const NSIG: usize = 10;
+
+/// The [`NSIG`] granular-signal names, in [`raw_granular`] / [`branch_weights`] / [`TechNorm`]
+/// order. For the Stage-3 orientation report (so a flipped sign is named, not an index).
+pub const SIGNAL_NAMES: [&str; NSIG] =
+    ["open", "cascade", "depth", "elim", "alts", "tight", "open_mean", "depth_tight", "transitions", "camo"];
 
 /// The raw granular signal values of `s`, in the [`TechNorm`] field order. The means collapse to
 /// the single firing's value for the single-forced UI specs (`elim_mean == scarcity`,
@@ -655,6 +662,12 @@ pub fn band_of_rating(rating: f64, n_bands: usize) -> usize {
 // rerun `examples/grade_diag --calibrate` and repaste both arrays if the generator or the grading
 // solve changes. Trunk rows (kinds < `NAKED_PAIR`) are unused placeholders: a trunk-only spec has
 // no bottleneck key, so [`rating`] short-circuits to `0` before indexing these.
+//
+// STAGE 3 (docs/grader-external-calibration.md §5): a few **signs** are human-oriented, not
+// grade_batch-oriented — **naked-triple** `tight`/`depth_tight` (+1 -> -1) and **xy-wing** `cascade`
+// (-1 -> +1), with their CDFs re-derived under the flipped sign (`grade_diag --human-orient` surgical
+// bake). Mean/scale/weight are untouched (re-orient, not re-weight). The stability gate reverted the
+// naked-pair / w-wing flips the human data also suggested (they regressed split-half stability < 0.90).
 
 pub const GRANULAR_NORM: [TechNorm; NUM] = [
     /* naked-single   */ TechNorm { open: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, cascade: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, elim: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, alts: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, open_mean: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth_tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, transitions: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, camo: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 } },
@@ -663,14 +676,14 @@ pub const GRANULAR_NORM: [TechNorm; NUM] = [
     /* lc-claiming    */ TechNorm { open: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, cascade: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, elim: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, alts: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, open_mean: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, depth_tight: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, transitions: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }, camo: SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 } },
     /* naked-pair     */ TechNorm { open: SigNorm { mean: 122.020, scale: 37.346, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 32.027, scale: 18.211, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 40.180, scale: 8.299, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 3.427, scale: 1.431, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 2.180, scale: 1.084, sign: 1.0, weight: 0.30 }, tight: SigNorm { mean: 0.471, scale: 0.242, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 121.508, scale: 36.748, sign: -1.0, weight: 0.05 }, depth_tight: SigNorm { mean: 19.393, scale: 11.321, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.167, scale: 0.373, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 4.120, scale: 3.568, sign: 1.0, weight: 0.00 } },
     /* hidden-pair    */ TechNorm { open: SigNorm { mean: 133.503, scale: 33.937, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 32.980, scale: 18.853, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 37.057, scale: 7.101, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 3.802, scale: 1.454, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 2.450, scale: 1.260, sign: 1.0, weight: 0.30 }, tight: SigNorm { mean: 0.446, scale: 0.213, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 133.679, scale: 33.161, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 16.828, scale: 8.526, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.340, scale: 0.521, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 5.727, scale: 5.799, sign: 1.0, weight: 0.00 } },
-    /* naked-triple   */ TechNorm { open: SigNorm { mean: 131.797, scale: 31.252, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 35.393, scale: 16.992, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 37.557, scale: 6.600, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 4.734, scale: 1.660, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.390, scale: 0.747, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.559, scale: 0.241, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 132.241, scale: 31.005, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 21.071, scale: 9.267, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.360, scale: 0.520, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 8.773, scale: 8.169, sign: 1.0, weight: 0.00 } },
+    /* naked-triple   */ TechNorm { open: SigNorm { mean: 131.797, scale: 31.252, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 35.393, scale: 16.992, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 37.557, scale: 6.600, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 4.734, scale: 1.660, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.390, scale: 0.747, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.559, scale: 0.241, sign: -1.0, weight: 0.10 }, open_mean: SigNorm { mean: 132.241, scale: 31.005, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 21.071, scale: 9.267, sign: -1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.360, scale: 0.520, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 8.773, scale: 8.169, sign: 1.0, weight: 0.00 } },
     /* hidden-triple  */ TechNorm { open: SigNorm { mean: 140.130, scale: 30.149, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 34.957, scale: 18.766, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 35.850, scale: 5.783, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 5.341, scale: 1.770, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.303, scale: 0.609, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.563, scale: 0.218, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 139.855, scale: 28.716, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 20.326, scale: 8.161, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.397, scale: 0.509, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 10.280, scale: 9.496, sign: 1.0, weight: 0.00 } },
     /* naked-quad     */ TechNorm { open: SigNorm { mean: 142.050, scale: 31.492, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 35.520, scale: 18.554, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 35.397, scale: 6.152, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 6.138, scale: 2.045, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.147, scale: 0.446, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.577, scale: 0.216, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 142.796, scale: 30.788, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 20.428, scale: 7.888, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.430, scale: 0.521, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 13.630, scale: 11.366, sign: 1.0, weight: 0.00 } },
     /* hidden-quad    */ TechNorm { open: SigNorm { mean: 139.457, scale: 27.912, sign: -1.0, weight: 0.20 }, cascade: SigNorm { mean: 36.773, scale: 17.365, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 36.130, scale: 5.584, sign: 1.0, weight: 0.00 }, elim: SigNorm { mean: 7.182, scale: 2.089, sign: -1.0, weight: 0.35 }, alts: SigNorm { mean: 1.053, scale: 0.253, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.567, scale: 0.172, sign: 1.0, weight: 0.10 }, open_mean: SigNorm { mean: 139.794, scale: 27.366, sign: -1.0, weight: 0.05 }, depth_tight: SigNorm { mean: 20.569, scale: 7.130, sign: 1.0, weight: 0.05 }, transitions: SigNorm { mean: 0.393, scale: 0.546, sign: 1.0, weight: 0.05 }, camo: SigNorm { mean: 16.983, scale: 14.357, sign: 1.0, weight: 0.00 } },
     /* x-wing         */ TechNorm { open: SigNorm { mean: 108.707, scale: 37.764, sign: -1.0, weight: 0.15 }, cascade: SigNorm { mean: 36.807, scale: 9.083, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 43.913, scale: 8.577, sign: 1.0, weight: 0.05 }, elim: SigNorm { mean: 3.773, scale: 1.465, sign: -1.0, weight: 0.45 }, alts: SigNorm { mean: 1.347, scale: 0.577, sign: 1.0, weight: 0.30 }, tight: SigNorm { mean: 0.451, scale: 0.089, sign: -1.0, weight: 0.00 }, open_mean: SigNorm { mean: 108.710, scale: 37.768, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 19.642, scale: 4.924, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.013, scale: 0.115, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 3.507, scale: 2.884, sign: 1.0, weight: 0.00 } },
     /* swordfish      */ TechNorm { open: SigNorm { mean: 110.897, scale: 31.398, sign: -1.0, weight: 0.15 }, cascade: SigNorm { mean: 37.107, scale: 8.338, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 43.157, scale: 6.755, sign: 1.0, weight: 0.05 }, elim: SigNorm { mean: 5.308, scale: 2.062, sign: -1.0, weight: 0.45 }, alts: SigNorm { mean: 1.607, scale: 0.540, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.407, scale: 0.091, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 110.855, scale: 31.385, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 17.649, scale: 4.953, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.033, scale: 0.180, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 4.153, scale: 3.459, sign: -1.0, weight: 0.00 } },
     /* jellyfish      */ TechNorm { open: SigNorm { mean: 111.217, scale: 23.297, sign: -1.0, weight: 0.15 }, cascade: SigNorm { mean: 37.453, scale: 6.036, sign: -1.0, weight: 0.05 }, depth: SigNorm { mean: 43.173, scale: 4.757, sign: 1.0, weight: 0.05 }, elim: SigNorm { mean: 7.095, scale: 2.119, sign: -1.0, weight: 0.45 }, alts: SigNorm { mean: 1.947, scale: 0.265, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.349, scale: 0.060, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 111.283, scale: 23.278, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 15.100, scale: 3.145, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.090, scale: 0.286, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 5.520, scale: 4.524, sign: 1.0, weight: 0.00 } },
-    /* xy-wing        */ TechNorm { open: SigNorm { mean: 75.327, scale: 30.878, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 24.660, scale: 12.449, sign: -1.0, weight: 0.15 }, depth: SigNorm { mean: 51.000, scale: 8.955, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.668, scale: 0.731, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 1.773, scale: 1.108, sign: 1.0, weight: 0.45 }, tight: SigNorm { mean: 0.528, scale: 0.281, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 75.446, scale: 30.059, sign: 1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 26.652, scale: 13.169, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.127, scale: 0.352, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 7.120, scale: 5.552, sign: 1.0, weight: 0.00 } },
+    /* xy-wing        */ TechNorm { open: SigNorm { mean: 75.327, scale: 30.878, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 24.660, scale: 12.449, sign: 1.0, weight: 0.15 }, depth: SigNorm { mean: 51.000, scale: 8.955, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.668, scale: 0.731, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 1.773, scale: 1.108, sign: 1.0, weight: 0.45 }, tight: SigNorm { mean: 0.528, scale: 0.281, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 75.446, scale: 30.059, sign: 1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 26.652, scale: 13.169, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.127, scale: 0.352, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 7.120, scale: 5.552, sign: 1.0, weight: 0.00 } },
     /* xyz-wing       */ TechNorm { open: SigNorm { mean: 82.563, scale: 29.472, sign: 1.0, weight: 0.00 }, cascade: SigNorm { mean: 25.033, scale: 13.867, sign: -1.0, weight: 0.15 }, depth: SigNorm { mean: 49.467, scale: 8.071, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.063, scale: 0.225, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 1.360, scale: 0.563, sign: 1.0, weight: 0.45 }, tight: SigNorm { mean: 0.511, scale: 0.166, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 82.055, scale: 29.489, sign: 1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 25.312, scale: 9.103, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.253, scale: 0.450, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 6.070, scale: 4.650, sign: 1.0, weight: 0.40 } },
     /* w-wing         */ TechNorm { open: SigNorm { mean: 73.240, scale: 30.810, sign: -1.0, weight: 0.00 }, cascade: SigNorm { mean: 22.067, scale: 13.296, sign: -1.0, weight: 0.15 }, depth: SigNorm { mean: 52.177, scale: 8.884, sign: -1.0, weight: 0.00 }, elim: SigNorm { mean: 1.639, scale: 0.813, sign: -1.0, weight: 0.00 }, alts: SigNorm { mean: 3.313, scale: 2.809, sign: 1.0, weight: 0.00 }, tight: SigNorm { mean: 0.425, scale: 0.264, sign: 1.0, weight: 0.00 }, open_mean: SigNorm { mean: 73.079, scale: 29.353, sign: -1.0, weight: 0.00 }, depth_tight: SigNorm { mean: 21.839, scale: 13.399, sign: 1.0, weight: 0.00 }, transitions: SigNorm { mean: 0.317, scale: 0.519, sign: 1.0, weight: 0.00 }, camo: SigNorm { mean: 9.237, scale: 10.235, sign: 1.0, weight: 0.00 } },
 ];
@@ -682,14 +695,14 @@ pub const GRANULAR_CDF: [[f64; CDF_ANCHORS]; NUM] = [
     [0.0; CDF_ANCHORS], // lc-claiming (trunk/unused)
     [0.249, 0.349, 0.399, 0.426, 0.471, 0.515, 0.566, 0.621, 1.569, 2.667, 5.639], // naked-pair
     [0.254, 0.337, 0.400, 0.432, 0.481, 0.534, 0.596, 1.524, 2.550, 3.434, 6.786], // hidden-pair
-    [0.162, 0.303, 0.405, 0.479, 0.568, 0.637, 1.409, 1.565, 1.729, 2.649, 6.493], // naked-triple
+    [0.178, 0.373, 0.453, 0.529, 0.594, 0.665, 1.404, 1.557, 1.741, 2.660, 6.372], // naked-triple
     [0.177, 0.277, 0.355, 0.471, 0.503, 0.627, 1.473, 1.611, 2.502, 2.787, 5.813], // hidden-triple
     [0.185, 0.312, 0.385, 0.467, 0.546, 0.672, 1.497, 1.625, 2.424, 2.719, 4.861], // naked-quad
     [0.151, 0.315, 0.398, 0.472, 0.515, 0.590, 1.363, 1.559, 1.700, 2.628, 5.739], // hidden-quad
     [0.200, 0.299, 0.351, 0.388, 0.443, 0.507, 0.553, 0.581, 0.645, 0.718, 2.603], // x-wing
     [0.095, 0.266, 0.362, 0.403, 0.462, 0.496, 0.565, 0.619, 0.695, 0.787, 2.769], // swordfish
     [0.102, 0.273, 0.351, 0.385, 0.446, 0.515, 0.586, 0.661, 0.757, 0.881, 2.793], // jellyfish
-    [0.273, 0.317, 0.343, 0.373, 0.402, 0.485, 0.537, 0.640, 1.329, 2.633, 10.967], // xy-wing
+    [0.320, 0.366, 0.396, 0.428, 0.453, 0.525, 0.574, 0.675, 1.371, 2.444, 10.778], // xy-wing
     [0.261, 0.326, 0.345, 0.383, 0.437, 0.517, 0.576, 0.737, 1.611, 2.668, 4.461], // xyz-wing
     [0.124, 0.245, 0.321, 0.408, 0.482, 0.557, 0.630, 1.427, 2.321, 3.840, 9.840], // w-wing
 ];
@@ -937,6 +950,106 @@ pub fn grade_puzzle(puzzle: &DigitGrid) -> Option<PuzzleGrade> {
         None => {
             let profile = trunk_profile(&SolverState::<Bands<RowMajor>>::from_digits(puzzle));
             Some(PuzzleGrade { signals: signals_of(&trace, 0), key: None, rating: trunk_rating(&profile) })
+        }
+    }
+}
+
+// --- Stage 3: human-oriented signal signs (docs/grader-external-calibration.md §5) ----------
+//
+// The granular signs baked in [`GRANULAR_NORM`] are oriented by [`TechNorm::calibrate`] against the
+// project's OWN relative grader (`grade_batch`) — the self-reference of §1. Stage 3 re-derives each
+// LIVE signal's sign in the DENSE technique buckets from the external HUMAN label instead, leaving
+// the mean/scale/weight (the §4.3.2 distribution shift is Stage 4's re-mine) and the thin buckets'
+// grade_batch signs untouched. The sign is *transferred*, not literally re-fit: the human labels
+// live on the dataset puzzles, the calibration on the isolated mined corpus, so the orientation is
+// measured on the dataset bucket ([`human_signal_orientation`]) and applied to the corpus
+// calibration ([`TechNorm::reoriented`]).
+
+/// Minimum rankable dataset n for a technique bucket to count as **dense** — large enough to
+/// re-orient its signs from the human label rather than keep the `grade_batch` fallback (§5 Stage
+/// 3). Below this the per-signal human correlation is too noisy to flip a determined sign, so the
+/// bucket keeps its (self-referential) `grade_batch` orientation. Picked from the Stage-1 board:
+/// hidden-pair / swordfish / naked-pair / w-wing / naked-triple / xy-wing clear it; the rest do not.
+pub const SIGN_DENSE_MIN: usize = 40;
+
+/// A technique bucket's pooled per-signal **human orientation** (Stage 3). `corr[j]` is the
+/// n-weighted-mean rank correlation of granular signal `j` (in [`raw_granular`] order) against the
+/// human label across the dataset groups that carry this technique: its **sign** orients the signal,
+/// its **magnitude** vs [`CORR_FLOOR`] says whether the human reference *determines* it. `n` is the
+/// total rankable dataset puzzles behind it — the bucket is dense iff `n >= SIGN_DENSE_MIN`.
+#[derive(Clone, Copy, Debug)]
+pub struct HumanOrient {
+    pub corr: [f64; NSIG],
+    pub n: usize,
+}
+
+/// Whether every element of `xs` is equal — a constant column carries no rank information.
+fn is_const(xs: &[f64]) -> bool {
+    xs.first().is_none_or(|&first| xs.iter().all(|&x| x == first))
+}
+
+/// Stage 3: aggregate one technique's per-signal human orientation across dataset `groups`. Each
+/// group is `(bucket_signals, human_labels)` aligned — the dataset puzzles whose inferred bottleneck
+/// is this technique, with their (group-local) human difficulty label. For each granular signal the
+/// per-group rank correlation against the human label is pooled n-weighted; a group contributes to a
+/// signal only when both that signal column and the label vary within it (otherwise there is no
+/// orientation to read). Pools the per-group CORRELATION, never the raw labels — labels are not
+/// comparable across groups (the §2.3 rule). Returns the pooled `corr` per signal and the total
+/// rankable `n` (the groups whose label varies, which is what "dense" is measured on).
+pub fn human_signal_orientation(groups: &[(&[Signals], &[f64])]) -> HumanOrient {
+    let mut num = [0.0f64; NSIG];
+    let mut den = [0.0f64; NSIG];
+    let mut n_total = 0usize;
+    for &(sigs, labels) in groups {
+        if sigs.len() < 2 || sigs.len() != labels.len() || is_const(labels) {
+            continue; // no within-bucket order to test in this group
+        }
+        n_total += sigs.len();
+        let w = sigs.len() as f64;
+        let mut cols: [Vec<f64>; NSIG] = core::array::from_fn(|_| Vec::with_capacity(sigs.len()));
+        for s in sigs {
+            let raw = raw_granular(s);
+            for (j, c) in cols.iter_mut().enumerate() {
+                c.push(raw[j]);
+            }
+        }
+        for j in 0..NSIG {
+            if is_const(&cols[j]) {
+                continue; // signal flat in this group -> no orientation info from it
+            }
+            num[j] += w * rank_corr(&cols[j], labels);
+            den[j] += w;
+        }
+    }
+    let corr = core::array::from_fn(|j| if den[j] > 0.0 { num[j] / den[j] } else { 0.0 });
+    HumanOrient { corr, n: n_total }
+}
+
+impl TechNorm {
+    /// Stage 3: return a copy with each **live** signal's `sign` re-set from a dense bucket's
+    /// [`HumanOrient`], where the human reference determines it (`|corr| >= CORR_FLOOR`). Signals the
+    /// human data leaves undetermined, and zero-weight signals, keep their existing sign. Mean, scale
+    /// and weight are unchanged — this **re-orients, it does not re-weight** (the §4.3.2 distribution
+    /// re-mine is Stage 4). The caller applies it only to dense buckets (`human.n >= SIGN_DENSE_MIN`).
+    pub fn reoriented(&self, human: &HumanOrient) -> TechNorm {
+        let orient = |sig: SigNorm, corr: f64| -> SigNorm {
+            if sig.weight > 0.0 && corr.abs() >= CORR_FLOOR {
+                SigNorm { sign: if corr >= 0.0 { 1.0 } else { -1.0 }, ..sig }
+            } else {
+                sig
+            }
+        };
+        TechNorm {
+            open: orient(self.open, human.corr[0]),
+            cascade: orient(self.cascade, human.corr[1]),
+            depth: orient(self.depth, human.corr[2]),
+            elim: orient(self.elim, human.corr[3]),
+            alts: orient(self.alts, human.corr[4]),
+            tight: orient(self.tight, human.corr[5]),
+            open_mean: orient(self.open_mean, human.corr[6]),
+            depth_tight: orient(self.depth_tight, human.corr[7]),
+            transitions: orient(self.transitions, human.corr[8]),
+            camo: orient(self.camo, human.corr[9]),
         }
     }
 }
@@ -1339,5 +1452,57 @@ mod tests {
         // Subset branch weights: open 0.30, depth 0.10, elim 0.50 (live); cascade dropped.
         assert!(norm.open.weight > 0.0 && norm.elim.weight > 0.0 && norm.depth.weight > 0.0);
         assert_eq!(norm.cascade.weight, 0.0, "a constant signal carries no weight");
+    }
+
+    // --- Stage 3: human-oriented signs --------------------------------------------------
+
+    #[test]
+    fn human_orientation_pools_per_group_and_skips_flat_labels() {
+        // Two groups for one technique. In both, `open` rises with the human label (-> +corr) and
+        // `elim` falls with it (-> -corr). A third group whose label is constant must contribute
+        // nothing (no within-bucket order). `n` counts only the rankable groups' puzzles.
+        let mk = |open, elim| Signals { bottleneck_count: 1, open, elim_sum: elim, ..Signals::default() };
+        let g1: Vec<Signals> = vec![mk(10, 40), mk(20, 30), mk(30, 20), mk(40, 10)];
+        let l1 = vec![1.0, 2.0, 3.0, 4.0];
+        let g2: Vec<Signals> = vec![mk(15, 9), mk(25, 6), mk(35, 3)];
+        let l2 = vec![10.0, 20.0, 30.0];
+        let flat: Vec<Signals> = vec![mk(99, 1), mk(50, 2)];
+        let lflat = vec![5.0, 5.0]; // constant label -> excluded
+        let groups: Vec<(&[Signals], &[f64])> =
+            vec![(g1.as_slice(), &l1), (g2.as_slice(), &l2), (flat.as_slice(), &lflat)];
+        let h = human_signal_orientation(&groups);
+        assert_eq!(h.n, 7, "only the two rankable groups (4 + 3) count toward n");
+        assert!(h.corr[0] > CORR_FLOOR, "open rises with the human label across both groups");
+        assert!(h.corr[3] < -CORR_FLOOR, "elim falls with the human label (scarcer = harder)");
+    }
+
+    #[test]
+    fn reoriented_flips_live_signs_only_when_determined() {
+        // A norm with `alts` baked sign +1 (live, weight 0.45) and `cascade` sign -1 (live). Human
+        // says alts should be -1 (strong negative corr) and cascade is undetermined (|corr| < floor):
+        // alts flips, cascade and the (zero-weight) others stay.
+        let live = |sign| SigNorm { mean: 0.0, scale: 1.0, sign, weight: 0.45 };
+        let off = SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 };
+        let norm = TechNorm {
+            open: off,
+            cascade: SigNorm { weight: 0.15, ..live(-1.0) },
+            depth: off,
+            elim: off,
+            alts: live(1.0),
+            tight: off,
+            open_mean: off,
+            depth_tight: off,
+            transitions: off,
+            camo: off,
+        };
+        let mut corr = [0.0f64; NSIG];
+        corr[4] = -0.6; // alts: strong negative -> flip to -1
+        corr[1] = 0.05; // cascade: below the floor -> keep
+        corr[0] = -0.9; // open: zero-weight -> ignored
+        let r = norm.reoriented(&HumanOrient { corr, n: 100 });
+        assert_eq!(r.alts.sign, -1.0, "a determined human sign flips the live signal");
+        assert_eq!(r.cascade.sign, -1.0, "an undetermined signal keeps its grade_batch sign");
+        assert_eq!(r.open.sign, 1.0, "a zero-weight signal is never re-oriented");
+        assert_eq!(r.alts.weight, 0.45, "re-orient does not re-weight");
     }
 }

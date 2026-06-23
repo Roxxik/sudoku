@@ -11,7 +11,7 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > **dropped.** The grader's output stays what it is today — a **per-spec, within-technique** rating.
 > The external data is for making that per-spec rating *better*, not for building a portable scalar.
 
-> Status: **Stages 0-2 BUILT & MEASURED (2026-06-23); Stages 3-4 not started.** Landed: the
+> Status: **Stages 0-3 BUILT & MEASURED (2026-06-23); Stage 4 not started.** Landed: the
 > spec-free grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, Stage 0); the
 > reworked [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) harness — Stage 1,
 > the **corrected per-technique-bucket scoreboard** (§4.4): it buckets each group's covered puzzles by
@@ -26,7 +26,16 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > is high; the trunk was flat `0` and held most of the data, pinning every trunk-bearing group's
 > aggregate to ~0; Stage 2 closes that — the trunk now correlates +0.34..+0.57 with humans, lifting
 > the group aggregates to +0.34..+0.55 and closing 70-95% of the gap to Pelánek (the ordinal groups
-> now match/beat the bar), exactly as §4.3.1 predicted.**
+> now match/beat the bar), exactly as §4.3.1 predicted.** And **Stage 3 — human sign adjudication**
+> ([`human_signal_orientation`](../generator-lab/src/grade.rs) + [`TechNorm::reoriented`](../generator-lab/src/grade.rs),
+> driven by [`grade_diag --human-orient`](../generator-lab/examples/grade_diag.rs), §4.6): in the
+> dense non-trunk buckets it re-derives each live signal's **sign** from the human label instead of
+> `grade_batch`, gated so a flip that regresses split-half stability is reverted. Result: the **`alts`
+> conflict (§1) is settled `+1`** (the human reference never orients it `−1`), the two largest dense
+> buckets (hidden-pair, swordfish) need no flip (the existing signs were right), and the one
+> human-improving stability-safe flip — **xy-wing `cascade` `−1→+1`** — lifts its pooled human-rho
+> +0.080→+0.179; naked-pair's and w-wing's bigger raw wins are stability-rejected. Surgical bake (signs
+> + two CDFs only; trunk and every other row byte-identical).
 
 ## 1. The problem: the grader only ever agreed with itself
 
@@ -250,6 +259,47 @@ Three reads:
 The per-technique (non-trunk) buckets are unchanged — Stage 2 touches only `grade_puzzle`'s trunk
 branch; the spec-based production path (`grade_one`/`rating`) is byte-identical.
 
+### 4.6 Stage 3 — human sign adjudication (measured 2026-06-23)
+
+Stage 3 re-derives, in the **dense** non-trunk buckets only (pooled rankable n ≥
+[`SIGN_DENSE_MIN`](../generator-lab/src/grade.rs) = 40 — hidden-pair 167, swordfish 115, w-wing 67,
+naked-pair 59, naked-triple 57, xy-wing 44), each **live** granular signal's **sign** from the human
+label instead of `grade_batch`. [`human_signal_orientation`](../generator-lab/src/grade.rs) pools the
+per-(group × bucket) rank correlation n-weighted — never the raw labels (the §2.3 rule) — and
+[`TechNorm::reoriented`](../generator-lab/src/grade.rs) flips a sign only where the human reference
+*determines* it (`|corr| ≥ CORR_FLOOR`). Mean/scale/weight are untouched (re-orient, not re-weight;
+the §4.3.2 re-mine is Stage 4). Workbench: [`grade_diag --human-orient`](../generator-lab/examples/grade_diag.rs).
+
+Three findings:
+
+1. **The `alts` conflict (§1) is settled in favour of `+1`.** Where `alts` is live — naked-pair
+   (`+0.038`), naked-triple (`+0.239`), xy-wing (`−0.123`) — the human reference either **agrees**
+   with the grade_batch `+1` (naked-triple) or is **undetermined** (below the floor; naked-pair,
+   xy-wing). It **never** orients `alts` to `−1`. The "intuitive −1" the code flagged is not what
+   humans see — the self-reference happened to be right here.
+2. **The two largest dense buckets need no flip.** hidden-pair (n=167) and swordfish (n=115) — the
+   bulk of the non-trunk dataset mass — have every live signal either agree with grade_batch or fall
+   below the floor, so their orientation is **unchanged** (human-rho before == after: +0.234, +0.278).
+   The biggest buckets *validate* the existing signs.
+3. **The biggest raw wins are stability-rejected; the gate enforces §6.5.** The human label wants to
+   flip naked-pair (`open`/`open_mean` −1→+1, human-rho +0.106→**+0.291**) and w-wing (`cascade`
+   −1→+1, +0.009→**+0.196**) — but each drops the within-technique split-half stability below the 0.90
+   floor (naked-pair 0.94→0.86, w-wing 0.92→0.78), so the **stability gate reverts both**. The flips
+   that survive are **xy-wing** `cascade` −1→+1 (stable 1.00; human-rho +0.080→**+0.179** pooled — on
+   the board solve_time +0.055→+0.192 at n=23, D_TO/D_TR −0.300→−0.100, org.uk +0.301→+0.241 the
+   minority direction) and **naked-triple** `tight`/`depth_tight` +1→−1 (stable 0.98; neutral,
+   +0.220→+0.222).
+
+The bake is **surgical** — the committed `GRANULAR_NORM` with exactly those three sign flips and the
+two affected CDFs re-derived under them (`grade_diag --human-orient` prints the paste-ready rows);
+every other norm/CDF row, the trunk, and the whole spec-based production path are **byte-identical**.
+Net on the production scoreboard the continuous groups tick up (solve_time +0.470→+0.472, D_TO
++0.546→+0.549, D_TR +0.514→+0.517), org.uk eases −0.004 (the xy-wing minority), the rest flat;
+acceptance keeps every technique's split-half stability ≥ 0.90 (criterion §6.5). A small, honest,
+stability-safe gain — Stage 3's value is *removing the §1 self-reference where the data is dense
+enough to trust*, and proving (alts, hidden-pair, swordfish) that the existing orientation was mostly
+already right.
+
 ## 5. The plan (per-spec; beat the bar; one change at a time)
 
 **Stage 1 — the corrected scoreboard (per-technique bucket). DONE (2026-06-23) — see §4.4.**
@@ -275,14 +325,22 @@ closing 70-95% of the gap to Pelánek and matching/beating the bar on the ordina
 is ablation-justified (it carries the ordinals, is neutral on `synnwang`). The change is confined to
 `grade_puzzle`'s trunk branch — the spec-based production path is untouched.
 
-**Stage 3 — adjudicate signal orientation with the human reference.** In the **dense** technique
-buckets only, recompute each signal's sign from `rank_corr(signal, human_label)` instead of
-`rank_corr(signal, grade_batch)`. First settle the known `alts` conflict (§1): does the human
-reference orient it `+1` or `−1`? Re-bake [`TechNorm::calibrate`](../generator-lab/src/grade.rs)'s
-`rel` from human labels where the bucket supports it; keep `grade_batch` as the fallback `rel` for
-thin buckets (most will be thin — Stage 0 confirms the data concentrates in trunk + a few kinds).
-Check the within-technique split-half stability does not regress (the C/D/E gains are kept; this
-re-orients, it does not re-weight).
+**Stage 3 — adjudicate signal orientation with the human reference. DONE (2026-06-23) — see §4.6.**
+In the **dense** technique buckets only (pooled rankable n ≥ [`SIGN_DENSE_MIN`](../generator-lab/src/grade.rs)),
+re-derived each **live** signal's sign from `rank_corr(signal, human_label)` instead of
+`rank_corr(signal, grade_batch)`: [`human_signal_orientation`](../generator-lab/src/grade.rs) pools the
+per-(group × bucket) correlation n-weighted (never the raw labels), and
+[`TechNorm::reoriented`](../generator-lab/src/grade.rs) flips a sign where the human reference clears
+the floor; mean/scale/weight stay (re-orient, not re-weight). A **stability gate** reverts any flip
+that drops the within-technique split-half stability below 0.90 (criterion §6.5), so the C/D/E gains
+survive. Thin buckets keep the `grade_batch` fallback. Outcome: the **`alts` conflict (§1) is settled
+`+1`** (the human reference never orients it `−1`); the two largest dense buckets (hidden-pair,
+swordfish) need no flip; the one stability-safe human-improving flip — **xy-wing `cascade` −1→+1**
+(pooled human-rho +0.080→+0.179) — and the neutral **naked-triple `tight`/`depth_tight` +1→−1** are
+applied; naked-pair's and w-wing's bigger raw wins are stability-rejected. Surgical bake
+(`grade_diag --human-orient`): the committed `GRANULAR_NORM` + those three sign flips + the two
+re-derived CDFs, everything else byte-identical. The `--data` datasets are loaded through the shared
+[`datasets`](../generator-lab/src/datasets.rs) module the Stage-1 scoreboard also uses.
 
 **Stage 4 — natural-puzzle re-mine + optional per-technique re-weight.** Re-mine the `NORM`/`CDF` over
 the gradeable dataset puzzles themselves (holdout-split per bucket), curing the §4.3.2 distribution

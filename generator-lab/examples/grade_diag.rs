@@ -30,11 +30,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use generator_lab::datasets::load_groups;
 use generator_lab::generate::warp_host::{GateStream, Pumped};
 use generator_lab::generate::{AttemptResult, attempt, baseline_fast_applicable};
 use generator_lab::grade::{
-    CDF_ANCHORS, SigNorm, Signals, TechNorm, Weights, band_coarse, band_of_rating, cdf_of,
-    grade_one, grade_signals, granular_score, rating_from_cdf,
+    CDF_ANCHORS, CORR_FLOOR, GRANULAR_NORM, HumanOrient, SIGN_DENSE_MIN, SIGNAL_NAMES, SigNorm,
+    Signals, TechNorm, Weights, band_coarse, band_of_rating, cdf_of, grade_one, grade_puzzle,
+    grade_signals, granular_score, human_signal_orientation, rating_from_cdf,
 };
 use generator_lab::repr::DigitGrid;
 use generator_lab::rng::Rng;
@@ -175,10 +177,20 @@ struct Calib {
 /// the relative [`grade_signals`] reference (the absolute path stands in for the same ordering),
 /// then build the granular-score CDF the rating reads against. The kind keys the per-technique
 /// `camo` weight override inside [`TechNorm::calibrate`].
-fn calibrate_target(kind: usize, sigs: &[Signals]) -> Calib {
+///
+/// Stage 3 (`docs/grader-external-calibration.md` §5): when `human` is `Some` and its bucket is
+/// **dense** (`n >= SIGN_DENSE_MIN`), the live signals' signs are re-oriented from the human label
+/// ([`TechNorm::reoriented`]) — replacing the self-referential `grade_batch` orientation — *before*
+/// the CDF is built, so the CDF stays consistent with the re-oriented score. Mean/scale/weight are
+/// untouched (re-orient, not re-weight). `human = None` (no `--human-orient`) reproduces the
+/// pre-Stage-3 calibration exactly.
+fn calibrate_target(kind: usize, sigs: &[Signals], human: Option<&HumanOrient>) -> Calib {
     let rel = grade_signals(sigs, &Weights::default(), 3);
     let rel_scores: Vec<f64> = rel.iter().map(|g| g.score).collect();
-    let norm = TechNorm::calibrate(kind, sigs, &rel_scores);
+    let mut norm = TechNorm::calibrate(kind, sigs, &rel_scores);
+    if let Some(h) = human.filter(|h| h.n >= SIGN_DENSE_MIN) {
+        norm = norm.reoriented(h);
+    }
     let scores: Vec<f64> = sigs.iter().map(|s| granular_score(s, &norm)).collect();
     Calib { norm, cdf: cdf_of(&scores) }
 }
@@ -186,6 +198,27 @@ fn calibrate_target(kind: usize, sigs: &[Signals]) -> Calib {
 /// One puzzle's continuous `[0, 1]` within-technique rating under a calibration.
 fn rating_of(calib: &Calib, s: &Signals) -> f64 {
     rating_from_cdf(granular_score(s, &calib.norm), &calib.cdf)
+}
+
+/// The minimum split-half rating stability a re-orientation must hold to be applied (criterion §6.5,
+/// "within-technique split-half stability ≥ 0.90"). A dense bucket whose human re-orientation drops
+/// below this is reverted to its grade_batch signs — the Stage-3 stability gate.
+const STABILITY_FLOOR: f64 = 0.90;
+
+/// Split-half rating stability for technique `kind` over pooled `sigs` under an optional human
+/// orientation: calibrate on each half, rate the WHOLE pool with each, Spearman the two ratings. A
+/// reproducible ordering (not sampling noise) keeps this near 1; the §6.5 no-regression metric. NaN
+/// if either half is too small to calibrate. Shared by [`acceptance`] and the Stage-3 gate.
+fn stability(kind: usize, sigs: &[Signals], human: Option<&HumanOrient>) -> f64 {
+    let a: Vec<Signals> = sigs.iter().step_by(2).copied().collect();
+    let b: Vec<Signals> = sigs.iter().skip(1).step_by(2).copied().collect();
+    if a.len() < 10 || b.len() < 10 {
+        return f64::NAN;
+    }
+    let (ca, cb) = (calibrate_target(kind, &a, human), calibrate_target(kind, &b, human));
+    let ra: Vec<f64> = sigs.iter().map(|s| rating_of(&ca, s)).collect();
+    let rb: Vec<f64> = sigs.iter().map(|s| rating_of(&cb, s)).collect();
+    spearman(&ra, &rb)
 }
 
 /// Fractional (tie-averaged) ranks of `xs`, in `[0, 1)` — the same mid-rank rule the grader
@@ -279,9 +312,9 @@ fn report(node: Node, sigs: &[Signals], calib: &Calib) -> String {
 /// - `stable` = split-half Spearman of the rating against itself (A-calibrated vs B-calibrated
 ///   on the shared pool), the granularity analogue of "distinct cut" (target ≥ 0.90);
 /// - `rho` = Spearman of the granular score vs the relative grader (faithfulness, target ≥ 0.85).
-fn acceptance(t: usize, sigs: &[Signals]) -> String {
+fn acceptance(t: usize, sigs: &[Signals], human: Option<&HumanOrient>) -> String {
     const R: usize = 10;
-    let full = calibrate_target(t, sigs);
+    let full = calibrate_target(t, sigs, human);
     let n = sigs.len();
     let ratings: Vec<f64> = sigs.iter().map(|s| rating_of(&full, s)).collect();
 
@@ -302,16 +335,7 @@ fn acceptance(t: usize, sigs: &[Signals]) -> String {
 
     // Rank stability: calibrate on each half, rate the WHOLE pool with each, correlate the two
     // ratings. A reproducible ordering (not sampling noise) keeps this near 1.
-    let a: Vec<Signals> = sigs.iter().step_by(2).copied().collect();
-    let b: Vec<Signals> = sigs.iter().skip(1).step_by(2).copied().collect();
-    let stable = if a.len() >= 10 && b.len() >= 10 {
-        let (ca, cb) = (calibrate_target(t, &a), calibrate_target(t, &b));
-        let ra: Vec<f64> = sigs.iter().map(|s| rating_of(&ca, s)).collect();
-        let rb: Vec<f64> = sigs.iter().map(|s| rating_of(&cb, s)).collect();
-        spearman(&ra, &rb)
-    } else {
-        f64::NAN
-    };
+    let stable = stability(t, sigs, human);
 
     // Faithfulness: Spearman of the granular score vs the relative grader over the pool.
     let gran: Vec<f64> = sigs.iter().map(|s| granular_score(s, &full.norm)).collect();
@@ -337,7 +361,7 @@ fn acceptance(t: usize, sigs: &[Signals]) -> String {
 /// and `GRANULAR_CDF` (per-technique granular-score percentile breakpoints) arrays, both indexed
 /// by kind over all `NUM` rows (trunk + any uncalibrated kind = an unused placeholder), so the
 /// output drops verbatim into `grade.rs`. Pooled train+drill.
-fn calibrate(targets: &[usize], pooled: &[Vec<Signals>]) {
+fn calibrate(targets: &[usize], pooled: &[Vec<Signals>], humans: &[Option<HumanOrient>]) {
     let fmt_sig = |s: &SigNorm| {
         format!(
             "SigNorm {{ mean: {:.3}, scale: {:.3}, sign: {:.1}, weight: {:.2} }}",
@@ -348,7 +372,7 @@ fn calibrate(targets: &[usize], pooled: &[Vec<Signals>]) {
     let mut by_kind: Vec<Option<Calib>> = (0..NUM).map(|_| None).collect();
     for (i, &t) in targets.iter().enumerate() {
         if !pooled[i].is_empty() {
-            by_kind[t] = Some(calibrate_target(t, &pooled[i]));
+            by_kind[t] = Some(calibrate_target(t, &pooled[i], humans[t].as_ref()));
         }
     }
     let placeholder = "SigNorm { mean: 0.0, scale: 1.0, sign: 1.0, weight: 0.0 }";
@@ -394,6 +418,174 @@ fn calibrate(targets: &[usize], pooled: &[Vec<Signals>]) {
     println!("];");
 }
 
+// --- Stage 3: human-oriented signs (docs/grader-external-calibration.md §5) -----------------
+
+/// Stage 3: load the human datasets under `data_dir`, grade every puzzle spec-free
+/// ([`grade_puzzle`]) and bucket per (group, inferred technique). Returns, per technique kind, one
+/// `(bucket_signals, human_labels)` pair per dataset group with >= 1 covered puzzle in that bucket —
+/// what [`human_signal_orientation`] aggregates. Trunk puzzles (`key == None`) are dropped (the
+/// trunk has no per-technique sign to orient — that is Stage 2's frontier rating, not Stage 3).
+fn dataset_buckets(data_dir: &Path) -> Vec<Vec<(Vec<Signals>, Vec<f64>)>> {
+    let mut per_kind: Vec<Vec<(Vec<Signals>, Vec<f64>)>> = (0..NUM).map(|_| Vec::new()).collect();
+    for g in load_groups(data_dir) {
+        let mut by_kind: Vec<(Vec<Signals>, Vec<f64>)> =
+            (0..NUM).map(|_| (Vec::new(), Vec::new())).collect();
+        for row in &g.rows {
+            let Some(pg) = DigitGrid::parse(&row.puzzle).and_then(|grid| grade_puzzle(&grid)) else {
+                continue;
+            };
+            if let Some(k) = pg.key {
+                by_kind[k].0.push(pg.signals);
+                by_kind[k].1.push(row.label_value);
+            }
+        }
+        for (k, b) in by_kind.into_iter().enumerate() {
+            if !b.0.is_empty() {
+                per_kind[k].push(b);
+            }
+        }
+    }
+    per_kind
+}
+
+/// The pooled per-signal human orientation of each technique kind's dataset bucket (Stage 3), or
+/// `None` where the dataset has no covered puzzles for that kind. Indexed by kind.
+fn human_by_kind(buckets: &[Vec<(Vec<Signals>, Vec<f64>)>]) -> Vec<Option<HumanOrient>> {
+    buckets
+        .iter()
+        .map(|groups| {
+            (!groups.is_empty()).then(|| {
+                let refs: Vec<(&[Signals], &[f64])> =
+                    groups.iter().map(|(s, l)| (s.as_slice(), l.as_slice())).collect();
+                human_signal_orientation(&refs)
+            })
+        })
+        .collect()
+}
+
+/// Aggregate human-rho of `norm` over a technique's dataset `groups`: per group the Spearman of the
+/// granular score (under `norm`) vs the human label, pooled n-weighted over the rankable groups
+/// (label varies, n >= 2). The before/after measurement of the Stage-3 report — a monotone proxy for
+/// the production `rating` (the CDF is monotone in score), so it reads the same within-bucket order.
+fn human_rho(norm: &TechNorm, groups: &[(Vec<Signals>, Vec<f64>)]) -> f64 {
+    let (mut num, mut den) = (0.0, 0.0);
+    for (sigs, labels) in groups {
+        if sigs.len() < 2 || labels.iter().all(|&x| x == labels[0]) {
+            continue;
+        }
+        let scores: Vec<f64> = sigs.iter().map(|s| granular_score(s, norm)).collect();
+        num += spearman(&scores, labels) * sigs.len() as f64;
+        den += sigs.len() as f64;
+    }
+    if den > 0.0 { num / den } else { f64::NAN }
+}
+
+/// One technique's Stage-3 orientation report: whether the bucket is dense, the human-rho of the
+/// baseline vs re-oriented score on the dataset bucket (before -> after), and the per-live-signal
+/// `grade_batch`-vs-human sign decision (the `alts` adjudication of §1 surfaces here). `isolated` is
+/// the pooled train+drill mined corpus the baseline norm is calibrated on; `groups`/`human` come
+/// from the dataset bucket.
+fn stage3_report(kind: usize, isolated: &[Signals], groups: &[(Vec<Signals>, Vec<f64>)], human: &HumanOrient) {
+    let rel = grade_signals(isolated, &Weights::default(), 3);
+    let rel_scores: Vec<f64> = rel.iter().map(|g| g.score).collect();
+    let baseline = TechNorm::calibrate(kind, isolated, &rel_scores);
+    let dense = human.n >= SIGN_DENSE_MIN;
+    let reoriented = baseline.reoriented(human);
+    let sigs = [
+        &baseline.open, &baseline.cascade, &baseline.depth, &baseline.elim, &baseline.alts,
+        &baseline.tight, &baseline.open_mean, &baseline.depth_tight, &baseline.transitions, &baseline.camo,
+    ];
+    // The stability gate: a re-orientation that drops the split-half stability below the floor is
+    // reverted (criterion §6.5). `flips` is 0 when the human data leaves every live sign as-is.
+    let flips = (0..SIGNAL_NAMES.len())
+        .filter(|&i| sigs[i].weight > 0.0 && human.corr[i].abs() >= CORR_FLOOR)
+        .filter(|&i| (human.corr[i] >= 0.0) != (sigs[i].sign >= 0.0))
+        .count();
+    let stable_after = stability(kind, isolated, Some(human));
+    let applied = dense && flips > 0 && stable_after >= STABILITY_FLOOR;
+    let verdict = if !dense {
+        "thin: keep gb".to_string()
+    } else if flips == 0 {
+        "no flips".to_string()
+    } else if applied {
+        format!("APPLIED ({flips} flip)")
+    } else {
+        format!("REJECT (stable {stable_after:+.2} < {STABILITY_FLOOR:.2})")
+    };
+    println!(
+        "{:<14} bucket_n={:<4} {}  human-rho: before {:+.3} -> after {:+.3}  stable {:+.2}->{:+.2}  [{}]",
+        NAMES[kind], human.n, if dense { "DENSE" } else { "thin " },
+        human_rho(&baseline, groups), human_rho(&reoriented, groups),
+        stability(kind, isolated, None), stable_after, verdict,
+    );
+    for (i, s) in sigs.iter().enumerate() {
+        if s.weight <= 0.0 {
+            continue; // only live signals carry the score
+        }
+        let c = human.corr[i];
+        let verdict = if !dense {
+            "thin: keep gb".to_string()
+        } else if c.abs() < CORR_FLOOR {
+            "undet: keep gb".to_string()
+        } else {
+            let hs = if c >= 0.0 { 1.0 } else { -1.0 };
+            if hs == s.sign {
+                format!("agree ({:+.0})", s.sign)
+            } else {
+                format!("FLIP {:+.0} -> {:+.0}", s.sign, hs)
+            }
+        };
+        println!(
+            "    {:<12} w={:.2}  gb_sign {:+.0}  human_corr {:+.3}   {}",
+            SIGNAL_NAMES[i], s.weight, s.sign, c, verdict,
+        );
+    }
+}
+
+/// The 10 signal signs of a [`TechNorm`], in [`SIGNAL_NAMES`] order.
+fn signs(t: &TechNorm) -> [f64; 10] {
+    [
+        t.open.sign, t.cascade.sign, t.depth.sign, t.elim.sign, t.alts.sign,
+        t.tight.sign, t.open_mean.sign, t.depth_tight.sign, t.transitions.sign, t.camo.sign,
+    ]
+}
+
+/// Stage-3 **surgical** bake (`docs/grader-external-calibration.md` §5): emit only the re-oriented
+/// buckets' rows, starting from the **committed** [`GRANULAR_NORM`] rather than a fresh full
+/// recalibration, so the production diff is exactly the human sign flips plus the CDF re-derived
+/// under them — every bucket's mean/scale/weight stay as baked (re-orient, not re-weight; the §4.3.2
+/// distribution re-mine is Stage 4). For each kind whose dense bucket survived the stability gate
+/// (`humans[kind]` is `Some` and actually flips a sign vs committed), prints the flipped `TechNorm`
+/// row and its CDF recomputed over the pooled isolated corpus, ready to paste into `grade.rs`.
+fn surgical_bake(targets: &[usize], pooled: &[Vec<Signals>], humans: &[Option<HumanOrient>]) {
+    let fmt_sig = |s: &SigNorm| {
+        format!(
+            "SigNorm {{ mean: {:.3}, scale: {:.3}, sign: {:.1}, weight: {:.2} }}",
+            s.mean, s.scale, s.sign, s.weight,
+        )
+    };
+    println!("=== STAGE 3 SURGICAL BAKE (committed norm + human flips; paste over the matching grade.rs rows) ===");
+    for (ti, &k) in targets.iter().enumerate() {
+        let Some(h) = &humans[k] else { continue };
+        let norm = GRANULAR_NORM[k].reoriented(h);
+        if signs(&norm) == signs(&GRANULAR_NORM[k]) {
+            continue; // gated-applied but no sign actually changed vs committed
+        }
+        let scores: Vec<f64> = pooled[ti].iter().map(|s| granular_score(s, &norm)).collect();
+        let cdf = cdf_of(&scores);
+        println!(
+            "    /* {:<14} */ TechNorm {{ open: {}, cascade: {}, depth: {}, elim: {}, alts: {}, \
+             tight: {}, open_mean: {}, depth_tight: {}, transitions: {}, camo: {} }},",
+            NAMES[k],
+            fmt_sig(&norm.open), fmt_sig(&norm.cascade), fmt_sig(&norm.depth), fmt_sig(&norm.elim),
+            fmt_sig(&norm.alts), fmt_sig(&norm.tight), fmt_sig(&norm.open_mean),
+            fmt_sig(&norm.depth_tight), fmt_sig(&norm.transitions), fmt_sig(&norm.camo),
+        );
+        let anchors: Vec<String> = cdf.iter().map(|x| format!("{x:.3}")).collect();
+        println!("    [{}], // {}", anchors.join(", "), NAMES[k]);
+    }
+}
+
 fn arg_val(flag: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -409,6 +601,12 @@ fn main() {
     let cache_dir: PathBuf = arg_val("--cache")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/grade-cache"));
+    // Stage 3: `--human-orient` re-derives the dense buckets' signal signs from the human datasets
+    // under `--data` (default `../datasets/normalized`) instead of the self-referential grade_batch.
+    let human_orient = arg_flag("--human-orient");
+    let data_dir: PathBuf = arg_val("--data")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../datasets/normalized"));
 
     // The campaign nodes: every target past the trunk, in train and drill.
     let targets: &[usize] = &[
@@ -464,8 +662,30 @@ fn main() {
             v
         })
         .collect();
-    let calibs: Vec<Calib> =
-        targets.iter().enumerate().map(|(ti, &t)| calibrate_target(t, &pooled[ti])).collect();
+    // Stage 3: the per-kind human orientation (empty / all-None unless `--human-orient`). Grading
+    // the ~3300 dataset puzzles spec-free is cheap (cold below-chains solves); the human sign of a
+    // dense bucket replaces grade_batch inside `calibrate_target`.
+    let buckets = if human_orient { dataset_buckets(&data_dir) } else { (0..NUM).map(|_| Vec::new()).collect() };
+    let humans_raw: Vec<Option<HumanOrient>> = human_by_kind(&buckets);
+
+    // Stage-3 stability gate (criterion §6.5): apply a dense bucket's re-orientation only if it holds
+    // the split-half stability floor; a bucket whose re-orientation regresses stability reverts to
+    // its grade_batch signs (`None`). `humans` is the gated set the calibration uses; `humans_raw`
+    // (with the gate verdict) drives the report.
+    let pooled_of = |kind: usize| targets.iter().position(|&t| t == kind).map(|ti| &pooled[ti]);
+    let humans: Vec<Option<HumanOrient>> = (0..NUM)
+        .map(|k| {
+            let h = humans_raw[k]?;
+            let sigs = pooled_of(k)?;
+            (h.n >= SIGN_DENSE_MIN && stability(k, sigs, Some(&h)) >= STABILITY_FLOOR).then_some(h)
+        })
+        .collect();
+
+    let calibs: Vec<Calib> = targets
+        .iter()
+        .enumerate()
+        .map(|(ti, &t)| calibrate_target(t, &pooled[ti], humans[t].as_ref()))
+        .collect();
     // target kind -> its index in `targets`, so a node can find its pooled calibration.
     let calib_of = |target: usize| targets.iter().position(|&t| t == target).unwrap();
 
@@ -483,15 +703,30 @@ fn main() {
         }
     }
 
-    // Acceptance (docs/grader-granular-scoring.md §2): per technique, pooled train+drill.
+    // Acceptance (docs/grader-granular-scoring.md §2): per technique, pooled train+drill. Under
+    // `--human-orient` `stable` re-uses the re-oriented signs, so it certifies the §6.5 no-regression
+    // criterion (the C/D/E split-half stability survives the re-orientation).
     println!("=== ACCEPTANCE (granular, pooled train+drill) ===");
     for (ti, &t) in targets.iter().enumerate() {
         if !pooled[ti].is_empty() {
-            println!("{}", acceptance(t, &pooled[ti]));
+            println!("{}", acceptance(t, &pooled[ti], humans[t].as_ref()));
         }
     }
 
+    // Stage 3 (docs/grader-external-calibration.md §5): the orientation report — per technique with
+    // dataset coverage, the dense/thin verdict, the human-rho before -> after re-orientation, and the
+    // per-live-signal grade_batch-vs-human sign decision (the `alts` adjudication of §1).
+    if human_orient {
+        println!("=== STAGE 3 — human sign orientation (DENSE buckets re-oriented) ===");
+        for (ti, &t) in targets.iter().enumerate() {
+            if let Some(h) = &humans_raw[t] {
+                stage3_report(t, &pooled[ti], &buckets[t], h);
+            }
+        }
+        surgical_bake(targets, &pooled, &humans);
+    }
+
     if arg_flag("--calibrate") {
-        calibrate(targets, &pooled);
+        calibrate(targets, &pooled, &humans);
     }
 }
