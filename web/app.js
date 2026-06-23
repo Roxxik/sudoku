@@ -16,7 +16,7 @@ let wasm, gen, play, stats, custom;
 let heavyReady;
 
 // ---- View routing ----
-const VIEWS = ["homeView", "campaignView", "customView", "puzzlesView", "playView", "statsView", "settingsView", "helpView", "privacyView"];
+const VIEWS = ["homeView", "campaignView", "dailyView", "customView", "puzzlesView", "playView", "statsView", "settingsView", "helpView", "privacyView"];
 
 function showView(id) {
   for (const v of VIEWS) {
@@ -176,6 +176,9 @@ async function launch(req, uncapped = false) {
     const genReq = req.usages
       ? { usages: req.usages, uncapped, forceAny: req.forceAny }
       : { target: req.kindIndex, drill: req.mode === "drill", uncapped };
+    // A daily request carries a pinned seed so every device generates the same
+    // puzzle; ordinary requests omit it and the worker draws its own.
+    if (req.seed != null) genReq.seed = req.seed;
     result = await gen.generate(genReq);
   } catch (e) {
     if (e && e.name === "AbortError") {
@@ -217,6 +220,7 @@ async function launch(req, uncapped = false) {
         specMasks: req.specMasks,
         forceAny: !!req.forceAny,
         label: req.label,
+        daily: req.daily || null,
         puzzle: result.puzzle,
         solution: result.solution,
         givens: result.givens,

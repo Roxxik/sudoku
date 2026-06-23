@@ -14,6 +14,7 @@ import * as backend from "./backend.js";
 import * as tracker from "./tracker.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
+import { levelName } from "./daily.js";
 import { copyText, gradeName, gradeBadge } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
 import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn, lightModeOn } from "./settings.js";
@@ -2301,9 +2302,15 @@ function updateHintButton() {
 }
 
 // ---- Solved screen ----
+// A daily puzzle gets its own win screen: just a Submit (leaderboard, stubbed) and
+// an X, both returning Home -- no "New puzzle" (the daily is fixed for the day).
+// Everything else shows the standard solved dialog. The backend solve/move sync in
+// onSolved already ran regardless, so this only swaps the dialog.
 function showSolved(finalMs) {
-  const dialog = document.getElementById("solvedDialog");
-  document.getElementById("solvedTime").textContent = formatDuration(finalMs);
+  const daily = !!(game && game.daily);
+  const dialog = document.getElementById(daily ? "dailySolvedDialog" : "solvedDialog");
+  document.getElementById(daily ? "dailySolvedTime" : "solvedTime").textContent =
+    formatDuration(finalMs);
   dialog.showModal();
 }
 
@@ -2382,6 +2389,14 @@ function setTitle(g) {
   const h = document.getElementById("playTitle");
   if (!h) return;
   if (g.mode === "custom") {
+    // A daily puzzle is a force_any custom game under the hood, but it isn't
+    // "Custom" to the player -- title it by its difficulty. Checked before reviewOf
+    // because Expert I's spec is identical to Review Lesson 1's.
+    const d = dailyOf(g);
+    if (d) {
+      h.textContent = `Daily · ${levelName(d.level)}`;
+      return;
+    }
     const r = reviewOf(g);
     if (r) {
       h.textContent = `${reviewTitle(r)} · ${reviewModeLabel(r)}`;
@@ -2479,9 +2494,17 @@ let curriculumList = [];
 
 // A custom game that is actually a Review lesson (force_any over a lesson's set):
 // its { name, mode }, else null. Used so the title shows the lesson, not "Custom".
+// A daily game wins first (Expert I's spec matches Review Lesson 1's).
 function reviewOf(g) {
+  if (dailyOf(g)) return null;
   if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
   return reviewIdentity(curriculumList, g.spec);
+}
+
+// A daily game's { day, level } tag, or null -- the play view's "is this the
+// Puzzle of the day" check, matching home.js / stats.js.
+function dailyOf(g) {
+  return g && g.daily && typeof g.daily.day === "number" ? g.daily : null;
 }
 
 // The hint's player-facing tier comes from the step's curriculum difficulty
@@ -2864,6 +2887,16 @@ function wireSolved() {
     document.getElementById("solvedDialog").close();
     onNewPuzzle(game);
   });
+
+  // Daily win screen: Submit is a stub (leaderboard not wired yet) and X is the
+  // dismiss -- both just close and return Home for now. The solve already synced to
+  // the backend in onSolved, per the usual privacy gate.
+  const closeDailyHome = () => {
+    document.getElementById("dailySolvedDialog").close();
+    onHome();
+  };
+  document.getElementById("dailySolvedSubmit").addEventListener("click", closeDailyHome);
+  document.getElementById("dailySolvedClose").addEventListener("click", closeDailyHome);
 }
 
 // Build the board and wire all controls once. `curriculum` maps kindIndex -> id

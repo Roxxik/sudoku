@@ -30,10 +30,13 @@
 //! per-request attempt budget so a hard target keeps searching until it finds a
 //! puzzle or the page terminates us — the page offers it after a capped request
 //! gives up.
-//! The worker seeds its own RNG (we want variety, not reproducibility), so the
-//! page never *sends* a seed — but the seed it drew is *returned* (as a decimal
-//! string, since a u64 won't fit a JS Number) so the page can show it for
-//! debugging and, with the same (seed, target, drill), reproduce the puzzle.
+//! By default the worker seeds its own RNG (we want variety, not reproducibility),
+//! so the page need not *send* a seed — but the seed it drew is *returned* (as a
+//! decimal string, since a u64 won't fit a JS Number) so the page can show it for
+//! debugging and, with the same (seed, target, drill), reproduce the puzzle. The
+//! page MAY send a `seed` (a u64 decimal string) to pin generation: the daily
+//! puzzle derives a per-(date, difficulty) seed so every device generates the same
+//! puzzle. A pinned seed rides through both paths and is returned unchanged.
 
 use js_sys::{Array, Math, Object, Reflect};
 use sudoku_core::lab;
@@ -53,14 +56,17 @@ fn main() {
     let onmessage = Closure::wrap(Box::new(move |msg: MessageEvent| {
         let data = msg.data();
         let uncapped = bool_field(&data, "uncapped");
+        // An optional pinned seed (u64 decimal string): present for the daily
+        // puzzle, absent for ordinary generation (which draws its own).
+        let seed = seed_field(&data, "seed");
         // A `spec` array is the custom-spec path; otherwise it's a campaign
         // request keyed by target/drill.
         let reply = match usages_field(&data, "spec") {
-            Some(usages) => generate_custom(&usages, bool_field(&data, "forceAny"), uncapped),
+            Some(usages) => generate_custom(&usages, bool_field(&data, "forceAny"), uncapped, seed),
             None => {
                 let target = num_field(&data, "target").unwrap_or(-1.0);
                 let drill = bool_field(&data, "drill");
-                generate(target, drill, uncapped)
+                generate(target, drill, uncapped, seed)
             }
         };
         // Best-effort: if the page already terminated us this never runs.
@@ -87,7 +93,7 @@ fn main() {
 /// (so e.g. an X-Wing puzzle can't be solved with a Naked Pair instead). The
 /// legacy branch-scoped `train`/`drill` are kept for an in-flight debugging
 /// effort; see `generator-lab/src/spec/mod.rs`.
-fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
+fn generate(target: f64, drill: bool, uncapped: bool, seed: Option<u64>) -> JsValue {
     if !(target >= 0.0) || target as usize >= lab::kinds::NUM {
         return err(&format!("target kind {target} out of range (0..{})", lab::kinds::NUM));
     }
@@ -97,7 +103,7 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
     } else {
         lab::Spec::train_isolated(target)
     };
-    run_spec(&spec, uncapped)
+    run_spec(&spec, uncapped, seed)
 }
 
 /// Generate one puzzle for an **explicit**, UI-built spec. `usages` is one code
@@ -115,7 +121,7 @@ fn generate(target: f64, drill: bool, uncapped: bool) -> JsValue {
 /// the set's techniques come up evenly across puzzles instead of collapsing onto the
 /// easiest member. `force_any` adds each member to the baseline itself, so the loop
 /// only collects their mask.
-fn generate_custom(usages: &[u8], force_any: bool, uncapped: bool) -> JsValue {
+fn generate_custom(usages: &[u8], force_any: bool, uncapped: bool, seed: Option<u64>) -> JsValue {
     let mut spec = lab::Spec::explicit();
     let mut any_mask: lab::kinds::KindMask = 0;
     for (idx, &u) in usages.iter().enumerate() {
@@ -136,14 +142,22 @@ fn generate_custom(usages: &[u8], force_any: bool, uncapped: bool) -> JsValue {
     if any_mask != 0 {
         spec = spec.force_any(any_mask, 1);
     }
-    run_spec(&spec, uncapped)
+    run_spec(&spec, uncapped, seed)
 }
 
 /// Run the rejection-sampling generator for `spec` and build the page reply —
 /// shared by the campaign and custom-spec paths. `uncapped` lifts the attempt
 /// budget (the only way out of a runaway uncapped search is `worker.terminate()`).
-fn run_spec(spec: &lab::Spec, uncapped: bool) -> JsValue {
-    let seed = random_seed();
+/// `seed` pins the RNG when the page sends one (the daily puzzle); otherwise a
+/// fresh random seed is drawn. Either way the seed used is returned in the reply.
+///
+/// Pinning makes the puzzle reproducible across devices: same seed + same spec +
+/// same budget => same puzzle. A pinned-but-capped run that exhausts the budget
+/// fails like any other; the page's uncapped retry re-runs the SAME seed, replaying
+/// the same failing attempts and continuing past the cap to the one puzzle that
+/// seed's stream yields (so the daily stays well-defined even past 10k attempts).
+fn run_spec(spec: &lab::Spec, uncapped: bool, seed: Option<u64>) -> JsValue {
+    let seed = seed.unwrap_or_else(random_seed);
     let mut rng = lab::Rng::from_seed(seed);
     let budget = if uncapped { usize::MAX } else { MAX_ATTEMPTS };
     let (generated, stats) = lab::generate(&mut rng, spec, budget);
@@ -247,6 +261,16 @@ fn bool_field(data: &JsValue, key: &str) -> bool {
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
+}
+
+/// Read `key` as a pinned u64 seed. The page sends it as a decimal string (a u64
+/// loses precision as a JS Number), so this parses the string; absent / non-string
+/// / unparseable all yield `None`, leaving the worker to draw its own seed.
+fn seed_field(data: &JsValue, key: &str) -> Option<u64> {
+    Reflect::get(data, &key.into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Read `key` as an array of small integers (the per-kind usage codes), or `None`

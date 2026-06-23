@@ -602,6 +602,39 @@ summary > span:first-of-type { flex: 1; }
 .mb-label { font-weight: 600; }
 .mb-sub { font-size: 0.72rem; color: var(--mark); }
 
+/* ---- Puzzle of the day ---- */
+/* The home entry carries a subtle accent border so the headline feature reads as
+   distinct from the campaign / custom nav buttons below it. */
+.daily-entry { border-color: var(--accent); }
+
+#dailyBody { display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; }
+
+/* One difficulty: name, blurb, the state-dependent action button, and the
+   (stubbed) leaderboard. A bordered container, no fill, so the panel button pops. */
+.daily-level {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.daily-level-name { font-weight: 600; font-size: 1.05rem; }
+.daily-level-blurb { margin: 0; font-size: 0.85rem; line-height: 1.4; color: var(--mark); }
+/* The action button fills the card width (vs the campaign's two-up mode grid). */
+.daily-play { width: 100%; }
+.daily-play[disabled] { cursor: default; opacity: 0.85; }
+/* Leaderboard placeholder until scores are wired (the win-screen Submit is a stub
+   too). A dashed box marks where the real list will drop in. */
+.daily-leaderboard {
+  text-align: center;
+  font-size: 0.78rem;
+  color: var(--mark);
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 10px 8px;
+}
+
 /* ---- Stats page ---- */
 .stats-summary {
   display: flex;
@@ -658,6 +691,10 @@ summary > span:first-of-type { flex: 1; }
   color: var(--accent);
 }
 .solved-actions { display: flex; flex-direction: column; gap: 8px; }
+
+/* Daily win screen: an X in the top-right corner over the centred solved body. */
+.daily-solved-body { position: relative; }
+.dialog-close { position: absolute; top: 6px; right: 6px; }
 
 /* ---- Generation overlay ---- */
 .overlay {

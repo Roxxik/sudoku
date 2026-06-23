@@ -228,6 +228,13 @@ function newId() {
 //   specMasks: {baseline, inScope, forced}  for the hint tree,
 //   label: string         a short title from its Forced techniques.
 // Campaign games leave all three null.
+//
+// A DAILY game (the Puzzle of the day) is a custom force_any game that ALSO carries
+//   daily: { day: number, level: number }
+// where `day` is the puzzle-day index (daily.js dayNumber) and `level` is the
+// difficulty's index into DAILY_LEVELS. The tag drives its Continue/history label
+// ("Daily · date · difficulty") and the daily page's already-played lookup; absent
+// on every non-daily game.
 
 // Create and persist a fresh active game from a generated puzzle. `kindIndex` is
 // null for a custom game; `spec`/`specMasks`/`label` are the custom extras; `seed`
@@ -243,6 +250,7 @@ export function createGame({
   specMasks = null,
   forceAny = false,
   label = null,
+  daily = null,
   puzzle,
   solution,
   givens,
@@ -267,6 +275,7 @@ export function createGame({
     specMasks,
     forceAny: !!forceAny,
     label,
+    daily: daily || null,
     puzzle,
     solution,
     givens,
@@ -361,6 +370,22 @@ export function activeGames() {
   return loadIndex()
     .filter((g) => g.status === "active")
     .sort((a, b) => key(b) - key(a));
+}
+
+// The stored daily game for a given puzzle-day + difficulty level, or null if that
+// difficulty hasn't been played today. Drives the daily page's per-difficulty
+// state (Play when null, Continue while active, Solved once solved). Reads the
+// index only -- the listing carries the `daily` tag and the status. If two exist
+// for the same key (shouldn't happen -- the page only creates one), the most
+// recently created wins.
+export function dailyGame(day, level) {
+  let found = null;
+  for (const g of loadIndex()) {
+    if (g.daily && g.daily.day === day && g.daily.level === level) {
+      if (!found || (g.createdAt || 0) > (found.createdAt || 0)) found = g;
+    }
+  }
+  return found;
 }
 
 // Solved games, most-recently-SOLVED first -- the Stats page history list.

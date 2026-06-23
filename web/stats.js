@@ -10,6 +10,7 @@ import * as store from "./store.js";
 import { formatDuration, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
 import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
+import { dayLabel, levelName } from "./daily.js";
 import { cheatOn } from "./cheat.js";
 
 // Per-kind stat buckets, in display order: each mode split into a plain Play and a
@@ -102,9 +103,15 @@ function historyCard(g) {
   // Review lesson is a custom game under the hood, but identifiable by its spec —
   // show its lesson + Train/Drill rather than "Custom".
   const isCustom = g.mode === "custom";
+  const daily = dailyOf(g);
   const review = reviewOf(g);
   let title, modeLabel;
-  if (review) {
+  if (daily) {
+    // A daily card reads as its difficulty + the puzzle's date (not "Custom",
+    // even though it's a force_any custom game under the hood).
+    title = `Daily · ${levelName(daily.level)}`;
+    modeLabel = dayLabel(daily.day);
+  } else if (review) {
     title = reviewTitle(review);
     modeLabel = reviewModeLabel(review);
   } else if (isCustom) {
@@ -136,9 +143,9 @@ function historyCard(g) {
 // The card's right-hand actions: every card can copy its puzzle; a custom card
 // also offers "Open spec" to resurface its spec in the builder.
 function cardActions(g) {
-  // Review games read as campaign games, so they don't expose the custom-spec
-  // "Open spec" affordance even though they're a custom spec under the hood.
-  if (g.mode !== "custom" || !Array.isArray(g.spec) || reviewOf(g)) return copyButton(g);
+  // Review and daily games read as campaign games, so they don't expose the
+  // custom-spec "Open spec" affordance even though they're custom specs underneath.
+  if (g.mode !== "custom" || !Array.isArray(g.spec) || reviewOf(g) || dailyOf(g)) return copyButton(g);
   const wrap = document.createElement("div");
   wrap.className = "hist-actions";
   wrap.append(openSpecButton(g), copyButton(g));
@@ -184,9 +191,17 @@ function idFor(kindIndex) {
 }
 
 // A custom game that is actually a Review lesson: its { name, mode }, else null.
+// The daily tag wins first -- Expert I's spec matches Review Lesson 1's, so a
+// daily would otherwise mislabel as a Review lesson.
 function reviewOf(g) {
+  if (dailyOf(g)) return null;
   if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
   return reviewIdentity(curriculum, g.spec);
+}
+
+// A daily game's { day, level } tag, or null.
+function dailyOf(g) {
+  return g && g.daily && typeof g.daily.day === "number" ? g.daily : null;
 }
 
 function summaryCard(totalSolved, totalMs) {

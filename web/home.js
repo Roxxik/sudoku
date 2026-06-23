@@ -40,6 +40,15 @@ import {
   reviewModeLabel,
 } from "./review.js";
 import {
+  DAILY_LEVELS,
+  dailyUsages,
+  dailySeed,
+  dailyLabel,
+  dayNumber,
+  dayLabel,
+  levelName,
+} from "./daily.js";
+import {
   formatDuration,
   techniqueName,
   BRANCH_LABEL,
@@ -75,6 +84,8 @@ export function initHome(opts) {
   document.getElementById("privacyBack").addEventListener("click", () => privacyReturn());
   wireHomeMenu();
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
+  document.getElementById("dailyBtn").addEventListener("click", openDaily);
+  document.getElementById("dailyBack").addEventListener("click", showHome);
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
   document.getElementById("continueListBtn").addEventListener("click", openPuzzles);
 
@@ -97,6 +108,7 @@ function groupCurriculum(list) {
 // ---- Start page ----
 export function renderHome() {
   const stats = store.statsByKind();
+  renderDailyEntry();
   renderTiers(stats);
   renderContinue();
   // The Stats page also hosts the solved-puzzle history (a debug aid), so it
@@ -200,8 +212,9 @@ function cardMenu(g) {
   const list = document.createElement("ul");
   list.className = "menu-list";
   list.hidden = true;
-  // Custom games can resurface their spec; campaign/imported/Review games can't.
-  if (g.mode === "custom" && Array.isArray(g.spec) && !reviewOf(g)) {
+  // Custom games can resurface their spec; campaign/imported/Review/daily games
+  // can't (a daily is a fixed puzzle, not a user-editable spec).
+  if (g.mode === "custom" && Array.isArray(g.spec) && !reviewOf(g) && !dailyOf(g)) {
     list.appendChild(menuItemLi("Open spec", () => onOpenSpec(g.spec)));
   }
   list.appendChild(exportItemLi(g));
@@ -283,6 +296,10 @@ function closeCardMenus(except) {
 
 function continueMeta(g) {
   const time = formatDuration(g.elapsedMs);
+  const d = dailyOf(g);
+  // The "Continue last puzzle" hero uses a generic title, so the daily identity
+  // (that it IS a daily, which difficulty, which date) has to live in the meta.
+  if (d) return `Daily · ${levelName(d.level)} · ${dayLabel(d.day)} · ${time}`;
   const r = reviewOf(g);
   if (r) return `${reviewTitle(r)} · ${reviewModeLabel(r)} · ${time}`;
   if (g.mode === "custom") return `Custom · ${time}`;
@@ -290,18 +307,146 @@ function continueMeta(g) {
   return `${techniqueName(idFor(g.kindIndex))} · ${mode} · ${time}`;
 }
 
-// The title for a game card: a Review lesson's name, else a custom game's own
-// label, else its technique name.
+// The title for a game card: a daily puzzle's difficulty, else a Review lesson's
+// name, else a custom game's own label, else its technique name.
 function gameTitle(g) {
+  const d = dailyOf(g);
+  if (d) return `Daily · ${levelName(d.level)}`;
   const r = reviewOf(g);
   if (r) return reviewTitle(r);
   return g.mode === "custom" ? g.label || "Custom" : techniqueName(idFor(g.kindIndex));
 }
 
 // A custom game that is actually a Review lesson: its { name, mode }, else null.
+// A daily game is a force_any custom game too -- and Expert I's spec is identical
+// to Review Lesson 1's -- so the daily tag wins first to keep the labels apart.
 function reviewOf(g) {
+  if (dailyOf(g)) return null;
   if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
   return reviewIdentity(curriculum, g.spec);
+}
+
+// A daily game's { day, level } tag, or null. The single source of truth for "is
+// this the Puzzle of the day" across the labels and the card menu.
+function dailyOf(g) {
+  return g && g.daily && typeof g.daily.day === "number" ? g.daily : null;
+}
+
+// ---- Puzzle of the day ----
+// The Puzzle of the day: four fixed difficulties, each a deterministic puzzle
+// derived from today's date (daily.js). The home entry opens this page; each
+// difficulty offers Play (unplayed) / Continue (in progress) / Solved, plus a
+// stubbed leaderboard. The generated game is an ordinary force_any custom game
+// tagged `daily`, so it also shows up in Continue and the Stats history.
+
+// Refresh the home "Puzzle of the day" entry's subtitle: today's date plus a
+// progress hint once any difficulty has been opened.
+function renderDailyEntry() {
+  const sub = document.getElementById("dailySub");
+  if (!sub) return;
+  const day = dayNumber();
+  let solved = 0;
+  let started = 0;
+  for (let i = 0; i < DAILY_LEVELS.length; i++) {
+    const g = store.dailyGame(day, i);
+    if (!g) continue;
+    if (g.status === "solved") solved += 1;
+    else started += 1;
+  }
+  const parts = [dayLabel(day)];
+  if (solved) parts.push(`${solved}/${DAILY_LEVELS.length} solved`);
+  else if (started) parts.push("in progress");
+  sub.textContent = parts.join(" · ");
+}
+
+// The daily page: a row per difficulty, each with its blurb, a Play/Continue/
+// Solved button keyed off today's stored game, and a stubbed leaderboard.
+function openDaily() {
+  const day = dayNumber();
+  setDailyTitle(`Puzzle of the day · ${dayLabel(day)}`);
+  const body = document.getElementById("dailyBody");
+  body.replaceChildren(...DAILY_LEVELS.map((level, i) => dailyLevelCard(level, i, day)));
+  showView("dailyView");
+}
+
+// One difficulty as a card: name, blurb, the state-dependent action button, and a
+// leaderboard placeholder (stubbed -- no scores yet).
+function dailyLevelCard(level, index, day) {
+  const card = document.createElement("div");
+  card.className = "daily-level";
+
+  const name = document.createElement("div");
+  name.className = "daily-level-name";
+  name.textContent = level.name;
+  card.appendChild(name);
+
+  const blurb = document.createElement("p");
+  blurb.className = "daily-level-blurb";
+  blurb.textContent = level.blurb;
+  card.appendChild(blurb);
+
+  card.appendChild(dailyActionButton(level, index, day));
+  card.appendChild(dailyLeaderboard());
+  return card;
+}
+
+// The per-difficulty action: Play when today's puzzle is untouched, Continue while
+// it's in progress, or a disabled "Solved · time" once it's done.
+function dailyActionButton(level, index, day) {
+  const btn = document.createElement("button");
+  btn.className = "mode-btn daily-play";
+  const lab = document.createElement("span");
+  lab.className = "mb-label";
+  const sub = document.createElement("span");
+  sub.className = "mb-sub";
+
+  const g = store.dailyGame(day, index);
+  if (g && g.status === "solved") {
+    btn.classList.add("solved");
+    btn.disabled = true;
+    lab.textContent = "Solved";
+    sub.textContent = formatDuration(g.elapsedMs);
+  } else if (g) {
+    lab.textContent = "Continue";
+    sub.textContent = formatDuration(g.elapsedMs);
+    btn.addEventListener("click", () => onResume(g.id));
+  } else {
+    lab.textContent = "Play";
+    sub.textContent = "";
+    btn.addEventListener("click", () => launchDaily(level, index));
+  }
+  btn.append(lab, sub);
+  return btn;
+}
+
+// The leaderboard placeholder -- a stub until scores are wired (the win screen's
+// Submit is a stub too). Kept as its own element so the real list drops in here.
+function dailyLeaderboard() {
+  const box = document.createElement("div");
+  box.className = "daily-leaderboard";
+  box.textContent = "Leaderboard — coming soon";
+  return box;
+}
+
+// Generate and open today's puzzle for a difficulty. Built as a force_any custom
+// spec (the Review-lesson path) but pinned to a per-(day, difficulty) seed so every
+// device gets the same puzzle, and tagged `daily` so it's recognised later.
+function launchDaily(level, index) {
+  const day = dayNumber();
+  const usages = dailyUsages(curriculum, level);
+  onLaunchSpec({
+    usages,
+    label: dailyLabel(level),
+    specMasks: masksFromUsages(usages),
+    forceAny: true,
+    seed: dailySeed(day, index),
+    daily: { day, level: index },
+    fromForced: false,
+  });
+}
+
+function setDailyTitle(text) {
+  document.getElementById("dailyTitle").textContent = text;
 }
 
 // ---- Campaign drill-down ----

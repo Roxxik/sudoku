@@ -60,15 +60,21 @@ function spawn() {
 // worker's `spec` field. `forceAny` (custom only) folds the Forced kinds into one
 // disjunction -- the puzzle requires some member, not every one. `uncapped` lifts
 // the worker's attempt budget so the search runs until it succeeds or is
-// cancelled (the page offers this after a capped attempt gives up). Resolves to
-// { puzzle, solution, givens, seed } (seed is a decimal-string u64); rejects on
-// a generation failure (capped budget exhausted) or if cancelled.
-export function generate({ target, drill, usages, uncapped, forceAny }) {
+// cancelled (the page offers this after a capped attempt gives up). `seed` (a u64
+// decimal string) pins the RNG so every device generates the same puzzle -- the
+// daily puzzle sends a per-(date, difficulty) seed; ordinary generation omits it
+// and the worker draws its own. Resolves to { puzzle, solution, givens, seed }
+// (seed is a decimal-string u64); rejects on a generation failure (capped budget
+// exhausted) or if cancelled.
+export function generate({ target, drill, usages, uncapped, forceAny, seed }) {
   if (pending) return Promise.reject(new Error("a generation is already running"));
   if (!worker) spawn();
   const msg = usages
     ? { spec: usages, uncapped: !!uncapped, forceAny: !!forceAny }
     : { target, drill, uncapped: !!uncapped };
+  // A pinned seed rides either path (sent only when present, so ordinary requests
+  // are byte-for-byte unchanged and the worker draws its own seed).
+  if (seed != null) msg.seed = seed;
   return new Promise((resolve, reject) => {
     pending = { resolve, reject };
     const mine = pending;
