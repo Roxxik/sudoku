@@ -8,6 +8,11 @@
 // the ALLOW_ORIGIN var (see fetch) -- local dev needs a different origin.
 const ALLOW_ORIGIN = "https://roxxik.github.io";
 
+// Cap on a stored client-error payload. The /errors endpoint is public-writable
+// (same speed-bump key as /solves), so this is the lone guard against a large-blob
+// dump -- a real failed batch (outbox is client-capped) sits well under it.
+const MAX_ERROR_BYTES = 64 * 1024;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -31,6 +36,24 @@ export default {
           "Access-Control-Allow-Headers": "content-type, x-api-key",
           "Access-Control-Max-Age": "86400",
         },
+      }));
+    }
+
+    // Capture endpoint for client-side upload failures. Deliberately schemaless:
+    // it checks the API key and nothing else, then stores the raw body verbatim,
+    // so the exact payload /solves rejected (or a solve that failed client-side
+    // validation) is recoverable from the backend without inspecting the device.
+    // A bad/missing key still 401s (visible in the dashboard); that is the gate.
+    if (url.pathname === "/errors") {
+      if (request.method !== "POST") return cors(new Response("method", { status: 405 }));
+      if (request.headers.get("x-api-key") !== env.API_KEY)
+        return cors(new Response("unauthorized", { status: 401 }));
+      let raw = "";
+      try { raw = await request.text(); } catch {}
+      if (raw.length > MAX_ERROR_BYTES) raw = raw.slice(0, MAX_ERROR_BYTES);
+      await env.DB.prepare("INSERT INTO client_errors (payload) VALUES (?)").bind(raw).run();
+      return cors(new Response(JSON.stringify({ ok: true }), {
+        status: 200, headers: { "content-type": "application/json" },
       }));
     }
 

@@ -11,3 +11,14 @@ CREATE TABLE IF NOT EXISTS solves (
   client_version TEXT    NOT NULL,       -- frontend build: short git commit, '-dirty' if built from a modified tree
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Client-side upload failures, captured for inspection (see web/backend.js's
+-- /errors reporter). Deliberately schemaless: one unvalidated JSON blob per
+-- failed attempt, so the very payload /solves rejected -- or a solve that failed
+-- client-side validation -- is recoverable without inspecting the device. The
+-- worker checks only the API key before inserting here.
+CREATE TABLE IF NOT EXISTS client_errors (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  payload    TEXT    NOT NULL,           -- raw JSON the client POSTed; unvalidated
+  created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);

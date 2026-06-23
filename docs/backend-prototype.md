@@ -11,11 +11,13 @@ Plus one script to download the database. Nothing else.
 ## Scope
 
 **In:** one write endpoint (`POST /solves`), a D1 table, a fire-and-forget client call from
-the solve hook, a shared-secret header, locked CORS, and a download script.
+the solve hook, a shared-secret header, locked CORS, and a download script. Plus (built on
+top, see *Offline outbox + failure capture*): a localStorage retry queue and a schemaless
+`POST /errors` capture endpoint backed by a second table.
 
-**Out (deferred, each noted at the end):** offline outbox + retry, the later auth scheme,
-custom domain / hosting the frontend on Cloudflare Pages, any read/query/stats endpoint,
-binary `.sqlite` export, rate limiting.
+**Out (deferred, each noted at the end):** the later auth scheme, custom domain / hosting the
+frontend on Cloudflare Pages, any read/query/stats endpoint, binary `.sqlite` export, rate
+limiting.
 
 ## Why this shape
 
@@ -57,9 +59,22 @@ CREATE TABLE IF NOT EXISTS solves (
 
 `solve_id` is a fresh `crypto.randomUUID()` minted **per solve** (not the game id — a game can
 be restarted and re-solved, so the game id is not unique per solve). Inserts use
-`INSERT OR IGNORE`, so a later offline-retry that re-sends an already-stored solve is a no-op.
-This is the only reason `solve_id` exists now: it makes the deferred offline outbox a
-frontend-only change with no schema churn.
+`INSERT OR IGNORE`, so an offline-retry that re-sends an already-stored solve is a no-op.
+This is the only reason `solve_id` exists: it makes the offline outbox a frontend-only change
+with no schema churn.
+
+A second, deliberately schemaless table captures client-side upload failures (see *Offline
+outbox + failure capture*). It stores one unvalidated JSON blob per failed attempt — the very
+payload `/solves` rejected — so a failure is diagnosable from the downloaded DB without
+touching the device.
+
+```sql
+CREATE TABLE IF NOT EXISTS client_errors (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  payload    TEXT    NOT NULL,           -- raw JSON the client POSTed; unvalidated
+  created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+```
 
 ## The Worker
 
@@ -210,7 +225,54 @@ backend.recordSolve({
 
 (`import * as backend from "./backend.js";` at the top of [`web/play.js`](../web/play.js),
 alongside its existing `store`/`gen` imports.) Verify with `trunk build` only — no frontend
-tests.
+tests. The sketch above is the *original* fire-and-forget body; the shipped
+[`web/backend.js`](../web/backend.js) extends it with the outbox + capture below (the
+`onSolved()` call site is unchanged).
+
+## Offline outbox + failure capture
+
+Frontend-only durability over the already batch-capable `/solves`, plus a server-side record of
+failures so they're diagnosable without inspecting the device. No `/solves` contract change.
+
+**Outbox.** `recordSolve` is enqueue-then-flush: the solve is appended to a localStorage queue
+(`sudoku.backend.outbox.v1`, capped at the newest 100) *before* the POST, so it survives a
+closed tab or a never-resolving request. A flush sends the **whole queue in one batch** and
+reconciles against the result. Three retry triggers drain it: **lazily on the next solve**
+(batched with it), on the **`online`** event, and **once on load**. `solve_id` + `INSERT OR
+IGNORE` make every re-send idempotent, so an over-eager retry just writes nothing. A single
+`flushing` guard serializes concurrent triggers.
+
+**Failure-status policy** (how a flush reconciles the queue):
+
+| Outcome              | Queue        | /errors capture            |
+|----------------------|--------------|----------------------------|
+| 2xx                  | drop (sent)  | —                          |
+| 401                  | **keep**     | — (dashboard; a fixed build re-delivers) |
+| other 4xx (e.g. 400) | drop         | yes — the rejected payload |
+| 5xx                  | keep, retry  | yes, **once** (`errorReported` flag) |
+| network reject       | keep, retry  | — (no network to report over) |
+
+A solve that fails the client-side mirror of the worker's `valid()` is never enqueued (so one
+bad entry can't 400 a whole batch); it's reported to `/errors` as `kind:"invalid_solve"` so it
+stays visible.
+
+**`POST /errors` — the capture endpoint.** Deliberately schemaless: it checks `x-api-key` and
+nothing else, then stores the raw body verbatim in `client_errors` (capped at 64 KB). A
+bad/missing key still 401s, which shows in the Cloudflare dashboard — that is the only gate.
+The endpoint is the `/solves` sibling on the same worker (`ENDPOINT.replace(/\/solves$/,
+"/errors")`), so `backend-config.js` needs no change. Reports are best-effort, never keepalive,
+and have no outbox of their own (a lost report is just lost — failures never recurse).
+
+```
+POST /errors
+  headers: content-type: application/json, x-api-key: <secret>
+  body:    any JSON (unvalidated; e.g. { kind, status, solves: [...], client_version, user_agent })
+  200:     { "ok": true }      // body stored verbatim, truncated to 64 KB
+  401:     bad/missing x-api-key
+  405:     method other than POST/OPTIONS
+```
+
+The captured rows ride down with the existing `scripts/db-download` SQL dump — no new tooling.
 
 ## Download script
 
@@ -320,9 +382,6 @@ composes with this for free.
 
 ## Deferred (and why each is cheap to add on top of this)
 
-- **Offline outbox + retry.** A localStorage queue appended in `onSolved()`, flushed on the
-  `online` event / next load via the **already batch-capable** endpoint; `INSERT OR IGNORE` on
-  `solve_id` makes retries idempotent. Frontend-only; no schema or API change.
 - **The real auth scheme.** Replaces/augments the shared header; user has a plan. The worker
   stays thin — auth is a header/token check, not domain logic.
 - **Custom domain / frontend on Cloudflare Pages.** Lets CORS relax to same-origin later;
@@ -334,9 +393,9 @@ composes with this for free.
 
 ```
 worker/wrangler.toml        new
-worker/schema.sql           new
-worker/src/index.js         new
-web/backend.js              new
+worker/schema.sql           new (+ client_errors table for failure capture)
+worker/src/index.js         new (+ POST /errors route)
+web/backend.js              new (+ outbox/retry + /errors capture)
 web/play.js                 +1 import, +1 call in onSolved()
 scripts/db-download         new (chmod +x)
 docs/backend-prototype.md   this doc
