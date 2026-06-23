@@ -40,6 +40,10 @@
 //!   yielded puzzles against each other off the instrumented easiest-first solve
 //!   ([`solve::solve_graded`]). Cold path, post-validity; see
 //!   `docs/campaign-grader-plan.md`.
+//! - [`pelanek`]: the Pelánek (2014) absolute difficulty metrics — the randomized
+//!   SiSuS human-solver model and its Refutation-sum / Dependency metrics,
+//!   correlated with human solving time. Cold path; see
+//!   `docs/pelanek-2014-sisus-refutation-dependency.md`.
 //! - [`generate`]: the strip-generate pipeline on the `repr` layer (the [`probe`]
 //!   prober + [`solve`] gate). [`generate::random`] is the shipped scalar/wasm
 //!   path; [`generate::warp_host`] (native only) is the W=8 SIMT warp host that
@@ -65,6 +69,7 @@ pub mod fingerprint;
 pub mod generate;
 pub mod grade;
 pub mod harvest;
+pub mod pelanek;
 pub mod probe;
 pub mod rng;
 pub mod scan;
