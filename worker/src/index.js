@@ -44,15 +44,20 @@ export default {
     const solves = body && Array.isArray(body.solves) ? body.solves : null;
     if (!solves || !solves.every(valid)) return cors(new Response("bad solves", { status: 400 }));
 
-    // INSERT OR IGNORE keyed on the per-solve client_id makes a re-sent solve
-    // (the deferred offline-retry case) an idempotent no-op.
-    const stmt = env.DB.prepare(
-      "INSERT OR IGNORE INTO solves (client_id, seed, puzzle, solution, solve_ms, client_version) VALUES (?,?,?,?,?,?)"
-    );
-    const res = await env.DB.batch(
-      solves.map((s) => stmt.bind(s.client_id, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.client_version))
-    );
-    const inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+    // INSERT OR IGNORE keyed on the per-solve solve_id makes a re-sent solve
+    // (the deferred offline-retry case) an idempotent no-op. D1's batch() rejects
+    // a zero-length list, so a validly-shaped empty request (e.g. a future
+    // offline-flush with nothing queued) is a no-op rather than a batch call.
+    let inserted = 0;
+    if (solves.length) {
+      const stmt = env.DB.prepare(
+        "INSERT OR IGNORE INTO solves (solve_id, seed, puzzle, solution, solve_ms, client_version) VALUES (?,?,?,?,?,?)"
+      );
+      const res = await env.DB.batch(
+        solves.map((s) => stmt.bind(s.solve_id, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.client_version))
+      );
+      inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+    }
     return cors(new Response(JSON.stringify({ inserted }), {
       status: 200, headers: { "content-type": "application/json" },
     }));
@@ -60,7 +65,7 @@ export default {
 };
 
 function valid(s) {
-  return s && typeof s.client_id === "string" && s.client_id.length > 0
+  return s && typeof s.solve_id === "string" && s.solve_id.length > 0
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
     && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)

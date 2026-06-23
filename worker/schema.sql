@@ -3,7 +3,7 @@
 --        (and --local for the wrangler dev loop).
 CREATE TABLE IF NOT EXISTS solves (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  client_id  TEXT    NOT NULL UNIQUE,   -- per-solve UUID minted on the client
+  solve_id   TEXT    NOT NULL UNIQUE,   -- per-solve UUID minted on the client
   seed       TEXT,                      -- decimal u64 string; NULL on pre-seed puzzles
   puzzle     TEXT    NOT NULL,          -- 81 chars, '.' = empty
   solution   TEXT    NOT NULL,          -- 81 chars

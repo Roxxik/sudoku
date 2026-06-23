@@ -588,7 +588,7 @@ function onSolved() {
   });
   // Append this solve to the backend log (fire-and-forget; offline/slow-safe).
   backend.recordSolve({
-    client_id: crypto.randomUUID(),
+    solve_id: crypto.randomUUID(),
     seed: game.seed,            // may be null on old records
     puzzle: game.puzzle,
     solution: game.solution,

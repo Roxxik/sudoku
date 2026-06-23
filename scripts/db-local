@@ -59,7 +59,7 @@ done
 if [ "$full" = 1 ]; then
   cols='*'
 else
-  cols="id, client_id, seed,
+  cols="id, solve_id, seed,
     substr(puzzle,1,4)||'<>'||substr(puzzle,-4)     AS puzzle,
     substr(solution,1,4)||'<>'||substr(solution,-4) AS solution,
     solve_ms, client_version, created_at"

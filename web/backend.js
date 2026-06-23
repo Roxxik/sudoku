@@ -31,7 +31,7 @@ const CONFIGURED = !ENDPOINT.includes("<subdomain>") && !API_KEY.includes("<past
 // Fire-and-forget: recording a solve must never affect the solve flow, so this
 // never throws and never awaits into the UI. An offline, slow, or failed POST
 // is swallowed. `keepalive` lets the request outlive any navigation the solved
-// dialog triggers. `solve` is { client_id, seed, puzzle, solution, solve_ms };
+// dialog triggers. `solve` is { solve_id, seed, puzzle, solution, solve_ms };
 // client_version is stamped here so the call site stays domain-only.
 export function recordSolve(solve) {
   const debug = cheatOn();

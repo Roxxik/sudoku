@@ -46,7 +46,7 @@ One table, append-only, one row per solve event.
 -- worker/schema.sql
 CREATE TABLE IF NOT EXISTS solves (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  client_id  TEXT    NOT NULL UNIQUE,   -- per-solve UUID minted on the client
+  solve_id   TEXT    NOT NULL UNIQUE,   -- per-solve UUID minted on the client
   seed       TEXT,                      -- decimal u64 string; NULL on pre-seed puzzles
   puzzle     TEXT    NOT NULL,          -- 81 chars, '.' = empty
   solution   TEXT    NOT NULL,          -- 81 chars
@@ -55,10 +55,10 @@ CREATE TABLE IF NOT EXISTS solves (
 );
 ```
 
-`client_id` is a fresh `crypto.randomUUID()` minted **per solve** (not the game id — a game can
+`solve_id` is a fresh `crypto.randomUUID()` minted **per solve** (not the game id — a game can
 be restarted and re-solved, so the game id is not unique per solve). Inserts use
 `INSERT OR IGNORE`, so a later offline-retry that re-sends an already-stored solve is a no-op.
-This is the only reason `client_id` exists now: it makes the deferred offline outbox a
+This is the only reason `solve_id` exists now: it makes the deferred offline outbox a
 frontend-only change with no schema churn.
 
 ## The Worker
@@ -92,7 +92,7 @@ endpoint with a longer array — no second route, no contract change.
 ```
 POST /solves
   headers: content-type: application/json, x-api-key: <secret>
-  body:    { "solves": [ { client_id, seed, puzzle, solution, solve_ms }, ... ] }
+  body:    { "solves": [ { solve_id, seed, puzzle, solution, solve_ms }, ... ] }
   200:     { "inserted": <n> }      // n = rows actually written (OR IGNORE may drop dupes)
   400:     malformed body
   401:     bad/missing x-api-key
@@ -100,7 +100,7 @@ POST /solves
 ```
 
 A single solve is a one-element array. The handler validates each entry (81-char
-puzzle/solution, integer `solve_ms`, non-empty `client_id`), then writes them with
+puzzle/solution, integer `solve_ms`, non-empty `solve_id`), then writes them with
 `env.DB.batch([...])` of prepared `INSERT OR IGNORE` statements.
 
 ### `src/index.js` skeleton
@@ -141,10 +141,10 @@ export default {
     if (!solves || !solves.every(valid)) return cors(new Response("bad solves", { status: 400 }));
 
     const stmt = env.DB.prepare(
-      "INSERT OR IGNORE INTO solves (client_id, seed, puzzle, solution, solve_ms) VALUES (?,?,?,?,?)"
+      "INSERT OR IGNORE INTO solves (solve_id, seed, puzzle, solution, solve_ms) VALUES (?,?,?,?,?)"
     );
     const res = await env.DB.batch(
-      solves.map((s) => stmt.bind(s.client_id, s.seed ?? null, s.puzzle, s.solution, s.solve_ms))
+      solves.map((s) => stmt.bind(s.solve_id, s.seed ?? null, s.puzzle, s.solution, s.solve_ms))
     );
     const inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
     return cors(new Response(JSON.stringify({ inserted }), {
@@ -154,7 +154,7 @@ export default {
 };
 
 function valid(s) {
-  return s && typeof s.client_id === "string" && s.client_id.length > 0
+  return s && typeof s.solve_id === "string" && s.solve_id.length > 0
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
     && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)
@@ -200,7 +200,7 @@ export function recordSolve(solve) {
 ```js
 // web/play.js — inside onSolved(), right after the updateGame(...status:"solved") call (~line 587)
 backend.recordSolve({
-  client_id: crypto.randomUUID(),
+  solve_id: crypto.randomUUID(),
   seed: game.seed,            // may be null on old records
   puzzle: game.puzzle,
   solution: game.solution,
@@ -311,7 +311,7 @@ The load-bearing guarantee is therefore one rule, not a version handshake:
   `valid()` check only ever *gains* `(s.newField == null || …)` clauses. Under this rule every old
   client keeps working forever with no coordination.
 
-`client_id` + `INSERT OR IGNORE` already make re-sends idempotent, so the deferred offline outbox
+`solve_id` + `INSERT OR IGNORE` already make re-sends idempotent, so the deferred offline outbox
 composes with this for free.
 
 > A client-version field + a "your app is out of date, refresh" nudge is a *separate* concern
@@ -322,7 +322,7 @@ composes with this for free.
 
 - **Offline outbox + retry.** A localStorage queue appended in `onSolved()`, flushed on the
   `online` event / next load via the **already batch-capable** endpoint; `INSERT OR IGNORE` on
-  `client_id` makes retries idempotent. Frontend-only; no schema or API change.
+  `solve_id` makes retries idempotent. Frontend-only; no schema or API change.
 - **The real auth scheme.** Replaces/augments the shared header; user has a plan. The worker
   stays thin — auth is a header/token check, not domain logic.
 - **Custom domain / frontend on Cloudflare Pages.** Lets CORS relax to same-origin later;
