@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{DigitGrid, Marks, SolverState};
-use crate::solve::{GradeTrace, TrunkProfile, solve_graded, trunk_profile};
+use crate::solve::{GradeTrace, TrunkProfile, solve_graded, trunk_profile, trunk_profiles_rand};
 use crate::spec::Spec;
 use crate::spec::kinds::{Branch, DIFFICULTY, KindMask, NAKED_PAIR, NUM, SWORDFISH, XYZ_WING, branch_of};
 
@@ -1041,6 +1041,84 @@ pub fn trunk_rating(p: &TrunkProfile) -> f64 {
     logistic(z)
 }
 
+// --- Stage 4: trunk-frontier averaging (docs/grader-external-calibration.md §4.5) ----------------
+//
+// Stage 2's [`trunk_dependency`] reads the frontier off ONE deterministic fill order; Pelánek's
+// *Dependency* averages it over ~30 randomized orders, and our single read reaches only ~80-95% of
+// its magnitude on the continuous trunks (§4.5 read 2). The fill order does not change *which*
+// puzzle is harder, but it is a noisy estimator of the underlying mean frontier; averaging a few
+// orders de-noises it toward the same quantity Pelánek measures — built off our own trace, never
+// tuned to the bar (§2.2). This touches ONLY the frontier term; the locked-candidate term stays the
+// deterministic Stage-2 value (Pelánek has no LC analogue, so it is out of scope for the averaging).
+
+/// Randomized fill orders the trunk frontier is averaged over (Pelánek's Dependency runs). The
+/// metric is insensitive above a handful of runs; 30 matches the Pelánek default.
+pub const TRUNK_DEP_RUNS: usize = 30;
+
+/// A stable per-puzzle RNG seed for [`trunk_profiles_rand`] — FNV-1a of the grid bytes — so the
+/// averaged trunk rating is a deterministic, reproducible function of the puzzle (the same property
+/// the deterministic fill had; the randomization is *within* the fill, seeded by the puzzle).
+pub fn trunk_seed(puzzle: &DigitGrid) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in puzzle.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The **averaged** trunk frontier mean (Stage 4): for each step index `i`, the mean
+/// [`TrunkProfile::possibilities`]`[i]` over the `profiles` runs, then the mean over the first
+/// [`TRUNK_DEP_K`] steps — Pelánek's per-step-index averaging exactly. Every run places one cell per
+/// step in the same total, so the per-index curve is well-defined; the `min` length guards a
+/// degenerate run defensively. `0.0` for no profiles / no steps. With a single run this equals
+/// [`trunk_dependency`] on that run.
+pub fn trunk_dependency_avg(profiles: &[TrunkProfile]) -> f64 {
+    if profiles.is_empty() {
+        return 0.0;
+    }
+    let n_steps = profiles.iter().map(|p| p.possibilities.len()).min().unwrap_or(0);
+    let k = TRUNK_DEP_K.min(n_steps);
+    if k == 0 {
+        return 0.0;
+    }
+    let mut acc = 0.0;
+    for i in 0..k {
+        let mean_i = profiles.iter().map(|p| p.possibilities[i] as f64).sum::<f64>()
+            / profiles.len() as f64;
+        acc += mean_i;
+    }
+    acc / k as f64
+}
+
+/// One trunk puzzle's continuous rating with the frontier term **averaged over fill orders** (Stage
+/// 4) — the same logistic as [`trunk_rating`], but the dependency is [`trunk_dependency_avg`] over
+/// the randomized `rand` profiles instead of the single deterministic read. The locked-candidate
+/// term is read from the deterministic profile `det` (out of scope for the averaging — see the
+/// module note), so an empty `rand` reproduces [`trunk_rating`] exactly.
+pub fn trunk_rating_avg(det: &TrunkProfile, rand: &[TrunkProfile]) -> f64 {
+    if det.possibilities.is_empty() {
+        return 0.0;
+    }
+    let dep = if rand.is_empty() { trunk_dependency(det) } else { trunk_dependency_avg(rand) };
+    let z = (TRUNK_DEP_CENTER - dep) / TRUNK_DEP_SCALE + TRUNK_LC_WEIGHT * det.lc_stalls as f64;
+    logistic(z)
+}
+
+/// The spec-free trunk rating, end to end: solve the trunk fill of `puzzle` and rate it, averaging
+/// the frontier over `runs` randomized fill orders (Stage 4). `runs == 0` is the deterministic
+/// Stage-2 baseline ([`trunk_rating`]); `runs > 0` averages (the §4.5 refinement). The single entry
+/// [`grade_puzzle`]'s trunk branch and the calibration harness both call.
+pub fn trunk_rating_runs(puzzle: &DigitGrid, runs: usize) -> f64 {
+    let board = SolverState::<Bands<RowMajor>>::from_digits(puzzle);
+    let det = trunk_profile(&board);
+    if runs == 0 {
+        return trunk_rating(&det);
+    }
+    let rand = trunk_profiles_rand(&board, runs, trunk_seed(puzzle));
+    trunk_rating_avg(&det, &rand)
+}
+
 /// Grade a **spec-less** puzzle (an external dataset entry) by inferring its bottleneck from the
 /// solve rather than from a [`Spec`] (the G1 gap of `docs/grader-external-calibration.md`). Solve
 /// with the [`FULL_TOOLBOX`]; the bottleneck is the hardest harder-than-trunk kind that fired, the
@@ -1075,10 +1153,12 @@ pub fn grade_puzzle(puzzle: &DigitGrid) -> Option<PuzzleGrade> {
             Some(PuzzleGrade { signals, key: Some(k), rating })
         }
         // No harder kind fired: the cheap closure (singles + locked candidates) solved it. Instead
-        // of the per-technique path's flat `0`, grade the trunk on its fill-path frontier — Stage 2.
+        // of the per-technique path's flat `0`, grade the trunk on its fill-path frontier — Stage 2,
+        // with the frontier averaged over [`TRUNK_DEP_RUNS`] randomized fill orders (the Stage-4
+        // §4.5 refinement: the single deterministic read trails Pelánek by the averaging margin).
         None => {
-            let profile = trunk_profile(&SolverState::<Bands<RowMajor>>::from_digits(puzzle));
-            Some(PuzzleGrade { signals: signals_of(&trace, 0), key: None, rating: trunk_rating(&profile) })
+            let rating = trunk_rating_runs(puzzle, TRUNK_DEP_RUNS);
+            Some(PuzzleGrade { signals: signals_of(&trace, 0), key: None, rating })
         }
     }
 }
@@ -1546,6 +1626,54 @@ mod tests {
     fn trunk_rating_zero_without_steps() {
         // A degenerate profile with no singles step (already-complete / no chain) is trivially easy.
         assert_eq!(trunk_rating(&TrunkProfile::default()), 0.0);
+    }
+
+    // --- Stage 4: trunk-frontier averaging (§4.5) ---------------------------------------
+
+    #[test]
+    fn trunk_dependency_avg_means_per_step_index() {
+        // Per step index, average the frontier across runs; then mean over the first k steps. Two
+        // runs (3,3,..) and (5,5,..) average to (4,4,..) -> dependency 4.0.
+        let a = trunk(3, 30, 0);
+        let b = trunk(5, 30, 0);
+        assert!((trunk_dependency_avg(&[a, b]) - 4.0).abs() < 1e-9);
+        // A single run reproduces the deterministic dependency exactly.
+        let one = trunk(7, 30, 0);
+        assert!((trunk_dependency_avg(std::slice::from_ref(&one)) - trunk_dependency(&one)).abs() < 1e-9);
+        // No profiles / no steps -> 0.0 (degenerate, trivially easy).
+        assert_eq!(trunk_dependency_avg(&[]), 0.0);
+    }
+
+    #[test]
+    fn trunk_rating_avg_empty_runs_equals_deterministic() {
+        // With no randomized runs the averaged rating falls back to the deterministic Stage-2 rating
+        // (the frontier term reads `det`; the LC term always does).
+        let det = trunk(4, 30, 1);
+        assert_eq!(trunk_rating_avg(&det, &[]), trunk_rating(&det));
+    }
+
+    #[test]
+    fn trunk_rating_avg_uses_det_lc_and_averaged_frontier() {
+        // The LC term comes from `det` (out of scope for the averaging); only the frontier is
+        // averaged. det frontier 9 (wide/easy) but rand frontier 2 (narrow/hard) -> the averaged
+        // rating reads the rand frontier, so it is strictly harder than rating(det) alone.
+        let det = trunk(9, 30, 0);
+        let rand = vec![trunk(2, 30, 0), trunk(2, 30, 0)];
+        let avg = trunk_rating_avg(&det, &rand);
+        assert!(avg > trunk_rating(&det), "the averaged narrow frontier rates harder than det's wide one");
+        assert!((0.0..=1.0).contains(&avg));
+    }
+
+    #[test]
+    fn trunk_rating_runs_is_reproducible_and_finishes() {
+        // The averaged spec-free trunk rating is a deterministic function of the puzzle (seeded from
+        // its bytes), in (0,1), and stable across calls.
+        let classic = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
+        let grid = DigitGrid::parse(classic).unwrap();
+        let r1 = trunk_rating_runs(&grid, TRUNK_DEP_RUNS);
+        let r2 = trunk_rating_runs(&grid, TRUNK_DEP_RUNS);
+        assert_eq!(r1, r2, "seeded from the puzzle -> reproducible");
+        assert!(r1 > 0.0 && r1 < 1.0);
     }
 
     #[test]

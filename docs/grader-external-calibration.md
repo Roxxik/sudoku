@@ -11,7 +11,8 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > **dropped.** The grader's output stays what it is today — a **per-spec, within-technique** rating.
 > The external data is for making that per-spec rating *better*, not for building a portable scalar.
 
-> Status: **Stages 0-4 BUILT & MEASURED (2026-06-23).** Landed: the
+> Status: **Stages 0-4 BUILT & MEASURED (2026-06-23), incl. the Stage-4 trunk-frontier-averaging
+> refinement (§4.8).** Landed: the
 > spec-free grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, Stage 0); the
 > reworked [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) harness — Stage 1,
 > the **corrected per-technique-bucket scoreboard** (§4.4): it buckets each group's covered puzzles by
@@ -35,7 +36,14 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > buckets (hidden-pair, swordfish) need no flip (the existing signs were right), and the one
 > human-improving stability-safe flip — **xy-wing `cascade` `−1→+1`** — lifts its pooled human-rho
 > +0.080→+0.179; naked-pair's and w-wing's bigger raw wins are stability-rejected. Surgical bake (signs
-> + two CDFs only; trunk and every other row byte-identical).
+> + two CDFs only; trunk and every other row byte-identical). And **Stage 4** — the natural-puzzle
+> NORM/CDF re-mine (§4.7, spec-free `NATURAL_*` overlay) **plus the trunk-frontier averaging** (§4.8,
+> [`trunk_profiles_rand`](../generator-lab/src/solve/logic.rs) + [`trunk_rating_runs`](../generator-lab/src/grade.rs)):
+> the trunk frontier is now averaged over 30 randomized fill orders (Pelánek's Dependency averaging,
+> off our own trace), closing the determinism-vs-averaging gap so **every trunk bucket matches/beats
+> the Pelánek Dependency bar** and the continuous-group aggregates land within ±0.03 of it (from
+> −0.11..−0.17 at Stage 2); scoped to the frontier term, seeded from the puzzle, spec-based production
+> byte-identical.
 
 ## 1. The problem: the grader only ever agreed with itself
 
@@ -250,7 +258,9 @@ Three reads:
 2. **We trail the bar exactly by the determinism-vs-averaging margin.** Our single deterministic fill
    path reaches ~80-95% of Pelánek's Dependency magnitude on the continuous trunks; the residual is
    that Pelánek averages the frontier over 30 randomized fill orders while we read one. Recovering it
-   (a few-run frontier average) is a natural Stage-4 refinement, not a re-tuning.
+   (a few-run frontier average) is a natural Stage-4 refinement, not a re-tuning. **DONE — §4.8: the
+   30-run average closes essentially the entire residual; we now match or beat the Dependency bar on
+   every trunk bucket.**
 3. **The locked-candidate term earns its place on the ordinal groups.** Ablating it (`TRUNK_LC_WEIGHT
    = 0`) costs the editorially-labelled ordinals (org.uk +0.463 → +0.395, sotd +0.558 → +0.530, nhk
    +0.343 → +0.242) — where "needs a locked candidate" is part of the site's difficulty rank — and is
@@ -374,9 +384,58 @@ result is a clean negative:
 
 So per the plan's "may simply lack the data in most buckets — **do not force it**," no weights are
 baked. The data is too thin for a credible per-technique re-weight; the harness stays as the machinery
-to re-attempt as the corpus grows. (A separate, untried Stage-4 refinement noted in §4.5 — averaging
-the **trunk** frontier over a few fill orders to recover the determinism-vs-averaging margin — would
-target the trunk-dominated continuous groups; it is orthogonal to this re-mine and remains future work.)
+to re-attempt as the corpus grows. (A separate Stage-4 refinement noted in §4.5 — averaging the
+**trunk** frontier over a few fill orders to recover the determinism-vs-averaging margin — targets the
+trunk-dominated continuous groups; orthogonal to this re-mine, it is now **done and baked: §4.8**.)
+
+### 4.8 Stage 4 (trunk) — frontier averaging over fill orders (measured 2026-06-23)
+
+Stage 2's trunk rating read the [`trunk_dependency`](../generator-lab/src/grade.rs) frontier off **one
+deterministic** easiest-first fill; Pelánek's *Dependency* averages it over ~30 *randomized* fill
+orders, and §4.5 read 2 measured that our single read reaches only ~80-95% of its magnitude. The fill
+order does not change *which* puzzle is harder, but a single order is a noisy estimator of the mean
+frontier — so this refinement de-noises it the same way Pelánek does, **built off our own trace, never
+tuned to the bar** (§2.2). [`trunk_profiles_rand`](../generator-lab/src/solve/logic.rs) runs `R`
+randomized fills (a uniformly-random forced cell each step, RNG seeded from the puzzle so the rating
+stays a deterministic, reproducible function of the puzzle), and
+[`trunk_dependency_avg`](../generator-lab/src/grade.rs) averages the frontier **per step index** over
+the runs (every run places one cell per step in the same total, so the curve is well-defined) before
+the mean over the first `k = 25` steps. The change is **scoped to the frontier term only**: the
+locked-candidate stall term is read from the deterministic profile (Pelánek has no LC analogue), so
+`R = 0` reproduces Stage 2 exactly. Driven by
+[`datasets_correlate --trunk-average`](../generator-lab/examples/datasets_correlate.rs) (our grader
+only, no Pelánek), which A/Bs the trunk bucket deterministic vs averaged at `R ∈ {2,4,8,16,30}`.
+
+The gain is **monotone in `R`, saturating by `R ≈ 16`**, and **regresses no group**. Baked at
+`R = TRUNK_DEP_RUNS = 30` (Pelánek's default) as the spec-free trunk default
+([`trunk_rating_runs`](../generator-lab/src/grade.rs), called by
+[`grade_puzzle`](../generator-lab/src/grade.rs)'s trunk branch). Trunk bucket and group aggregate,
+deterministic (Stage 2) → averaged (`R = 30`), against the Pelánek Dependency bar:
+
+| group | trunk: det → R30 | trunk bar (|pel dep|) | group agg: det → R30 | bar | gap (ours − bar) |
+|---|---|---|---|---|---|
+| `synnwang/solve_time` | +0.485 → **+0.588** | 0.591 | +0.473 → **+0.572** | 0.584 | −0.111 → **−0.012** |
+| `synnwang/D_TO` | +0.570 → **+0.711** | 0.716 | +0.549 → **+0.686** | 0.714 | −0.165 → **−0.027** |
+| `synnwang/D_TR` | +0.530 → **+0.634** | 0.633 | +0.517 → **+0.618** | 0.625 | −0.108 → **−0.008** |
+| `armane/org.uk` | +0.463 → **+0.484** | 0.452 | +0.344 → +0.360 | 0.376 | −0.032 → **−0.016** |
+| `armane/sotd` | +0.558 → **+0.567** | 0.557 | +0.406 → +0.411 | 0.385 | +0.021 → **+0.026** (beats bar) |
+| `sakana/nhk` | +0.343 → **+0.392** | 0.364 | +0.343 → +0.392 | 0.364 | −0.021 → **+0.027** (beats bar) |
+| `armane/extreme` | (no trunk) | — | +0.133 (unchanged) | 0.052 | +0.081 |
+
+Two reads:
+
+1. **The averaging closes essentially the entire residual determinism-vs-averaging gap.** Every trunk
+   bucket now **matches or beats** the Pelánek Dependency bar (`D_TR`, `org.uk`, `sotd`, `nhk` beat it;
+   `solve_time`/`D_TO` land within ±0.005 of it). The trunk-dominated continuous-group aggregates,
+   which trailed the bar by −0.11..−0.17 at Stage 2, now sit within **±0.03** of it — the §4.5 read 2
+   prediction realised in full. This is the single largest remaining lift in the plan, and it needed no
+   new constants (the logistic center/scale/LC weight are untouched), only a less-biased estimator of
+   the *same* frontier quantity.
+2. **Production is untouched and the change is reproducible.** Like the rest of Stage 4 it lives on the
+   spec-free path only ([`grade_puzzle`](../generator-lab/src/grade.rs), example-only); the spec-based
+   `grade_one`/`rating` path the web app's `gen_worker` calls is byte-identical. The per-puzzle RNG seed
+   ([`trunk_seed`](../generator-lab/src/grade.rs), FNV-1a of the grid) makes the averaged rating a pure,
+   reproducible function of the puzzle — the same property the deterministic fill had.
 
 ## 5. The plan (per-spec; beat the bar; one change at a time)
 
@@ -432,7 +491,16 @@ non-degeneracy guard, every gain is split-luck or a degenerate single-signal col
 `cascade`-only), so per "do not force it" the data is too thin to re-weight. Driven by
 [`datasets_correlate --natural-remine`](../generator-lab/examples/datasets_correlate.rs) (our grader
 only; no Pelánek needed), which prints the paste-ready `NATURAL_*` arrays and the re-weight verdicts.
-A further trunk-frontier-averaging refinement (§4.5) is orthogonal and remains future work.
+
+**Stage 4 (trunk) — frontier averaging over fill orders. DONE (2026-06-23) — see §4.8.** Replaced the
+trunk bucket's single deterministic frontier read with the mean over `R = 30` randomized fill orders
+(Pelánek's Dependency averaging, off our own trace), scoped to the frontier term only (the LC term and
+all logistic constants are unchanged, so `R = 0` is Stage 2 exactly). Seeded from the puzzle, so the
+rating stays a reproducible pure function of it. Result: every trunk bucket now matches/beats the
+Pelánek Dependency bar and the trunk-dominated continuous-group aggregates close to within ±0.03 of it
+(from −0.11..−0.17 at Stage 2). Baked as `grade_puzzle`'s spec-free trunk default
+([`trunk_rating_runs`](../generator-lab/src/grade.rs)); the spec-based production path is byte-identical.
+Driven by [`datasets_correlate --trunk-average`](../generator-lab/examples/datasets_correlate.rs).
 
 Re-use the resumable [`grade_diag`](../generator-lab/examples/grade_diag.rs) mining-cache machinery so
 the (slow, especially for Pelánek) dataset solves are computed once and recalibration is instant.

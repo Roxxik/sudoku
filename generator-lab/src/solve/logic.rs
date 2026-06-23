@@ -7,7 +7,8 @@
 //! correctness oracle.
 
 use super::{LogicBoard, Solver, techniques};
-use crate::repr::{CELLS, Digit, UNITS};
+use crate::repr::{CELLS, CellIdx, Digit, UNITS};
+use crate::rng::Rng;
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
@@ -479,17 +480,27 @@ pub struct TrunkProfile {
     pub solved: bool,
 }
 
-/// Count the cells forced by a naked or hidden single on `b` — the frontier width, deduped by
-/// cell (a naked single's lone candidate is the only digit any hidden single could target the
-/// cell with, so a cell is never double-counted). Non-mutating: it reads the stall, it does not
-/// resolve it. This is [`super::techniques::naked_single`] + [`super::techniques::hidden_single`]
-/// run as an enumeration rather than a "fire the first one" step.
-fn singles_frontier<V: LogicBoard>(b: &V) -> u32 {
-    let mut forced = [false; CELLS];
+/// Enumerate the cells forced by a naked or hidden single on `b` as `(cell, digit)` fill moves —
+/// the frontier, deduped by cell (a naked single's lone candidate is the only digit any hidden
+/// single could target the cell with, so a cell is never double-counted, and either reading gives
+/// the same forced digit). Naked singles first in cell order, then the remaining hidden singles in
+/// unit order, so `out[0]` is the lowest-index naked single (else the first hidden single) — the
+/// exact cell [`super::techniques::naked_single`]/[`super::techniques::hidden_single`] would place.
+/// Non-mutating: it reads the stall, it does not resolve it.
+///
+/// `out.len()` is the frontier width — Pelánek's *Dependency* per-step `possibilities`. A
+/// uniformly-random element is one randomized fill move ([`trunk_profiles_rand`]).
+fn forced_moves<V: LogicBoard>(b: &V, out: &mut Vec<(CellIdx, Digit)>) {
+    out.clear();
+    let mut seen = [false; CELLS];
     // Naked singles: an empty cell with exactly one candidate.
     for c in 0..CELLS {
-        if b.is_empty(c) && b.get(c).len() == 1 {
-            forced[c] = true;
+        if b.is_empty(c) {
+            let m = b.get(c);
+            if m.len() == 1 {
+                out.push((c, m.iter().next().expect("exactly one candidate")));
+                seen[c] = true;
+            }
         }
     }
     // Hidden singles: a (unit, digit) whose digit has exactly one candidate cell.
@@ -508,36 +519,46 @@ fn singles_frontier<V: LogicBoard>(b: &V) -> u32 {
                 }
             }
             if count == 1 {
-                forced[only.expect("count == 1")] = true;
+                let c = only.expect("count == 1");
+                if !seen[c] {
+                    out.push((c, d));
+                    seen[c] = true;
+                }
             }
         }
     }
-    forced.iter().filter(|&&f| f).count() as u32
 }
 
-/// Profile the trunk fill of `board`: an easiest-first singles + locked-candidate solve that, at
-/// every step, records the [`singles_frontier`] width *before* placing **one** forced cell (naked
-/// single first, else hidden single — `step_once`'s cheap order), and tallies the locked-candidate
-/// firings needed to break each singles stall. Cold path; runs on a trunk-keyed dataset puzzle off
-/// the hot loop. See [`TrunkProfile`].
+/// Profile one trunk fill of `board`: an easiest-first singles + locked-candidate solve that, at
+/// every step, records the [`forced_moves`] frontier width *before* placing **one** forced cell —
+/// the cell `pick(frontier_len)` selects — and tallies the locked-candidate firings needed to break
+/// each singles stall. Cold path; runs on a trunk-keyed dataset puzzle off the hot loop. See
+/// [`TrunkProfile`].
+///
+/// `pick` chooses which of the `frontier_len` forced cells to place: the deterministic baseline
+/// ([`trunk_profile`]) passes `|_| 0` (`out[0]` = the lowest-index naked-first move, `step_once`'s
+/// cheap order); a randomized run ([`trunk_profiles_rand`]) passes `|len| rng.range(len)` (Pelánek's
+/// uniform simple-move pick). The frontier-width *sequence* depends on the order, which is the whole
+/// point of averaging over orders — but the **number of placements is invariant** (one per empty
+/// cell), so every run records the same number of `possibilities` and the curves are averageable per
+/// step index ([`grade::trunk_dependency_avg`](crate::grade::trunk_dependency_avg)).
 ///
 /// Both progress measures are monotone (a placement fills a cell, a locked candidate prunes a
 /// candidate), so the fill always terminates; on a genuine trunk puzzle it terminates *solved*.
-pub fn trunk_profile<V: LogicBoard>(board: &V) -> TrunkProfile {
+fn trunk_fill<V: LogicBoard>(board: &V, mut pick: impl FnMut(usize) -> usize) -> TrunkProfile {
     let mut b = board.clone();
     let mut p = TrunkProfile::default();
+    let mut moves: Vec<(CellIdx, Digit)> = Vec::new();
     loop {
         if is_solved(&b) {
             p.solved = true;
             return p;
         }
-        let frontier = singles_frontier(&b);
-        if frontier > 0 {
-            p.possibilities.push(frontier);
-            // Place one forced cell, naked single first (the cheap-order head of `step_once`).
-            if !techniques::naked_single(&mut b) {
-                techniques::hidden_single(&mut b);
-            }
+        forced_moves(&b, &mut moves);
+        if !moves.is_empty() {
+            p.possibilities.push(moves.len() as u32);
+            let (c, d) = moves[pick(moves.len())];
+            b.place(c, d);
             continue;
         }
         // Singles stalled: apply locked-candidate firings until a single reappears (or none
@@ -548,7 +569,8 @@ pub fn trunk_profile<V: LogicBoard>(board: &V) -> TrunkProfile {
             if techniques::lc_pointing(&mut b) || techniques::lc_claiming(&mut b) {
                 p.lc_elims += 1;
                 fired = true;
-                if singles_frontier(&b) > 0 {
+                forced_moves(&b, &mut moves);
+                if !moves.is_empty() {
                     break; // a single reappeared — resume the singles fill
                 }
             } else {
@@ -564,6 +586,30 @@ pub fn trunk_profile<V: LogicBoard>(board: &V) -> TrunkProfile {
         // profiler total by returning the partial profile (`solved == false`).
         return p;
     }
+}
+
+/// Profile the trunk fill **deterministically** — easiest-first, naked single before hidden single,
+/// lowest index first (`step_once`'s cheap order). The Stage-2 baseline; [`trunk_profiles_rand`] is
+/// the Stage-4 randomized-frontier-average refinement.
+pub fn trunk_profile<V: LogicBoard>(board: &V) -> TrunkProfile {
+    trunk_fill(board, |_| 0)
+}
+
+/// Profile `runs` **randomized** trunk fills, each placing a uniformly-random forced cell from the
+/// frontier (RNG seeded from `seed`, so the result is reproducible). This is our analogue of
+/// Pelánek's averaging the *Dependency* frontier curve over several randomized fill orders — the
+/// Stage-4 refinement of `docs/grader-external-calibration.md` §4.5, recovering the
+/// determinism-vs-averaging margin our single deterministic fill leaves on the table (~80-95% of
+/// Pelánek's magnitude). Every run solves the same trunk puzzle in the same number of placements, so
+/// the profiles share a step count and
+/// [`grade::trunk_dependency_avg`](crate::grade::trunk_dependency_avg) averages them per step index.
+pub fn trunk_profiles_rand<V: LogicBoard>(board: &V, runs: usize, seed: u64) -> Vec<TrunkProfile> {
+    let mut rng = Rng::from_seed(seed);
+    let mut out = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        out.push(trunk_fill(board, |len| rng.range(len)));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -620,6 +666,27 @@ mod tests {
         // One frontier reading per non-given cell placed; every reading is a real forced count.
         assert!(!p.possibilities.is_empty(), "a singles fill records its frontier");
         assert!(p.possibilities.iter().all(|&w| w >= 1), "each step has >= 1 forced cell");
+    }
+
+    /// Every randomized fill order solves the same trunk puzzle in the **same number of
+    /// placements** as the deterministic one — the invariant that lets the frontier curves be
+    /// averaged per step index. The frontier *sequence* may differ (that is the point of
+    /// averaging), but its length must not.
+    #[test]
+    fn trunk_profiles_rand_share_the_deterministic_step_count() {
+        let board = state::<Bands<RowMajor>>(PUZZLE);
+        let det = super::trunk_profile(&board);
+        let runs = super::trunk_profiles_rand(&board, 8, 0xC0FFEE);
+        assert_eq!(runs.len(), 8);
+        for (i, r) in runs.iter().enumerate() {
+            assert!(r.solved, "randomized run {i} solved the trunk puzzle");
+            assert_eq!(
+                r.possibilities.len(),
+                det.possibilities.len(),
+                "randomized run {i} placed the same number of cells as the deterministic fill",
+            );
+            assert!(r.possibilities.iter().all(|&w| w >= 1), "each step has >= 1 forced cell");
+        }
     }
 
     /// An already-complete grid profiles to no steps (nothing to fill) and reports solved.

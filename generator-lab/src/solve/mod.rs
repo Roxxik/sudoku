@@ -48,7 +48,9 @@ pub use logic::{CHEAP_KINDS, GradeStep, GradeTrace, solve_graded};
 /// Trunk-bucket fill-path profiler (cold path): the frontier-width + locked-candidate signal
 /// that gives a singles-solvable puzzle a continuous difficulty sub-order (see
 /// [`crate::grade::trunk_rating`], `docs/grader-external-calibration.md` Stage 2).
-pub use logic::{TrunkProfile, trunk_profile};
+/// [`trunk_profiles_rand`](logic::trunk_profiles_rand) is the Stage-4 randomized-frontier-average
+/// refinement (§4.5).
+pub use logic::{TrunkProfile, trunk_profile, trunk_profiles_rand};
 
 /// Baseline-gate workload counters (`feature = "count"`), for the SIMT-baseline
 /// solver design study — read by the `baselinestat` example.

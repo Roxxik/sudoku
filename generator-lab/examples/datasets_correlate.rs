@@ -25,9 +25,13 @@
 //! `--model-seed` reloads instantly; the cache is invalidated only when those knobs change. Pass
 //! `--no-pelanek` to skip the bar entirely for fast iteration on our own grader (Stages 2-4).
 //!
+//! `--natural-remine` (§4.7) and `--trunk-average` (§4.8) run the two Stage-4 A/B passes after the
+//! board (our grader only — pair with `--no-pelanek`): the natural NORM/CDF held-out re-mine, and the
+//! trunk-frontier averaging over randomized fill orders vs the deterministic Stage-2 read.
+//!
 //! Usage: cargo run --release -p generator-lab --example datasets_correlate -- \
 //!          [--data DIR] [--jobs J=8] [--limit N] [--runs R=30] [--k K=25] \
-//!          [--model-seed S=1] [--cache DIR] [--no-pelanek]
+//!          [--model-seed S=1] [--cache DIR] [--no-pelanek] [--natural-remine] [--trunk-average]
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -39,7 +43,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use generator_lab::datasets::{Group, Row, load_group};
 use generator_lab::grade::{
     CDF_ANCHORS, GRANULAR_CDF, GRANULAR_NORM, PuzzleGrade, SIGN_DENSE_MIN, SigNorm, Signals, TechNorm,
-    cdf_of, grade_puzzle, granular_score, rating_from_cdf,
+    cdf_of, grade_puzzle, granular_score, rating_from_cdf, trunk_rating_runs,
 };
 use generator_lab::pelanek::{Opts, grade_puzzle as pelanek_grade};
 use generator_lab::repr::DigitGrid;
@@ -877,6 +881,121 @@ fn reweight_report(by_kind: &[Vec<KindGroup>], chosen: &[Option<&'static str>]) 
 const SIG_NAMES: [&str; NSIG] =
     ["open", "cascade", "depth", "elim", "alts", "tight", "open_mean", "depth_tight", "transitions", "camo"];
 
+// --- Stage 4 (trunk): frontier averaging over fill orders (docs §4.5) ---------------------------
+//
+// Stage 2 reads the trunk frontier off ONE deterministic fill; Pelánek averages it over ~30
+// randomized orders and our single read reaches only ~80-95% of its magnitude (§4.5 read 2). This
+// pass recomputes the trunk bucket's rating with the frontier averaged over R runs and reports the
+// trunk human-rho deterministic vs averaged (a few R), plus the resulting group aggregate — so the
+// determinism-vs-averaging margin is measured before it is baked as `grade_puzzle`'s trunk default.
+// Our grader only; no Pelánek. Run with `--trunk-average` (best with `--no-pelanek`).
+
+/// The §4.5 number of randomized fill orders to A/B at (the last is `TRUNK_DEP_RUNS`).
+const TRUNK_AVG_RS: [usize; 5] = [2, 4, 8, 16, 30];
+
+/// Re-rate a group's `trunk` rows with the frontier averaged over `runs` fill orders, in parallel.
+/// Aligned to `trunk` (a parse failure — never expected on covered rows — falls back to `0.0`).
+fn trunk_avg_ratings(group: &Group, trunk: &[usize], runs: usize, jobs: usize) -> Vec<f64> {
+    let out: Vec<Mutex<f64>> = (0..trunk.len()).map(|_| Mutex::new(0.0)).collect();
+    let cursor = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                loop {
+                    let j = cursor.fetch_add(1, AtomicOrdering::Relaxed);
+                    if j >= trunk.len() {
+                        break;
+                    }
+                    if let Some(grid) = DigitGrid::parse(&group.rows[trunk[j]].puzzle) {
+                        *out[j].lock().unwrap() = trunk_rating_runs(&grid, runs);
+                    }
+                }
+            });
+        }
+    });
+    out.into_iter().map(|m| m.into_inner().unwrap()).collect()
+}
+
+/// The board's per-group aggregate (n-weighted over buckets, flat/single-level -> 0 with n counted,
+/// `n < 2` excluded) of `ratings` (aligned to `ours`, covered entries only) vs the human label —
+/// exactly the `--no-pelanek` aggregate, so swapping the trunk ratings shows the whole-group effect.
+fn agg_with_ratings(group: &Group, ours: &[Option<PuzzleGrade>], ratings: &[f64]) -> f64 {
+    let metric = if group.ordinal { Metric::Ordinal } else { Metric::Continuous };
+    let mut buckets: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, o) in ours.iter().enumerate() {
+        if let Some(g) = o {
+            buckets.entry(g.key.map_or(-1, |k| k as i64)).or_default().push(i);
+        }
+    }
+    let mut agg = Agg::default();
+    for idxs in buckets.values() {
+        let labels: Vec<f64> = idxs.iter().map(|&i| group.rows[i].label_value).collect();
+        if idxs.len() < 2 || is_const(&labels) {
+            continue;
+        }
+        let xs: Vec<f64> = idxs.iter().map(|&i| ratings[i]).collect();
+        let ws: Vec<f64> = idxs.iter().map(|&i| group.rows[i].weight).collect();
+        agg.add(metric.corr(&xs, &labels, &ws), idxs.len());
+    }
+    agg.get()
+}
+
+/// Stage-4 trunk-frontier-averaging report: per group, the trunk-bucket human-rho deterministic
+/// (Stage 2) vs averaged at each `TRUNK_AVG_RS`, and the group aggregate det -> R=30.
+fn trunk_average_report(graded: &[(Group, Vec<Option<PuzzleGrade>>)], jobs: usize) {
+    println!("\n# === STAGE 4 (trunk) — frontier averaging over fill orders (§4.5) ===");
+    let mut hdr = String::from("# group                      n_trunk   det   ");
+    for r in TRUNK_AVG_RS {
+        hdr.push_str(&format!(" R={r:<5}"));
+    }
+    hdr.push_str("   group AGG: det -> R30");
+    println!("{hdr}");
+
+    for (group, ours) in graded {
+        let metric = if group.ordinal { Metric::Ordinal } else { Metric::Continuous };
+        let trunk: Vec<usize> =
+            (0..ours.len()).filter(|&i| ours[i].as_ref().is_some_and(|g| g.key.is_none())).collect();
+        if trunk.len() < 2 {
+            continue;
+        }
+        let labels: Vec<f64> = trunk.iter().map(|&i| group.rows[i].label_value).collect();
+        let weights: Vec<f64> = trunk.iter().map(|&i| group.rows[i].weight).collect();
+        if is_const(&labels) {
+            continue; // single-level trunk (no within-bucket order) — not testable
+        }
+
+        // The full-group rating vector = `ours`, with the trunk rows overridden by `trunk_vals` —
+        // so the swapped-trunk aggregate is apples-to-apples with the board's --no-pelanek AGG.
+        let base_ratings = |trunk_vals: &[f64]| -> Vec<f64> {
+            let mut r: Vec<f64> = ours.iter().map(|o| o.as_ref().map_or(0.0, |g| g.rating)).collect();
+            for (j, &i) in trunk.iter().enumerate() {
+                r[i] = trunk_vals[j];
+            }
+            r
+        };
+
+        // Deterministic baseline computed EXPLICITLY (`runs = 0`), so the A/B is independent of
+        // whatever grade_puzzle's current trunk default is (after the bake `ours[i].rating` is the
+        // average; this recovers the Stage-2 deterministic rating to compare against).
+        let det_trunk = trunk_avg_ratings(group, &trunk, 0, jobs);
+        let det_rho = metric.corr(&det_trunk, &labels, &weights);
+        let det_agg = agg_with_ratings(group, ours, &base_ratings(&det_trunk));
+
+        // Averaged trunk rho at each R, and (for R=30) the swapped whole-group aggregate.
+        let mut line = format!("{:<26} n={:<5} {} ", group.id, trunk.len(), fmt_rho(det_rho));
+        let mut r30_agg = det_agg;
+        for r in TRUNK_AVG_RS {
+            let avg = trunk_avg_ratings(group, &trunk, r, jobs);
+            line.push_str(&format!(" {}", fmt_rho(metric.corr(&avg, &labels, &weights))));
+            if r == 30 {
+                r30_agg = agg_with_ratings(group, ours, &base_ratings(&avg));
+            }
+        }
+        line.push_str(&format!("   {} -> {}", fmt_rho(det_agg), fmt_rho(r30_agg)));
+        println!("{line}");
+    }
+}
+
 fn arg_val(flag: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -927,6 +1046,8 @@ fn main() {
 
     // `--natural-remine` runs the Stage-4 held-out re-mine (over our grader only) after the board.
     let remine = arg_flag("--natural-remine");
+    // `--trunk-average` runs the Stage-4 trunk-frontier-averaging A/B (§4.5) after the board.
+    let trunk_average = arg_flag("--trunk-average");
 
     let t0 = std::time::Instant::now();
     let mut graded: Vec<(Group, Vec<Option<PuzzleGrade>>)> = Vec::new();
@@ -957,5 +1078,8 @@ fn main() {
 
     if remine {
         natural_remine(&graded);
+    }
+    if trunk_average {
+        trunk_average_report(&graded, jobs);
     }
 }
