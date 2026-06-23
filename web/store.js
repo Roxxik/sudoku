@@ -28,6 +28,15 @@ function gameKey(id) {
   return `sudoku.game.${id}`;
 }
 
+// The move-tracking timeline for a game lives under its own third key, separate
+// from both the index and the heavy board state. It is append-mostly and can
+// grow without bound, so keeping it off the per-keystroke heavy key leaves that
+// save path O(1). Frontend-only capture for the grader (see tracker.js); never
+// sent anywhere.
+function trackKey(id) {
+  return `sudoku.track.${id}`;
+}
+
 // The fields that live in the per-game heavy key rather than the index. These are
 // the ones that change as you play; everything else is listing metadata.
 const HEAVY_FIELDS = ["value", "centerMarks", "cornerMarks", "history", "redo", "elapsedMs"];
@@ -92,6 +101,40 @@ function writeHeavy(id, heavy) {
 function deleteHeavy(id) {
   try {
     localStorage.removeItem(gameKey(id));
+  } catch {
+    /* ignore */
+  }
+}
+
+// ---- Move-tracking log (per game) ----
+// The events array for one game ([] if absent/corrupt). Loading it on session
+// start lets a puzzle played across several sittings keep one continuous
+// timeline rather than starting fresh each time it's reopened.
+export function loadTrack(id) {
+  try {
+    const raw = localStorage.getItem(trackKey(id));
+    if (!raw) return [];
+    const data = JSON.parse(raw);
+    return Array.isArray(data && data.events) ? data.events : [];
+  } catch {
+    return [];
+  }
+}
+
+// Overwrite a game's whole event log. Wrapped in a small envelope so the schema
+// can be versioned later without ambiguity. Tolerates quota/privacy failures the
+// same way the index and heavy writes do -- tracking must never break play.
+export function saveTrack(id, events) {
+  try {
+    localStorage.setItem(trackKey(id), JSON.stringify({ v: 1, events }));
+  } catch {
+    /* quota or privacy mode: the log just won't persist this session. */
+  }
+}
+
+function deleteTrack(id) {
+  try {
+    localStorage.removeItem(trackKey(id));
   } catch {
     /* ignore */
   }
@@ -261,6 +304,7 @@ export function getGame(id) {
 export function deleteGame(id) {
   saveIndex(loadIndex().filter((g) => g.id !== id));
   deleteHeavy(id);
+  deleteTrack(id); // drop the move-tracking log along with the game
 }
 
 // Checkpoint the player's in-progress board as one keystroke's save. This is the

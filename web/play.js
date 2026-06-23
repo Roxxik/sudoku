@@ -11,11 +11,12 @@
 import { bindings } from "./wasm.js";
 import * as store from "./store.js";
 import * as backend from "./backend.js";
+import * as tracker from "./tracker.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
 import { copyText, gradeName, gradeBadge } from "./ui.js";
 import { cheatOn, CHEAT_KEY } from "./cheat.js";
-import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn } from "./settings.js";
+import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn, lightModeOn } from "./settings.js";
 
 const N = 81;
 
@@ -181,6 +182,7 @@ function undo() {
   applySnapshot(history.pop());
   updateHistoryButtons();
   persist();
+  tracker.track("undo");
   refreshTimer(); // a restart-undo rewinds the clock -- show it at once
   render();
 }
@@ -191,6 +193,7 @@ function redo() {
   applySnapshot(redoStack.pop());
   updateHistoryButtons();
   persist();
+  tracker.track("redo");
   refreshTimer();
   render();
 }
@@ -200,12 +203,15 @@ function redo() {
 // back through them one at a time.
 function redoAll() {
   if (redoStack.length === 0) return;
+  let steps = 0;
   while (redoStack.length > 0) {
     history.push(snapshot());
     applySnapshot(redoStack.pop());
+    steps++;
   }
   updateHistoryButtons();
   persist();
+  tracker.track("redoAll", { steps });
   refreshTimer();
   render();
 }
@@ -223,14 +229,17 @@ function onRedoTap() {
 // tap at a time (or all at once via Redo's up-flick). The error-hint "Undo to
 // before..." buttons use this to drop the player back to the last state that was
 // still correct -- including any moves they built on top of the slip.
-function undoToClear(hasError) {
+function undoToClear(hasError, reason) {
   if (history.length === 0 || !hasError()) return;
+  let steps = 0;
   do {
     redoStack.push(snapshot()); // remember where we are so redo can return here
     applySnapshot(history.pop());
+    steps++;
   } while (history.length > 0 && hasError());
   updateHistoryButtons();
   persist();
+  tracker.track("undoToClear", { reason: reason || null, steps });
   refreshTimer(); // a rewound restart entry rewinds the clock -- show it at once
   render();
 }
@@ -238,6 +247,39 @@ function undoToClear(hasError) {
 function updateHistoryButtons() {
   if (undoBtn) undoBtn.disabled = history.length === 0;
   if (redoBtn) redoBtn.disabled = redoStack.length === 0;
+}
+
+// ---- Move tracking ----
+// A snapshot of every play-relevant setting, recorded on the session event and
+// diffed on resume to catch setting changes. The settings screen is only
+// reachable from the board through a pause -> Settings -> resume round trip (see
+// app.js openSettingsFromPlay), so comparing the live values against the last
+// snapshot whenever the clock resumes attributes each change to the play session
+// without coupling the tracker into settings.js.
+function settingsSnapshot() {
+  return {
+    lightMode: lightModeOn(),
+    eliminate: eliminateCandidatesOn(),
+    showTimer: showTimerOn(),
+    highlight: highlightMode(),
+    disableFinished: disableFinishedDigitsOn(),
+    hintFromMarks: hintFromMarksOn(),
+  };
+}
+
+let lastSettings = null;
+
+// Emit one settingChange event per setting that differs from the last snapshot,
+// then re-baseline. Called on resume (where a change can only just have happened)
+// and seeded by loadGame so the first resume of a session diffs against nothing.
+function trackSettingChanges() {
+  const now = settingsSnapshot();
+  if (lastSettings) {
+    for (const k of Object.keys(now)) {
+      if (now[k] !== lastSettings[k]) tracker.track("settingChange", { key: k, value: now[k] });
+    }
+  }
+  lastSettings = now;
 }
 
 // ---- Persistence / timer ----
@@ -273,7 +315,8 @@ function checkpointListing() {
 // Pause the clock (folding the running span into the accumulated base) and
 // checkpoint. Called when leaving the view or hiding the tab.
 export function pause() {
-  if (runStart !== null) {
+  const wasRunning = runStart !== null;
+  if (wasRunning) {
     timerBase = elapsedMs();
     runStart = null;
   }
@@ -281,16 +324,25 @@ export function pause() {
   refreshTimer(); // freeze the readout at the paused time
   persist();
   checkpointListing(); // refresh the start page's elapsed/last-played listing
+  // Record only a genuine pause (the clock was running); pause() is also called
+  // defensively where it's already stopped. Flush regardless so navigating away
+  // never loses the tail of the timeline.
+  if (wasRunning) tracker.track("pause");
+  tracker.flush();
 }
 
 // Resume the clock, unless the puzzle is already solved.
 export function resume() {
-  if (!finished && game && runStart === null) {
+  const started = !finished && game && runStart === null;
+  if (started) {
     runStart = performance.now();
   }
   startTimer();
   // Returning from Settings routes through here, so re-render to pick up any
-  // changed display setting (e.g. the highlight mode) on the live board.
+  // changed display setting (e.g. the highlight mode) on the live board -- and
+  // diff those settings to record any that changed while away.
+  trackSettingChanges();
+  if (started) tracker.track("resume");
   render();
 }
 
@@ -581,6 +633,11 @@ function onSolved() {
   closeHint();
   pause(); // freeze and persist the elapsed time
   const finalMs = elapsedMs();
+  // Close the timeline. Flush now (not just on the pause above): the solved
+  // dialog's Home button navigates away without a further pause, so this is the
+  // last guaranteed chance to persist the tail of the log.
+  tracker.track("solved", { elapsedMs: finalMs });
+  tracker.flush();
   game = store.updateGame(game.id, {
     status: "solved",
     solvedAt: Date.now(),
@@ -712,10 +769,34 @@ function onBoardPointerUp(e) {
     // Commit the whole gesture -- pressed cell plus any painted cells -- as one
     // undo step (cellSinglePushed lets a following double-tap roll it back).
     cellSinglePushed = commitSnapshot(lockBefore);
+    // Record the gesture as one event iff it actually changed the board (same
+    // condition the undo entry rides on), so a later double-tap rollback can drop
+    // it in lockstep with popping history. A note gesture carries every painted
+    // cell; a value gesture is the single pressed cell, place vs clear read off
+    // the resulting board.
+    if (cellSinglePushed && lockEdit) {
+      if (lockEdit.type === "note") {
+        tracker.track("note", {
+          kind: lockEdit.kind,
+          op: lockEdit.op,
+          cells: [...lockPainted],
+          digit: lockEdit.digit,
+          src: "lock",
+        });
+      } else {
+        const placed = value[lockEdit.cell] === lockEdit.digit;
+        tracker.track(placed ? "place" : "clear", {
+          cells: [lockEdit.cell],
+          digit: lockEdit.digit,
+          src: "lock",
+        });
+      }
+    }
     gestureLocked = false;
     lockMark = null;
     lockBefore = null;
     lockPainted = null;
+    lockEdit = null;
   }
 }
 
@@ -738,6 +819,7 @@ let gestureLocked = false; // true between a locked pointerdown and its release
 let lockBefore = null; // board snapshot at the gesture's start, for a one-step undo
 let lockMark = null; // {corner, add, d} brush for a mark-painting drag, else null
 let lockPainted = null; // cells already painted this gesture (paint each once)
+let lockEdit = null; // tracking descriptor of the gesture, emitted at release
 
 // Extend a mark-painting drag onto one cell, at most once per gesture. The
 // direction is fixed by the anchor (`add`), so a drag only ever adds the mark or
@@ -771,9 +853,11 @@ function onLockedPointerDown(i, e) {
   const d = activeDigit;
 
   // A double-tap nets to "the opposite action": roll the prior single tap's
-  // commit back first so the whole double stays one undo step.
+  // commit back first so the whole double stays one undo step -- and drop its
+  // tracking event in lockstep, so the log collapses to the net action too.
   if (isDouble && cellSinglePushed) {
     applySnapshot(history.pop());
+    tracker.dropLast();
     cellSinglePushed = false;
     updateHistoryButtons();
   }
@@ -797,8 +881,10 @@ function onLockedPointerDown(i, e) {
     const corner = markKind === MODE_CORNER;
     const set = corner ? cornerMarks[i] : centerMarks[i];
     lockMark = { corner, add: !set.has(d), d };
+    lockEdit = { type: "note", kind: corner ? "corner" : "center", op: lockMark.add ? "add" : "remove", digit: d };
   } else {
     lockMark = null; // a value placement: only the pressed cell takes it
+    lockEdit = { type: "value", cell: i, digit: d };
   }
   lockPainted = new Set([i]);
 
@@ -888,11 +974,15 @@ function applyOppositeToCell(i, d) {
 // *every* settable cell already shows it (else it's placed in all); a note is
 // removed only if every markable cell already carries it (else added to all).
 // For a single selected cell this reduces to the same toggle applyDigitToCell did.
+// Returns a tracking descriptor of what it did (type + affected cells), or null
+// when nothing was settable -- non-empty targets always change the board (a
+// uniform toggle either sets every cell or clears every cell), so the descriptor
+// lines up exactly with whether `commit` records an undo step.
 function applyDigitToSelection(d) {
   if (placing) {
     // Values go into non-clue cells.
     const targets = [...selection].filter((i) => given[i] === 0);
-    if (!targets.length) return;
+    if (!targets.length) return null;
     const clearing = targets.every((i) => value[i] === d);
     for (const i of targets) {
       if (clearing) {
@@ -906,22 +996,37 @@ function applyDigitToSelection(d) {
     // A placed digit can't be a candidate in any peer of any filled cell.
     if (!clearing && eliminateCandidatesOn())
       for (const i of targets) clearPeerMarks(i, d);
+    return { type: clearing ? "clear" : "place", cells: targets, digit: d };
   } else {
     // Notes only go into empty, non-clue cells (a value would hide them).
     const target = markKind === MODE_CORNER ? cornerMarks : centerMarks;
     const targets = [...selection].filter((i) => given[i] === 0 && value[i] === 0);
-    if (!targets.length) return;
+    if (!targets.length) return null;
     const clearing = targets.every((i) => target[i].has(d));
     for (const i of targets) {
       if (clearing) target[i].delete(d);
       else target[i].add(d);
     }
+    return {
+      type: "note",
+      kind: markKind === MODE_CORNER ? "corner" : "center",
+      op: clearing ? "remove" : "add",
+      cells: targets,
+      digit: d,
+    };
   }
 }
 
 function inputDigit(d) {
   if (finished || selection.size === 0) return false;
-  const pushed = commit(() => applyDigitToSelection(d));
+  let desc = null;
+  const pushed = commit(() => {
+    desc = applyDigitToSelection(d);
+  });
+  if (pushed && desc) {
+    const { type, ...rest } = desc;
+    tracker.track(type, { ...rest, src: "select" });
+  }
   render();
   return pushed;
 }
@@ -938,7 +1043,8 @@ function setLock(d) {
 // one undo step.
 function erase() {
   if (finished || selection.size === 0) return;
-  commit(() => {
+  const cells = [...selection].filter((i) => given[i] === 0);
+  const pushed = commit(() => {
     for (const i of selection) {
       if (given[i] !== 0) continue;
       value[i] = 0;
@@ -946,6 +1052,7 @@ function erase() {
       cornerMarks[i].clear();
     }
   });
+  if (pushed) tracker.track("erase", { cells });
   render();
 }
 
@@ -954,23 +1061,27 @@ function erase() {
 // value and the other kind alone. One undo step each.
 function eraseCorners() {
   if (finished || selection.size === 0) return;
-  commit(() => {
+  const cells = [...selection].filter((i) => given[i] === 0);
+  const pushed = commit(() => {
     for (const i of selection) {
       if (given[i] !== 0) continue;
       cornerMarks[i].clear();
     }
   });
+  if (pushed) tracker.track("eraseCorners", { cells });
   render();
 }
 
 function eraseCenters() {
   if (finished || selection.size === 0) return;
-  commit(() => {
+  const cells = [...selection].filter((i) => given[i] === 0);
+  const pushed = commit(() => {
     for (const i of selection) {
       if (given[i] !== 0) continue;
       centerMarks[i].clear();
     }
   });
+  if (pushed) tracker.track("eraseCenters", { cells });
   render();
 }
 
@@ -981,7 +1092,8 @@ function eraseCenters() {
 function undoSelected() {
   if (finished || selection.size === 0 || history.length === 0) return;
   const prev = history[history.length - 1];
-  commit(() => {
+  const cells = [...selection].filter((i) => given[i] === 0);
+  const pushed = commit(() => {
     for (const i of selection) {
       if (given[i] !== 0) continue;
       value[i] = prev.v[i];
@@ -989,6 +1101,7 @@ function undoSelected() {
       cornerMarks[i] = new Set(prev.n[i]);
     }
   });
+  if (pushed) tracker.track("undoSelected", { cells });
   render();
 }
 
@@ -1018,13 +1131,15 @@ function switchMarkKind() {
 // existing center marks are kept and the corners are merged on top. One undo step.
 function cornersToCenters() {
   if (finished || selection.size === 0) return;
-  commit(() => {
+  const cells = [...selection].filter((i) => given[i] === 0);
+  const pushed = commit(() => {
     for (const i of selection) {
       if (given[i] !== 0) continue; // clues carry no marks
       for (const d of cornerMarks[i]) centerMarks[i].add(d);
       cornerMarks[i].clear();
     }
   });
+  if (pushed) tracker.track("cornersToCenters", { cells });
   render();
 }
 
@@ -1184,6 +1299,9 @@ function restart() {
   });
   game = store.getGame(game.id);
   startTimer();
+  // The clock has reset to ~0, so this event lands at t~0 (a deliberate
+  // discontinuity); elapsedBefore records how long the wiped attempt ran.
+  tracker.track("restart", { elapsedBefore: before.t });
   render();
 }
 
@@ -1360,12 +1478,13 @@ function staleMarkCells() {
 function removeStaleMarks() {
   const detail = staleMarkDetail();
   if (!detail.length) return;
-  commit(() => {
+  const pushed = commit(() => {
     for (const e of detail) {
       for (const d of e.center) centerMarks[e.cell].delete(d);
       for (const d of e.corner) cornerMarks[e.cell].delete(d);
     }
   });
+  if (pushed) tracker.track("removeStaleMarks", { cells: detail.map((e) => e.cell) });
   render();
 }
 
@@ -1382,8 +1501,12 @@ export function closeHint() {
 
 function toggleHintPanel() {
   const panel = document.getElementById("hintPanel");
-  if (panel.hidden) openHint();
-  else closeHint();
+  if (panel.hidden) {
+    openHint("user");
+  } else {
+    tracker.track("hintClose");
+    closeHint();
+  }
 }
 
 // The Snyder (corner) pins implied by the player's notes, shared by the solver
@@ -1450,8 +1573,11 @@ function solverBoard(wasm) {
   return new wasm.Board(cellDigits, cand);
 }
 
-// Build the panel content for the current board and show it.
-function openHint() {
+// Build the panel content for the current board and show it. `reason` labels the
+// tracked hintOpen event -- "user" when the player pressed Hint, "auto" when an
+// in-panel action (apply, remove-stale, undo-to-clear) re-rendered the panel --
+// so the grader can tell deliberate consultations from re-renders.
+function openHint(reason = "auto") {
   const body = document.getElementById("hintBody");
   const note = (msg) => {
     const p = document.createElement("p");
@@ -1470,6 +1596,7 @@ function openHint() {
     hintTitle("Mistake");
     body.replaceChildren(errorStage("logical", logical));
     showPanel();
+    tracker.track("hintOpen", { trigger: reason, health: "logical", cells: logical.length });
     return;
   }
   const solved = solvedErrorCells();
@@ -1477,6 +1604,7 @@ function openHint() {
     hintTitle("Mistake");
     body.replaceChildren(errorStage("solved", solved));
     showPanel();
+    tracker.track("hintOpen", { trigger: reason, health: "solvedError", cells: solved.length });
     return;
   }
 
@@ -1485,6 +1613,7 @@ function openHint() {
     hintTitle("Hint");
     note("The solver is still loading. Try again in a moment.");
     showPanel();
+    tracker.track("hintOpen", { trigger: reason, health: "loading" });
     return;
   }
   let steps, isSolved;
@@ -1500,6 +1629,7 @@ function openHint() {
     hintTitle("Hint");
     note("Couldn't read the board. Check for an obvious slip.");
     showPanel();
+    tracker.track("hintOpen", { trigger: reason, health: "error" });
     console.log(e);
     return;
   }
@@ -1508,6 +1638,7 @@ function openHint() {
     hintTitle("Solved");
     note("The puzzle is already solved.");
     showPanel();
+    tracker.track("hintOpen", { trigger: reason, health: "solved" });
     return;
   }
   // First layer: confirm the board's health (all good / stale marks) without
@@ -1519,6 +1650,20 @@ function openHint() {
   hintTitle("Hint");
   body.replaceChildren(statusStage(steps, masks, wrong, stale));
   showPanel();
+  // Summarize what's on offer (technique id, instance count, in/out of scope)
+  // alongside the board-health banner the player sees.
+  const techniques = groupSteps(steps).map((g) => ({
+    id: g.id,
+    count: g.count,
+    inScope: isInScope(g, masks),
+  }));
+  tracker.track("hintOpen", {
+    trigger: reason,
+    health: wrong.length ? "wrong" : stale.length ? "stale" : "ok",
+    wrong: wrong.length,
+    stale: stale.length,
+    techniques,
+  });
 }
 
 // A bold banner with an icon, in one of three states: "ok" (green check, all
@@ -1566,7 +1711,10 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
   const reveal = document.createElement("button");
   reveal.className = "hint-bigbtn";
   reveal.textContent = "Show available techniques";
-  reveal.addEventListener("click", renderTechStage);
+  reveal.addEventListener("click", () => {
+    tracker.track("hintShowTechniques");
+    renderTechStage();
+  });
   actions.appendChild(reveal);
 
   if (wrong) {
@@ -1574,6 +1722,7 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
     show.className = "hint-bigbtn";
     show.textContent = "Show wrong marks";
     show.addEventListener("click", () => {
+      tracker.track("hintShowWrong", { cells: wrongCandidateCells.length });
       clearHighlights();
       for (const c of wrongCandidateCells) cells[c].classList.add("hl-elim");
     });
@@ -1587,7 +1736,7 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
       back.className = "hint-bigbtn";
       back.textContent = "Undo to before the wrong mark";
       back.addEventListener("click", () => {
-        undoToClear(() => wrongMarkCells().length > 0);
+        undoToClear(() => wrongMarkCells().length > 0, "wrongMark");
         openHint();
       });
       actions.appendChild(back);
@@ -1604,6 +1753,7 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
     show.className = "hint-bigbtn";
     show.textContent = "Show stale marks";
     show.addEventListener("click", () => {
+      tracker.track("hintShowStale", { cells: staleCells.length });
       clearHighlights();
       for (const c of staleCells) cells[c].classList.add("hl-stale");
     });
@@ -1623,7 +1773,7 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
     const ez = document.createElement("button");
     ez.className = "hint-bigbtn cheat";
     ez.textContent = "Apply easiest";
-    ez.addEventListener("click", () => applyStep(easiestStep(steps, masks), openHint));
+    ez.addEventListener("click", () => applyStep(easiestStep(steps, masks), openHint, "easiest"));
     actions.appendChild(ez);
   }
   box.appendChild(actions);
@@ -1696,6 +1846,7 @@ function errorStage(kind, errCells) {
   show.className = "hint-bigbtn";
   show.textContent = "Show me where";
   show.addEventListener("click", () => {
+    tracker.track("hintShowWhere", { kind, cells: errCells.length });
     clearHighlights();
     for (const c of errCells) cells[c].classList.add("hl-elim");
   });
@@ -1713,7 +1864,7 @@ function errorStage(kind, errCells) {
     back.className = "hint-bigbtn";
     back.textContent = "Undo to before the mistake";
     back.addEventListener("click", () => {
-      undoToClear(stillWrong);
+      undoToClear(stillWrong, kind === "logical" ? "logicalError" : "solvedError");
       if (finished) closeHint();
       else openHint();
     });
@@ -1725,15 +1876,18 @@ function errorStage(kind, errCells) {
     fix.className = "hint-bigbtn cheat";
     fix.textContent = "Erase mistakes";
     fix.addEventListener("click", () => {
-      commit(() => {
+      const fixed = [];
+      const pushed = commit(() => {
         for (const c of errCells) {
           if (given[c] === 0 && value[c] !== solution[c]) {
             value[c] = 0;
             centerMarks[c].clear();
             cornerMarks[c].clear();
+            fixed.push(c);
           }
         }
       });
+      if (pushed) tracker.track("eraseMistakes", { kind, cells: fixed });
       render();
       if (!finished) openHint();
       else closeHint();
@@ -1803,7 +1957,7 @@ function techStage(groups, masks) {
     const ez = document.createElement("button");
     ez.className = "hint-apply";
     ez.textContent = "Apply easiest";
-    ez.addEventListener("click", () => applyStep((primary[0] || sorted[0]).rep));
+    ez.addEventListener("click", () => applyStep((primary[0] || sorted[0]).rep, undefined, "easiest"));
     ctl.appendChild(ez);
     wrap.appendChild(ctl);
   }
@@ -1826,6 +1980,10 @@ function techStage(groups, masks) {
     more.className = "hint-more hint-harder";
     more.textContent = `Show other techniques (${other.length})`;
     more.addEventListener("click", () => {
+      tracker.track("hintShowOther", {
+        count: other.length,
+        techniques: other.map((g) => g.id),
+      });
       for (const g of other) ul.appendChild(buildRow(g));
       more.remove();
     });
@@ -1871,6 +2029,7 @@ function buildMultiRow(g) {
       more.addEventListener("click", (e) => {
         e.stopPropagation();
         r += 1;
+        tracker.track("hintReveal", { technique: g.id, stage: stages[r] });
         refresh();
       });
     } else {
@@ -1880,6 +2039,7 @@ function buildMultiRow(g) {
       more.textContent = `Show the ${g.count} spots`;
       more.addEventListener("click", (e) => {
         e.stopPropagation();
+        tracker.track("hintShowSpots", { technique: g.id, count: g.count });
         let after = li;
         for (const step of g.steps) {
           const child = buildStepRow(step, g, "name");
@@ -1923,6 +2083,7 @@ function buildStepRow(step, group, lead) {
       more.addEventListener("click", (e) => {
         e.stopPropagation();
         r += 1;
+        tracker.track("hintReveal", { technique: step.technique.id, stage: stages[r] });
         refresh();
         focusRow(li, step, stages[r]);
       });
@@ -1988,8 +2149,10 @@ function textSpan(text, cls) {
 }
 
 // Apply a step's deductions through the normal undoable commit path (cheat).
-function applyStep(step, rerender) {
-  commit(() => {
+// `how` ("easiest" for the one-tap shortcut, "row" for a specific row's Apply)
+// labels the tracked event.
+function applyStep(step, rerender, how) {
+  const pushed = commit(() => {
     for (const d of step.deductions) {
       if (given[d.cell] !== 0) continue;
       if (d.kind === "place") {
@@ -2004,6 +2167,14 @@ function applyStep(step, rerender) {
       }
     }
   });
+  if (pushed) {
+    tracker.track("applyStep", {
+      how: how || "row",
+      technique: step.technique.id,
+      difficulty: step.technique.difficulty,
+      deductions: step.deductions.map((d) => ({ cell: d.cell, digit: d.digit, kind: d.kind })),
+    });
+  }
   render();
   // Re-render the layer the Apply was clicked from (technique tree by default;
   // the status layer passes openHint), so applying stays where you are and can
@@ -2033,12 +2204,13 @@ function candidatesFor(i) {
 // ≠ deduction only has something to strike once the candidates are penned. Re-run
 // it any time to refresh notes that placements have left stale.
 function fillAllCandidates() {
-  commit(() => {
+  const pushed = commit(() => {
     for (let i = 0; i < N; i++) {
       if (digitAt(i) !== 0) continue;
       centerMarks[i] = candidatesFor(i);
     }
   });
+  if (pushed) tracker.track("fillCandidates");
   render();
 }
 
@@ -2056,6 +2228,7 @@ function setCheat(on) {
   } catch {
     /* ignore */
   }
+  tracker.track("cheatToggle", { on });
   updateHintButton();
   updateSeedLine();
   // Reflect the new mode in an open panel (adds/removes Apply buttons).
@@ -2104,6 +2277,24 @@ export function loadGame(g) {
   finished = g.status === "solved";
   timerBase = g.elapsedMs || 0;
   runStart = null;
+
+  // Open a tracking session for this sitting. beginSession flushes the previous
+  // game's log first, then loads this game's so a puzzle resumed across sittings
+  // keeps one continuous timeline. timerBase is already set, so the session
+  // event is stamped with the elapsed time the puzzle resumes at. Seed the
+  // settings baseline here so the resume() below (and later ones) diff against
+  // the state at load, attributing only real changes.
+  tracker.beginSession(g.id, {
+    startedAt: Date.now(),
+    elapsedAtLoad: timerBase,
+    cheat: cheatOn(),
+    settings: settingsSnapshot(),
+    fromForced: !!g.fromForced,
+    seed: g.seed || null,
+    puzzle: g.puzzle,
+    status: g.status,
+  });
+  lastSettings = settingsSnapshot();
 
   lastDigit = 0;
   lastCell = -1;
@@ -2411,9 +2602,11 @@ function onDigitTap(d) {
       setLock(d === prevLock ? 0 : d);
     } else {
       // The first tap placed into the selected cell -> roll that back (it was
-      // recorded on the undo stack), then pen-lock instead. Net: no edit.
+      // recorded on the undo stack), then pen-lock instead. Net: no edit -- so
+      // drop the place event the first tap recorded too.
       if (digitSinglePushed) {
         applySnapshot(history.pop());
+        tracker.dropLast();
         digitSinglePushed = false;
         updateHistoryButtons();
       }
@@ -2501,7 +2694,10 @@ function wireKeyboard() {
 
 function wireHint() {
   const hintBtn = document.getElementById("hint");
-  document.getElementById("hintClose").addEventListener("click", closeHint);
+  document.getElementById("hintClose").addEventListener("click", () => {
+    tracker.track("hintClose");
+    closeHint();
+  });
 
   // A normal tap (click) toggles the panel. A >=5s hold toggles cheat mode; the
   // click that ends the hold is swallowed. The pointer timer only detects the
@@ -2621,6 +2817,9 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onS
   idByKind = {};
   for (const t of curriculum) idByKind[t.kindIndex] = t.id;
   curriculumList = curriculum; // full records (tier/difficulty) for review id-ing
+
+  // Stamp every tracked event with the solve-elapsed clock (pauses excluded).
+  tracker.setClock(elapsedMs);
 
   boardEl = document.getElementById("board");
   notesBtn = document.getElementById("notes");
