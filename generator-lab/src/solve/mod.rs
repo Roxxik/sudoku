@@ -45,6 +45,10 @@ pub use logic::{HARD_STEPS_DEFAULT, HardStep, solve_fixpoint_with_order};
 /// Campaign difficulty grader surface (cold path): the instrumented easiest-first solve
 /// and the step trace its per-puzzle signals are derived from (see [`crate::grade`]).
 pub use logic::{CHEAP_KINDS, GradeStep, GradeTrace, solve_graded};
+/// Trunk-bucket fill-path profiler (cold path): the frontier-width + locked-candidate signal
+/// that gives a singles-solvable puzzle a continuous difficulty sub-order (see
+/// [`crate::grade::trunk_rating`], `docs/grader-external-calibration.md` Stage 2).
+pub use logic::{TrunkProfile, trunk_profile};
 
 /// Baseline-gate workload counters (`feature = "count"`), for the SIMT-baseline
 /// solver design study — read by the `baselinestat` example.

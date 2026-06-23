@@ -7,7 +7,7 @@
 //! correctness oracle.
 
 use super::{LogicBoard, Solver, techniques};
-use crate::repr::CELLS;
+use crate::repr::{CELLS, Digit, UNITS};
 use crate::spec::kinds::{
     HIDDEN_PAIR, HIDDEN_QUAD, HIDDEN_SINGLE, HIDDEN_TRIPLE, KindMask, LC_CLAIMING, LC_POINTING,
     NAKED_PAIR, NAKED_QUAD, NAKED_SINGLE, NAKED_TRIPLE, NUM, SolveTrace,
@@ -443,6 +443,129 @@ pub fn solve_graded<V: LogicBoard>(board: &V, allowed: KindMask) -> GradeTrace {
     }
 }
 
+// --- trunk fill-path profile (docs/grader-external-calibration.md, Stage 2) -----------------
+//
+// A trunk puzzle is one no harder-than-cheap technique resolves — singles + locked candidates
+// solve it outright. The per-technique grader has nothing to grade there (no bottleneck firing),
+// so it rates every such puzzle a flat `0`; but real human-difficulty corpora concentrate in this
+// range, and Pelánek's *Dependency* metric proves a singles-only puzzle still carries a continuous
+// difficulty signal — the **frontier width** of the forced-fill chain (fewer simultaneous forced
+// cells = a narrower, more sequential, harder chain). [`trunk_profile`] reproduces that signal off
+// our own deterministic fill (not tuned to Pelánek), plus the locked-candidate structure the
+// singles-only model lacks.
+
+/// The trunk **fill-path profile**: the frontier-width curve of the singles + locked-candidate
+/// closure — our deterministic analogue of Pelánek's *Dependency* — plus the locked-candidate
+/// structure the singles-only model has no analogue for. Built by [`trunk_profile`] off one
+/// easiest-first fill; read by [`grade::trunk_rating`](crate::grade::trunk_rating) to give the
+/// trunk bucket a real within-bucket sub-order in place of the flat `0`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrunkProfile {
+    /// `possibilities[i]` = how many cells were forced by a naked or hidden single (deduped by
+    /// cell — the *frontier width*) the instant trunk step `i` had to pick a cell, **before** one
+    /// was placed. A narrow frontier is a more sequential, harder chain; Pelánek's Dependency is
+    /// the mean of exactly this, *inverse* to difficulty (larger = easier).
+    pub possibilities: Vec<u32>,
+    /// Locked-candidate elimination firings applied to break a singles stall — the one cheap
+    /// technique strictly above singles. Higher = harder; the singles-only Dependency model has no
+    /// analogue for it.
+    pub lc_elims: u32,
+    /// How many times the singles frontier emptied and a locked candidate was needed to resume —
+    /// the "stalled and resumed" structure. Higher = harder.
+    pub lc_stalls: u32,
+    /// Whether singles + locked candidates finished the grid. Always `true` for a trunk-keyed
+    /// puzzle (it solved under the full toolbox with no harder kind firing); the field keeps the
+    /// featurizer total for any other input.
+    pub solved: bool,
+}
+
+/// Count the cells forced by a naked or hidden single on `b` — the frontier width, deduped by
+/// cell (a naked single's lone candidate is the only digit any hidden single could target the
+/// cell with, so a cell is never double-counted). Non-mutating: it reads the stall, it does not
+/// resolve it. This is [`super::techniques::naked_single`] + [`super::techniques::hidden_single`]
+/// run as an enumeration rather than a "fire the first one" step.
+fn singles_frontier<V: LogicBoard>(b: &V) -> u32 {
+    let mut forced = [false; CELLS];
+    // Naked singles: an empty cell with exactly one candidate.
+    for c in 0..CELLS {
+        if b.is_empty(c) && b.get(c).len() == 1 {
+            forced[c] = true;
+        }
+    }
+    // Hidden singles: a (unit, digit) whose digit has exactly one candidate cell.
+    for unit in &UNITS {
+        for di in 0..9 {
+            let d = Digit::from_index(di);
+            let mut only = None;
+            let mut count = 0u32;
+            for &c in unit {
+                if b.get(c).contains(d) {
+                    only = Some(c);
+                    count += 1;
+                    if count > 1 {
+                        break;
+                    }
+                }
+            }
+            if count == 1 {
+                forced[only.expect("count == 1")] = true;
+            }
+        }
+    }
+    forced.iter().filter(|&&f| f).count() as u32
+}
+
+/// Profile the trunk fill of `board`: an easiest-first singles + locked-candidate solve that, at
+/// every step, records the [`singles_frontier`] width *before* placing **one** forced cell (naked
+/// single first, else hidden single — `step_once`'s cheap order), and tallies the locked-candidate
+/// firings needed to break each singles stall. Cold path; runs on a trunk-keyed dataset puzzle off
+/// the hot loop. See [`TrunkProfile`].
+///
+/// Both progress measures are monotone (a placement fills a cell, a locked candidate prunes a
+/// candidate), so the fill always terminates; on a genuine trunk puzzle it terminates *solved*.
+pub fn trunk_profile<V: LogicBoard>(board: &V) -> TrunkProfile {
+    let mut b = board.clone();
+    let mut p = TrunkProfile::default();
+    loop {
+        if is_solved(&b) {
+            p.solved = true;
+            return p;
+        }
+        let frontier = singles_frontier(&b);
+        if frontier > 0 {
+            p.possibilities.push(frontier);
+            // Place one forced cell, naked single first (the cheap-order head of `step_once`).
+            if !techniques::naked_single(&mut b) {
+                techniques::hidden_single(&mut b);
+            }
+            continue;
+        }
+        // Singles stalled: apply locked-candidate firings until a single reappears (or none
+        // applies). Each `lc_*` call applies one firing's eliminations; loop so a chain of locked
+        // candidates that together unlock a single counts as ONE stall, not several.
+        let mut fired = false;
+        loop {
+            if techniques::lc_pointing(&mut b) || techniques::lc_claiming(&mut b) {
+                p.lc_elims += 1;
+                fired = true;
+                if singles_frontier(&b) > 0 {
+                    break; // a single reappeared — resume the singles fill
+                }
+            } else {
+                break; // no locked candidate applies
+            }
+        }
+        if fired {
+            p.lc_stalls += 1;
+            continue;
+        }
+        // No single and no locked candidate: the puzzle needs a harder technique. This does not
+        // happen on a trunk-keyed puzzle (singles + LC solved it under the full toolbox); keep the
+        // profiler total by returning the partial profile (`solved == false`).
+        return p;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::repr::banded::{Bands, RowMajor};
@@ -486,5 +609,33 @@ mod tests {
         let baseline = subset_spec_for_mode(0).baseline_mask();
         let empty: Banded = state(&".".repeat(81));
         assert!(!LogicSolver::solve_tracked(&empty, baseline).solved);
+    }
+
+    /// The trunk profiler fills the classic singles puzzle to a solved grid, recording one
+    /// frontier width per placed cell — the continuous fill-path signal Stage 2 grades on.
+    #[test]
+    fn trunk_profile_records_frontier_and_solves() {
+        let p = super::trunk_profile(&state::<Bands<RowMajor>>(PUZZLE));
+        assert!(p.solved, "the classic puzzle is solved by singles");
+        // One frontier reading per non-given cell placed; every reading is a real forced count.
+        assert!(!p.possibilities.is_empty(), "a singles fill records its frontier");
+        assert!(p.possibilities.iter().all(|&w| w >= 1), "each step has >= 1 forced cell");
+    }
+
+    /// An already-complete grid profiles to no steps (nothing to fill) and reports solved.
+    #[test]
+    fn trunk_profile_complete_grid_has_no_steps() {
+        const SOLVED: &str = "\
+            534678912\
+            672195348\
+            198342567\
+            859761423\
+            426853791\
+            713924856\
+            961537284\
+            287419635\
+            345286179";
+        let p = super::trunk_profile(&state::<Bands<RowMajor>>(SOLVED));
+        assert!(p.solved && p.possibilities.is_empty());
     }
 }

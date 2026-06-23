@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 
 use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{DigitGrid, Marks, SolverState};
-use crate::solve::{GradeTrace, solve_graded};
+use crate::solve::{GradeTrace, TrunkProfile, solve_graded, trunk_profile};
 use crate::spec::Spec;
 use crate::spec::kinds::{Branch, DIFFICULTY, KindMask, NAKED_PAIR, NUM, XYZ_WING, branch_of};
 
@@ -843,12 +843,64 @@ pub const FULL_TOOLBOX: KindMask = (1 << NUM) - 1;
 pub struct PuzzleGrade {
     pub signals: Signals,
     /// The bottleneck technique inferred from the solve — the hardest ([`DIFFICULTY`])
-    /// harder-than-trunk kind that fired. `None` for a puzzle the cheap closure solved on its
-    /// own (no harder kind fired); such a puzzle is uniformly easiest ([`rating`](Self::rating) 0).
+    /// harder-than-trunk kind that fired. `None` for a puzzle the cheap closure solved on its own
+    /// (no harder kind fired); such a puzzle is graded on its trunk fill-path instead ([`trunk_rating`]).
     pub key: Option<usize>,
-    /// The within-technique rating in `[0, 1]` against the inferred technique's baked
-    /// calibration ([`GRANULAR_NORM`]/[`GRANULAR_CDF`]). `0.0` for a trunk-only puzzle.
+    /// The within-technique rating in `[0, 1]`. For a keyed puzzle: its percentile against the
+    /// inferred technique's baked calibration ([`GRANULAR_NORM`]/[`GRANULAR_CDF`]). For a trunk
+    /// puzzle ([`key`](Self::key) `None`): the continuous trunk sub-order ([`trunk_rating`], Stage
+    /// 2) off the singles + locked-candidate fill — no longer a flat `0`.
     pub rating: f64,
+}
+
+// --- Stage 2: the trunk-bucket sub-order (docs/grader-external-calibration.md §5) -----------
+//
+// A trunk puzzle (no harder kind fires) has no bottleneck to grade, so the per-technique [`rating`]
+// is a flat `0` — and the external corpora concentrate there, pinning our within-bucket aggregate
+// to ~0 on every trunk-bearing group (the §4.4 finding). Stage 2 gives the trunk a real continuous
+// sub-order off the singles + locked-candidate fill ([`trunk_profile`]): the frontier-width mean
+// (our deterministic analogue of Pelánek's human-validated Dependency) plus the locked-candidate
+// structure singles-only Dependency lacks. Built off the trace, never tuned to Pelánek (§2.2).
+
+/// Steps the trunk frontier is averaged over — Pelánek's Dependency window `k` (the early forced
+/// chain is the discriminating part; the tail trivially widens as the grid cascades shut).
+pub const TRUNK_DEP_K: usize = 25;
+
+/// The trunk frontier mean's logistic center/scale and the locked-candidate term's weight. These
+/// set only *where in `(0, 1)`* a trunk rating lands — the **within-trunk-bucket rank** the
+/// calibration measures is invariant to them for the pure-singles majority (the rating is then a
+/// monotone reparam of `-dependency`); they matter only for how the rarer locked-candidate puzzles
+/// interleave with the singles ones. Fixed sensible defaults, NOT a calibrated fit (that is Stage
+/// 3/4); the `4.5 / 2.0` pair spreads the observed trunk frontier means (~2..9) across `(0, 1)`.
+const TRUNK_DEP_CENTER: f64 = 4.5;
+const TRUNK_DEP_SCALE: f64 = 2.0;
+const TRUNK_LC_WEIGHT: f64 = 0.9;
+
+/// The trunk **frontier mean** (our Dependency analogue): the mean [`TrunkProfile::possibilities`]
+/// over the first [`TRUNK_DEP_K`] steps. Lower = a narrower, more sequential forced chain = harder
+/// (Pelánek's Dependency is the same quantity, oriented *inverse* to difficulty). `0.0` for a
+/// profile with no steps (an already-complete grid — handled as trivially easy by [`trunk_rating`]).
+pub fn trunk_dependency(p: &TrunkProfile) -> f64 {
+    let k = TRUNK_DEP_K.min(p.possibilities.len());
+    if k == 0 {
+        return 0.0;
+    }
+    p.possibilities[..k].iter().map(|&x| x as f64).sum::<f64>() / k as f64
+}
+
+/// One trunk puzzle's continuous within-bucket **rating** in `(0, 1)` — Stage 2's replacement for
+/// the flat `0`. Higher = harder: a narrower singles frontier (lower [`trunk_dependency`], oriented
+/// like Pelánek's *inverse* Dependency) and more locked-candidate stalls both raise it. The
+/// within-bucket rank — all `datasets_correlate` reads — is driven by `-dependency` for the
+/// pure-singles majority; the locked-candidate term only lifts the puzzles that needed an LC above
+/// the rest. A profile with no singles step at all (degenerate / already-complete) rates `0.0`.
+pub fn trunk_rating(p: &TrunkProfile) -> f64 {
+    if p.possibilities.is_empty() {
+        return 0.0;
+    }
+    let z = (TRUNK_DEP_CENTER - trunk_dependency(p)) / TRUNK_DEP_SCALE
+        + TRUNK_LC_WEIGHT * p.lc_stalls as f64;
+    logistic(z)
 }
 
 /// Grade a **spec-less** puzzle (an external dataset entry) by inferring its bottleneck from the
@@ -880,9 +932,12 @@ pub fn grade_puzzle(puzzle: &DigitGrid) -> Option<PuzzleGrade> {
             let rating = rating_from_cdf(granular_score(&signals, &GRANULAR_NORM[k]), &GRANULAR_CDF[k]);
             Some(PuzzleGrade { signals, key: Some(k), rating })
         }
-        // No harder kind fired: the cheap closure solved it. Uniformly easiest, like a
-        // trunk-only spec under [`rating`].
-        None => Some(PuzzleGrade { signals: signals_of(&trace, 0), key: None, rating: 0.0 }),
+        // No harder kind fired: the cheap closure (singles + locked candidates) solved it. Instead
+        // of the per-technique path's flat `0`, grade the trunk on its fill-path frontier — Stage 2.
+        None => {
+            let profile = trunk_profile(&SolverState::<Bands<RowMajor>>::from_digits(puzzle));
+            Some(PuzzleGrade { signals: signals_of(&trace, 0), key: None, rating: trunk_rating(&profile) })
+        }
     }
 }
 
@@ -1217,6 +1272,49 @@ mod tests {
             }
         }
         assert!(graded, "the generator should yield a naked-pair puzzle within the seed budget");
+    }
+
+    // --- Stage 2: trunk-bucket sub-order ------------------------------------------------
+
+    /// A trunk profile with `n` steps all of frontier `f`, and `lc_stalls` locked-candidate stalls.
+    fn trunk(f: u32, n: usize, lc_stalls: u32) -> TrunkProfile {
+        TrunkProfile { possibilities: vec![f; n], lc_elims: lc_stalls, lc_stalls, solved: true }
+    }
+
+    #[test]
+    fn trunk_rating_is_bounded_and_orders_by_frontier() {
+        // A narrower singles frontier (fewer simultaneous forced cells) is a more sequential,
+        // harder chain -> a higher trunk rating (our inverse-Dependency orientation).
+        let wide = trunk_rating(&trunk(9, 30, 0));
+        let narrow = trunk_rating(&trunk(2, 30, 0));
+        assert!((0.0..=1.0).contains(&wide) && (0.0..=1.0).contains(&narrow));
+        assert!(narrow > wide, "a narrower frontier = harder = higher rating");
+    }
+
+    #[test]
+    fn trunk_rating_rises_with_lc_stalls() {
+        // Two puzzles with the same frontier but one needing a locked-candidate stall: the LC one
+        // is strictly harder (a cheap technique above singles), so it rates higher.
+        let pure = trunk_rating(&trunk(5, 30, 0));
+        let with_lc = trunk_rating(&trunk(5, 30, 1));
+        assert!(with_lc > pure, "needing a locked candidate = harder = higher rating");
+    }
+
+    #[test]
+    fn trunk_rating_zero_without_steps() {
+        // A degenerate profile with no singles step (already-complete / no chain) is trivially easy.
+        assert_eq!(trunk_rating(&TrunkProfile::default()), 0.0);
+    }
+
+    #[test]
+    fn grade_puzzle_trunk_gets_continuous_rating() {
+        // The classic singles-only puzzle is solved by the cheap closure alone (no harder kind
+        // fires), so it keys to the trunk bucket — and Stage 2 grades it on its fill-path frontier
+        // to a continuous rating rather than the old flat `0`.
+        let classic = "53..7....6..195....98....6.8...6...34..8.3..17...2...6.6....28....419..5....8..79";
+        let g = grade_puzzle(&DigitGrid::parse(classic).unwrap()).expect("singles puzzle solves");
+        assert_eq!(g.key, None, "the classic puzzle is singles-only (trunk bucket)");
+        assert!(g.rating > 0.0 && g.rating < 1.0, "trunk rating is a continuous (0,1), not flat 0");
     }
 
     #[test]

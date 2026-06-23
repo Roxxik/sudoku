@@ -11,19 +11,22 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > **dropped.** The grader's output stays what it is today — a **per-spec, within-technique** rating.
 > The external data is for making that per-spec rating *better*, not for building a portable scalar.
 
-> Status: **Stages 0-1 BUILT & MEASURED (2026-06-23); Stages 2-4 not started.** Landed: the
-> spec-free grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, Stage 0) and the
+> Status: **Stages 0-2 BUILT & MEASURED (2026-06-23); Stages 3-4 not started.** Landed: the
+> spec-free grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, Stage 0); the
 > reworked [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) harness — Stage 1,
 > the **corrected per-technique-bucket scoreboard** (§4.4): it buckets each group's covered puzzles by
 > inferred bottleneck (incl. the trunk bucket), reports our `rating` vs human and Pelánek vs human
 > PER BUCKET, and aggregates n-weighted within a group, **never pooled across techniques**. Pelánek's
 > per-puzzle metrics are cached (`--cache`, keyed by the puzzle, invalidated only by `--runs`/`--k`/
-> `--model-seed`) so re-runs are instant; `--no-pelanek` skips the bar for fast iteration. The
-> grading path itself is unchanged; no tuning yet. The headline findings (§4): **coverage is high;
-> our per-spec rating is flat (rating 0) in the trunk bucket that holds most of the data, pinning our
-> within-bucket aggregate to ~0 on every group that has a trunk; the one trunk-free group
-> (`armane/extreme`) is the only one where we have signal — and there we already match/beat Pelánek;
-> everywhere else Pelánek's Dependency carries the bar via the trunk.**
+> `--model-seed`) so re-runs are instant; `--no-pelanek` skips the bar for fast iteration. And **Stage
+> 2 — the trunk frontier rating** ([`trunk_profile`](../generator-lab/src/solve/logic.rs) +
+> [`trunk_rating`](../generator-lab/src/grade.rs), §4.5): the trunk bucket is no longer a flat `0` —
+> it is graded on the singles + locked-candidate fill-path frontier (our own deterministic analogue of
+> Pelánek's Dependency, built off the trace, not tuned to it). The headline findings (§4): **coverage
+> is high; the trunk was flat `0` and held most of the data, pinning every trunk-bearing group's
+> aggregate to ~0; Stage 2 closes that — the trunk now correlates +0.34..+0.57 with humans, lifting
+> the group aggregates to +0.34..+0.55 and closing 70-95% of the gap to Pelánek (the ordinal groups
+> now match/beat the bar), exactly as §4.3.1 predicted.**
 
 ## 1. The problem: the grader only ever agreed with itself
 
@@ -205,6 +208,48 @@ their per-bucket rho is noisy and many are single-level (reported `n/a`) — the
 deflation of §7. The board is reproducible instantly from the cache; it is the baseline Stages 2-4
 are judged against.
 
+### 4.5 Stage 2 — the trunk frontier rating (measured 2026-06-23)
+
+The trunk bucket is no longer flat. [`trunk_profile`](../generator-lab/src/solve/logic.rs) runs one
+deterministic easiest-first singles + locked-candidate fill and records, at every step, the **frontier
+width** — how many cells a naked or hidden single forces at once (deduped by cell). The mean of that
+over the first `k = 25` steps is our [`trunk_dependency`](../generator-lab/src/grade.rs): the same
+quantity Pelánek's *Dependency* averages (a narrow, sequential forced chain = harder), but read off
+our own fill rather than 30 randomized rollouts, so it is **built off the trace, never tuned to the
+bar** (§2.2). [`trunk_rating`](../generator-lab/src/grade.rs) maps it (oriented harder = higher) plus
+a locked-candidate-stall term through a logistic to a continuous `(0, 1)`. The within-bucket rank — all
+the harness reads — is a monotone reparam of `−dependency` for the pure-singles majority, so the
+logistic constants are presentation only; the LC term only lifts the puzzles that needed a locked
+candidate above the singles ones.
+
+| group | trunk: Stage 1 → Stage 2 | trunk bar (Pelánek dep) | group agg: Stage 1 → Stage 2 | bar | gap (ours − bar) |
+|---|---|---|---|---|---|
+| `synnwang/solve_time` | flat → **+0.485** | −0.591 | +0.002 → **+0.470** | 0.584 | −0.582 → **−0.114** |
+| `synnwang/D_TO` | flat → +0.570 | −0.716 | −0.009 → +0.546 | 0.714 | −0.723 → −0.168 |
+| `synnwang/D_TR` | flat → +0.530 | −0.633 | −0.002 → +0.514 | 0.625 | −0.627 → −0.111 |
+| `armane/org.uk` | flat → +0.463 | −0.452 | −0.009 → +0.349 | 0.376 | −0.385 → **−0.027** |
+| `armane/sotd` | flat → +0.558 | −0.557 | +0.041 → +0.406 | 0.385 | −0.344 → **+0.021** (beats bar) |
+| `sakana/nhk` | flat → +0.343 | −0.364 | +0.000 → +0.343 | 0.364 | −0.364 → −0.022 |
+| `armane/extreme` | (no trunk) | — | +0.105 (unchanged) | 0.052 | +0.053 |
+
+Three reads:
+
+1. **The trunk now carries the groups it used to pin to zero.** The trunk-bucket correlation jumped
+   from flat to +0.34..+0.57, lifting every trunk-bearing group's aggregate to +0.34..+0.55 and
+   closing **70-95% of the gap to Pelánek**. `armane/sotd` and `org.uk` now match or beat the bar.
+   This is §4.3.1 ("closing the trunk is worth essentially the entire continuous-group gap") realised.
+2. **We trail the bar exactly by the determinism-vs-averaging margin.** Our single deterministic fill
+   path reaches ~80-95% of Pelánek's Dependency magnitude on the continuous trunks; the residual is
+   that Pelánek averages the frontier over 30 randomized fill orders while we read one. Recovering it
+   (a few-run frontier average) is a natural Stage-4 refinement, not a re-tuning.
+3. **The locked-candidate term earns its place on the ordinal groups.** Ablating it (`TRUNK_LC_WEIGHT
+   = 0`) costs the editorially-labelled ordinals (org.uk +0.463 → +0.395, sotd +0.558 → +0.530, nhk
+   +0.343 → +0.242) — where "needs a locked candidate" is part of the site's difficulty rank — and is
+   neutral on `synnwang` (±0.003), whose trunk is almost all pure singles. It never hurts, so it stays.
+
+The per-technique (non-trunk) buckets are unchanged — Stage 2 touches only `grade_puzzle`'s trunk
+branch; the spec-based production path (`grade_one`/`rating`) is byte-identical.
+
 ## 5. The plan (per-spec; beat the bar; one change at a time)
 
 **Stage 1 — the corrected scoreboard (per-technique bucket). DONE (2026-06-23) — see §4.4.**
@@ -219,13 +264,16 @@ excluded from the aggregate). Pelánek is mined once into a per-puzzle cache (`-
 
     cargo run --release -p generator-lab --example datasets_correlate -- --jobs 12 [--no-pelanek]
 
-**Stage 2 — close the trunk gap (highest leverage).** Give the **trunk node** a real within-spec
-sub-order so it is not flat `0`. The signal must vary when no harder kind fires — candidates already in
-the trace: singles/LC **fill-path depth** (how far the cheap closure went, where it stalled and
-resumed), the LC firing count, the candidate-population profile. (Pelánek's *Dependency* is the
-human-validated proof such a signal exists; we build our own off the trace rather than tune to it.)
-Measure against the trunk-bucket human label — `synnwang` is mostly trunk, so the data is dense here.
-One change, measured against Stage 1.
+**Stage 2 — close the trunk gap (highest leverage). DONE (2026-06-23) — see §4.5.** Gave the **trunk
+bucket** a real within-bucket sub-order off the singles + locked-candidate fill: the frontier-width
+mean ([`trunk_dependency`](../generator-lab/src/grade.rs), our deterministic analogue of Pelánek's
+Dependency — fewer simultaneous forced cells = a narrower, harder chain) plus a locked-candidate-stall
+term, mapped harder = higher through a logistic to `(0, 1)` ([`trunk_rating`](../generator-lab/src/grade.rs)).
+Built off the trace,
+never tuned to the bar (§2.2). Result: the trunk went from flat to +0.34..+0.57 vs the human label,
+closing 70-95% of the gap to Pelánek and matching/beating the bar on the ordinal groups; the LC term
+is ablation-justified (it carries the ordinals, is neutral on `synnwang`). The change is confined to
+`grade_puzzle`'s trunk branch — the spec-based production path is untouched.
 
 **Stage 3 — adjudicate signal orientation with the human reference.** In the **dense** technique
 buckets only, recompute each signal's sign from `rank_corr(signal, human_label)` instead of
