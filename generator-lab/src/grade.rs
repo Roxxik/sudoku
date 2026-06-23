@@ -24,7 +24,7 @@ use crate::repr::banded::{Bands, RowMajor};
 use crate::repr::{DigitGrid, Marks, SolverState};
 use crate::solve::{GradeTrace, TrunkProfile, solve_graded, trunk_profile};
 use crate::spec::Spec;
-use crate::spec::kinds::{Branch, DIFFICULTY, KindMask, NAKED_PAIR, NUM, XYZ_WING, branch_of};
+use crate::spec::kinds::{Branch, DIFFICULTY, KindMask, NAKED_PAIR, NUM, SWORDFISH, XYZ_WING, branch_of};
 
 /// The default band count — gentle / medium / spicy, the plan's natural per-node cut.
 pub const DEFAULT_BANDS: usize = 3;
@@ -382,7 +382,7 @@ pub const CORR_FLOOR: f64 = 0.20;
 /// (`+1` if a higher raw value is *harder* for this technique, `-1` if lower is), and the
 /// branch `weight` this signal carries in the blend. A signal that is constant within a
 /// technique (`scale` ~ 0) gets `weight == 0` so it cannot pull the blend toward `0.5`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SigNorm {
     pub mean: f64,
     pub scale: f64,
@@ -403,7 +403,7 @@ impl SigNorm {
 /// Tier-D trajectory features (`tight`, `open_mean`, `depth_tight`, `transitions`), and the
 /// Tier-E spotting signal (`camo`, E1 near-miss camouflage). Built once over a mined corpus
 /// ([`calibrate`](Self::calibrate)) and baked, then read by [`granular_score`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TechNorm {
     pub open: SigNorm,
     pub cascade: SigNorm,
@@ -581,6 +581,69 @@ impl TechNorm {
             camo: build(9),
         }
     }
+
+    /// Stage 4 (`docs/grader-external-calibration.md` §5): a copy of `self` with each signal's
+    /// `(mean, scale)` recomputed from a **natural-puzzle** `sample`, inheriting the existing
+    /// `sign`/`weight` (the Stage-3-adjudicated orientation, the branch weight). The §4.3.2
+    /// distribution-shift cure at the per-signal level: the isolated mean/scale can push a natural
+    /// signal into a saturated logistic tail (every natural value ~0 or ~1, no discrimination), and
+    /// re-centering on the natural distribution restores its spread. **Re-means, it does not
+    /// re-orient or re-weight** (signs are Stage 3, weights are the optional re-weight). A signal that
+    /// is constant across `sample` (`scale ~ 0`) keeps its baked params — there is nothing to
+    /// re-center, and a zero scale would divide by ~0.
+    pub fn remeaned(&self, sample: &[Signals]) -> TechNorm {
+        let cols: [Vec<f64>; NSIG] = {
+            let mut c: [Vec<f64>; NSIG] = core::array::from_fn(|_| Vec::with_capacity(sample.len()));
+            for s in sample {
+                let raw = raw_granular(s);
+                for k in 0..NSIG {
+                    c[k].push(raw[k]);
+                }
+            }
+            c
+        };
+        let base = [
+            self.open, self.cascade, self.depth, self.elim, self.alts,
+            self.tight, self.open_mean, self.depth_tight, self.transitions, self.camo,
+        ];
+        let remean = |k: usize| -> SigNorm {
+            let (mean, sd) = mean_std(&cols[k]);
+            if sd >= 1e-9 { SigNorm { mean, scale: sd, ..base[k] } } else { base[k] }
+        };
+        TechNorm {
+            open: remean(0),
+            cascade: remean(1),
+            depth: remean(2),
+            elim: remean(3),
+            alts: remean(4),
+            tight: remean(5),
+            open_mean: remean(6),
+            depth_tight: remean(7),
+            transitions: remean(8),
+            camo: remean(9),
+        }
+    }
+
+    /// Stage 4 (the *optional* per-technique re-weight): a copy of `self` with each signal's blend
+    /// `weight` replaced by `w[j]` (in [`raw_granular`] order), keeping mean/scale/sign. The search
+    /// target of the held-out weight fit; the blend renormalizes by the live weight sum, so only the
+    /// relative magnitudes matter. Baked only where the fitted weights beat the re-mine on a held-out
+    /// bucket half (criterion §6.4) — most buckets are too thin and the gate keeps the baked weights.
+    pub fn reweighted(&self, w: &[f64; NSIG]) -> TechNorm {
+        let set = |sig: SigNorm, weight: f64| SigNorm { weight, ..sig };
+        TechNorm {
+            open: set(self.open, w[0]),
+            cascade: set(self.cascade, w[1]),
+            depth: set(self.depth, w[2]),
+            elim: set(self.elim, w[3]),
+            alts: set(self.alts, w[4]),
+            tight: set(self.tight, w[5]),
+            open_mean: set(self.open_mean, w[6]),
+            depth_tight: set(self.depth_tight, w[7]),
+            transitions: set(self.transitions, w[8]),
+            camo: set(self.camo, w[9]),
+        }
+    }
 }
 
 /// One puzzle's **granular absolute** score: the integer `grind` backbone plus the continuous
@@ -706,6 +769,68 @@ pub const GRANULAR_CDF: [[f64; CDF_ANCHORS]; NUM] = [
     [0.261, 0.326, 0.345, 0.383, 0.437, 0.517, 0.576, 0.737, 1.611, 2.668, 4.461], // xyz-wing
     [0.124, 0.245, 0.321, 0.408, 0.482, 0.557, 0.630, 1.427, 2.321, 3.840, 9.840], // w-wing
 ];
+
+// --- Stage 4: the spec-free path's NATURAL tables (docs/grader-external-calibration.md §5) ---
+//
+// [`GRANULAR_NORM`]/[`GRANULAR_CDF`] above are mined over the *isolated* curriculum corpus (train/
+// drill specs that force one technique), so they fit the spec-based production path ([`grade_one`]/
+// [`rating`], which grades exactly those isolated-spec puzzles). A **natural** puzzle solved with the
+// [`FULL_TOOLBOX`] produces a different signal distribution at the same inferred bottleneck (the
+// §4.3.2 distribution shift) — so the spec-free path ([`grade_puzzle`]) reads its own NATURAL tables,
+// re-mined over the gradeable dataset puzzles themselves (`grade_diag --natural-remine`). The
+// production curriculum path keeps GRANULAR_* untouched, so [`grade_one`]/[`rating`] are byte-identical
+// (criterion §6.5: no regression of the internal grade).
+//
+// A bucket the dataset cannot support a re-mine for keeps its GRANULAR_* row verbatim (the isolated
+// fallback), so before any bake these are *identical* to GRANULAR_* and [`grade_puzzle`] is unchanged.
+// The dense, re-mined rows are baked in below as they pass the held-out gate (§4.7); the rest alias.
+
+/// The spec-free path's per-technique [`TechNorm`] — the curriculum [`GRANULAR_NORM`] with the Stage-4
+/// dense-bucket re-mines overlaid (only the rows whose natural re-mine beat the isolated table on a
+/// held-out bucket half; every other row is the isolated value, *exactly*). Read only by
+/// [`grade_puzzle`]; the production [`rating`]/[`grade_one`] path keeps [`GRANULAR_NORM`].
+///
+/// BAKED via `datasets_correlate --natural-remine`. Accepted (2-fold held-out human-rho, §4.7):
+/// **naked-pair** `normcdf` (+0.043 -> +0.067 — the NORM mean/scale re-centered on the natural
+/// distribution, e.g. `alts` mean 2.18 -> 14.0); **swordfish** is `cdf`-only, so its NORM is unchanged.
+pub const NATURAL_NORM: [TechNorm; NUM] = natural_norm();
+
+const fn natural_norm() -> [TechNorm; NUM] {
+    let mut n = GRANULAR_NORM;
+    // naked-pair — `normcdf`: mean/scale re-centered on the natural naked-pair distribution; signs and
+    // weights inherited from the Stage-3 GRANULAR_NORM row (re-mean, not re-orient/re-weight).
+    n[NAKED_PAIR] = TechNorm {
+        open: SigNorm { mean: 126.644, scale: 39.750, sign: -1.0, weight: 0.20 },
+        cascade: SigNorm { mean: 34.027, scale: 18.729, sign: -1.0, weight: 0.05 },
+        depth: SigNorm { mean: 37.877, scale: 9.004, sign: 1.0, weight: 0.00 },
+        elim: SigNorm { mean: 3.048, scale: 1.402, sign: -1.0, weight: 0.35 },
+        alts: SigNorm { mean: 14.027, scale: 7.140, sign: 1.0, weight: 0.30 },
+        tight: SigNorm { mean: 0.122, scale: 0.086, sign: 1.0, weight: 0.10 },
+        open_mean: SigNorm { mean: 127.136, scale: 38.898, sign: -1.0, weight: 0.05 },
+        depth_tight: SigNorm { mean: 4.827, scale: 3.858, sign: 1.0, weight: 0.05 },
+        transitions: SigNorm { mean: 0.151, scale: 0.358, sign: 1.0, weight: 0.05 },
+        camo: SigNorm { mean: 37.986, scale: 20.307, sign: 1.0, weight: 0.00 },
+    };
+    n
+}
+
+/// The spec-free path's per-technique granular-score CDF — re-mined over the natural dataset score
+/// distribution where the held-out gate accepted it, else the isolated row verbatim. The §4.3.2
+/// clamping cure: natural scores that overran the isolated CDF's range pinned to a tie at `1.0`,
+/// losing all within-bucket resolution. Read only by [`grade_puzzle`].
+///
+/// BAKED with [`NATURAL_NORM`]. Accepted (held-out, §4.7): **swordfish** `cdf` (+0.095 -> +0.166 —
+/// the natural score range is [0.5, 10.7] vs the isolated CDF's [0.1, 2.8], so 63% of `armane/extreme`
+/// swordfish clamped at `1.0`; the re-mined CDF restores their order); **naked-pair** `normcdf` (the
+/// CDF re-derived under the re-meaned NORM above). Every other row is [`GRANULAR_CDF`] verbatim.
+pub const NATURAL_CDF: [[f64; CDF_ANCHORS]; NUM] = natural_cdf();
+
+const fn natural_cdf() -> [[f64; CDF_ANCHORS]; NUM] {
+    let mut c = GRANULAR_CDF;
+    c[NAKED_PAIR] = [0.211, 0.364, 0.417, 0.451, 0.526, 0.564, 0.603, 1.457, 1.584, 2.656, 5.634]; // normcdf
+    c[SWORDFISH] = [0.504, 1.560, 2.436, 2.567, 3.400, 3.572, 3.703, 4.543, 4.699, 5.726, 10.741]; // cdf (un-clamp)
+    c
+}
 
 /// One puzzle's **continuous within-technique rating** in `[0, 1]` — the Tier C output
 /// (`docs/grader-continuous-scoring.md`): its percentile against its technique's baked
@@ -941,8 +1066,12 @@ pub fn grade_puzzle(puzzle: &DigitGrid) -> Option<PuzzleGrade> {
         .max_by_key(|&k| DIFFICULTY[k]);
     match key {
         Some(k) => {
+            // Spec-free path: read the NATURAL tables (Stage 4 re-mine), not the curriculum
+            // GRANULAR_* — a natural puzzle's signal/score distribution differs from the isolated
+            // corpus the curriculum tables were mined on (§4.3.2). Identical to GRANULAR_* for any
+            // bucket without a natural re-mine, so this is byte-identical until a row is baked.
             let signals = signals_of(&trace, 1 << k);
-            let rating = rating_from_cdf(granular_score(&signals, &GRANULAR_NORM[k]), &GRANULAR_CDF[k]);
+            let rating = rating_from_cdf(granular_score(&signals, &NATURAL_NORM[k]), &NATURAL_CDF[k]);
             Some(PuzzleGrade { signals, key: Some(k), rating })
         }
         // No harder kind fired: the cheap closure (singles + locked candidates) solved it. Instead
@@ -1504,5 +1633,59 @@ mod tests {
         assert_eq!(r.cascade.sign, -1.0, "an undetermined signal keeps its grade_batch sign");
         assert_eq!(r.open.sign, 1.0, "a zero-weight signal is never re-oriented");
         assert_eq!(r.alts.weight, 0.45, "re-orient does not re-weight");
+    }
+
+    // --- Stage 4: natural-puzzle re-mine ------------------------------------------------
+
+    #[test]
+    fn remeaned_recenters_mean_scale_keeps_sign_and_weight() {
+        // One live signal (`open`, sign -1, weight 0.5) plus a constant-in-sample one (`cascade`).
+        let live = SigNorm { mean: 100.0, scale: 10.0, sign: -1.0, weight: 0.5 };
+        let off = SigNorm { mean: 5.0, scale: 1.0, sign: 1.0, weight: 0.0 };
+        let base = TechNorm {
+            open: live, cascade: off, depth: off, elim: off, alts: off,
+            tight: off, open_mean: off, depth_tight: off, transitions: off, camo: off,
+        };
+        // `open` takes 10/20/30 (mean 20, pop-std ~8.165); every other raw signal is constant 0.
+        let mk = |open| Signals { bottleneck_count: 1, open, ..Signals::default() };
+        let r = base.remeaned(&[mk(10), mk(20), mk(30)]);
+        assert!((r.open.mean - 20.0).abs() < 1e-9, "mean re-centered on the natural sample");
+        assert!((r.open.scale - 8.16497).abs() < 1e-3, "scale = pop std of the natural sample");
+        assert_eq!(r.open.sign, -1.0, "re-mean inherits the sign (does not re-orient)");
+        assert_eq!(r.open.weight, 0.5, "re-mean inherits the weight (does not re-weight)");
+        assert_eq!(r.cascade, off, "a signal constant across the sample keeps its baked params");
+    }
+
+    #[test]
+    fn natural_tables_overlay_only_the_accepted_buckets() {
+        // Production-safety guard: the spec-free NATURAL_* tables must equal the curriculum
+        // GRANULAR_* everywhere EXCEPT the two held-out-accepted Stage-4 buckets (naked-pair normcdf,
+        // swordfish cdf-only). Any other drift would silently change grading on an unvalidated bucket.
+        for k in 0..NUM {
+            if k == NAKED_PAIR {
+                assert_ne!(NATURAL_CDF[k], GRANULAR_CDF[k], "naked-pair CDF is re-mined");
+                assert_ne!(NATURAL_NORM[k], GRANULAR_NORM[k], "naked-pair NORM is re-meaned (normcdf)");
+            } else if k == SWORDFISH {
+                assert_ne!(NATURAL_CDF[k], GRANULAR_CDF[k], "swordfish CDF is re-mined (un-clamp)");
+                assert_eq!(NATURAL_NORM[k], GRANULAR_NORM[k], "swordfish is cdf-only: NORM unchanged");
+            } else {
+                assert_eq!(NATURAL_NORM[k], GRANULAR_NORM[k], "non-accepted NORM stays the isolated row");
+                assert_eq!(NATURAL_CDF[k], GRANULAR_CDF[k], "non-accepted CDF stays the isolated row");
+            }
+        }
+    }
+
+    #[test]
+    fn natural_swordfish_cdf_unclamps_the_isolated_range() {
+        // The §4.3.2 distribution shift, quantified: natural swordfish scores (up to ~10.7) overran
+        // the isolated CDF's top anchor (~2.77), pinning 63% of armane/extreme at rating 1.0. The
+        // re-mined CDF's top anchor must reach the natural range, so those scores no longer clamp.
+        let nat = NATURAL_CDF[SWORDFISH][CDF_ANCHORS - 1];
+        let iso = GRANULAR_CDF[SWORDFISH][CDF_ANCHORS - 1];
+        assert!(nat > 2.0 * iso, "natural swordfish CDF spans far past the isolated max ({nat} vs {iso})");
+        // The CDF is monotone non-decreasing (cdf_of guarantees it) — a sanity check on the bake.
+        for w in NATURAL_CDF[SWORDFISH].windows(2) {
+            assert!(w[1] >= w[0], "natural swordfish CDF must be non-decreasing");
+        }
     }
 }

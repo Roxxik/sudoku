@@ -11,7 +11,7 @@ The plan for making the **per-spec difficulty gradings** the grader already prod
 > **dropped.** The grader's output stays what it is today — a **per-spec, within-technique** rating.
 > The external data is for making that per-spec rating *better*, not for building a portable scalar.
 
-> Status: **Stages 0-3 BUILT & MEASURED (2026-06-23); Stage 4 not started.** Landed: the
+> Status: **Stages 0-4 BUILT & MEASURED (2026-06-23).** Landed: the
 > spec-free grading path [`grade_puzzle`](../generator-lab/src/grade.rs) (G1, Stage 0); the
 > reworked [`datasets_correlate`](../generator-lab/examples/datasets_correlate.rs) harness — Stage 1,
 > the **corrected per-technique-bucket scoreboard** (§4.4): it buckets each group's covered puzzles by
@@ -290,7 +290,25 @@ Three findings:
    minority direction) and **naked-triple** `tight`/`depth_tight` +1→−1 (stable 0.98; neutral,
    +0.220→+0.222).
 
-The bake is **surgical** — the committed `GRANULAR_NORM` with exactly those three sign flips and the
+And **Stage 4 — the natural-puzzle re-mine** ([`NATURAL_NORM`/`NATURAL_CDF`](../generator-lab/src/grade.rs),
+driven by [`datasets_correlate --natural-remine`](../generator-lab/examples/datasets_correlate.rs),
+§4.7): the **spec-free** path ([`grade_puzzle`](../generator-lab/src/grade.rs)) gets its **own** tables,
+re-mined over the gradeable dataset puzzles, gated by a held-out human correlation — leaving the
+curriculum `GRANULAR_*` tables (the production `grade_one`/`rating` path) **byte-identical**. Two
+buckets clear the 2-fold held-out gate and are baked: **swordfish** `cdf` (+0.095 → +0.166 held-out —
+the §4.3.2 clamping made concrete: natural swordfish scores span [0.5, 10.7] vs the isolated CDF's
+[0.1, 2.8], so 63% of `armane/extreme` swordfish pinned at rating `1.0`; the re-mined CDF restores
+their order) and **naked-pair** `normcdf` (+0.043 → +0.067 — NORM mean/scale re-centered, e.g. `alts`
+mean 2.18 → 14.0). Headline: **`armane/extreme` +0.105 → +0.133** (the no-trunk control, where the
+distribution shift bit hardest; swordfish bucket +0.086 → +0.159, now beating the Pelánek bar by
++0.081 vs +0.053), every other group flat (trunk-dominated or thin). The **optional per-technique
+re-weight is attempted but NOT baked**: under repeated 6-partition CV + split-half stability + a
+non-degeneracy guard, every apparent gain is either split-luck (naked-pair/naked-triple: positive
+mean, negative worst-partition) or a degenerate single-signal collapse (xy-wing → `cascade`-only,
+zeroing `alts` — a Stage-3 orientation, not a re-weight), so per "do not force it" the data is too
+thin to re-weight. Production untouched.
+
+The Stage-3 bake is **surgical** — the committed `GRANULAR_NORM` with exactly those three sign flips and the
 two affected CDFs re-derived under them (`grade_diag --human-orient` prints the paste-ready rows);
 every other norm/CDF row, the trunk, and the whole spec-based production path are **byte-identical**.
 Net on the production scoreboard the continuous groups tick up (solve_time +0.470→+0.472, D_TO
@@ -299,6 +317,66 @@ acceptance keeps every technique's split-half stability ≥ 0.90 (criterion §6.
 stability-safe gain — Stage 3's value is *removing the §1 self-reference where the data is dense
 enough to trust*, and proving (alts, hidden-pair, swordfish) that the existing orientation was mostly
 already right.
+
+### 4.7 Stage 4 — natural-puzzle re-mine + (rejected) re-weight (measured 2026-06-23)
+
+Stage 4 acts on the **G1 distribution shift** (§4.3.2): the baked `GRANULAR_*` tables were mined on
+the *isolated* curriculum corpus (specs that force one technique), so a **natural** dataset puzzle
+solved with the full toolbox lands at a different signal/score distribution at the same inferred
+bottleneck. The architecture exploits a clean split: the spec-based production path
+([`grade_one`/`rating`](../generator-lab/src/grade.rs), the web app's `gen_worker`) grades exactly
+those isolated-spec puzzles, while the spec-free path ([`grade_puzzle`](../generator-lab/src/grade.rs))
+grades natural puzzles. So Stage 4 gives the spec-free path its **own** tables
+([`NATURAL_NORM`/`NATURAL_CDF`](../generator-lab/src/grade.rs), an overlay on `GRANULAR_*` that only
+touches the re-mined rows), and the production path stays **byte-identical** (criterion §6.5, free).
+
+**The NORM/CDF re-mine — baked.** [`datasets_correlate --natural-remine`](../generator-lab/examples/datasets_correlate.rs)
+buckets every group's covered, keyed puzzles by inferred technique, and for each bucket dense enough
+(`>= SIGN_DENSE_MIN` natural puzzles) runs a **2-fold held-out** comparison of the isolated tables vs
+two re-mine candidates — `cdf` (re-percentile the CDF over the natural scores, un-clamping) and
+`normcdf` ([`TechNorm::remeaned`](../generator-lab/src/grade.rs) re-centers each signal's logistic on
+the natural distribution *and* re-CDFs under it). A candidate is baked only if it beats the isolated
+table on a bucket half it was **not** fit on (criterion §6.4). Two buckets clear it:
+
+| bucket | candidate | held-out (isolated → re-mine) | what it fixes |
+|---|---|---|---|
+| `swordfish` | `cdf` | +0.095 → **+0.166** | natural scores span [0.5, 10.7] vs isolated CDF [0.1, 2.8] → 63% of `armane/extreme` clamped at `1.0`; re-CDF restores their order |
+| `naked-pair` | `normcdf` | +0.043 → **+0.067** | NORM mean/scale re-centered (`alts` mean 2.18 → 14.0 — natural naked-pairs sit in a busier stall) |
+
+`hidden-pair` (n=192), `naked-triple`, `xy-wing`, `w-wing` show **no** held-out gain and keep the
+isolated row (the re-mine neither helps nor is forced). On the board (no-Pelánek aggregates):
+
+| group | S3 agg | S4 agg | Δ | note |
+|---|---|---|---|---|
+| `armane/extreme` | +0.105 | **+0.133** | **+0.028** | the no-trunk control — swordfish bucket +0.086 → +0.159, now `ours-bar` +0.081 (was +0.053) |
+| `synnwang/solve_time` | +0.472 | +0.473 | +0.001 | trunk-dominated; naked-pair bucket thin |
+| `armane/org.uk` | +0.345 | +0.344 | −0.001 | naked-pair n=11 |
+| `sotd` / `nhk` / `D_TO` / `D_TR` | — | — | 0 | trunk-dominated / thin non-trunk buckets |
+
+This is exactly §4.3.2's prediction: the natural re-mine helps **where the distribution shift bit** —
+`armane/extreme`, the one group with no flat trunk and the heaviest clamping — and is neutral
+everywhere the aggregate is carried by the (Stage-2) trunk or by buckets too thin to re-mine.
+
+**The optional per-technique re-weight — attempted, NOT baked.** The harness then fits each dense
+bucket's blend **weights** against the human label (coordinate ascent on the live signals), under a
+deliberately strict gate: **repeated 6-partition** 2-fold CV (a single even/odd split is high-variance
+on a thin bucket — it lets a fit generalise across *that* split by luck), **plus** the §6.5 split-half
+stability floor, **plus** a non-degeneracy guard (a fit may rebalance the blend but not zero the
+branch's dominant designed signal — that is a Stage-3 *orientation* question, not a re-weight). The
+result is a clean negative:
+
+- `naked-pair` (+0.037 mean / **−0.037** worst) and `naked-triple` (+0.017 / **−0.040**) — **split-luck**:
+  the single-split gain reverses on other partitions.
+- `xy-wing` is the only robust gain (+0.094 worst-partition, stable 0.92) — but it collapses to
+  **`cascade`-only, zeroing `alts`** (the wing branch's primary signal, weight 0.45). That is the same
+  `cascade` the Stage-3 sign flip already human-oriented (§4.6); a weight refinement that deletes the
+  technique's primary signal is a *replacement*, not a re-weight, and it moves **no** group aggregate.
+
+So per the plan's "may simply lack the data in most buckets — **do not force it**," no weights are
+baked. The data is too thin for a credible per-technique re-weight; the harness stays as the machinery
+to re-attempt as the corpus grows. (A separate, untried Stage-4 refinement noted in §4.5 — averaging
+the **trunk** frontier over a few fill orders to recover the determinism-vs-averaging margin — would
+target the trunk-dominated continuous groups; it is orthogonal to this re-mine and remains future work.)
 
 ## 5. The plan (per-spec; beat the bar; one change at a time)
 
@@ -342,12 +420,19 @@ applied; naked-pair's and w-wing's bigger raw wins are stability-rejected. Surgi
 re-derived CDFs, everything else byte-identical. The `--data` datasets are loaded through the shared
 [`datasets`](../generator-lab/src/datasets.rs) module the Stage-1 scoreboard also uses.
 
-**Stage 4 — natural-puzzle re-mine + optional per-technique re-weight.** Re-mine the `NORM`/`CDF` over
-the gradeable dataset puzzles themselves (holdout-split per bucket), curing the §4.3.2 distribution
-shift, and bake it as the spec-free path's table. Then, only where a bucket is large enough, fit
-per-technique weight vectors by monotone-constrained regression against the human label,
-holdout-gated (accept only weights whose held-out human rho beats the per-bucket baseline — small
-buckets overfit instantly). Heaviest step; may simply lack the data in most buckets — do not force it.
+**Stage 4 — natural-puzzle re-mine + optional per-technique re-weight. DONE (2026-06-23) — see §4.7.**
+Re-mined the `NORM`/`CDF` over the gradeable dataset puzzles and baked them as the **spec-free path's
+own** tables ([`NATURAL_NORM`/`NATURAL_CDF`](../generator-lab/src/grade.rs)), an overlay on `GRANULAR_*`
+that touches only the rows whose natural re-mine beat the isolated table on a **2-fold held-out** human
+correlation — so the spec-based production path is byte-identical. Two buckets cleared the gate
+(swordfish `cdf`, the §4.3.2 un-clamp; naked-pair `normcdf`), lifting `armane/extreme` +0.105 → +0.133
+(swordfish bucket +0.086 → +0.159) and neutral elsewhere (trunk-dominated / thin). The **optional
+re-weight is attempted but NOT baked**: under repeated 6-partition CV + split-half stability + a
+non-degeneracy guard, every gain is split-luck or a degenerate single-signal collapse (xy-wing →
+`cascade`-only), so per "do not force it" the data is too thin to re-weight. Driven by
+[`datasets_correlate --natural-remine`](../generator-lab/examples/datasets_correlate.rs) (our grader
+only; no Pelánek needed), which prints the paste-ready `NATURAL_*` arrays and the re-weight verdicts.
+A further trunk-frontier-averaging refinement (§4.5) is orthogonal and remains future work.
 
 Re-use the resumable [`grade_diag`](../generator-lab/examples/grade_diag.rs) mining-cache machinery so
 the (slow, especially for Pelánek) dataset solves are computed once and recalibration is instant.

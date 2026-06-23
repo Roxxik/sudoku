@@ -37,10 +37,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use generator_lab::datasets::{Group, Row, load_group};
-use generator_lab::grade::{PuzzleGrade, grade_puzzle};
+use generator_lab::grade::{
+    CDF_ANCHORS, GRANULAR_CDF, GRANULAR_NORM, PuzzleGrade, SIGN_DENSE_MIN, SigNorm, Signals, TechNorm,
+    cdf_of, grade_puzzle, granular_score, rating_from_cdf,
+};
 use generator_lab::pelanek::{Opts, grade_puzzle as pelanek_grade};
 use generator_lab::repr::DigitGrid;
-use generator_lab::spec::kinds::NAMES;
+use generator_lab::spec::kinds::{NAMES, NUM};
 
 // --- rank-correlation primitives ----------------------------------------------------------------
 
@@ -481,6 +484,399 @@ fn print_level_coverage(group: &Group, ours: &[Option<PuzzleGrade>]) {
     println!();
 }
 
+// --- Stage 4: the natural-puzzle re-mine (docs/grader-external-calibration.md §5) ----------------
+//
+// The spec-free path's baked tables ([`grade::NATURAL_NORM`]/[`grade::NATURAL_CDF`]) start identical
+// to the *isolated* curriculum tables ([`GRANULAR_NORM`]/[`GRANULAR_CDF`]), which were mined on specs
+// that force one technique. Natural dataset puzzles solved with the full toolbox land at a different
+// signal/score distribution at the same inferred bottleneck (the §4.3.2 shift), so their scores
+// overrun the isolated CDF's range and pin to a tie at `1.0` — all within-bucket resolution lost
+// (e.g. `armane/extreme` swordfish, 63% clamped). Stage 4 re-mines a bucket's NORM(mean/scale)+CDF
+// over the natural puzzles themselves, gated by a 2-fold held-out human correlation: a re-mine is
+// baked only if it beats the isolated tables on a bucket half it was NOT fit on (criterion §6.4).
+
+/// One technique kind's natural per-group bucket: the covered puzzles' [`Signals`], their human
+/// labels and row weights, and the group's [`Metric`] — so the held-out validation uses the **same**
+/// correlation the board is judged on (weighted Spearman for continuous, Kendall tau-b for ordinal).
+struct KindGroup {
+    metric: Metric,
+    sigs: Vec<Signals>,
+    labels: Vec<f64>,
+    weights: Vec<f64>,
+}
+
+/// Bucket every group's covered, keyed (non-trunk) puzzles by inferred technique, returning per kind
+/// its list of per-group [`KindGroup`]s. The trunk (`key == None`) is excluded — it has no
+/// per-technique NORM/CDF (its sub-order is Stage 2's frontier rating, not a granular score).
+fn natural_by_kind(graded: &[(Group, Vec<Option<PuzzleGrade>>)]) -> Vec<Vec<KindGroup>> {
+    let mut per_kind: Vec<Vec<KindGroup>> = (0..NUM).map(|_| Vec::new()).collect();
+    for (group, ours) in graded {
+        let metric = if group.ordinal { Metric::Ordinal } else { Metric::Continuous };
+        let mut by_kind: Vec<(Vec<Signals>, Vec<f64>, Vec<f64>)> =
+            (0..NUM).map(|_| (Vec::new(), Vec::new(), Vec::new())).collect();
+        for (i, o) in ours.iter().enumerate() {
+            if let Some(g) = o {
+                if let Some(k) = g.key {
+                    by_kind[k].0.push(g.signals);
+                    by_kind[k].1.push(group.rows[i].label_value);
+                    by_kind[k].2.push(group.rows[i].weight);
+                }
+            }
+        }
+        for (k, (sigs, labels, weights)) in by_kind.into_iter().enumerate() {
+            if !sigs.is_empty() {
+                per_kind[k].push(KindGroup { metric, sigs, labels, weights });
+            }
+        }
+    }
+    per_kind
+}
+
+/// A candidate set of spec-free tables for a kind: a [`TechNorm`] and its granular-score CDF. `build`
+/// (below) maps a training sample to one of these; [`heldout_rho`] then scores it on held-out halves.
+type Tables = (TechNorm, [f64; CDF_ANCHORS]);
+
+/// The three re-mine candidates for kind `k`, each as a `train_sample -> Tables` builder:
+///  - **baseline** — the isolated `GRANULAR_*` row verbatim (ignores the sample); the bar to beat.
+///  - **cdf** — keep the isolated NORM, re-mine only the CDF over the natural scores (un-clamp).
+///  - **normcdf** — re-mean/scale the NORM on the natural sample too, then re-mine the CDF under it.
+fn candidate(k: usize, which: &str) -> impl Fn(&[Signals]) -> Tables {
+    move |train: &[Signals]| match which {
+        "baseline" => (GRANULAR_NORM[k], GRANULAR_CDF[k]),
+        "cdf" => {
+            let norm = GRANULAR_NORM[k];
+            let scores: Vec<f64> = train.iter().map(|s| granular_score(s, &norm)).collect();
+            (norm, cdf_of(&scores))
+        }
+        _ /* normcdf */ => {
+            let norm = GRANULAR_NORM[k].remeaned(train);
+            let scores: Vec<f64> = train.iter().map(|s| granular_score(s, &norm)).collect();
+            (norm, cdf_of(&scores))
+        }
+    }
+}
+
+/// The held-out human correlation of a candidate over a kind's per-group buckets: 2-fold CV. Each
+/// group's bucket is split even/odd; in fold `f` the candidate trains on the pooled *other* halves
+/// across groups and is scored on each group's held-out half-`f` (its own metric), pooled n-weighted
+/// into one [`Agg`]. So a re-mine never sees the puzzles it is graded on. A test half whose label is
+/// constant (no order to match) is skipped; a candidate whose rating is constant there (the baseline
+/// clamping) scores `NaN` -> `0` with its n still counted, exactly as the board treats a flat bucket.
+fn heldout_rho(groups: &[KindGroup], build: &dyn Fn(&[Signals]) -> Tables) -> Agg {
+    let mut agg = Agg::default();
+    for fold in 0..2usize {
+        let train: Vec<Signals> = groups
+            .iter()
+            .flat_map(|g| g.sigs.iter().enumerate().filter(move |(i, _)| i % 2 != fold).map(|(_, s)| *s))
+            .collect();
+        if train.len() < 2 {
+            continue;
+        }
+        let (norm, cdf) = build(&train);
+        for g in groups {
+            let idx: Vec<usize> = (0..g.sigs.len()).filter(|i| i % 2 == fold).collect();
+            let y: Vec<f64> = idx.iter().map(|&i| g.labels[i]).collect();
+            if idx.len() < 2 || is_const(&y) {
+                continue; // no held-out order to match in this group/fold
+            }
+            let x: Vec<f64> =
+                idx.iter().map(|&i| rating_from_cdf(granular_score(&g.sigs[i], &norm), &cdf)).collect();
+            let w: Vec<f64> = idx.iter().map(|&i| g.weights[i]).collect();
+            agg.add(g.metric.corr(&x, &y, &w), idx.len());
+        }
+    }
+    agg
+}
+
+/// Minimum held-out human-rho gain for a re-mine to be **applied** over the isolated baseline (and
+/// for `normcdf` to be preferred over the simpler `cdf`). Above the per-bucket CV noise; a smaller
+/// gain is reported but not baked (keep the isolated row — fewer fitted numbers, less overfit).
+const REMINE_MARGIN: f64 = 0.01;
+
+/// Stage 4 driver: for each technique kind dense enough across the datasets (`>= SIGN_DENSE_MIN`
+/// natural puzzles), report the 2-fold held-out human-rho of the isolated baseline vs the two
+/// re-mine candidates, decide which (if any) to bake, then print the paste-ready `NATURAL_NORM` /
+/// `NATURAL_CDF` arrays — accepted kinds re-mined over their FULL bucket (the validated method,
+/// refit on all data), every other row the `GRANULAR_*` value verbatim.
+fn natural_remine(graded: &[(Group, Vec<Option<PuzzleGrade>>)]) {
+    let by_kind = natural_by_kind(graded);
+    println!("\n# === STAGE 4 — natural-puzzle re-mine (2-fold held-out human-rho) ===");
+    println!("# kind            n   baseline   cdf      normcdf   verdict");
+
+    // The chosen builder per kind (None = keep the isolated GRANULAR_* row).
+    let mut chosen: Vec<Option<&'static str>> = vec![None; NUM];
+    for k in 0..NUM {
+        let groups = &by_kind[k];
+        let total: usize = groups.iter().map(|g| g.sigs.len()).sum();
+        if total < SIGN_DENSE_MIN {
+            if total > 0 {
+                println!("# {:<14} n={:<4} thin (< {SIGN_DENSE_MIN}) -> keep isolated", NAMES[k], total);
+            }
+            continue;
+        }
+        let base = heldout_rho(groups, &candidate(k, "baseline")).get();
+        let cdf = heldout_rho(groups, &candidate(k, "cdf")).get();
+        let normcdf = heldout_rho(groups, &candidate(k, "normcdf")).get();
+
+        // Prefer the simpler `cdf` unless `normcdf` clears it by the margin; apply only if the chosen
+        // candidate clears the baseline by the margin.
+        let (best, tag) =
+            if normcdf - cdf >= REMINE_MARGIN { (normcdf, "normcdf") } else { (cdf, "cdf") };
+        let verdict = if best - base >= REMINE_MARGIN {
+            chosen[k] = Some(tag);
+            format!("APPLY {tag} (+{:.3} held-out)", best - base)
+        } else {
+            format!("keep isolated (best {:+.3} <= base {:+.3})", best, base)
+        };
+        println!(
+            "# {:<14} n={:<4} {:+.3}    {:+.3}   {:+.3}   {verdict}",
+            NAMES[k], total, base, cdf, normcdf,
+        );
+    }
+
+    print_natural_tables(&by_kind, &chosen);
+    reweight_report(&by_kind, &chosen);
+}
+
+/// Print the full paste-ready `NATURAL_NORM` / `NATURAL_CDF` arrays. An accepted kind's row is the
+/// chosen candidate re-mined over its whole bucket; every other row is the `GRANULAR_*` value
+/// verbatim (so the spec-free path falls back to the isolated table there).
+fn print_natural_tables(by_kind: &[Vec<KindGroup>], chosen: &[Option<&'static str>]) {
+    let fmt_sig = |s: &SigNorm| {
+        format!("SigNorm {{ mean: {:.3}, scale: {:.3}, sign: {:.1}, weight: {:.2} }}", s.mean, s.scale, s.sign, s.weight)
+    };
+    // kind -> the row's (norm, cdf): re-mined for accepted kinds, isolated otherwise.
+    let tables: Vec<Tables> = (0..NUM)
+        .map(|k| match chosen[k] {
+            Some(which) => {
+                let all: Vec<Signals> = by_kind[k].iter().flat_map(|g| g.sigs.iter().copied()).collect();
+                candidate(k, which)(&all)
+            }
+            None => (GRANULAR_NORM[k], GRANULAR_CDF[k]),
+        })
+        .collect();
+
+    println!("\n// === paste into grade.rs (Stage 4 natural re-mine) ===");
+    println!("pub const NATURAL_NORM: [TechNorm; NUM] = [");
+    for k in 0..NUM {
+        let c = &tables[k].0;
+        let tag = chosen[k].map_or("isolated", |w| w);
+        println!(
+            "    /* {:<14} */ TechNorm {{ open: {}, cascade: {}, depth: {}, elim: {}, alts: {}, \
+             tight: {}, open_mean: {}, depth_tight: {}, transitions: {}, camo: {} }}, // {tag}",
+            NAMES[k],
+            fmt_sig(&c.open), fmt_sig(&c.cascade), fmt_sig(&c.depth), fmt_sig(&c.elim), fmt_sig(&c.alts),
+            fmt_sig(&c.tight), fmt_sig(&c.open_mean), fmt_sig(&c.depth_tight), fmt_sig(&c.transitions), fmt_sig(&c.camo),
+        );
+    }
+    println!("];");
+    println!("pub const NATURAL_CDF: [[f64; CDF_ANCHORS]; NUM] = [");
+    for k in 0..NUM {
+        let anchors: Vec<String> = tables[k].1.iter().map(|x| format!("{x:.3}")).collect();
+        let tag = chosen[k].map_or("isolated", |w| w);
+        println!("    [{}], // {} ({tag})", anchors.join(", "), NAMES[k]);
+    }
+    println!("];");
+}
+
+// --- Stage 4 (optional): the per-technique re-weight (docs/grader-external-calibration.md §5) -----
+//
+// After the NORM/CDF re-mine, optionally re-fit each dense bucket's blend WEIGHTS against the human
+// label. Strictly held-out: weights are fit on a training fold (coordinate ascent maximizing the
+// n-weighted pooled per-group training human-rho) and judged on the other fold; a fit is reported as
+// applicable only if its held-out human-rho beats the re-mine's on the same held-out halves. The doc
+// warns this "may simply lack the data in most buckets — do not force it"; the gate enforces that.
+
+const NSIG: usize = 10;
+
+/// Number of independent 2-fold partitions the re-weight is cross-validated over. A single even/odd
+/// 2-fold is high-variance on a thin bucket — a coordinate search can fit a weight vector that
+/// generalises across *that one* split by luck. Requiring the held-out gain to survive every one of
+/// several hash-shuffled partitions separates a real re-weight from split-luck (the doc's overfit risk).
+const REWEIGHT_PARTITIONS: u64 = 6;
+
+/// A balanced pseudo-random 2-fold assignment (`0` or `1`) of within-group index `i` under `salt` —
+/// a cheap integer hash, so each salt is a different partition of the bucket. Deterministic (no RNG).
+fn fold_hash(i: usize, salt: u64) -> usize {
+    let mut h = (i as u64).wrapping_add(salt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((h >> 31) & 1) as usize
+}
+
+/// A [`TechNorm`]'s 10 blend weights, in `raw_granular` order (the [`TechNorm::reweighted`] argument).
+fn weights_of(n: &TechNorm) -> [f64; NSIG] {
+    [
+        n.open.weight, n.cascade.weight, n.depth.weight, n.elim.weight, n.alts.weight,
+        n.tight.weight, n.open_mean.weight, n.depth_tight.weight, n.transitions.weight, n.camo.weight,
+    ]
+}
+
+/// The n-weighted pooled per-group human-rho of `(norm, cdf)` over each group's indices where
+/// `sel(i)` holds. The objective the weight fit climbs (on training indices) and the held-out gate
+/// reads (on test indices); pooled per group, never across labels (§2.3).
+fn pooled_rho(groups: &[KindGroup], sel: &dyn Fn(usize) -> bool, norm: &TechNorm, cdf: &[f64; CDF_ANCHORS]) -> f64 {
+    let mut agg = Agg::default();
+    for g in groups {
+        let idx: Vec<usize> = (0..g.sigs.len()).filter(|&i| sel(i)).collect();
+        let y: Vec<f64> = idx.iter().map(|&i| g.labels[i]).collect();
+        if idx.len() < 2 || is_const(&y) {
+            continue;
+        }
+        let x: Vec<f64> =
+            idx.iter().map(|&i| rating_from_cdf(granular_score(&g.sigs[i], norm), cdf)).collect();
+        let w: Vec<f64> = idx.iter().map(|&i| g.weights[i]).collect();
+        agg.add(g.metric.corr(&x, &y, &w), idx.len());
+    }
+    agg.get()
+}
+
+/// Fit blend weights for a kind on the training fold (`sel` true), by bounded coordinate ascent over
+/// the live signals: each live weight is tried at {0, ½, 2}× its baked value, the change kept if it
+/// lifts the pooled training human-rho. Two passes; the search is deliberately small because the
+/// per-group training halves are thin (a wider search just memorises them).
+fn fit_weights(groups: &[KindGroup], sel: &dyn Fn(usize) -> bool, norm: &TechNorm, cdf: &[f64; CDF_ANCHORS]) -> [f64; NSIG] {
+    let base = weights_of(norm);
+    let mut best_w = base;
+    let mut best = pooled_rho(groups, sel, &norm.reweighted(&best_w), cdf);
+    for _pass in 0..2 {
+        for j in 0..NSIG {
+            if base[j] <= 0.0 {
+                continue; // never light up a signal the branch left off
+            }
+            for &f in &[0.0f64, 0.5, 2.0] {
+                let mut cand = best_w;
+                cand[j] = base[j] * f;
+                if cand.iter().sum::<f64>() <= 0.0 {
+                    continue;
+                }
+                let rho = pooled_rho(groups, sel, &norm.reweighted(&cand), cdf);
+                if rho.is_finite() && rho > best + 1e-9 {
+                    best = rho;
+                    best_w = cand;
+                }
+            }
+        }
+    }
+    best_w
+}
+
+/// The §6.5 within-technique split-half rating stability floor a re-weight must clear (Stage 3's
+/// gate, reused). A weight fit that collapses the blend onto one or two signals reorders puzzles
+/// differently each resample — its two half-fits disagree — so this catches the thin-bucket overfit
+/// the held-out human-rho alone can miss (a gain bought by discarding the within-technique structure).
+const STABILITY_FLOOR: f64 = 0.90;
+
+/// The split-half rating stability of the re-weight pipeline for kind `k` under re-mine `which`:
+/// re-mine tables + fit weights on each half of the pooled natural bucket, rate the WHOLE pool with
+/// each, and Spearman the two ratings. Near 1 iff the fitted weights reproduce across resamples (a
+/// real, stable re-weight); low iff the fit overfits each half to a different degenerate vector.
+fn reweight_stability(groups: &[KindGroup], k: usize, which: &str) -> f64 {
+    let all: Vec<Signals> = groups.iter().flat_map(|g| g.sigs.iter().copied()).collect();
+    let rate_half = |parity: usize| -> Vec<f64> {
+        let train: Vec<Signals> = groups
+            .iter()
+            .flat_map(|g| g.sigs.iter().enumerate().filter(move |(i, _)| i % 2 == parity).map(|(_, s)| *s))
+            .collect();
+        let (norm, cdf) = candidate(k, which)(&train);
+        let w = fit_weights(groups, &move |i| i % 2 == parity, &norm, &cdf);
+        let rw = norm.reweighted(&w);
+        all.iter().map(|s| rating_from_cdf(granular_score(s, &rw), &cdf)).collect()
+    };
+    let (a, b) = (rate_half(0), rate_half(1));
+    let ones = vec![1.0; a.len()];
+    weighted_spearman(&a, &b, &ones)
+}
+
+/// Stage 4 (optional): per dense kind, report the 2-fold held-out human-rho of the re-mine vs a
+/// re-mine-plus-fitted-weights, layered on whichever re-mine the NORM/CDF gate chose. A fit is
+/// applicable only if it BOTH clears the held-out human-rho margin AND holds the §6.5 split-half
+/// stability floor (Stage 3's gate) — the second condition rejects the thin-bucket degenerate
+/// collapses. Prints the verdict and, for any survivor, the fitted weight vector ready to bake.
+fn reweight_report(by_kind: &[Vec<KindGroup>], chosen: &[Option<&'static str>]) {
+    println!("\n# === STAGE 4 (optional) — per-technique re-weight (2-fold held-out) ===");
+    println!("# kind            n   remine    +reweight  verdict");
+    for k in 0..NUM {
+        let groups = &by_kind[k];
+        let total: usize = groups.iter().map(|g| g.sigs.len()).sum();
+        if total < SIGN_DENSE_MIN {
+            continue;
+        }
+        let which = chosen[k].unwrap_or("baseline");
+        let build = candidate(k, which);
+
+        // Repeated 2-fold CV: a held-out gain per partition. Report the mean and the WORST (min) — a
+        // real re-weight is positive across partitions; split-luck swings.
+        let mut gains: Vec<f64> = Vec::new();
+        for salt in 0..REWEIGHT_PARTITIONS {
+            let (mut base, mut rw) = (Agg::default(), Agg::default());
+            for fold in 0..2usize {
+                let train: Vec<Signals> = groups
+                    .iter()
+                    .flat_map(|g| g.sigs.iter().enumerate().filter(|(i, _)| fold_hash(*i, salt) != fold).map(|(_, s)| *s))
+                    .collect();
+                if train.len() < 2 {
+                    continue;
+                }
+                let (norm, cdf) = build(&train);
+                let on_train = move |i: usize| fold_hash(i, salt) != fold;
+                let w = fit_weights(groups, &on_train, &norm, &cdf);
+                let rwnorm = norm.reweighted(&w);
+                for g in groups {
+                    let idx: Vec<usize> = (0..g.sigs.len()).filter(|i| fold_hash(*i, salt) == fold).collect();
+                    let y: Vec<f64> = idx.iter().map(|&i| g.labels[i]).collect();
+                    if idx.len() < 2 || is_const(&y) {
+                        continue;
+                    }
+                    let yw: Vec<f64> = idx.iter().map(|&i| g.weights[i]).collect();
+                    let rate = |n: &TechNorm| -> Vec<f64> {
+                        idx.iter().map(|&i| rating_from_cdf(granular_score(&g.sigs[i], n), &cdf)).collect()
+                    };
+                    base.add(g.metric.corr(&rate(&norm), &y, &yw), idx.len());
+                    rw.add(g.metric.corr(&rate(&rwnorm), &y, &yw), idx.len());
+                }
+            }
+            gains.push(rw.get() - base.get());
+        }
+        let mean_gain = gains.iter().sum::<f64>() / gains.len().max(1) as f64;
+        let min_gain = gains.iter().cloned().fold(f64::INFINITY, f64::min);
+        let stable = reweight_stability(groups, k, which);
+
+        // The full-bucket fit (what a bake would use) — and its degeneracy check: a weight refinement
+        // may rebalance the blend, but a fit that zeroes the branch's DOMINANT designed signal (the
+        // largest baked weight) has *replaced* the within-technique rating with a single raw signal —
+        // a Stage-3 orientation question, not a Stage-4 re-weight. Reject it (it discards the §6.5
+        // within-technique structure the human anchor is meant to sit on top of).
+        let all: Vec<Signals> = groups.iter().flat_map(|g| g.sigs.iter().copied()).collect();
+        let (fnorm, fcdf) = build(&all);
+        let fw = fit_weights(groups, &|_| true, &fnorm, &fcdf);
+        let base_w = weights_of(&fnorm);
+        let dom = (0..NSIG).max_by(|&a, &b| base_w[a].partial_cmp(&base_w[b]).unwrap()).unwrap();
+        let degenerate = fw[dom] <= 0.0;
+
+        // Apply only if the gain is robust across EVERY partition (min), split-half stable, AND not a
+        // degenerate single-signal collapse.
+        let apply = min_gain >= REMINE_MARGIN && stable >= STABILITY_FLOOR && !degenerate;
+        let verdict = if apply {
+            format!("APPLY reweight (mean +{mean_gain:.3}, min +{min_gain:.3}, stable {stable:.2})")
+        } else if min_gain >= REMINE_MARGIN && degenerate {
+            format!("REJECT (robust +{min_gain:.3} but drops the dominant '{}' signal — a Stage-3 orientation, not a re-weight)", SIG_NAMES[dom])
+        } else if mean_gain >= REMINE_MARGIN {
+            format!("REJECT (mean +{mean_gain:.3} but min {min_gain:+.3} < {REMINE_MARGIN:.2} — split-luck, not robust)")
+        } else {
+            format!("keep re-mine weights (mean gain {mean_gain:+.3})")
+        };
+        println!("# {:<14} n={:<4} mean{:+.3} min{:+.3} stable{:.2}  {verdict}", NAMES[k], total, mean_gain, min_gain, stable);
+        if apply {
+            println!("#   fitted weights: {fw:?}");
+        }
+    }
+}
+
+/// The granular signal names in `raw_granular`/weight order, for the re-weight degeneracy report.
+const SIG_NAMES: [&str; NSIG] =
+    ["open", "cascade", "depth", "elim", "alts", "tight", "open_mean", "depth_tight", "transitions", "camo"];
+
 fn arg_val(flag: &str) -> Option<String> {
     let a: Vec<String> = std::env::args().collect();
     a.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -529,7 +925,11 @@ fn main() {
     println!("# Stage 1 — per-technique-bucket scoreboard (NO tuning). Rank WITHIN a bucket only;");
     println!("# aggregate is n-weighted over buckets, never pooled across techniques. Bar = Pelanek.");
 
+    // `--natural-remine` runs the Stage-4 held-out re-mine (over our grader only) after the board.
+    let remine = arg_flag("--natural-remine");
+
     let t0 = std::time::Instant::now();
+    let mut graded: Vec<(Group, Vec<Option<PuzzleGrade>>)> = Vec::new();
     for path in &files {
         let Some(mut group) = load_group(path) else {
             eprintln!("  skip (parse) {}", path.display());
@@ -551,6 +951,11 @@ fn main() {
         };
         report_group(&group, &ours, &pelanek, with_pel);
         eprintln!("  done {} ({:.1}s elapsed)", group.id, t0.elapsed().as_secs_f64());
+        graded.push((group, ours));
     }
     eprintln!("datasets_correlate: all groups in {:.1}s", t0.elapsed().as_secs_f64());
+
+    if remine {
+        natural_remine(&graded);
+    }
 }
