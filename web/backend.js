@@ -358,10 +358,202 @@ export function recordMoves(log) {
   flushMoveOutbox();
 }
 
-// Forget everything queued for upload. Called when the user opts OUT of sharing
-// (Settings -> Share play data) so "off" leaves nothing pending on the device --
-// not even a stale snapshot from a session when sharing was on. Best-effort and
-// quota-safe like the other writes; clearing the queues never affects play.
+// ---- Daily-solve outbox ----
+// The Puzzle-of-the-day Submit button. UNLIKE the solve/move feeds above, a daily
+// submission is an EXPLICIT user act: tapping Submit means "post my time", so it
+// bypasses the data-sharing opt-out (it gates on CONFIGURED alone, never on
+// dataSharingOn) and is NOT dropped by clearOutboxes. It also drives a tri-state
+// button -- Submit (active) -> Submit (disabled, queued) -> Submitted -- so beyond
+// the pending outbox we keep a persistent set of ACCEPTED solve_ids: an outbox
+// entry vanishes on delivery, but "Submitted" must survive that (and the session),
+// so the done-set is where the final state lives. Sibling endpoint of /solves.
+const DAILY_ENDPOINT = ENDPOINT.replace(/\/solves$/, "/daily");
+const DAILY_OUTBOX_KEY = "sudoku.backend.daily.outbox.v1";
+const DAILY_DONE_KEY = "sudoku.backend.daily.done.v1";
+const DAILY_OUTBOX_MAX = 50; // distinct dailies in flight; coalesced per solve_id
+// Only today's four dailies are ever queried (the overview shows one day), so the
+// accepted set never needs to be large; bound it well above that and drop oldest.
+const DAILY_DONE_MAX = 200;
+
+// A daily submission posts regardless of the data-sharing setting -- the tap is the
+// consent -- so it gates on a configured backend alone.
+function dailyPostingEnabled() {
+  return CONFIGURED;
+}
+
+function loadDailyOutbox() {
+  let raw;
+  try { raw = localStorage.getItem(DAILY_OUTBOX_KEY); } catch { return []; }
+  if (!raw) return [];
+  try {
+    const entries = JSON.parse(raw);
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDailyOutbox(entries) {
+  try {
+    localStorage.setItem(DAILY_OUTBOX_KEY, JSON.stringify(entries));
+  } catch {
+    // Quota or privacy mode: durability is best-effort; the play flow is unaffected.
+  }
+}
+
+function loadDailyDone() {
+  let raw;
+  try { raw = localStorage.getItem(DAILY_DONE_KEY); } catch { return []; }
+  if (!raw) return [];
+  try {
+    const ids = JSON.parse(raw);
+    return Array.isArray(ids) ? ids : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDailyDone(ids) {
+  try {
+    localStorage.setItem(DAILY_DONE_KEY, JSON.stringify(ids));
+  } catch {
+    // Quota or privacy mode: tolerated like the other writes.
+  }
+}
+
+function removeFromDailyOutbox(ids) {
+  const drop = new Set(ids);
+  saveDailyOutbox(loadDailyOutbox().filter((e) => !drop.has(e.solve_id)));
+}
+
+// Mark solve_ids as accepted by the backend (the durable "Submitted" state),
+// appending to the done-set and dropping the oldest past the cap. Idempotent.
+function markDailyDone(ids) {
+  const set = new Set(loadDailyDone());
+  for (const id of ids) set.add(id);
+  let arr = [...set];
+  if (arr.length > DAILY_DONE_MAX) arr = arr.slice(arr.length - DAILY_DONE_MAX);
+  saveDailyDone(arr);
+}
+
+// Mirror of the worker's validDaily(): (day, level) name the puzzle, seed optional,
+// client_version stamped by us.
+function validDailyPayload(s) {
+  return !!s
+    && typeof s.solve_id === "string" && s.solve_id.length > 0
+    && Number.isInteger(s.day)
+    && Number.isInteger(s.level)
+    && typeof s.puzzle === "string"   && s.puzzle.length === 81
+    && typeof s.solution === "string" && s.solution.length === 81
+    && Number.isInteger(s.solve_ms)
+    && (s.seed == null || typeof s.seed === "string");
+}
+
+// The submit state of one daily, by its solve_id, for the overview button:
+//   "submitted" -> accepted by the backend (durable; in the done-set)
+//   "pending"   -> queued for upload, not yet accepted (in the outbox)
+//   "none"      -> never submitted
+export function dailySubmitState(solve_id) {
+  if (!solve_id) return "none";
+  if (loadDailyDone().includes(solve_id)) return "submitted";
+  if (loadDailyOutbox().some((e) => e.solve_id === solve_id)) return "pending";
+  return "none";
+}
+
+// The daily-overview / win-screen buttons listen here so they can flip live as a
+// submission queues and then lands -- without a global event bus. Set by home.js;
+// invoked after any change to the daily outbox or done-set.
+let dailyChangeListener = null;
+export function setDailyChangeListener(cb) {
+  dailyChangeListener = typeof cb === "function" ? cb : null;
+}
+function notifyDailyChange() {
+  if (dailyChangeListener) {
+    try { dailyChangeListener(); } catch {}
+  }
+}
+
+let flushingDaily = false;
+let flushDailyAgain = false;
+
+// Send the daily outbox in one batch and reconcile:
+//   2xx            -> accepted; move to the done-set (durable "Submitted") and drop.
+//   401            -> bad/missing key -> keep; a corrected build delivers it.
+//   other 4xx      -> permanent client error -> capture and drop.
+//   5xx            -> transient -> keep for retry.
+//   network reject -> offline/unreachable -> keep for retry, don't report.
+// NOT gated on the data-sharing opt-out (see the section header): a submitted daily
+// keeps retrying even with passive sharing off.
+async function flushDailyOutbox() {
+  if (!dailyPostingEnabled()) return;
+  if (flushingDaily) { flushDailyAgain = true; return; }
+  const batch = loadDailyOutbox();
+  if (!batch.length) return;
+  flushingDaily = true;
+  const debug = cheatOn();
+  const sentIds = batch.map((e) => e.solve_id);
+  try {
+    const resp = await fetch(DAILY_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({ solves: batch }),
+      keepalive: true,
+    });
+    if (debug) {
+      let body = "";
+      try { body = await resp.text(); } catch {}
+      console.log(`[backend] daily POST (${batch.length}) -> ${resp.status} ${body}`.trimEnd());
+    }
+    if (resp.ok) {
+      markDailyDone(sentIds);
+      removeFromDailyOutbox(sentIds);
+      notifyDailyChange();
+    } else if (resp.status === 401) {
+      // Keep: don't lose a deliberate submission to a deploy-time key mismatch.
+    } else if (resp.status < 500) {
+      reportFailure({ kind: "daily_post_rejected", status: resp.status, solves: batch });
+      removeFromDailyOutbox(sentIds);
+      notifyDailyChange();
+    } else {
+      // 5xx: keep for the next retry; nothing reported.
+    }
+  } catch (err) {
+    if (debug) console.warn("[backend] daily POST failed (queued for retry):", err);
+  } finally {
+    flushingDaily = false;
+    if (flushDailyAgain) { flushDailyAgain = false; flushDailyOutbox(); }
+  }
+}
+
+// Submit a solved daily for upload. Enqueue-then-flush like recordSolve, coalescing
+// by solve_id so a double tap (or submitting from both the win screen and the
+// overview) can't duplicate. Fire-and-forget: never throws, never awaits into the
+// UI. `solve` is { solve_id, day, level, seed, puzzle, solution, solve_ms }.
+export function recordDailySolve(solve) {
+  if (!dailyPostingEnabled()) {
+    if (cheatOn()) console.log("[backend] daily solve not recorded: backend not configured");
+    return;
+  }
+  const entry = { ...solve, client_version: VERSION };
+  if (!validDailyPayload(entry)) {
+    if (cheatOn()) console.warn("[backend] daily solve failed client validation; not queued:", entry);
+    reportFailure({ kind: "invalid_daily_solve", solve: entry });
+    return;
+  }
+  // Already accepted -> idempotent no-op (don't re-queue a finished submission).
+  if (loadDailyDone().includes(entry.solve_id)) return;
+  const outbox = loadDailyOutbox().filter((e) => e.solve_id !== entry.solve_id);
+  outbox.push(entry);
+  saveDailyOutbox(outbox.length > DAILY_OUTBOX_MAX ? outbox.slice(outbox.length - DAILY_OUTBOX_MAX) : outbox);
+  notifyDailyChange(); // reflect the pending state at once, before the POST resolves
+  flushDailyOutbox();
+}
+
+// Forget everything queued for PASSIVE upload. Called when the user opts OUT of
+// sharing (Settings -> Share play data) so "off" leaves nothing pending on the
+// device -- not even a stale snapshot from a session when sharing was on. The daily
+// outbox is deliberately NOT cleared: a daily submission is an explicit act the
+// opt-out doesn't govern. Best-effort and quota-safe; clearing never affects play.
 export function clearOutboxes() {
   try { localStorage.removeItem(OUTBOX_KEY); } catch {}
   try { localStorage.removeItem(MOVE_OUTBOX_KEY); } catch {}
@@ -372,7 +564,8 @@ export function clearOutboxes() {
 // sees no `online` transition, so without this a queue left by a previous session
 // would sit until the next solve/sync). All no-op when unconfigured or empty.
 if (typeof window !== "undefined") {
-  window.addEventListener("online", () => { flushOutbox(); flushMoveOutbox(); });
+  window.addEventListener("online", () => { flushOutbox(); flushMoveOutbox(); flushDailyOutbox(); });
   flushOutbox();
   flushMoveOutbox();
+  flushDailyOutbox();
 }

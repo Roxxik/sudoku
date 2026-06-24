@@ -22,8 +22,11 @@
 
 import * as store from "./store.js";
 import * as settings from "./settings.js";
-// Opting out of data sharing drops any upload queue (see openSettings).
-import { clearOutboxes } from "./backend.js";
+// Opting out of data sharing drops the passive upload queue (clearOutboxes, see
+// openSettings). The daily Submit button posts a daily time explicitly
+// (recordDailySolve, opt-out-bypassing), reads its tri-state (dailySubmitState),
+// and re-renders live as a submission lands (setDailyChangeListener).
+import { clearOutboxes, recordDailySolve, dailySubmitState, setDailyChangeListener } from "./backend.js";
 import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { TECHNIQUE_INFO } from "./techniques.js";
 import { masksFromUsages } from "./spec.js";
@@ -86,6 +89,12 @@ export function initHome(opts) {
   document.getElementById("campaignBack").addEventListener("click", () => campaignBack());
   document.getElementById("dailyBtn").addEventListener("click", openDaily);
   document.getElementById("dailyBack").addEventListener("click", showHome);
+  // Flip the daily action buttons live as a submission queues and then lands (the
+  // backend resolves the POST asynchronously, and retries can land in the
+  // background while the page is open). Only re-render while the daily page shows.
+  setDailyChangeListener(() => {
+    if (!document.getElementById("dailyView").hidden) renderDailyBody(dayNumber());
+  });
   document.getElementById("puzzlesBack").addEventListener("click", showHome);
   document.getElementById("continueListBtn").addEventListener("click", openPuzzles);
 
@@ -335,9 +344,10 @@ function dailyOf(g) {
 // ---- Puzzle of the day ----
 // The Puzzle of the day: four fixed difficulties, each a deterministic puzzle
 // derived from today's date (daily.js). The home entry opens this page; each
-// difficulty offers Play (unplayed) / Continue (in progress) / Solved, plus a
-// stubbed leaderboard. The generated game is an ordinary force_any custom game
-// tagged `daily`, so it also shows up in Continue and the Stats history.
+// difficulty offers Play (unplayed) / Continue (in progress) / Submit (solved,
+// post the time) / Submitted (uploaded), plus a stubbed leaderboard. The generated
+// game is an ordinary force_any custom game tagged `daily`, so it also shows up in
+// Continue and the Stats history.
 
 // Refresh the home "Puzzle of the day" entry's subtitle: today's date plus a
 // progress hint once any difficulty has been opened.
@@ -360,13 +370,19 @@ function renderDailyEntry() {
 }
 
 // The daily page: a row per difficulty, each with its blurb, a Play/Continue/
-// Solved button keyed off today's stored game, and a stubbed leaderboard.
+// Submit/Submitted button keyed off today's stored game, and a stubbed leaderboard.
 function openDaily() {
   const day = dayNumber();
   setDailyTitle(`Puzzle of the day · ${dayLabel(day)}`);
+  renderDailyBody(day);
+  showView("dailyView");
+}
+
+// (Re)build the per-difficulty cards. Split from openDaily so the change listener
+// can refresh the buttons in place as a submission moves through its states.
+function renderDailyBody(day) {
   const body = document.getElementById("dailyBody");
   body.replaceChildren(...DAILY_LEVELS.map((level, i) => dailyLevelCard(level, i, day)));
-  showView("dailyView");
 }
 
 // One difficulty as a card: name, blurb, the state-dependent action button, and a
@@ -390,8 +406,13 @@ function dailyLevelCard(level, index, day) {
   return card;
 }
 
-// The per-difficulty action: Play when today's puzzle is untouched, Continue while
-// it's in progress, or a disabled "Solved · time" once it's done.
+// The per-difficulty action, keyed off today's stored game and its submit state:
+//   no game            -> "Play"     (active)   start today's puzzle
+//   in progress        -> "Continue" (active)   resume it
+//   solved, unsent     -> "Submit"   (active)   post the time (the deliberate act)
+//   solved, queued     -> "Submit"   (disabled) in the outbox, not yet accepted
+//   solved, accepted   -> "Submitted"(disabled) the backend has it
+// The time sits in the sub line from the solve onward.
 function dailyActionButton(level, index, day) {
   const btn = document.createElement("button");
   btn.className = "mode-btn daily-play";
@@ -402,10 +423,21 @@ function dailyActionButton(level, index, day) {
 
   const g = store.dailyGame(day, index);
   if (g && g.status === "solved") {
-    btn.classList.add("solved");
-    btn.disabled = true;
-    lab.textContent = "Solved";
     sub.textContent = formatDuration(g.elapsedMs);
+    const state = dailySubmitState(g.solve_id);
+    if (state === "submitted") {
+      btn.classList.add("solved");
+      btn.disabled = true;
+      lab.textContent = "Submitted";
+    } else if (state === "pending") {
+      // Queued but not yet accepted: a disabled Submit, retried in the background.
+      btn.classList.add("solved");
+      btn.disabled = true;
+      lab.textContent = "Submit";
+    } else {
+      lab.textContent = "Submit";
+      btn.addEventListener("click", () => submitDaily(g, day));
+    }
   } else if (g) {
     lab.textContent = "Continue";
     sub.textContent = formatDuration(g.elapsedMs);
@@ -419,8 +451,28 @@ function dailyActionButton(level, index, day) {
   return btn;
 }
 
-// The leaderboard placeholder -- a stub until scores are wired (the win screen's
-// Submit is a stub too). Kept as its own element so the real list drops in here.
+// Post a solved daily's time to the backend. Tapping Submit IS the consent, so
+// this bypasses the data-sharing opt-out (recordDailySolve gates on a configured
+// backend alone). Re-render at once so the button drops to its disabled
+// "Submit"/pending look; the change listener flips it to "Submitted" when the POST
+// lands. `g` is the light index record -- it already carries every field below.
+function submitDaily(g, day) {
+  if (!g.daily || !g.solve_id) return;
+  recordDailySolve({
+    solve_id: g.solve_id,
+    day: g.daily.day,
+    level: g.daily.level,
+    seed: g.seed || null,
+    puzzle: g.puzzle,
+    solution: g.solution,
+    solve_ms: Math.round(g.elapsedMs),
+  });
+  renderDailyBody(day);
+}
+
+// The leaderboard placeholder -- a stub until the read path is wired. Submit
+// already uploads daily times (recordDailySolve); only fetching/showing the scores
+// is pending. Kept as its own element so the real list drops in here.
 function dailyLeaderboard() {
   const box = document.createElement("div");
   box.className = "daily-leaderboard";

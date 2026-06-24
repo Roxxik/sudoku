@@ -101,6 +101,32 @@ CREATE TABLE IF NOT EXISTS move_logs (
 );
 ```
 
+A fourth table holds **Puzzle-of-the-day solve times**, kept apart from `solves` because they
+have a different *consent model*: a daily time lands here only when the player taps **Submit**
+(an explicit act that **bypasses** the data-sharing opt-out), whereas `solves` is the passive,
+privacy-gated grader feed. `(day, level)` names the daily puzzle — `day` is the puzzle-day index
+(`daily.js dayNumber`, ticking at 02:30 UTC) and `level` the difficulty's index into
+`DAILY_LEVELS` — and a covering index on `(day, level, solve_ms)` makes the eventual "fastest
+solves for one day/difficulty" leaderboard query an ordered range scan with no table sort. Only
+the **write** path is wired now; the leaderboard read endpoint is deferred. See *Daily solves*.
+
+```sql
+CREATE TABLE IF NOT EXISTS daily_solves (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  solve_id   TEXT    NOT NULL UNIQUE,     -- stable per-puzzle id; resubmit -> INSERT OR IGNORE no-op
+  day        INTEGER NOT NULL,            -- puzzle-day index (daily.js dayNumber)
+  level      INTEGER NOT NULL,            -- difficulty index into DAILY_LEVELS
+  seed       TEXT,                        -- decimal u64 string of the pinned daily seed
+  puzzle     TEXT    NOT NULL,            -- 81 chars, '.' = empty
+  solution   TEXT    NOT NULL,            -- 81 chars
+  solve_ms   INTEGER NOT NULL,            -- final elapsedMs
+  client_version TEXT NOT NULL,
+  created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_daily_solves_day_level
+  ON daily_solves (day, level, solve_ms);
+```
+
 ## The Worker
 
 Plain JS module worker, no build step, no TypeScript. wrangler is the only dependency.
@@ -346,6 +372,44 @@ device info or identifier (the `user_agent` that `/errors` records is *not* sent
 user-facing privacy notice and a possible future opt-in ("use my solve data to improve
 grading") are tracked separately.
 
+## Daily solves
+
+The Puzzle of the day (`daily.js`) has its own **Submit** flow, separate from the passive feeds
+above. The defining difference is *consent*: `recordSolve`/`recordMoves` upload automatically
+**only** when the player has opted into data sharing, whereas tapping **Submit** on a daily IS
+the consent — so a daily submission **bypasses the opt-out** entirely. It is gated on a
+configured backend alone, never on `dataSharingOn`, and `clearOutboxes` (opting out) leaves it
+untouched. The two never share a row: dailies go to `daily_solves`, not `solves`.
+
+**The button is a tri-state**, which the client tracks with two localStorage stores rather than
+one outbox:
+
+- `sudoku.backend.daily.outbox.v1` — the **pending** queue (coalesced per `solve_id`), like the
+  other outboxes; an entry here means *queued, not yet accepted*.
+- `sudoku.backend.daily.done.v1` — a capped list of **accepted** `solve_id`s. A delivered outbox
+  entry is removed, but "Submitted" must persist across that and across sessions, so the final
+  state lives here, not in the (now-empty) outbox.
+
+`dailySubmitState(solve_id)` reads the pair → `submitted` (in done) / `pending` (in outbox) /
+`none`, driving the overview button **Play → Continue → Submit → Submit (disabled, queued) →
+Submitted**. A `setDailyChangeListener` hook lets the page flip the button live as the POST lands
+(or as a background retry succeeds) without a global event bus. Same retry triggers (`online`,
+load) and failure-status policy as `/solves`; on 2xx the `solve_id`s move to the done-set.
+
+```
+POST /daily
+  headers: content-type: application/json, x-api-key: <secret>
+  body:    { "solves": [ { solve_id, day, level, seed, puzzle, solution, solve_ms, client_version }, ... ] }
+  200:     { "inserted": <n> }   // n = rows actually written (INSERT OR IGNORE on solve_id)
+  400:     bad json / a solve failing validation
+  401:     bad/missing x-api-key
+  405:     method other than POST/OPTIONS
+```
+
+The **leaderboard read path is deliberately not wired** — this only stores the daily solves and
+their timings. The `(day, level, solve_ms)` index is laid down now so the eventual top-N query
+lands cheaply.
+
 ## Download script
 
 ```bash
@@ -460,15 +524,18 @@ composes with this for free.
   until then, locked CORS.
 - **Reads / stats endpoints, binary `.sqlite` export, rate limiting / Turnstile** — none needed
   to validate "solves land in a table I can download."
+- **The daily leaderboard read endpoint.** The write path + covering index exist; surfacing the
+  scores is a `GET /daily?day=&level=` (or similar) plus the UI to render it. Deferred.
 
 ## Files this touches
 
 ```
 worker/wrangler.toml        new
-worker/schema.sql           new (+ client_errors table for failure capture)
-worker/src/index.js         new (+ POST /errors route)
-web/backend.js              new (+ outbox/retry + /errors capture)
-web/play.js                 +1 import, +1 call in onSolved()
+worker/schema.sql           new (+ client_errors, move_logs, daily_solves tables)
+worker/src/index.js         new (+ POST /errors, /moves, /daily routes)
+web/backend.js              new (+ solve/move/daily outboxes, retry, /errors capture)
+web/play.js                 + move-sync + daily Submit wiring in the solved screen
+web/home.js                 daily overview tri-state Submit button + listener
 scripts/db-download         new (chmod +x)
 docs/backend-prototype.md   this doc
 ```

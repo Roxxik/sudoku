@@ -2302,10 +2302,11 @@ function updateHintButton() {
 }
 
 // ---- Solved screen ----
-// A daily puzzle gets its own win screen: just a Submit (leaderboard, stubbed) and
-// an X, both returning Home -- no "New puzzle" (the daily is fixed for the day).
-// Everything else shows the standard solved dialog. The backend solve/move sync in
-// onSolved already ran regardless, so this only swaps the dialog.
+// A daily puzzle gets its own win screen: a Submit (posts the day's time -- see
+// wireSolved) and an X (dismiss), both returning Home -- no "New puzzle" (the daily
+// is fixed for the day). Everything else shows the standard solved dialog. The
+// passive backend solve/move sync in onSolved already ran regardless, so this only
+// swaps the dialog.
 function showSolved(finalMs) {
   const daily = !!(game && game.daily);
   const dialog = document.getElementById(daily ? "dailySolvedDialog" : "solvedDialog");
@@ -2888,15 +2889,38 @@ function wireSolved() {
     onNewPuzzle(game);
   });
 
-  // Daily win screen: Submit is a stub (leaderboard not wired yet) and X is the
-  // dismiss -- both just close and return Home for now. The solve already synced to
-  // the backend in onSolved, per the usual privacy gate.
-  const closeDailyHome = () => {
+  // Daily win screen. Submit posts the day's time to the backend's separate daily
+  // table -- an explicit act, so it bypasses the data-sharing opt-out (see
+  // backend.recordDailySolve); the daily overview then shows the puzzle as
+  // submitted. X dismisses WITHOUT posting (the player can still Submit later from
+  // the overview). Both close and return Home. The passive /solves + /moves sync in
+  // onSolved already ran for opted-in players, independent of this.
+  document.getElementById("dailySolvedSubmit").addEventListener("click", () => {
+    submitDaily(game);
     document.getElementById("dailySolvedDialog").close();
     onHome();
-  };
-  document.getElementById("dailySolvedSubmit").addEventListener("click", closeDailyHome);
-  document.getElementById("dailySolvedClose").addEventListener("click", closeDailyHome);
+  });
+  document.getElementById("dailySolvedClose").addEventListener("click", () => {
+    document.getElementById("dailySolvedDialog").close();
+    onHome();
+  });
+}
+
+// Upload a solved daily's time (the win-screen Submit). Reads the current game
+// record (its time, seed, puzzle, and the day/level the daily tag names); no-op if
+// it isn't a daily or predates the stable solve_id.
+function submitDaily(g) {
+  const d = dailyOf(g);
+  if (!d || !g.solve_id) return;
+  backend.recordDailySolve({
+    solve_id: g.solve_id,
+    day: d.day,
+    level: d.level,
+    seed: g.seed || null,
+    puzzle: g.puzzle,
+    solution: g.solution,
+    solve_ms: Math.round(g.elapsedMs),
+  });
 }
 
 // Build the board and wire all controls once. `curriculum` maps kindIndex -> id

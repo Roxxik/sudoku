@@ -108,6 +108,38 @@ export default {
       }));
     }
 
+    // Puzzle-of-the-day solve times. Written to the SEPARATE daily_solves table,
+    // not `solves`: a daily solve lands here only when the player taps Submit (an
+    // explicit act that bypasses the data-sharing opt-out -- see web/backend.js),
+    // so it is kept apart from the passive, privacy-gated /solves feed. Same key
+    // gate and batch shape as /solves; INSERT OR IGNORE on the unique solve_id
+    // makes a resent submission idempotent. The leaderboard READ path isn't wired
+    // yet -- this only stores the solves and their timings.
+    if (url.pathname === "/daily") {
+      if (request.method !== "POST") return cors(new Response("method", { status: 405 }));
+      if (request.headers.get("x-api-key") !== env.API_KEY)
+        return cors(new Response("unauthorized", { status: 401 }));
+
+      let dbody;
+      try { dbody = await request.json(); } catch { return cors(new Response("bad json", { status: 400 })); }
+      const solves = dbody && Array.isArray(dbody.solves) ? dbody.solves : null;
+      if (!solves || !solves.every(validDaily)) return cors(new Response("bad solves", { status: 400 }));
+
+      let inserted = 0;
+      if (solves.length) {
+        const stmt = env.DB.prepare(
+          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solution, solve_ms, client_version) VALUES (?,?,?,?,?,?,?,?)"
+        );
+        const res = await env.DB.batch(
+          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.client_version))
+        );
+        inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+      }
+      return cors(new Response(JSON.stringify({ inserted }), {
+        status: 200, headers: { "content-type": "application/json" },
+      }));
+    }
+
     if (url.pathname !== "/solves") return cors(new Response("not found", { status: 404 }));
     if (request.method !== "POST")  return cors(new Response("method", { status: 405 }));
     if (request.headers.get("x-api-key") !== env.API_KEY)
@@ -140,6 +172,20 @@ export default {
 
 function valid(s) {
   return s && typeof s.solve_id === "string" && s.solve_id.length > 0
+    && typeof s.puzzle === "string"   && s.puzzle.length === 81
+    && typeof s.solution === "string" && s.solution.length === 81
+    && Number.isInteger(s.solve_ms)
+    && (s.seed == null || typeof s.seed === "string")
+    && typeof s.client_version === "string" && s.client_version.length > 0;
+}
+
+// Shape check for a /daily entry. Like valid() plus the (day, level) that names
+// the daily puzzle; both are required integers (the seed merely reproduces the
+// puzzle and may be null on an odd record).
+function validDaily(s) {
+  return s && typeof s.solve_id === "string" && s.solve_id.length > 0
+    && Number.isInteger(s.day)
+    && Number.isInteger(s.level)
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
     && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)

@@ -371,9 +371,9 @@
     </div>
   </dialog>
 
-  <!-- Daily win screen. Like the solved dialog but with a Submit (leaderboard,
-       stubbed) and an X (top-right) -- both return Home for now (play.js). No
-       "New puzzle": the daily is fixed for the day. -->
+  <!-- Daily win screen. Like the solved dialog but with a Submit (posts the day's
+       time to the backend; play.js) and an X (top-right, dismiss) -- both return
+       Home. No "New puzzle": the daily is fixed for the day. -->
   <dialog id="dailySolvedDialog" class="dialog">
     <div class="dialog-body solved-body daily-solved-body">
       <button id="dailySolvedClose" class="iconbtn dialog-close" aria-label="Close">
