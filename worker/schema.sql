@@ -65,9 +65,16 @@ CREATE TABLE IF NOT EXISTS daily_solves (
   puzzle     TEXT    NOT NULL,            -- 81 chars, '.' = empty
   solution   TEXT    NOT NULL,            -- 81 chars
   solve_ms   INTEGER NOT NULL,            -- final elapsedMs
+  hints      INTEGER NOT NULL DEFAULT 0,  -- dual-score axis: distinct hint reveals (0 = clean)
+  cheated    INTEGER NOT NULL DEFAULT 0,  -- backstop: 1 if cheat mode tainted the solve (excluded from the board)
   client_version TEXT NOT NULL,           -- frontend build that submitted this solve
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+-- Adding the dual-score columns to an already-applied DB (they default in for fresh
+-- ones): wrangler d1 execute sudoku --remote --command \
+--   "ALTER TABLE daily_solves ADD COLUMN hints INTEGER NOT NULL DEFAULT 0; \
+--    ALTER TABLE daily_solves ADD COLUMN cheated INTEGER NOT NULL DEFAULT 0;"
+-- (also --local for the dev loop). Not deployed yet, so a fresh apply needs no ALTER.
 
 -- The leaderboard read path is "fastest solves for one (day, level)". This index
 -- covers exactly that: an ordered range scan over (day, level) already sorted by

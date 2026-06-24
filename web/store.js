@@ -39,7 +39,7 @@ function trackKey(id) {
 
 // The fields that live in the per-game heavy key rather than the index. These are
 // the ones that change as you play; everything else is listing metadata.
-const HEAVY_FIELDS = ["value", "centerMarks", "cornerMarks", "history", "redo", "elapsedMs"];
+const HEAVY_FIELDS = ["value", "centerMarks", "cornerMarks", "history", "redo", "elapsedMs", "revealedHints"];
 
 // ---- Low-level load/save ----
 
@@ -217,6 +217,13 @@ function newId() {
 //     a snapshot is { v: number[81], c: number[][81], n: number[][81] } --
 //     value + center/corner marks-as-arrays (legacy snapshots carry `m` -> center),
 //   elapsedMs: accumulated play time,  [heavy = live; index keeps a listing copy]
+//   hints: number of distinct hint entries charged (mistake reveals + technique
+//          locations); 0 on a hint-free solve. The dual-score axis for the daily
+//          leaderboard. Mirrored in the index for a heavy-free read.
+//   cheated: bool   sticky -- true once cheat mode was on at any point this game.
+//                   Disqualifies the daily leaderboard (submitDaily refuses it).
+//   revealedHints: string[]  the charged entry keys, for dedup across reopens/
+//                            sittings, so re-viewing a revealed move is free. [heavy]
 //   status: "active"|"solved",
 //   createdAt, solvedAt (ms epoch, solvedAt null until solved)
 // }
@@ -284,6 +291,15 @@ export function createGame({
     grade: grade || null,
     fromForced: !!fromForced,
     elapsedMs: 0,
+    // Hint accounting (kept in the light index so the daily Submit / listing can
+    // read them without a heavy load). `hints` is the number of distinct hint
+    // entries the player has been charged for (see play.js: a solution-surfaced
+    // mistake, or a technique's location once "Reveal where" exposed it); `cheated`
+    // is the sticky disqualifier -- true once cheat mode was on at any point, which
+    // bars the daily leaderboard. The dedup keys themselves live in the heavy
+    // record (`revealedHints`).
+    hints: 0,
+    cheated: false,
     status: "active",
     createdAt: now,
     lastPlayedAt: now,
@@ -297,6 +313,10 @@ export function createGame({
     history: [],
     redo: [],
     elapsedMs: 0,
+    // Persistent dedup set for the hint counter: entry keys already charged, so a
+    // move re-drilled (or a mistake re-viewed) across panel reopens and sittings is
+    // free to look at again. The count mirrored into the index is its length.
+    revealedHints: [],
   };
   const games = loadIndex();
   games.push(meta);

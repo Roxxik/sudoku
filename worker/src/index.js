@@ -33,6 +33,12 @@ export default {
       return resp;
     };
 
+    // Guard the whole routing body: a thrown handler error (e.g. a D1 schema
+    // drift) would otherwise escape as a bare 500 with no CORS header, which the
+    // browser reports only as an opaque CORS failure. Catch it, log it, and return
+    // the 500 WITH the CORS header so the real status reaches the client and the
+    // stack reaches the worker log. (Indented flat -- it wraps the entire body.)
+    try {
     if (request.method === "OPTIONS") {
       // CORS preflight for the cross-origin requests from Pages: the POST writes
       // and the GET that reads the daily leaderboard (the lone read path). The
@@ -136,8 +142,9 @@ export default {
 
         const levelRaw = url.searchParams.get("level");
         if (levelRaw === null) {
+          // Teaser counts exclude cheat-tainted solves (they never rank).
           const rows = await env.DB.prepare(
-            "SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? GROUP BY level"
+            "SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? AND cheated = 0 GROUP BY level"
           ).bind(day).all();
           const counts = {};
           for (const r of rows.results) counts[r.level] = r.n;
@@ -148,11 +155,16 @@ export default {
 
         const level = intParam(url, "level");
         if (level === null) return cors(new Response("bad level", { status: 400 }));
+        // Cheat-tainted solves never rank (a client backstop -- they shouldn't reach
+        // here at all). The board ranks by HINTS first, then time: a clean solve
+        // outranks any hinted one, ties broken by the faster time. `hints` parallels
+        // `times` in that rank order (the dual-score column).
         const rows = await env.DB.prepare(
-          "SELECT solve_ms FROM daily_solves WHERE day = ? AND level = ? ORDER BY solve_ms, created_at"
+          "SELECT solve_ms, hints FROM daily_solves WHERE day = ? AND level = ? AND cheated = 0 ORDER BY hints, solve_ms, created_at"
         ).bind(day, level).all();
         const times = rows.results.map((r) => r.solve_ms);
-        return cors(new Response(JSON.stringify({ day, level, count: times.length, times }), {
+        const hints = rows.results.map((r) => r.hints);
+        return cors(new Response(JSON.stringify({ day, level, count: times.length, times, hints }), {
           status: 200, headers: { "content-type": "application/json" },
         }));
       }
@@ -169,10 +181,10 @@ export default {
       let inserted = 0;
       if (solves.length) {
         const stmt = env.DB.prepare(
-          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solution, solve_ms, client_version) VALUES (?,?,?,?,?,?,?,?)"
+          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solution, solve_ms, hints, cheated, client_version) VALUES (?,?,?,?,?,?,?,?,?,?)"
         );
         const res = await env.DB.batch(
-          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.client_version))
+          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.hints ?? 0, s.cheated ? 1 : 0, s.client_version))
         );
         inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
       }
@@ -208,6 +220,10 @@ export default {
     return cors(new Response(JSON.stringify({ inserted }), {
       status: 200, headers: { "content-type": "application/json" },
     }));
+    } catch (e) {
+      console.error("worker error:", (e && e.stack) || e);
+      return cors(new Response("internal error", { status: 500 }));
+    }
   },
 };
 
@@ -231,7 +247,9 @@ function valid(s) {
 
 // Shape check for a /daily entry. Like valid() plus the (day, level) that names
 // the daily puzzle; both are required integers (the seed merely reproduces the
-// puzzle and may be null on an odd record).
+// puzzle and may be null on an odd record). `hints` (dual score) and `cheated`
+// (backstop flag) are optional -- an older client omits them, defaulting at bind
+// time -- but if present must be the right shape.
 function validDaily(s) {
   return s && typeof s.solve_id === "string" && s.solve_id.length > 0
     && Number.isInteger(s.day)
@@ -240,6 +258,8 @@ function validDaily(s) {
     && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)
     && (s.seed == null || typeof s.seed === "string")
+    && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0))
+    && (s.cheated == null || typeof s.cheated === "boolean" || s.cheated === 0 || s.cheated === 1)
     && typeof s.client_version === "string" && s.client_version.length > 0;
 }
 

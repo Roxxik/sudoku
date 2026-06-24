@@ -433,8 +433,15 @@ function dailyActionButton(level, index, day) {
   sub.className = "mb-sub";
 
   const g = store.dailyGame(day, index);
-  if (g && g.status === "solved") {
+  if (g && g.status === "solved" && g.cheated) {
+    // Cheat mode tainted the solve: it can never reach the leaderboard, so there is
+    // no Submit -- just a disabled disqualified state showing the time.
+    btn.classList.add("solved");
+    btn.disabled = true;
+    lab.textContent = "Disqualified";
     sub.textContent = formatDuration(g.elapsedMs);
+  } else if (g && g.status === "solved") {
+    sub.textContent = hintSubLabel(g);
     const state = dailySubmitState(g.solve_id);
     if (state === "submitted") {
       btn.classList.add("solved");
@@ -468,7 +475,7 @@ function dailyActionButton(level, index, day) {
 // "Submit"/pending look; the change listener flips it to "Submitted" when the POST
 // lands. `g` is the light index record -- it already carries every field below.
 function submitDaily(g, day) {
-  if (!g.daily || !g.solve_id) return;
+  if (!g.daily || !g.solve_id || g.cheated) return; // cheat-tainted solves are disqualified
   recordDailySolve({
     solve_id: g.solve_id,
     day: g.daily.day,
@@ -477,8 +484,18 @@ function submitDaily(g, day) {
     puzzle: g.puzzle,
     solution: g.solution,
     solve_ms: Math.round(g.elapsedMs),
+    hints: g.hints || 0,
+    cheated: !!g.cheated,
   });
   renderDailyBody(day);
+}
+
+// The solved-card sub-line: solve time, plus the dual-score hint tally so the
+// overview shows at a glance whether a solve was clean.
+function hintSubLabel(g) {
+  const time = formatDuration(g.elapsedMs);
+  const n = g.hints || 0;
+  return n === 0 ? `${time} · hint-free` : `${time} · ${n} ${n === 1 ? "hint" : "hints"}`;
 }
 
 // The per-card leaderboard slot. Rendered synchronously with a "loading" state and
@@ -537,7 +554,9 @@ function renderDailyTeaser(box, count, g, joined) {
   let text;
   if (count <= 0) text = "Be the first to solve";
   else text = count === 1 ? "1 solved today" : `${count} solved today`;
-  if (!joined && g && g.status === "solved") text += " · Submit to see where you rank";
+  // Nudge a solved-but-not-submitted player to join -- but not a cheat-disqualified
+  // one, who can't submit (no nudge they could act on).
+  if (!joined && g && g.status === "solved" && !g.cheated) text += " · Submit to see where you rank";
   box.textContent = text;
 }
 
@@ -547,12 +566,22 @@ function renderDailyTeaser(box, count, g, joined) {
 // fetched times yet, so their own time is spliced in at its sorted position.
 function renderDailyBoard(box, board, g, state) {
   const mine = Math.round(g.elapsedMs);
+  const mineHints = g.hints || 0;
   const times = board.times.slice();
+  const hints = board.hints.slice(); // parallels times, in (hints, time) rank order
+  // The board ranks by HINTS first, then time: a clean solve outranks any hinted
+  // one, ties broken by the faster time. The server already returns the field in
+  // that order; the player's own splice and rank below use the same comparator.
+  const iBeat = (h, t) => mineHints < h || (mineHints === h && mine < t);   // mine strictly better than (h,t)
+  const beatsMe = (h, t) => h < mineHints || (h === mineHints && t < mine); // (h,t) strictly better than mine
   if (state !== "submitted") {
-    // Pending: not in the backend list yet -- show the projected standing.
-    let at = times.findIndex((t) => t > mine);
-    if (at < 0) at = times.length;
+    // Pending: not in the backend list yet -- splice the player's own (hints, time)
+    // in at its rank position (after every entry that beats-or-ties, before the
+    // first one mine beats).
+    let at = 0;
+    while (at < times.length && !iBeat(hints[at], times[at])) at++;
     times.splice(at, 0, mine);
+    hints.splice(at, 0, mineHints);
   }
   const total = times.length;
 
@@ -566,10 +595,12 @@ function renderDailyBoard(box, board, g, state) {
     return;
   }
 
-  // Competition rank: one past everyone strictly faster (ties share the top slot).
-  let strictlyFaster = 0;
-  while (strictlyFaster < total && times[strictlyFaster] < mine) strictlyFaster++;
-  const rank = strictlyFaster + 1;
+  // Competition rank: one past everyone strictly better on (hints, then time);
+  // ties (same hints AND same time) share the slot. The better entries are the
+  // contiguous prefix, since the list is in rank order.
+  let better = 0;
+  while (better < total && beatsMe(hints[better], times[better])) better++;
+  const rank = better + 1;
 
   box.classList.add("has-board");
   box.replaceChildren();
@@ -594,7 +625,14 @@ function renderDailyBoard(box, board, g, state) {
       t.className = "lb-time";
       const ms = times[row - 1];
       t.textContent = ms == null ? "—" : formatDuration(ms);
-      line.append(r, t);
+      // The dual score: a hint tally per row -- "clean" (green) for a hint-free
+      // solve, otherwise the count -- so the board ranks on time but shows who
+      // earned it without help.
+      const h = document.createElement("span");
+      const n = hints[row - 1];
+      h.className = "lb-hints" + (n === 0 ? " clean" : "");
+      h.textContent = ms == null ? "" : n === 0 ? "clean" : `${n}h`;
+      line.append(r, t, h);
     }
     box.appendChild(line);
   }

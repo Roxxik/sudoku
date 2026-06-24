@@ -446,7 +446,9 @@ function validDailyPayload(s) {
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
     && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)
-    && (s.seed == null || typeof s.seed === "string");
+    && (s.seed == null || typeof s.seed === "string")
+    && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0))
+    && (s.cheated == null || typeof s.cheated === "boolean");
 }
 
 // The submit state of one daily, by its solve_id, for the overview button:
@@ -598,7 +600,16 @@ export async function fetchDailyBoard(day, level) {
     if (!resp.ok) return null;
     const body = await resp.json();
     if (!body || !Array.isArray(body.times)) return null;
-    return { count: typeof body.count === "number" ? body.count : body.times.length, times: body.times };
+    // `hints` parallels `times` (same ascending-time order) -- the dual-score axis.
+    // Tolerate an older worker that omits it by falling back to an all-zero column.
+    const hints = Array.isArray(body.hints) && body.hints.length === body.times.length
+      ? body.hints
+      : body.times.map(() => 0);
+    return {
+      count: typeof body.count === "number" ? body.count : body.times.length,
+      times: body.times,
+      hints,
+    };
   } catch (err) {
     if (debug) console.warn("[backend] daily board GET failed:", err);
     return null;

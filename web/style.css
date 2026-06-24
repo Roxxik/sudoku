@@ -657,16 +657,20 @@ summary > span:first-of-type { flex: 1; }
   color: var(--text);
   margin-bottom: 4px;
 }
-/* One rank row: rank number left, time right, tabular figures so times align. */
+/* One rank row: rank number left, time next, hint tally right. Tabular figures so
+   times align; the time flexes to push the hint column to the right edge. */
 .lb-row {
   display: flex;
-  justify-content: space-between;
+  gap: 10px;
   padding: 2px 6px;
   border-radius: 5px;
   font-variant-numeric: tabular-nums;
 }
-.lb-rank { color: var(--mark); }
-.lb-time { color: var(--text); }
+.lb-rank { color: var(--mark); min-width: 2.2em; }
+.lb-time { color: var(--text); flex: 1; }
+/* The dual-score column: muted hint count, green when the solve was hint-free. */
+.lb-hints { color: var(--mark); font-size: 0.85rem; }
+.lb-hints.clean { color: var(--ok); }
 /* The player's own row, highlighted in the selection wash. */
 .lb-row.lb-you {
   background: var(--cell-sel);
@@ -738,6 +742,18 @@ summary > span:first-of-type { flex: 1; }
   color: var(--accent);
 }
 .solved-actions { display: flex; flex-direction: column; gap: 8px; }
+
+/* Daily win screen extras: the dual-score hint line and the cheat disqualifier. */
+.solved-hints { margin: -10px 0 16px; font-size: 0.95rem; font-weight: 600; color: var(--mark); }
+.solved-dq {
+  margin: 0 0 14px;
+  font-size: 0.9rem;
+  color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.solved-dq[hidden] { display: none; }
 
 /* Daily win screen: an X in the top-right corner over the centred solved body. */
 .daily-solved-body { position: relative; }
@@ -1038,6 +1054,32 @@ summary > span:first-of-type { flex: 1; }
   touch-action: manipulation;
 }
 .hint-apply { background: var(--accent); color: #10131a; border-color: var(--accent); }
+
+/* "Reveal where" charges a hint -- tint it so the cost reads before the tap. */
+.hint-more.costs { border-color: var(--warn); color: var(--warn); }
+
+/* Running hint tally in the panel header. Sits between the title and the close
+   button; bumps (a brief scale pulse) when a reveal charges one so the player sees
+   it tick. Turns red once the game is cheat-tainted (a daily disqualifier). */
+.hint-count {
+  flex: none;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+  white-space: nowrap;
+}
+.hint-count[hidden] { display: none; }
+.hint-count.cheated { background: color-mix(in srgb, var(--bad) 20%, transparent); color: var(--bad); }
+.hint-count.bumped { animation: hint-bump 0.32s ease-out; }
+@keyframes hint-bump {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.22); }
+  100% { transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) { .hint-count.bumped { animation: none; } }
 
 /* The Hint button flips colour while cheat mode is on (persistent indicator). */
 .key.cheat { background: var(--accent); color: #10131a; border-color: var(--accent); }

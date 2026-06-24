@@ -66,6 +66,19 @@ let timerBase = 0; // accumulated ms from prior sessions / before the last resum
 let runStart = null; // performance.now() while the clock is running, else null
 let finished = false; // true once solved -- freezes the timer
 
+// Hint accounting. `revealedHints` is the persistent set of entry keys already
+// shown this game (a mistake the solution-check surfaced, or a technique's location
+// once "Reveal where" exposed it) -- the dedup memory that keeps a re-look free
+// across panel reopens and sittings. `hintCount` is the score the player sees and
+// the daily ranks on; it is tracked separately from the set's size because a
+// mistake check charges once per discovery, not once per offending cell (see the
+// hint-accounting section). `cheatedThisGame` is the sticky disqualifier: true once
+// cheat mode was on at any point, which bars the daily leaderboard (see
+// submitDaily). All three are restored from / persisted to the game record.
+let revealedHints = new Set();
+let hintCount = 0;
+let cheatedThisGame = false;
+
 // Navigation callbacks supplied by the app shell.
 let onHome = () => {};
 let onNewPuzzle = () => {};
@@ -302,7 +315,98 @@ function persist() {
     history: history.map(snapshotToJSON),
     redo: redoStack.map(snapshotToJSON),
     elapsedMs: elapsedMs(),
+    revealedHints: [...revealedHints],
   });
+}
+
+// ---- Hint accounting ----
+// `hintCount` is the score; `revealedHints` is the dedup memory (which entries have
+// already been shown). They are kept separate on purpose: a technique location
+// charges one per spot (one key, one point), but a mistake check charges one per
+// DISCOVERY -- finding two wrong cells at once is still a single "you have a
+// mistake" hint -- while still marking every current offender known so re-checking
+// the same slip is free. So the count is not simply the set size.
+
+// Persist the hint counter + sticky cheat flag into the light index (so the daily
+// Submit / listing read them without a heavy load); the dedup keys ride along in
+// the heavy record via persist() above. Cheap and rare (a charge happens only on a
+// deliberate hint action), so the extra index write is fine off the hot path.
+function saveHintState() {
+  if (!game) return;
+  persist();
+  store.updateGame(game.id, { hints: hintCount, cheated: cheatedThisGame });
+  updateHintBadge();
+}
+
+// Charge the location of a technique's move: one hint the first time this exact
+// spot is drilled, free forever after (re-drilled now or after a reopen), and a
+// different spot is its own charge (the per-spot rule).
+function chargeLocation(step) {
+  const key = locationKey(step);
+  if (revealedHints.has(key)) return;
+  revealedHints.add(key);
+  hintCount += 1;
+  saveHintState();
+}
+
+// Charge a mistake the solution-check surfaced. Costs one hint per discovery: a
+// charge only when the check reveals a wrong cell the player hasn't been told about
+// yet, and then every current offender is marked known so re-opening on the same
+// unresolved slip is free (a clean board never charges at all). Keyed per cell+value
+// so correcting a slip and making a different one is a fresh discovery. `cells` are
+// the offending cells; `kind` distinguishes a wrong entry from a wrong pencil mark.
+function chargeMistake(kind, cells) {
+  const keys = cells.map((c) => `miss|${kind}|${c}:${value[c]}`);
+  // Every offender already known -> a free re-check, nothing to charge or persist.
+  if (keys.every((k) => revealedHints.has(k))) return;
+  for (const k of keys) revealedHints.add(k); // mark all current offenders known
+  hintCount += 1;
+  saveHintState();
+}
+
+// Mark this game cheat-tainted (sticky). Called whenever cheat mode is observed on
+// -- at load and on every toggle-on -- so a single moment of cheat disqualifies the
+// daily even if it is switched back off before solving.
+function noteCheat() {
+  if (cheatedThisGame || !game) return;
+  cheatedThisGame = true;
+  store.updateGame(game.id, { cheated: true });
+  updateHintBadge();
+}
+
+// The dedup key for a technique's location entry: the technique plus the exact spot
+// it acts on (its focus cells and the deductions it makes), so the same move
+// re-drilled later is recognised and not recharged, while a different instance of
+// the same technique is its own entry (the per-spot rule).
+function locationKey(step) {
+  const focus = (step.focusCells || []).slice().sort((a, b) => a - b).join(".");
+  const ded = step.deductions.map((d) => `${d.cell}:${d.digit}:${d.kind}`).sort().join(",");
+  return `loc|${step.technique.id}|${focus}|${ded}`;
+}
+
+// A reveal stage that exposes WHERE a move goes (anything past the free tier/name
+// nudge) -- the first such step on a row is the charge point for its location entry.
+function isLocationStage(stage) {
+  return stage && stage !== "tier" && stage !== "name";
+}
+
+// Reflect the current hint count in the panel header badge, flashing it briefly so
+// a fresh charge is visible at the moment it happens.
+function updateHintBadge() {
+  const badge = document.getElementById("hintCount");
+  if (!badge) return;
+  const n = hintCount;
+  // Nothing to show on an untouched, un-cheated game; a cheat-tainted game shows the
+  // badge even at zero hints so the disqualifier is visible.
+  badge.hidden = n === 0 && !cheatedThisGame;
+  badge.textContent = cheatedThisGame
+    ? (n ? `${n} ${n === 1 ? "hint" : "hints"} · cheat` : "cheat")
+    : n === 1 ? "1 hint" : `${n} hints`;
+  badge.classList.toggle("cheated", cheatedThisGame);
+  // Restart the bump animation: remove, force reflow, re-add.
+  badge.classList.remove("bumped");
+  void badge.offsetWidth;
+  badge.classList.add("bumped");
 }
 
 // Refresh the index's listing copy of the timer and last-played time so the
@@ -1679,6 +1783,11 @@ function openHint(reason = "auto") {
   const solved = solvedErrorCells();
   if (solved.length) {
     hintTitle("Mistake");
+    // The solution-check found a wrong entry -- information the player didn't have,
+    // so a deliberate consultation pays one hint (deduped: re-opening on the same
+    // unresolved slip is free; a different slip later is a fresh charge). The panel
+    // still doesn't reveal WHERE until "Show me where" is tapped.
+    if (reason === "user") chargeMistake("solved", solved);
     body.replaceChildren(errorStage("solved", solved));
     showPanel();
     logOpen("solvedError");
@@ -1724,6 +1833,11 @@ function openHint(reason = "auto") {
   const masks = specMasksFor(wasm);
   const wrong = wrongMarkCells();
   const stale = staleMarkCells();
+  // A wrong pencil mark (one that excludes the correct digit) is solution-derived,
+  // so it costs a hint like a wrong entry does -- deduped by the offending cells.
+  // Stale marks and an all-clear board cost nothing: the player could derive those
+  // from their own placements, so checking stays free and frequent.
+  if (reason === "user" && wrong.length) chargeMistake("wrong", wrong);
   hintTitle("Hint");
   body.replaceChildren(statusStage(steps, masks, wrong, stale));
   showPanel();
@@ -2140,12 +2254,20 @@ function buildStepRow(step, group, lead) {
     const ctl = document.createElement("div");
     ctl.className = "hint-row-ctl";
     if (r < stages.length - 1) {
+      // Revealing tier -> name is a free nudge ("there's a Hidden Single"). The
+      // first step that exposes WHERE it goes charges one hint, once per this exact
+      // move (deduped by locationKey), so re-drilling it -- now or after a reopen --
+      // is free, and a different spot is its own charge. Label the button so the
+      // player knows before they tap whether it costs.
+      const next = stages[r + 1];
+      const willCharge = isLocationStage(next) && !revealedHints.has(locationKey(step));
       const more = document.createElement("button");
-      more.className = "hint-more";
-      more.textContent = "Reveal more";
+      more.className = "hint-more" + (willCharge ? " costs" : "");
+      more.textContent = willCharge ? "Reveal where (+1 hint)" : "Reveal more";
       more.addEventListener("click", (e) => {
         e.stopPropagation();
         r += 1;
+        if (isLocationStage(stages[r])) chargeLocation(step);
         tracker.track("hintReveal", { technique: step.technique.id, stage: stages[r] });
         refresh();
         focusRow(li, step, stages[r]);
@@ -2292,6 +2414,9 @@ function setCheat(on) {
   } catch {
     /* ignore */
   }
+  // Turning cheat on taints the game for good (sticky), disqualifying its daily
+  // submission even if it's switched back off before the solve.
+  if (on) noteCheat();
   tracker.track("cheatToggle", { on });
   updateHintButton();
   updateSeedLine();
@@ -2317,6 +2442,16 @@ function showSolved(finalMs) {
   const dialog = document.getElementById(daily ? "dailySolvedDialog" : "solvedDialog");
   document.getElementById(daily ? "dailySolvedTime" : "solvedTime").textContent =
     formatDuration(finalMs);
+  if (daily) {
+    // Surface the dual score, and swap Submit for a disqualified note when cheat
+    // mode tainted the solve (it can't be ranked).
+    const n = hintCount;
+    document.getElementById("dailySolvedHints").textContent =
+      n === 0 ? "Hint-free" : `${n} ${n === 1 ? "hint" : "hints"} used`;
+    const dq = !!cheatedThisGame;
+    document.getElementById("dailySolvedSubmit").hidden = dq;
+    document.getElementById("dailySolvedDq").hidden = !dq;
+  }
   dialog.showModal();
 }
 
@@ -2349,6 +2484,15 @@ export function loadGame(g) {
   finished = g.status === "solved";
   timerBase = g.elapsedMs || 0;
   runStart = null;
+
+  // Restore the hint accounting for this game (the persistent dedup set + the
+  // sticky cheat flag). If cheat mode is on right now, this sitting taints the game
+  // even if nothing cheat-y is used -- the flag is set the moment cheat is observed.
+  revealedHints = new Set(g.revealedHints || []);
+  hintCount = g.hints || 0;
+  cheatedThisGame = !!g.cheated;
+  if (cheatOn()) noteCheat();
+  updateHintBadge();
 
   // Open a tracking session for this sitting. beginSession flushes the previous
   // game's log first, then loads this game's so a puzzle resumed across sittings
@@ -2917,6 +3061,9 @@ function wireSolved() {
 function submitDaily(g) {
   const d = dailyOf(g);
   if (!d || !g.solve_id) return;
+  // Cheat mode at any point disqualifies the daily leaderboard, so a tainted solve
+  // never reaches the outbox (the win screen / overview also surface this state).
+  if (g.cheated) return;
   backend.recordDailySolve({
     solve_id: g.solve_id,
     day: d.day,
@@ -2925,6 +3072,10 @@ function submitDaily(g) {
     puzzle: g.puzzle,
     solution: g.solution,
     solve_ms: Math.round(g.elapsedMs),
+    // The dual-score axis: how many hints the solve leaned on (0 = clean). cheated
+    // rides along too -- always false here, but stored server-side as a backstop.
+    hints: g.hints || 0,
+    cheated: !!g.cheated,
   });
 }
 

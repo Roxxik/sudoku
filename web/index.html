@@ -286,6 +286,9 @@
       <section id="hintPanel" class="hint-panel" hidden>
         <div class="hint-head">
           <h2 id="hintTitle">Hint</h2>
+          <!-- Running hint tally for this game; ticks (bumps) when a reveal charges
+               one. Hidden at zero so an untouched solve shows nothing. -->
+          <span id="hintCount" class="hint-count" hidden>0 hints</span>
           <button id="hintClose" class="iconbtn" aria-label="Close hint">
             <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
               <path fill="currentColor" d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2"/>
@@ -383,6 +386,10 @@
       </button>
       <h2>Daily solved</h2>
       <p class="solved-time" id="dailySolvedTime"></p>
+      <!-- Dual score: how many hints the solve used (or "Hint-free"). -->
+      <p class="solved-hints" id="dailySolvedHints"></p>
+      <!-- Shown instead of Submit when cheat mode tainted the solve. -->
+      <p class="solved-dq" id="dailySolvedDq" hidden>Cheat mode was on, so this solve can't be submitted to the leaderboard.</p>
       <div class="solved-actions">
         <button id="dailySolvedSubmit" class="key wide">Submit</button>
       </div>
