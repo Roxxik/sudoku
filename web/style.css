@@ -624,8 +624,9 @@ summary > span:first-of-type { flex: 1; }
 /* The action button fills the card width (vs the campaign's two-up mode grid). */
 .daily-play { width: 100%; }
 .daily-play[disabled] { cursor: default; opacity: 0.85; }
-/* Leaderboard placeholder until scores are wired (the win-screen Submit is a stub
-   too). A dashed box marks where the real list will drop in. */
+/* Leaderboard slot. Default (loading / pre-join teaser): a dashed, centred, muted
+   line -- the solver count or a nudge. Once the player has joined the board it gets
+   `.has-board` and becomes the windowed rank list below. */
 .daily-leaderboard {
   text-align: center;
   font-size: 0.78rem;
@@ -633,6 +634,52 @@ summary > span:first-of-type { flex: 1; }
   border: 1px dashed var(--line);
   border-radius: 8px;
   padding: 10px 8px;
+}
+/* First solver: keep the centred placeholder shape but mark the milestone in the
+   success colour rather than the muted teaser grey. */
+.daily-leaderboard.first {
+  color: var(--ok);
+  font-weight: 600;
+}
+/* The real board: a solid panel with a left-aligned list of rank/time rows. */
+.daily-leaderboard.has-board {
+  text-align: left;
+  border-style: solid;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+/* "#rank of total" -- the standing, which carries the field size even when the
+   player's row is windowed away from the leaders. */
+.lb-head {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+/* One rank row: rank number left, time right, tabular figures so times align. */
+.lb-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.lb-rank { color: var(--mark); }
+.lb-time { color: var(--text); }
+/* The player's own row, highlighted in the selection wash. */
+.lb-row.lb-you {
+  background: var(--cell-sel);
+  font-weight: 600;
+}
+.lb-row.lb-you .lb-rank,
+.lb-row.lb-you .lb-time { color: var(--text); }
+/* The collapsed-range marker between the leaders and the player's neighbourhood. */
+.lb-gap {
+  text-align: center;
+  color: var(--mark);
+  line-height: 0.8;
+  padding: 1px 0;
 }
 
 /* ---- Stats page ---- */

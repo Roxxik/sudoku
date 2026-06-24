@@ -34,11 +34,14 @@ export default {
     };
 
     if (request.method === "OPTIONS") {
-      // CORS preflight for the cross-origin POST from Pages.
+      // CORS preflight for the cross-origin requests from Pages: the POST writes
+      // and the GET that reads the daily leaderboard (the lone read path). The
+      // x-api-key header makes the GET non-simple, so it preflights too; the long
+      // Max-Age means that costs one round trip a day, not one per board fetch.
       return cors(new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
           "Access-Control-Allow-Headers": "content-type, x-api-key",
           "Access-Control-Max-Age": "86400",
         },
@@ -116,6 +119,44 @@ export default {
     // makes a resent submission idempotent. The leaderboard READ path isn't wired
     // yet -- this only stores the solves and their timings.
     if (url.pathname === "/daily") {
+      // Read path: the daily leaderboard. Two shapes, both anonymous (times only,
+      // no identity is stored -- see daily_solves):
+      //   GET /daily?day=D          -> { day, counts: { level: n } }  (overview teaser)
+      //   GET /daily?day=D&level=L  -> { day, level, count, times: [ms asc] }  (one board)
+      // Same key gate as the writes. The board ships the FULL ordered time list:
+      // the client needs the total and the times around the player's rank to render
+      // its window, and at the friends-scale this feed serves that is a few rows,
+      // not a payload worth paginating. Indexed by (day, level, solve_ms) so neither
+      // query sorts a table.
+      if (request.method === "GET") {
+        if (request.headers.get("x-api-key") !== env.API_KEY)
+          return cors(new Response("unauthorized", { status: 401 }));
+        const day = intParam(url, "day");
+        if (day === null) return cors(new Response("bad day", { status: 400 }));
+
+        const levelRaw = url.searchParams.get("level");
+        if (levelRaw === null) {
+          const rows = await env.DB.prepare(
+            "SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? GROUP BY level"
+          ).bind(day).all();
+          const counts = {};
+          for (const r of rows.results) counts[r.level] = r.n;
+          return cors(new Response(JSON.stringify({ day, counts }), {
+            status: 200, headers: { "content-type": "application/json" },
+          }));
+        }
+
+        const level = intParam(url, "level");
+        if (level === null) return cors(new Response("bad level", { status: 400 }));
+        const rows = await env.DB.prepare(
+          "SELECT solve_ms FROM daily_solves WHERE day = ? AND level = ? ORDER BY solve_ms, created_at"
+        ).bind(day, level).all();
+        const times = rows.results.map((r) => r.solve_ms);
+        return cors(new Response(JSON.stringify({ day, level, count: times.length, times }), {
+          status: 200, headers: { "content-type": "application/json" },
+        }));
+      }
+
       if (request.method !== "POST") return cors(new Response("method", { status: 405 }));
       if (request.headers.get("x-api-key") !== env.API_KEY)
         return cors(new Response("unauthorized", { status: 401 }));
@@ -169,6 +210,15 @@ export default {
     }));
   },
 };
+
+// A required integer query param, or null if absent / not a base-10 integer. Used
+// by the GET /daily read path to parse day and level (both small non-negative
+// ints); a malformed value 400s rather than silently scanning the wrong key.
+function intParam(url, name) {
+  const raw = url.searchParams.get(name);
+  if (raw === null || !/^-?\d+$/.test(raw)) return null;
+  return Number(raw);
+}
 
 function valid(s) {
   return s && typeof s.solve_id === "string" && s.solve_id.length > 0

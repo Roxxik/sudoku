@@ -145,3 +145,49 @@ function setUsage(curriculum, usages, id, code) {
   const t = curriculum.find((e) => e.id === id);
   if (t) usages[t.kindIndex] = code;
 }
+
+// ---- Leaderboard windowing ----
+// The post-solve daily board can grow past a screen, so it is rendered as a fixed
+// window rather than the whole list. This pure selector decides WHICH ranks to
+// show for a player sitting at `rank` of `total` (both 1-based, total >= 1). It
+// returns a list whose entries are either a rank number (a row to render, looked
+// up as times[rank-1] by the caller) or the string "gap" -- a single collapsed
+// "..." marker standing in for the hidden ranks between the top anchor and the
+// player's neighbourhood.
+//
+// Shape, by design (settled with the rules below in mind):
+//   * Cap at LEADERBOARD_CAP rendered rows, ALWAYS filled to the cap when the field
+//     is large enough -- a rank-1 player still sees ranks 1..9, not just a stub.
+//   * Small field (total <= cap): no windowing, just show everyone.
+//   * Large field: anchor the top 3, show the player with +/-2 neighbours, and
+//     collapse the range between with exactly ONE gap marker (the marker itself
+//     occupies one of the capped rows, so the row count stays constant).
+//   * No trailing gap below the player's band and no separate last-place anchor:
+//     the "#rank of total" header the caller draws already conveys the unseen tail.
+export const LEADERBOARD_CAP = 9;
+
+export function leaderboardWindow(rank, total) {
+  const cap = LEADERBOARD_CAP;
+  if (total <= cap) return range(1, total); // small field: the whole board fits.
+
+  // Large field. If the player (with +/-2 context) fits inside the top `cap`, just
+  // show a contiguous 1..cap -- no gap needed, and it stays filled to the cap.
+  if (rank + 2 <= cap) return range(1, cap);
+
+  // Deeper down: top anchor (1..TOP) + a gap marker + a band of the remaining rows
+  // centred on the player. TOP + 1 (gap) + band = cap, so the band is cap-TOP-1
+  // rows. The band ends at the player's +2 (clamped to the last rank) and runs back
+  // `band` rows; with rank >= cap-1 here, it always starts past the top anchor, so
+  // the gap is real (never a zero-width "...").
+  const TOP = 3;
+  const band = cap - TOP - 1;
+  const bandEnd = Math.min(rank + 2, total);
+  const bandStart = bandEnd - (band - 1);
+  return [...range(1, TOP), "gap", ...range(bandStart, bandEnd)];
+}
+
+function range(a, b) {
+  const out = [];
+  for (let i = a; i <= b; i++) out.push(i);
+  return out;
+}

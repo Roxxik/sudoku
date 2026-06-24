@@ -549,6 +549,62 @@ export function recordDailySolve(solve) {
   flushDailyOutbox();
 }
 
+// ---- Daily leaderboard read ----
+// The READ side of the daily board (the writes are the outbox above). Reading the
+// public, anonymous leaderboard is NOT "sharing your data", so -- unlike /solves --
+// these gate on CONFIGURED alone, never on the data-sharing opt-out: an opted-out
+// player still sees where the day's times landed. Both are awaited by the UI (they
+// return data, not fire-and-forget) and never throw -- any failure (offline,
+// unconfigured, a bad response) degrades to an empty/null result so the overview
+// simply shows no board rather than breaking the page. The x-api-key header is the
+// same speed-bump gate the writes use; it makes the GET preflight (cached a day).
+
+// Per-level solver counts for one puzzle-day: { level: n }. Drives the overview's
+// pre-solve teaser ("N solved today"), which deliberately ships counts only, no
+// times -- the times are the post-solve reward. Returns an object on success (a
+// day with no solves yet is a real {}), or NULL when the board can't be read at all
+// (unconfigured / offline / bad response) so the UI shows "unavailable" rather than
+// passing off "no backend" as "be the first".
+export async function fetchDailyCounts(day) {
+  if (!CONFIGURED) return null;
+  const debug = cheatOn();
+  try {
+    const resp = await fetch(`${DAILY_ENDPOINT}?day=${encodeURIComponent(day)}`, {
+      headers: { "x-api-key": API_KEY },
+    });
+    if (debug) console.log(`[backend] daily counts GET (day ${day}) -> ${resp.status}`);
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    return body && body.counts && typeof body.counts === "object" ? body.counts : {};
+  } catch (err) {
+    if (debug) console.warn("[backend] daily counts GET failed:", err);
+    return null;
+  }
+}
+
+// The full ordered board for one (day, level): { count, times } with times the
+// ascending solve_ms list (anonymous -- the table stores no identity). The caller
+// locates the player's own time in it to compute a rank and window. Returns null
+// on any failure (the overview then falls back to the teaser).
+export async function fetchDailyBoard(day, level) {
+  if (!CONFIGURED) return null;
+  const debug = cheatOn();
+  try {
+    const resp = await fetch(
+      `${DAILY_ENDPOINT}?day=${encodeURIComponent(day)}&level=${encodeURIComponent(level)}`,
+      { headers: { "x-api-key": API_KEY } },
+    );
+    if (debug) console.log(`[backend] daily board GET (day ${day}, level ${level}) -> ${resp.status}`);
+    if (!resp.ok) return null;
+    const body = await resp.json();
+    if (!body || !Array.isArray(body.times)) return null;
+    return { count: typeof body.count === "number" ? body.count : body.times.length, times: body.times };
+  } catch (err) {
+    if (debug) console.warn("[backend] daily board GET failed:", err);
+    return null;
+  }
+}
+
 // Forget everything queued for PASSIVE upload. Called when the user opts OUT of
 // sharing (Settings -> Share play data) so "off" leaves nothing pending on the
 // device -- not even a stale snapshot from a session when sharing was on. The daily

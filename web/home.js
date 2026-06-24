@@ -26,7 +26,14 @@ import * as settings from "./settings.js";
 // openSettings). The daily Submit button posts a daily time explicitly
 // (recordDailySolve, opt-out-bypassing), reads its tri-state (dailySubmitState),
 // and re-renders live as a submission lands (setDailyChangeListener).
-import { clearOutboxes, recordDailySolve, dailySubmitState, setDailyChangeListener } from "./backend.js";
+import {
+  clearOutboxes,
+  recordDailySolve,
+  dailySubmitState,
+  setDailyChangeListener,
+  fetchDailyCounts,
+  fetchDailyBoard,
+} from "./backend.js";
 import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { TECHNIQUE_INFO } from "./techniques.js";
 import { masksFromUsages } from "./spec.js";
@@ -50,6 +57,7 @@ import {
   dayNumber,
   dayLabel,
   levelName,
+  leaderboardWindow,
 } from "./daily.js";
 import {
   formatDuration,
@@ -383,6 +391,9 @@ function openDaily() {
 function renderDailyBody(day) {
   const body = document.getElementById("dailyBody");
   body.replaceChildren(...DAILY_LEVELS.map((level, i) => dailyLevelCard(level, i, day)));
+  // Cards render synchronously with a "loading" board; fill the leaderboards from
+  // the backend after (fire-and-forget -- a fetch failure leaves the placeholders).
+  fillDailyLeaderboards(day);
 }
 
 // One difficulty as a card: name, blurb, the state-dependent action button, and a
@@ -402,7 +413,7 @@ function dailyLevelCard(level, index, day) {
   card.appendChild(blurb);
 
   card.appendChild(dailyActionButton(level, index, day));
-  card.appendChild(dailyLeaderboard());
+  card.appendChild(dailyLeaderboard(index));
   return card;
 }
 
@@ -470,14 +481,123 @@ function submitDaily(g, day) {
   renderDailyBody(day);
 }
 
-// The leaderboard placeholder -- a stub until the read path is wired. Submit
-// already uploads daily times (recordDailySolve); only fetching/showing the scores
-// is pending. Kept as its own element so the real list drops in here.
-function dailyLeaderboard() {
+// The per-card leaderboard slot. Rendered synchronously with a "loading" state and
+// tagged with its level; fillDailyLeaderboards then drops in the real content once
+// the backend responds. Keyed by level so the async fill can find its box again.
+function dailyLeaderboard(index) {
   const box = document.createElement("div");
   box.className = "daily-leaderboard";
-  box.textContent = "Leaderboard — coming soon";
+  box.dataset.level = String(index);
+  box.textContent = "Leaderboard…";
   return box;
+}
+
+// Populate each card's leaderboard from the backend. Two reveals, gated on whether
+// the player has JOINED that level's board (tapped Submit -- pending or submitted):
+//   not joined -> a teaser: the solver count only, no times (the times are the
+//                 post-solve reward; see the design notes).
+//   joined     -> the full windowed board (leaderboardWindow), the player's row
+//                 highlighted. While the submission is still pending (not yet in the
+//                 backend), the player's own time is merged in locally so they see
+//                 their projected rank immediately.
+// One counts fetch serves every card's teaser; joined levels additionally fetch
+// their board. All failures degrade quietly (the placeholder text is replaced with
+// a dash). Re-run on every renderDailyBody, so it refreshes as a submission lands.
+async function fillDailyLeaderboards(day) {
+  const counts = await fetchDailyCounts(day); // { level: n } | null (unavailable)
+  const boxes = document.querySelectorAll("#dailyBody .daily-leaderboard");
+  for (const box of boxes) {
+    const index = Number(box.dataset.level);
+    const g = store.dailyGame(day, index);
+    const state = g && g.status === "solved" ? dailySubmitState(g.solve_id) : "none";
+    const joined = state === "submitted" || state === "pending";
+    if (joined) {
+      const board = await fetchDailyBoard(day, index);
+      if (board) { renderDailyBoard(box, board, g, state); continue; }
+      // Board unreadable -> fall through to the teaser (no nudge: already joined).
+    }
+    if (counts === null) renderDailyUnavailable(box);
+    else renderDailyTeaser(box, counts[index] || 0, g, joined);
+  }
+}
+
+// The board can't be read (no backend / offline). Keep the placeholder look.
+function renderDailyUnavailable(box) {
+  box.classList.remove("has-board");
+  box.replaceChildren();
+  box.textContent = "Leaderboard unavailable";
+}
+
+// The pre-join teaser: solver count only (no times -- those are the post-solve
+// reward), plus a nudge for a player who has solved but not yet submitted, since
+// their time isn't on the board until they do. The nudge is suppressed once joined.
+function renderDailyTeaser(box, count, g, joined) {
+  box.classList.remove("has-board");
+  box.replaceChildren();
+  let text;
+  if (count <= 0) text = "Be the first to solve";
+  else text = count === 1 ? "1 solved today" : `${count} solved today`;
+  if (!joined && g && g.status === "solved") text += " · Submit to see where you rank";
+  box.textContent = text;
+}
+
+// The post-join board: the player's rank in the day's field, then the windowed
+// list of times with the player's row highlighted. `board` is { count, times }
+// (times ascending). When the submission is only `pending` the player isn't in the
+// fetched times yet, so their own time is spliced in at its sorted position.
+function renderDailyBoard(box, board, g, state) {
+  const mine = Math.round(g.elapsedMs);
+  const times = board.times.slice();
+  if (state !== "submitted") {
+    // Pending: not in the backend list yet -- show the projected standing.
+    let at = times.findIndex((t) => t > mine);
+    if (at < 0) at = times.length;
+    times.splice(at, 0, mine);
+  }
+  const total = times.length;
+
+  // First (and so far only) solver: a "#1 of 1" one-row board says nothing, so
+  // mark the milestone instead -- the mirror of the "Be the first to solve" teaser.
+  if (total <= 1) {
+    box.classList.remove("has-board");
+    box.classList.add("first");
+    box.replaceChildren();
+    box.textContent = "You're the first to solve!";
+    return;
+  }
+
+  // Competition rank: one past everyone strictly faster (ties share the top slot).
+  let strictlyFaster = 0;
+  while (strictlyFaster < total && times[strictlyFaster] < mine) strictlyFaster++;
+  const rank = strictlyFaster + 1;
+
+  box.classList.add("has-board");
+  box.replaceChildren();
+
+  const head = document.createElement("div");
+  head.className = "lb-head";
+  head.textContent = `#${rank} of ${total}`;
+  box.appendChild(head);
+
+  for (const row of leaderboardWindow(rank, total)) {
+    const line = document.createElement("div");
+    if (row === "gap") {
+      line.className = "lb-gap";
+      line.textContent = "···";
+    } else {
+      line.className = "lb-row";
+      if (row === rank) line.classList.add("lb-you");
+      const r = document.createElement("span");
+      r.className = "lb-rank";
+      r.textContent = `${row}.`;
+      const t = document.createElement("span");
+      t.className = "lb-time";
+      const ms = times[row - 1];
+      t.textContent = ms == null ? "—" : formatDuration(ms);
+      line.append(r, t);
+    }
+    box.appendChild(line);
+  }
 }
 
 // Generate and open today's puzzle for a difficulty. Built as a force_any custom
