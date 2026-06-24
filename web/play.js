@@ -1553,7 +1553,14 @@ function hintTitle(text) {
 }
 
 export function closeHint() {
-  document.getElementById("hintPanel").hidden = true;
+  const panel = document.getElementById("hintPanel");
+  // Track the close here, not at each caller, so EVERY close emits exactly one
+  // hintClose -- the explicit X / Hint toggle and the programmatic ones (solve,
+  // restart, apply-to-finish, game swap) alike. That makes a consultation's dwell
+  // always hintClose.t minus the matching hintOpen.t, with no dangling opens. The
+  // guard skips closes of an already-hidden panel (e.g. game-swap teardown).
+  if (!panel.hidden) tracker.track("hintClose");
+  panel.hidden = true;
   document.getElementById("playPad").hidden = false;
   clearHighlights();
 }
@@ -1563,7 +1570,6 @@ function toggleHintPanel() {
   if (panel.hidden) {
     openHint("user");
   } else {
-    tracker.track("hintClose");
     closeHint();
   }
 }
@@ -1632,12 +1638,24 @@ function solverBoard(wasm) {
   return new wasm.Board(cellDigits, cand);
 }
 
-// Build the panel content for the current board and show it. `reason` labels the
-// tracked hintOpen event -- "user" when the player pressed Hint, "auto" when an
-// in-panel action (apply, remove-stale, undo-to-clear) re-rendered the panel --
-// so the grader can tell deliberate consultations from re-renders.
+// Build the panel content for the current board and show it. `reason` is "user"
+// when the player pressed Hint and "auto" when an in-panel action (apply,
+// remove-stale, undo-to-clear) re-rendered the panel. Only deliberate "user"
+// consultations are logged: each auto re-render is preceded by its own action
+// event (applyStep / removeStaleMarks / undoToClear / eraseMistakes), so a
+// hintOpen for the re-render would only restate board health the grader already
+// reconstructs -- noise. logOpen() is the single gate.
 function openHint(reason = "auto") {
   const body = document.getElementById("hintBody");
+  // Record a deliberate consultation and nothing but the `health` status -- the
+  // one-word banner the player saw ("ok"/"stale"/"wrong"/an error state). Every
+  // other field we used to attach (the technique listing, the wrong/stale cell
+  // counts) is re-derivable from the resulting board with the same solver; health
+  // is kept only because it's a tiny fixed string that saves the recompute, not
+  // because it carries anything the board doesn't.
+  const logOpen = (health) => {
+    if (reason === "user") tracker.track("hintOpen", { health });
+  };
   const note = (msg) => {
     const p = document.createElement("p");
     p.className = "hint-note";
@@ -1655,7 +1673,7 @@ function openHint(reason = "auto") {
     hintTitle("Mistake");
     body.replaceChildren(errorStage("logical", logical));
     showPanel();
-    tracker.track("hintOpen", { trigger: reason, health: "logical", cells: logical.length });
+    logOpen("logical");
     return;
   }
   const solved = solvedErrorCells();
@@ -1663,7 +1681,7 @@ function openHint(reason = "auto") {
     hintTitle("Mistake");
     body.replaceChildren(errorStage("solved", solved));
     showPanel();
-    tracker.track("hintOpen", { trigger: reason, health: "solvedError", cells: solved.length });
+    logOpen("solvedError");
     return;
   }
 
@@ -1672,7 +1690,7 @@ function openHint(reason = "auto") {
     hintTitle("Hint");
     note("The solver is still loading. Try again in a moment.");
     showPanel();
-    tracker.track("hintOpen", { trigger: reason, health: "loading" });
+    logOpen("loading");
     return;
   }
   let steps, isSolved;
@@ -1688,7 +1706,7 @@ function openHint(reason = "auto") {
     hintTitle("Hint");
     note("Couldn't read the board. Check for an obvious slip.");
     showPanel();
-    tracker.track("hintOpen", { trigger: reason, health: "error" });
+    logOpen("error");
     console.log(e);
     return;
   }
@@ -1697,7 +1715,7 @@ function openHint(reason = "auto") {
     hintTitle("Solved");
     note("The puzzle is already solved.");
     showPanel();
-    tracker.track("hintOpen", { trigger: reason, health: "solved" });
+    logOpen("solved");
     return;
   }
   // First layer: confirm the board's health (all good / stale marks) without
@@ -1709,20 +1727,7 @@ function openHint(reason = "auto") {
   hintTitle("Hint");
   body.replaceChildren(statusStage(steps, masks, wrong, stale));
   showPanel();
-  // Summarize what's on offer (technique id, instance count, in/out of scope)
-  // alongside the board-health banner the player sees.
-  const techniques = groupSteps(steps).map((g) => ({
-    id: g.id,
-    count: g.count,
-    inScope: isInScope(g, masks),
-  }));
-  tracker.track("hintOpen", {
-    trigger: reason,
-    health: wrong.length ? "wrong" : stale.length ? "stale" : "ok",
-    wrong: wrong.length,
-    stale: stale.length,
-    techniques,
-  });
+  logOpen(wrong.length ? "wrong" : stale.length ? "stale" : "ok");
 }
 
 // A bold banner with an icon, in one of three states: "ok" (green check, all
@@ -1781,7 +1786,7 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
     show.className = "hint-bigbtn";
     show.textContent = "Show wrong marks";
     show.addEventListener("click", () => {
-      tracker.track("hintShowWrong", { cells: wrongCandidateCells.length });
+      tracker.track("hintShowWrong");
       clearHighlights();
       for (const c of wrongCandidateCells) cells[c].classList.add("hl-elim");
     });
@@ -1812,7 +1817,7 @@ function statusStage(steps, masks, wrongCandidateCells, staleCells) {
     show.className = "hint-bigbtn";
     show.textContent = "Show stale marks";
     show.addEventListener("click", () => {
-      tracker.track("hintShowStale", { cells: staleCells.length });
+      tracker.track("hintShowStale");
       clearHighlights();
       for (const c of staleCells) cells[c].classList.add("hl-stale");
     });
@@ -1905,7 +1910,7 @@ function errorStage(kind, errCells) {
   show.className = "hint-bigbtn";
   show.textContent = "Show me where";
   show.addEventListener("click", () => {
-    tracker.track("hintShowWhere", { kind, cells: errCells.length });
+    tracker.track("hintShowWhere", { kind });
     clearHighlights();
     for (const c of errCells) cells[c].classList.add("hl-elim");
   });
@@ -2039,10 +2044,9 @@ function techStage(groups, masks) {
     more.className = "hint-more hint-harder";
     more.textContent = `Show other techniques (${other.length})`;
     more.addEventListener("click", () => {
-      tracker.track("hintShowOther", {
-        count: other.length,
-        techniques: other.map((g) => g.id),
-      });
+      // The event alone is the signal: which/how-many out-of-scope techniques
+      // existed is re-derivable from the board + spec.
+      tracker.track("hintShowOther");
       for (const g of other) ul.appendChild(buildRow(g));
       more.remove();
     });
@@ -2098,7 +2102,7 @@ function buildMultiRow(g) {
       more.textContent = `Show the ${g.count} spots`;
       more.addEventListener("click", (e) => {
         e.stopPropagation();
-        tracker.track("hintShowSpots", { technique: g.id, count: g.count });
+        tracker.track("hintShowSpots", { technique: g.id });
         let after = li;
         for (const step of g.steps) {
           const child = buildStepRow(step, g, "name");
@@ -2230,7 +2234,8 @@ function applyStep(step, rerender, how) {
     tracker.track("applyStep", {
       how: how || "row",
       technique: step.technique.id,
-      difficulty: step.technique.difficulty,
+      // difficulty is a static property of the technique id -- the grader has the
+      // technique table, so storing it per event would be redundant.
       deductions: step.deductions.map((d) => ({ cell: d.cell, digit: d.digit, kind: d.kind })),
     });
   }
@@ -2357,8 +2362,9 @@ export function loadGame(g) {
     cheat: cheatOn(),
     settings: settingsSnapshot(),
     fromForced: !!g.fromForced,
-    seed: g.seed || null,
-    puzzle: g.puzzle,
+    // puzzle + seed are not repeated here: the /moves envelope already carries
+    // both (backend.recordMoves binds them per row), so the session event would
+    // only duplicate ~90 bytes per log.
     status: g.status,
   });
   lastSettings = settingsSnapshot();
@@ -2778,7 +2784,6 @@ function wireKeyboard() {
 function wireHint() {
   const hintBtn = document.getElementById("hint");
   document.getElementById("hintClose").addEventListener("click", () => {
-    tracker.track("hintClose");
     closeHint();
   });
 
