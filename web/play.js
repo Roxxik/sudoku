@@ -14,9 +14,9 @@ import * as backend from "./backend.js";
 import * as tracker from "./tracker.js";
 import { formatDuration, techniqueName } from "./util.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
-import { levelName } from "./daily.js";
+import { levelName, dailyUnrankableReason, projectedStanding } from "./daily.js";
 import { copyText, gradeName, gradeBadge } from "./ui.js";
-import { cheatOn, CHEAT_KEY } from "./cheat.js";
+import { cheatOn, setCheatMode } from "./cheat.js";
 import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn, lightModeOn } from "./settings.js";
 
 const N = 81;
@@ -396,12 +396,13 @@ function updateHintBadge() {
   const badge = document.getElementById("hintCount");
   if (!badge) return;
   const n = hintCount;
-  // Nothing to show on an untouched, un-cheated game; a cheat-tainted game shows the
-  // badge even at zero hints so the disqualifier is visible.
+  // Always show the hint count; cheat mode only ADDS its marker, it never replaces
+  // the count -- cheat is a debug layer and must not conceal info (so "0 hints ·
+  // cheat", not bare "cheat"). Hidden only on an untouched, un-cheated game, where
+  // there's genuinely nothing to show.
   badge.hidden = n === 0 && !cheatedThisGame;
-  badge.textContent = cheatedThisGame
-    ? (n ? `${n} ${n === 1 ? "hint" : "hints"} · cheat` : "cheat")
-    : n === 1 ? "1 hint" : `${n} hints`;
+  const label = n === 1 ? "1 hint" : `${n} hints`;
+  badge.textContent = cheatedThisGame ? `${label} · cheat` : label;
   badge.classList.toggle("cheated", cheatedThisGame);
   // Restart the bump animation: remove, force reflow, re-add.
   badge.classList.remove("bumped");
@@ -2406,14 +2407,11 @@ function fillAllCandidates() {
 // flip on the Hint button so you can tell it's on.
 const LONG_PRESS_MS = 5000;
 
-// cheatOn() and the tri-state CHEAT_KEY default live in cheat.js (shared with the
-// stats history). Toggling and the play-view UI reactions stay here.
+// cheatOn() / setCheatMode() and the tri-state default live in cheat.js (shared
+// with the stats history and the daily page's prompt). Toggling persists through
+// that shared setter; the play-view UI reactions stay here.
 function setCheat(on) {
-  try {
-    localStorage.setItem(CHEAT_KEY, on ? "1" : "0");
-  } catch {
-    /* ignore */
-  }
+  setCheatMode(on);
   // Turning cheat on taints the game for good (sticky), disqualifying its daily
   // submission even if it's switched back off before the solve.
   if (on) noteCheat();
@@ -2432,27 +2430,74 @@ function updateHintButton() {
 }
 
 // ---- Solved screen ----
-// A daily puzzle gets its own win screen: a Submit (posts the day's time -- see
-// wireSolved) and an X (dismiss), both returning Home -- no "New puzzle" (the daily
-// is fixed for the day). Everything else shows the standard solved dialog. The
-// passive backend solve/move sync in onSolved already ran regardless, so this only
-// swaps the dialog.
+// A daily puzzle gets its own win screen: it shows the time, the hint tally, and a
+// primary action that posts the time and reveals the player's rank -- or, when the
+// solve can't be ranked (cheat / late), just reveals a would-be rank -- with Home
+// below. Everything else shows the standard solved dialog. The passive backend
+// solve/move sync in onSolved already ran regardless, so this only swaps the dialog.
 function showSolved(finalMs) {
   const daily = !!(game && game.daily);
   const dialog = document.getElementById(daily ? "dailySolvedDialog" : "solvedDialog");
   document.getElementById(daily ? "dailySolvedTime" : "solvedTime").textContent =
     formatDuration(finalMs);
-  if (daily) {
-    // Surface the dual score, and swap Submit for a disqualified note when cheat
-    // mode tainted the solve (it can't be ranked).
-    const n = hintCount;
-    document.getElementById("dailySolvedHints").textContent =
-      n === 0 ? "Hint-free" : `${n} ${n === 1 ? "hint" : "hints"} used`;
-    const dq = !!cheatedThisGame;
-    document.getElementById("dailySolvedSubmit").hidden = dq;
-    document.getElementById("dailySolvedDq").hidden = !dq;
-  }
+  if (daily) setupDailySolved();
   dialog.showModal();
+}
+
+// Reset the daily win screen for the current solve: the hint tally, the
+// unrankable reason (cheat / late, if any), and the primary action. The primary is
+// "Submit" when the solve is rankable and "Reveal rank" when it isn't; either way
+// pressing it reveals the rank line (uploading first only when rankable) and then
+// disables, leaving Home. Reset fresh each time since the dialog is reused.
+function setupDailySolved() {
+  const n = hintCount;
+  document.getElementById("dailySolvedHints").textContent =
+    n === 0 ? "Hint-free" : `${n} ${n === 1 ? "hint" : "hints"} used`;
+
+  const reason = dailyUnrankableReason(game);
+  const reasonEl = document.getElementById("dailySolvedReason");
+  reasonEl.hidden = !reason;
+  reasonEl.textContent =
+    reason === "cheat" ? "Cheat mode was on, so this solve can't be ranked."
+    : reason === "late" ? "This puzzle's day has passed, so this solve can't be ranked."
+    : "";
+
+  const rankEl = document.getElementById("dailySolvedRank");
+  rankEl.hidden = true;
+  rankEl.textContent = "";
+
+  const btn = document.getElementById("dailySolvedSubmit");
+  btn.disabled = false;
+  btn.textContent = reason ? "Reveal rank" : "Submit";
+}
+
+// The daily win screen's primary action. Uploads first when the solve is rankable
+// (so it joins the board), then fetches the board and shows the player's standing
+// inline -- a real rank once submitted, a would-be rank otherwise. Disables itself
+// after, so it reads as a one-shot reveal; Home remains to leave.
+async function revealDailyStanding() {
+  const g = game;
+  const d = dailyOf(g);
+  if (!d) return;
+  const btn = document.getElementById("dailySolvedSubmit");
+  const rankEl = document.getElementById("dailySolvedRank");
+  const rankable = !dailyUnrankableReason(g);
+  btn.disabled = true;
+  if (rankable) submitDaily(g); // upload (fire-and-forget); the splice below projects the standing
+  rankEl.hidden = false;
+  rankEl.textContent = "Loading the board…";
+  const board = await backend.fetchDailyBoard(d.day, d.level, g.solve_id);
+  if (!board) {
+    rankEl.textContent = "Leaderboard unavailable.";
+    return;
+  }
+  // Use the server-reported row index when our upload already landed (so we aren't
+  // counted twice); otherwise project by splicing. An unrankable solve was never
+  // uploaded, so mine stays -1.
+  const { rank, total } = projectedStanding(board.times, board.hints, hintCount, Math.round(g.elapsedMs), board.mine);
+  rankEl.textContent = rankable
+    ? `You placed #${rank} of ${total}`
+    : `You'd place #${rank} of ${total}`;
 }
 
 // ---- Load a game ----
@@ -2526,6 +2571,10 @@ export function loadGame(g) {
   setTitle(g);
   updateDifficulty();
   updateSeedLine();
+  // Sync the Hint-button cheat tint to the live cheat state: cheat may have been
+  // toggled off outside the play view (e.g. the daily "turn off cheat" prompt sets
+  // it before this game loads), and only this refresh clears the stale tint.
+  updateHintButton();
   updateDigitButtons();
   updateHistoryButtons();
   render();
@@ -3038,44 +3087,35 @@ function wireSolved() {
     onNewPuzzle(game);
   });
 
-  // Daily win screen. Submit posts the day's time to the backend's separate daily
-  // table -- an explicit act, so it bypasses the data-sharing opt-out (see
-  // backend.recordDailySolve); the daily overview then shows the puzzle as
-  // submitted. X dismisses WITHOUT posting (the player can still Submit later from
-  // the overview). Both close and return Home. The passive /solves + /moves sync in
-  // onSolved already ran for opted-in players, independent of this.
+  // Daily win screen. The primary reveals the player's standing (submitting first
+  // when the solve is rankable -- an explicit act that bypasses the data-sharing
+  // opt-out, see backend.recordDailySolve), then disables itself; Home leaves
+  // without revealing. The passive /solves + /moves sync in onSolved already ran for
+  // opted-in players, independent of this.
   document.getElementById("dailySolvedSubmit").addEventListener("click", () => {
-    submitDaily(game);
-    document.getElementById("dailySolvedDialog").close();
-    onHome();
+    revealDailyStanding();
   });
-  document.getElementById("dailySolvedClose").addEventListener("click", () => {
+  document.getElementById("dailySolvedHome").addEventListener("click", () => {
     document.getElementById("dailySolvedDialog").close();
     onHome();
   });
 }
 
-// Upload a solved daily's time (the win-screen Submit). Reads the current game
-// record (its time, seed, puzzle, and the day/level the daily tag names); no-op if
-// it isn't a daily or predates the stable solve_id.
+// Upload a solved daily's time. Reads the current game record (its time, seed,
+// puzzle, hint tally, and the day/level the daily tag names); no-op if it isn't a
+// daily, predates the stable solve_id, or can't be ranked (cheat / late -- those
+// get a would-be rank only, never an upload).
 function submitDaily(g) {
   const d = dailyOf(g);
-  if (!d || !g.solve_id) return;
-  // Cheat mode at any point disqualifies the daily leaderboard, so a tainted solve
-  // never reaches the outbox (the win screen / overview also surface this state).
-  if (g.cheated) return;
+  if (!d || !g.solve_id || dailyUnrankableReason(g)) return;
   backend.recordDailySolve({
     solve_id: g.solve_id,
     day: d.day,
     level: d.level,
     seed: g.seed || null,
     puzzle: g.puzzle,
-    solution: g.solution,
     solve_ms: Math.round(g.elapsedMs),
-    // The dual-score axis: how many hints the solve leaned on (0 = clean). cheated
-    // rides along too -- always false here, but stored server-side as a backstop.
-    hints: g.hints || 0,
-    cheated: !!g.cheated,
+    hints: g.hints || 0, // the dual-score axis (0 = clean)
   });
 }
 

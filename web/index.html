@@ -374,24 +374,36 @@
     </div>
   </dialog>
 
-  <!-- Daily win screen. Like the solved dialog but with a Submit (posts the day's
-       time to the backend; play.js) and an X (top-right, dismiss) -- both return
-       Home. No "New puzzle": the daily is fixed for the day. -->
+  <!-- Daily win screen. Two stacked actions: the primary posts the day's time and
+       reveals the player's rank (or, when the solve can't be ranked, just reveals a
+       would-be rank), then disables itself; Home below leaves. No "New puzzle": the
+       daily is fixed for the day. The full board lives on the daily page, not here. -->
   <dialog id="dailySolvedDialog" class="dialog">
     <div class="dialog-body solved-body daily-solved-body">
-      <button id="dailySolvedClose" class="iconbtn dialog-close" aria-label="Close">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-          <path fill="none" stroke="currentColor" stroke-width="2" d="M6 6l12 12M18 6L6 18"/>
-        </svg>
-      </button>
       <h2>Daily solved</h2>
       <p class="solved-time" id="dailySolvedTime"></p>
       <!-- Dual score: how many hints the solve used (or "Hint-free"). -->
       <p class="solved-hints" id="dailySolvedHints"></p>
-      <!-- Shown instead of Submit when cheat mode tainted the solve. -->
-      <p class="solved-dq" id="dailySolvedDq" hidden>Cheat mode was on, so this solve can't be submitted to the leaderboard.</p>
+      <!-- Why the solve can't be ranked (cheat / late); hidden when it can. -->
+      <p class="solved-reason" id="dailySolvedReason" hidden></p>
+      <!-- The rank, filled in once the primary button is pressed. -->
+      <p class="solved-rank" id="dailySolvedRank" hidden></p>
       <div class="solved-actions">
         <button id="dailySolvedSubmit" class="key wide">Submit</button>
+        <button id="dailySolvedHome" class="key wide ghost">Home</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Shown when starting/resuming a daily with cheat mode on: a last chance to turn
+       it off and stay rankable. Cancelling (Esc/backdrop) does nothing. -->
+  <dialog id="dailyCheatDialog" class="dialog">
+    <div class="dialog-body solved-body">
+      <h2>Cheat mode is on</h2>
+      <p class="daily-blurb">Daily solves played with cheat mode on can't be ranked. Turn it off to keep this one on the leaderboard.</p>
+      <div class="solved-actions">
+        <button id="dailyCheatOff" class="key wide">Turn off cheat &amp; play</button>
+        <button id="dailyCheatAnyway" class="key wide ghost">Play unranked</button>
       </div>
     </div>
   </dialog>

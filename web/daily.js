@@ -191,3 +191,42 @@ function range(a, b) {
   for (let i = a; i <= b; i++) out.push(i);
   return out;
 }
+
+// ---- Standing on the board ----
+// The board ranks by HINTS first, then time: a clean solve outranks any hinted one,
+// ties broken by the faster time (then insertion order). Given the day's board
+// (`times`/`hints` parallel arrays already in that order, as the worker returns them)
+// and the player's own (hints, ms), return the board to render plus the player's
+// 1-based rank. `mineIndex` is the server-reported index of the player's own row (the
+// GET's `mine`), or -1 if it isn't there:
+//   >= 0 -> already on the board, so the rank IS that position; nothing to splice.
+//   -1   -> not on the board (a just-queued or unrankable solve), so splice the
+//           player's (hints, ms) in at its rank position and report that.
+// Rank is positional (matching the board's own tiebreak), so the caller's highlight
+// lands on the exact row. Pure: shared by the daily page and the win-screen line.
+export function projectedStanding(times, hints, mineHints, mineMs, mineIndex) {
+  if (mineIndex >= 0) return { times, hints, rank: mineIndex + 1, total: times.length };
+  times = times.slice();
+  hints = hints.slice();
+  // Insert after every entry the player ties or loses to, before the first it beats
+  // -- the same order the board uses, a new tie landing after the existing ones.
+  const iBeat = (h, t) => mineHints < h || (mineHints === h && mineMs < t);
+  let at = 0;
+  while (at < times.length && !iBeat(hints[at], times[at])) at++;
+  times.splice(at, 0, mineMs);
+  hints.splice(at, 0, mineHints);
+  return { times, hints, rank: at + 1, total: times.length };
+}
+
+// ---- Daily leaderboard eligibility ----
+// Why a solved daily can't be uploaded (and so can't be ranked): "cheat" (tainted),
+// "late" (finished after its puzzle-day rolled over, by the device clock), or null
+// when it can. Cheat or late -> the player still sees a would-be rank, but nothing
+// is sent. Centralised here so the win screen, the daily page, and the submit guards
+// all agree. `now` is overridable for testing.
+export function dailyUnrankableReason(g, now = Date.now()) {
+  if (!g || !g.daily) return null;
+  if (g.cheated) return "cheat";
+  if (g.daily.day !== dayNumber(now)) return "late";
+  return null;
+}

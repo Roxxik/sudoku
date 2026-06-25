@@ -54,30 +54,23 @@ CREATE TABLE IF NOT EXISTS move_logs (
 -- index into DAILY_LEVELS, so (day, level) names one daily puzzle; the same
 -- deterministic seed gives every device that puzzle. solve_id (minted at game
 -- creation) is the idempotency key: a resent submission is an INSERT OR IGNORE
--- no-op. This is the WRITE path only -- the leaderboard READ endpoint isn't wired
--- yet, but the index below is laid down now so it lands cheaply when it is.
+-- no-op. Only rankable solves are uploaded: a cheat-tainted or late solve (finished
+-- after its day rolled over) stays on-device and is shown a would-be rank instead.
 CREATE TABLE IF NOT EXISTS daily_solves (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   solve_id   TEXT    NOT NULL UNIQUE,     -- stable per-puzzle id; resubmit -> idempotent no-op
   day        INTEGER NOT NULL,            -- puzzle-day index (daily.js dayNumber)
   level      INTEGER NOT NULL,            -- difficulty index into DAILY_LEVELS
   seed       TEXT,                        -- decimal u64 string of the pinned daily seed
-  puzzle     TEXT    NOT NULL,            -- 81 chars, '.' = empty
-  solution   TEXT    NOT NULL,            -- 81 chars
+  puzzle     TEXT    NOT NULL,            -- 81 chars, '.' = empty (seed-drift check)
   solve_ms   INTEGER NOT NULL,            -- final elapsedMs
   hints      INTEGER NOT NULL DEFAULT 0,  -- dual-score axis: distinct hint reveals (0 = clean)
-  cheated    INTEGER NOT NULL DEFAULT 0,  -- backstop: 1 if cheat mode tainted the solve (excluded from the board)
   client_version TEXT NOT NULL,           -- frontend build that submitted this solve
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
--- Adding the dual-score columns to an already-applied DB (they default in for fresh
--- ones): wrangler d1 execute sudoku --remote --command \
---   "ALTER TABLE daily_solves ADD COLUMN hints INTEGER NOT NULL DEFAULT 0; \
---    ALTER TABLE daily_solves ADD COLUMN cheated INTEGER NOT NULL DEFAULT 0;"
--- (also --local for the dev loop). Not deployed yet, so a fresh apply needs no ALTER.
 
--- The leaderboard read path is "fastest solves for one (day, level)". This index
--- covers exactly that: an ordered range scan over (day, level) already sorted by
--- solve_ms, so the top-N query needs no table sort.
+-- The leaderboard read path reads one (day, level) in board order: fewest hints
+-- first, then fastest time. This index matches that order, so the read is a range
+-- scan with no table sort.
 CREATE INDEX IF NOT EXISTS idx_daily_solves_day_level
-  ON daily_solves (day, level, solve_ms);
+  ON daily_solves (day, level, hints, solve_ms);

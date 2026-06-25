@@ -437,18 +437,16 @@ function markDailyDone(ids) {
 }
 
 // Mirror of the worker's validDaily(): (day, level) name the puzzle, seed optional,
-// client_version stamped by us.
+// hints the dual score, client_version stamped by us.
 function validDailyPayload(s) {
   return !!s
     && typeof s.solve_id === "string" && s.solve_id.length > 0
     && Number.isInteger(s.day)
     && Number.isInteger(s.level)
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
-    && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)
     && (s.seed == null || typeof s.seed === "string")
-    && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0))
-    && (s.cheated == null || typeof s.cheated === "boolean");
+    && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0));
 }
 
 // The submit state of one daily, by its solve_id, for the overview button:
@@ -584,24 +582,25 @@ export async function fetchDailyCounts(day) {
   }
 }
 
-// The full ordered board for one (day, level): { count, times } with times the
-// ascending solve_ms list (anonymous -- the table stores no identity). The caller
-// locates the player's own time in it to compute a rank and window. Returns null
-// on any failure (the overview then falls back to the teaser).
-export async function fetchDailyBoard(day, level) {
+// The full ordered board for one (day, level): { count, times, hints, mine } in
+// (hints, then time) rank order (anonymous -- the table stores no identity). When
+// `solveId` is given, `mine` is the 0-based index of the caller's own row (or -1),
+// so the caller can tell whether its solve is already on the board and avoid
+// double-counting it when projecting a rank. Returns null on any failure (the
+// overview then falls back to the teaser).
+export async function fetchDailyBoard(day, level, solveId) {
   if (!CONFIGURED) return null;
   const debug = cheatOn();
   try {
-    const resp = await fetch(
-      `${DAILY_ENDPOINT}?day=${encodeURIComponent(day)}&level=${encodeURIComponent(level)}`,
-      { headers: { "x-api-key": API_KEY } },
-    );
+    let qs = `day=${encodeURIComponent(day)}&level=${encodeURIComponent(level)}`;
+    if (solveId) qs += `&solve_id=${encodeURIComponent(solveId)}`;
+    const resp = await fetch(`${DAILY_ENDPOINT}?${qs}`, { headers: { "x-api-key": API_KEY } });
     if (debug) console.log(`[backend] daily board GET (day ${day}, level ${level}) -> ${resp.status}`);
     if (!resp.ok) return null;
     const body = await resp.json();
     if (!body || !Array.isArray(body.times)) return null;
-    // `hints` parallels `times` (same ascending-time order) -- the dual-score axis.
-    // Tolerate an older worker that omits it by falling back to an all-zero column.
+    // `hints` parallels `times` (same rank order) -- the dual-score axis. Tolerate an
+    // older worker that omits it (all-zero column) or `mine` (treat as not found).
     const hints = Array.isArray(body.hints) && body.hints.length === body.times.length
       ? body.hints
       : body.times.map(() => 0);
@@ -609,6 +608,7 @@ export async function fetchDailyBoard(day, level) {
       count: typeof body.count === "number" ? body.count : body.times.length,
       times: body.times,
       hints,
+      mine: Number.isInteger(body.mine) ? body.mine : -1,
     };
   } catch (err) {
     if (debug) console.warn("[backend] daily board GET failed:", err);

@@ -58,7 +58,10 @@ import {
   dayLabel,
   levelName,
   leaderboardWindow,
+  projectedStanding,
+  dailyUnrankableReason,
 } from "./daily.js";
+import { cheatOn, setCheatMode } from "./cheat.js";
 import {
   formatDuration,
   techniqueName,
@@ -198,7 +201,7 @@ function continueCard(g, title, sizeClass) {
   card.className = "continue-card";
   const main = document.createElement("button");
   main.className = "continue-item";
-  main.addEventListener("click", () => onResume(g.id));
+  main.addEventListener("click", () => resumeGame(g));
   const col = textColumn(title, continueMeta(g));
   const badge = gradeBadge(g.grade);
   if (badge) col.appendChild(badge);
@@ -390,7 +393,10 @@ function openDaily() {
 // can refresh the buttons in place as a submission moves through its states.
 function renderDailyBody(day) {
   const body = document.getElementById("dailyBody");
-  body.replaceChildren(...DAILY_LEVELS.map((level, i) => dailyLevelCard(level, i, day)));
+  const blurb = document.createElement("p");
+  blurb.className = "daily-blurb";
+  blurb.textContent = "Boards rank by fewest hints, then fastest time.";
+  body.replaceChildren(blurb, ...DAILY_LEVELS.map((level, i) => dailyLevelCard(level, i, day)));
   // Cards render synchronously with a "loading" board; fill the leaderboards from
   // the backend after (fire-and-forget -- a fetch failure leaves the placeholders).
   fillDailyLeaderboards(day);
@@ -433,13 +439,14 @@ function dailyActionButton(level, index, day) {
   sub.className = "mb-sub";
 
   const g = store.dailyGame(day, index);
-  if (g && g.status === "solved" && g.cheated) {
-    // Cheat mode tainted the solve: it can never reach the leaderboard, so there is
-    // no Submit -- just a disabled disqualified state showing the time.
+  if (g && g.status === "solved" && dailyUnrankableReason(g)) {
+    // Cheat-tainted (today's board only ever shows today's puzzles, so "late" can't
+    // arise here): it can't be submitted, so the button is a disabled "Disqualified"
+    // -- the would-be standing shows in the leaderboard slot below.
     btn.classList.add("solved");
     btn.disabled = true;
     lab.textContent = "Disqualified";
-    sub.textContent = formatDuration(g.elapsedMs);
+    sub.textContent = hintSubLabel(g);
   } else if (g && g.status === "solved") {
     sub.textContent = hintSubLabel(g);
     const state = dailySubmitState(g.solve_id);
@@ -459,11 +466,11 @@ function dailyActionButton(level, index, day) {
   } else if (g) {
     lab.textContent = "Continue";
     sub.textContent = formatDuration(g.elapsedMs);
-    btn.addEventListener("click", () => onResume(g.id));
+    btn.addEventListener("click", () => resumeGame(g));
   } else {
     lab.textContent = "Play";
     sub.textContent = "";
-    btn.addEventListener("click", () => launchDaily(level, index));
+    btn.addEventListener("click", () => withDailyCheatCheck(false, () => launchDaily(level, index)));
   }
   btn.append(lab, sub);
   return btn;
@@ -475,17 +482,15 @@ function dailyActionButton(level, index, day) {
 // "Submit"/pending look; the change listener flips it to "Submitted" when the POST
 // lands. `g` is the light index record -- it already carries every field below.
 function submitDaily(g, day) {
-  if (!g.daily || !g.solve_id || g.cheated) return; // cheat-tainted solves are disqualified
+  if (!g.daily || !g.solve_id || dailyUnrankableReason(g)) return; // cheat / late -> not uploaded
   recordDailySolve({
     solve_id: g.solve_id,
     day: g.daily.day,
     level: g.daily.level,
     seed: g.seed || null,
     puzzle: g.puzzle,
-    solution: g.solution,
     solve_ms: Math.round(g.elapsedMs),
-    hints: g.hints || 0,
-    cheated: !!g.cheated,
+    hints: g.hints || 0, // the dual-score axis (0 = clean)
   });
   renderDailyBody(day);
 }
@@ -509,15 +514,18 @@ function dailyLeaderboard(index) {
   return box;
 }
 
-// Populate each card's leaderboard from the backend. Two reveals, gated on whether
-// the player has JOINED that level's board (tapped Submit -- pending or submitted):
+// Populate each card's leaderboard from the backend. The reveal is gated on the
+// player's state for that level:
 //   not joined -> a teaser: the solver count only, no times (the times are the
 //                 post-solve reward; see the design notes).
 //   joined     -> the full windowed board (leaderboardWindow), the player's row
 //                 highlighted. While the submission is still pending (not yet in the
 //                 backend), the player's own time is merged in locally so they see
 //                 their projected rank immediately.
-// One counts fetch serves every card's teaser; joined levels additionally fetch
+//   would-be   -> a cheat solve can't be submitted, but the player still sees where
+//                 it WOULD land: the board with their projected position, computed
+//                 locally and never uploaded.
+// One counts fetch serves every card's teaser; the board levels additionally fetch
 // their board. All failures degrade quietly (the placeholder text is replaced with
 // a dash). Re-run on every renderDailyBody, so it refreshes as a submission lands.
 async function fillDailyLeaderboards(day) {
@@ -526,12 +534,14 @@ async function fillDailyLeaderboards(day) {
   for (const box of boxes) {
     const index = Number(box.dataset.level);
     const g = store.dailyGame(day, index);
-    const state = g && g.status === "solved" ? dailySubmitState(g.solve_id) : "none";
+    const solved = g && g.status === "solved";
+    const state = solved ? dailySubmitState(g.solve_id) : "none";
     const joined = state === "submitted" || state === "pending";
-    if (joined) {
-      const board = await fetchDailyBoard(day, index);
-      if (board) { renderDailyBoard(box, board, g, state); continue; }
-      // Board unreadable -> fall through to the teaser (no nudge: already joined).
+    const wouldbe = solved && !joined && !!dailyUnrankableReason(g); // cheat (today)
+    if (joined || wouldbe) {
+      const board = await fetchDailyBoard(day, index, g.solve_id);
+      if (board) { renderDailyBoard(box, board, g, joined ? state : "wouldbe"); continue; }
+      // Board unreadable -> fall through to the teaser.
     }
     if (counts === null) renderDailyUnavailable(box);
     else renderDailyTeaser(box, counts[index] || 0, g, joined);
@@ -560,34 +570,24 @@ function renderDailyTeaser(box, count, g, joined) {
   box.textContent = text;
 }
 
-// The post-join board: the player's rank in the day's field, then the windowed
-// list of times with the player's row highlighted. `board` is { count, times }
-// (times ascending). When the submission is only `pending` the player isn't in the
-// fetched times yet, so their own time is spliced in at its sorted position.
+// The post-join board: the player's standing in the day's field, then the windowed
+// list of rows (time + hint tally) with the player's row highlighted. `board` is
+// { count, times, hints, mine } in (hints, then time) rank order. `state` selects
+// the framing -- "submitted"/"pending" (a real standing) vs "wouldbe" (a cheat/late
+// solve's projected position, never sent). `board.mine` (the server-reported index of
+// the player's solve_id, or -1) drives the rank: it's authoritative when the row is
+// already on the board, and -1 makes projectedStanding splice -- so a pending upload
+// that has just landed is handled right either way. Shared with the win screen.
 function renderDailyBoard(box, board, g, state) {
-  const mine = Math.round(g.elapsedMs);
-  const mineHints = g.hints || 0;
-  const times = board.times.slice();
-  const hints = board.hints.slice(); // parallels times, in (hints, time) rank order
-  // The board ranks by HINTS first, then time: a clean solve outranks any hinted
-  // one, ties broken by the faster time. The server already returns the field in
-  // that order; the player's own splice and rank below use the same comparator.
-  const iBeat = (h, t) => mineHints < h || (mineHints === h && mine < t);   // mine strictly better than (h,t)
-  const beatsMe = (h, t) => h < mineHints || (h === mineHints && t < mine); // (h,t) strictly better than mine
-  if (state !== "submitted") {
-    // Pending: not in the backend list yet -- splice the player's own (hints, time)
-    // in at its rank position (after every entry that beats-or-ties, before the
-    // first one mine beats).
-    let at = 0;
-    while (at < times.length && !iBeat(hints[at], times[at])) at++;
-    times.splice(at, 0, mine);
-    hints.splice(at, 0, mineHints);
-  }
-  const total = times.length;
+  const wouldbe = state === "wouldbe";
+  const { times, hints, rank, total } = projectedStanding(
+    board.times, board.hints, g.hints || 0, Math.round(g.elapsedMs), board.mine
+  );
 
-  // First (and so far only) solver: a "#1 of 1" one-row board says nothing, so
-  // mark the milestone instead -- the mirror of the "Be the first to solve" teaser.
-  if (total <= 1) {
+  // First (and so far only) ranked solver: a "#1 of 1" one-row board says nothing,
+  // so mark the milestone instead (the mirror of the "Be the first to solve"
+  // teaser). Not for a would-be standing -- there's no achievement to celebrate.
+  if (total <= 1 && !wouldbe) {
     box.classList.remove("has-board");
     box.classList.add("first");
     box.replaceChildren();
@@ -595,19 +595,12 @@ function renderDailyBoard(box, board, g, state) {
     return;
   }
 
-  // Competition rank: one past everyone strictly better on (hints, then time);
-  // ties (same hints AND same time) share the slot. The better entries are the
-  // contiguous prefix, since the list is in rank order.
-  let better = 0;
-  while (better < total && beatsMe(hints[better], times[better])) better++;
-  const rank = better + 1;
-
   box.classList.add("has-board");
   box.replaceChildren();
 
   const head = document.createElement("div");
   head.className = "lb-head";
-  head.textContent = `#${rank} of ${total}`;
+  head.textContent = wouldbe ? `Would-be #${rank} of ${total}` : `#${rank} of ${total}`;
   box.appendChild(head);
 
   for (const row of leaderboardWindow(rank, total)) {
@@ -626,8 +619,7 @@ function renderDailyBoard(box, board, g, state) {
       const ms = times[row - 1];
       t.textContent = ms == null ? "—" : formatDuration(ms);
       // The dual score: a hint tally per row -- "clean" (green) for a hint-free
-      // solve, otherwise the count -- so the board ranks on time but shows who
-      // earned it without help.
+      // solve, otherwise the count.
       const h = document.createElement("span");
       const n = hints[row - 1];
       h.className = "lb-hints" + (n === 0 ? " clean" : "");
@@ -636,6 +628,33 @@ function renderDailyBoard(box, board, g, state) {
     }
     box.appendChild(line);
   }
+}
+
+// Resume an in-progress game from anywhere (the daily page, the home Continue hero,
+// the puzzles list). A daily routes through the cheat check first so the warning is
+// consistent no matter where it's resumed from; anything else resumes directly.
+function resumeGame(g) {
+  if (g.daily) withDailyCheatCheck(!!g.cheated, () => onResume(g.id));
+  else onResume(g.id);
+}
+
+// Before starting or resuming a daily with cheat mode on, give the player a chance
+// to turn it off so the solve stays rankable -- they often forget it's on. Skipped
+// when cheat is off, or when the game is already cheat-tainted (turning it off now
+// wouldn't un-taint it). `proceed` runs once the choice is made (or immediately when
+// no prompt is needed); cancelling the dialog runs nothing.
+function withDailyCheatCheck(alreadyTainted, proceed) {
+  if (!cheatOn() || alreadyTainted) { proceed(); return; }
+  const dlg = document.getElementById("dailyCheatDialog");
+  const done = (turnOff) => {
+    if (turnOff) setCheatMode(false);
+    dlg.close();
+    proceed();
+  };
+  // Fresh handlers each open (not addEventListener) so they don't stack.
+  document.getElementById("dailyCheatOff").onclick = () => done(true);
+  document.getElementById("dailyCheatAnyway").onclick = () => done(false);
+  dlg.showModal();
 }
 
 // Generate and open today's puzzle for a difficulty. Built as a force_any custom

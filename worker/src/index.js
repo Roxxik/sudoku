@@ -122,18 +122,18 @@ export default {
     // explicit act that bypasses the data-sharing opt-out -- see web/backend.js),
     // so it is kept apart from the passive, privacy-gated /solves feed. Same key
     // gate and batch shape as /solves; INSERT OR IGNORE on the unique solve_id
-    // makes a resent submission idempotent. The leaderboard READ path isn't wired
-    // yet -- this only stores the solves and their timings.
+    // makes a resent submission idempotent.
     if (url.pathname === "/daily") {
-      // Read path: the daily leaderboard. Two shapes, both anonymous (times only,
-      // no identity is stored -- see daily_solves):
-      //   GET /daily?day=D          -> { day, counts: { level: n } }  (overview teaser)
-      //   GET /daily?day=D&level=L  -> { day, level, count, times: [ms asc] }  (one board)
-      // Same key gate as the writes. The board ships the FULL ordered time list:
-      // the client needs the total and the times around the player's rank to render
-      // its window, and at the friends-scale this feed serves that is a few rows,
-      // not a payload worth paginating. Indexed by (day, level, solve_ms) so neither
-      // query sorts a table.
+      // Read path: the daily leaderboard. Two shapes, both anonymous (no identity is
+      // stored -- see daily_solves):
+      //   GET /daily?day=D                     -> { day, counts: { level: n } }          (overview teaser)
+      //   GET /daily?day=D&level=L[&solve_id=S] -> { day, level, count, times, hints, mine } (one board)
+      // Same key gate as the writes. The board ships the FULL ordered list (times +
+      // the parallel hints column): the client needs the total and the rows around
+      // the player's rank to render its window, and at friends-scale that is a few
+      // rows, not a payload worth paginating. `mine` is the 0-based index of the
+      // caller's own solve_id in that order (or -1), so the client can dedup its own
+      // row when projecting a rank without ever seeing anyone else's id.
       if (request.method === "GET") {
         if (request.headers.get("x-api-key") !== env.API_KEY)
           return cors(new Response("unauthorized", { status: 401 }));
@@ -142,9 +142,8 @@ export default {
 
         const levelRaw = url.searchParams.get("level");
         if (levelRaw === null) {
-          // Teaser counts exclude cheat-tainted solves (they never rank).
           const rows = await env.DB.prepare(
-            "SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? AND cheated = 0 GROUP BY level"
+            "SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? GROUP BY level"
           ).bind(day).all();
           const counts = {};
           for (const r of rows.results) counts[r.level] = r.n;
@@ -155,16 +154,18 @@ export default {
 
         const level = intParam(url, "level");
         if (level === null) return cors(new Response("bad level", { status: 400 }));
-        // Cheat-tainted solves never rank (a client backstop -- they shouldn't reach
-        // here at all). The board ranks by HINTS first, then time: a clean solve
-        // outranks any hinted one, ties broken by the faster time. `hints` parallels
-        // `times` in that rank order (the dual-score column).
+        // The board ranks by HINTS first, then time: a clean solve outranks any
+        // hinted one, ties broken by the faster time. `hints` parallels `times` in
+        // that rank order (the dual-score column). solve_id is read only to locate
+        // the caller's own row index (`mine`); it is never echoed back.
+        const sid = url.searchParams.get("solve_id");
         const rows = await env.DB.prepare(
-          "SELECT solve_ms, hints FROM daily_solves WHERE day = ? AND level = ? AND cheated = 0 ORDER BY hints, solve_ms, created_at"
+          "SELECT solve_id, solve_ms, hints FROM daily_solves WHERE day = ? AND level = ? ORDER BY hints, solve_ms, created_at"
         ).bind(day, level).all();
         const times = rows.results.map((r) => r.solve_ms);
         const hints = rows.results.map((r) => r.hints);
-        return cors(new Response(JSON.stringify({ day, level, count: times.length, times, hints }), {
+        const mine = sid ? rows.results.findIndex((r) => r.solve_id === sid) : -1;
+        return cors(new Response(JSON.stringify({ day, level, count: times.length, times, hints, mine }), {
           status: 200, headers: { "content-type": "application/json" },
         }));
       }
@@ -181,10 +182,10 @@ export default {
       let inserted = 0;
       if (solves.length) {
         const stmt = env.DB.prepare(
-          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solution, solve_ms, hints, cheated, client_version) VALUES (?,?,?,?,?,?,?,?,?,?)"
+          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solve_ms, hints, client_version) VALUES (?,?,?,?,?,?,?,?)"
         );
         const res = await env.DB.batch(
-          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solution, s.solve_ms, s.hints ?? 0, s.cheated ? 1 : 0, s.client_version))
+          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solve_ms, s.hints ?? 0, s.client_version))
         );
         inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
       }
@@ -245,21 +246,18 @@ function valid(s) {
     && typeof s.client_version === "string" && s.client_version.length > 0;
 }
 
-// Shape check for a /daily entry. Like valid() plus the (day, level) that names
-// the daily puzzle; both are required integers (the seed merely reproduces the
-// puzzle and may be null on an odd record). `hints` (dual score) and `cheated`
-// (backstop flag) are optional -- an older client omits them, defaulting at bind
-// time -- but if present must be the right shape.
+// Shape check for a /daily entry. (day, level) name the daily puzzle (both required
+// integers); the seed merely reproduces the puzzle and may be null. `hints` (dual
+// score) is optional -- an older client omits it, defaulting at bind time -- but if
+// present must be a non-negative integer.
 function validDaily(s) {
   return s && typeof s.solve_id === "string" && s.solve_id.length > 0
     && Number.isInteger(s.day)
     && Number.isInteger(s.level)
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
-    && typeof s.solution === "string" && s.solution.length === 81
     && Number.isInteger(s.solve_ms)
     && (s.seed == null || typeof s.seed === "string")
     && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0))
-    && (s.cheated == null || typeof s.cheated === "boolean" || s.cheated === 0 || s.cheated === 1)
     && typeof s.client_version === "string" && s.client_version.length > 0;
 }
 

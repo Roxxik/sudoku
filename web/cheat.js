@@ -35,3 +35,15 @@ export function cheatOn() {
   if (s === "0") return false;
   return privateHost();
 }
+
+// The single place that writes the cheat flag, so the play view's toggle and the
+// daily page's "turn off cheat" prompt persist it the same way. Callers that need
+// to react (play.js: tracking, the Hint-button colour, an open panel) layer that on
+// top of this -- this only sets the durable explicit state.
+export function setCheatMode(on) {
+  try {
+    localStorage.setItem(CHEAT_KEY, on ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}

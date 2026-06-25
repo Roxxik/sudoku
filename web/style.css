@@ -743,9 +743,10 @@ summary > span:first-of-type { flex: 1; }
 }
 .solved-actions { display: flex; flex-direction: column; gap: 8px; }
 
-/* Daily win screen extras: the dual-score hint line and the cheat disqualifier. */
+/* Daily win screen extras: the dual-score hint line, the why-it-can't-be-ranked
+   reason, and the revealed rank line. */
 .solved-hints { margin: -10px 0 16px; font-size: 0.95rem; font-weight: 600; color: var(--mark); }
-.solved-dq {
+.solved-reason {
   margin: 0 0 14px;
   font-size: 0.9rem;
   color: var(--bad);
@@ -753,7 +754,17 @@ summary > span:first-of-type { flex: 1; }
   border-radius: 8px;
   padding: 10px 12px;
 }
-.solved-dq[hidden] { display: none; }
+.solved-reason[hidden] { display: none; }
+.solved-rank { margin: 0 0 14px; font-size: 1.1rem; font-weight: 700; color: var(--accent); }
+.solved-rank[hidden] { display: none; }
+
+/* Secondary dialog action (e.g. Home next to a primary Submit/Reveal): muted so the
+   primary reads as the main action. */
+.key.ghost { background: transparent; color: var(--mark); font-weight: 500; }
+.key.ghost:active { background: var(--cell-sel); }
+
+/* The one-line sorting note at the top of the daily page. */
+.daily-blurb { margin: 0 0 14px; font-size: 0.85rem; color: var(--mark); }
 
 /* Daily win screen: an X in the top-right corner over the centred solved body. */
 .daily-solved-body { position: relative; }
