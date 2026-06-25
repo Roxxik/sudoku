@@ -19,6 +19,17 @@ const MAX_ERROR_BYTES = 64 * 1024;
 // (400s the batch) rather than truncating the timeline silently.
 const MAX_LOG_BYTES = 512 * 1024;
 
+// --- Status dashboard ---------------------------------------------------------
+// The day boundary and difficulty roster mirror web/daily.js (DAILY_RESET_MS,
+// DAY_MS, the dayNumber math and the DAILY_LEVELS order/names), so GET /status can
+// name "today" and label the daily board exactly as the client does. Kept as a
+// tiny local copy -- the worker shares no module with the frontend bundle.
+const DAILY_RESET_MS = 2.5 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DAILY_LEVEL_NAMES = ["Beginner", "Intermediate", "Expert I", "Expert II"];
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -52,6 +63,33 @@ export default {
           "Access-Control-Max-Age": "86400",
         },
       }));
+    }
+
+    // Status dashboard. A read-only ops view of the backend's health and recent
+    // activity -- D1 reachability, per-table row counts with recency deltas and
+    // last-write times, the client-error alarm (windowed over 7 DAYS, since errors
+    // are rare), today's daily board, and every frontend build seen in the last
+    // week. Two shapes off one collector, so they can never drift:
+    //   GET /status       -> a self-contained HTML dashboard (manual refresh)
+    //   GET /status.json  -> the same numbers as JSON (curl / a cron alarm)
+    // Key-gated like the rest: aggregate counts plus a rejected-payload preview are
+    // not public. The HTML route alone serves a key-prompt form when the key is
+    // ABSENT (so it is browser-usable from a bookmark); a present-but-WRONG key
+    // still 401s, so a brute-force shows up as 401s the way it does on /solves.
+    if (url.pathname === "/status" || url.pathname === "/status.json") {
+      if (request.method !== "GET") return cors(new Response("method", { status: 405 }));
+      const key = request.headers.get("x-api-key") || url.searchParams.get("key");
+      if (url.pathname === "/status" && !key) return cors(htmlResp(statusLoginHtml()));
+      if (key !== env.API_KEY) return cors(new Response("unauthorized", { status: 401 }));
+
+      const now = Date.now();
+      const data = await collectStatus(env, dayNumber(now), now);
+      if (url.pathname === "/status.json") {
+        return cors(new Response(JSON.stringify(data, null, 2), {
+          status: 200, headers: { "content-type": "application/json" },
+        }));
+      }
+      return cors(htmlResp(renderStatus(data, key)));
     }
 
     // Capture endpoint for client-side upload failures. Deliberately schemaless:
@@ -274,3 +312,296 @@ function validLog(s) {
     && typeof s.client_version === "string" && s.client_version.length > 0
     && JSON.stringify(s.events).length <= MAX_LOG_BYTES;
 }
+
+// --- Status dashboard helpers -------------------------------------------------
+
+// Puzzle-day index that ticks over at 02:30 UTC -- mirrors web/daily.js dayNumber.
+function dayNumber(now) {
+  return Math.floor((now - DAILY_RESET_MS) / DAY_MS);
+}
+
+// The calendar date a puzzle-day belongs to, formatted at its 02:30 UTC boundary
+// (so the label is the right date in any viewer's timezone) -- mirrors web/daily.js
+// dayLabel, but built from local arrays to avoid an Intl dependency in the worker.
+function dayLabel(day) {
+  const d = new Date(day * DAY_MS + DAILY_RESET_MS);
+  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+}
+
+// A compact "Nm ago" for a stored "YYYY-MM-DD HH:MM:SS" UTC timestamp (D1 writes
+// datetime('now')), or "never" when the column is NULL (an empty table).
+function ago(ts, nowMs) {
+  if (!ts) return "never";
+  const t = Date.parse(ts.replace(" ", "T") + "Z");
+  if (Number.isNaN(t)) return ts;
+  const s = Math.max(0, Math.round((nowMs - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60); if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60); if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+// Thousands-separated integer, without leaning on a locale in the worker runtime.
+function fmt(n) {
+  return String(n ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+// Minimal escaper for the few dynamic strings the page emits (version strings, the
+// error preview, date labels).
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+}
+
+// An HTML 200 with no-store: the dashboard is always live, never cached.
+function htmlResp(body) {
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+// One D1 round trip for the whole page: a SELECT 1 ping (timed for the health dot),
+// per-table aggregates, the latest client error, every recent frontend build, and
+// the daily board/week. `today` is the current day index; `now` the wall clock for
+// the recency deltas. Returns a plain object the JSON route serializes and the HTML
+// route renders, so the two views can never drift. A thrown batch (D1 down / schema
+// drift) is caught and reported as a degraded health state rather than a bare 500.
+async function collectStatus(env, today, now) {
+  const q = (sql) => env.DB.prepare(sql);
+
+  // total rows, rows newer than `window`, and the most recent timestamp. SUM over a
+  // boolean comparison counts the recent rows; COALESCE turns the empty-table NULL
+  // into 0. `window` is a SQLite datetime modifier, e.g. '-1 days' or '-7 days'.
+  const recencyAgg = (table, window) =>
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(created_at >= datetime('now', '${window}')), 0) AS recent,
+            MAX(created_at) AS latest
+       FROM ${table}`;
+
+  const t0 = Date.now();
+  let res, dbOk = true, dbErr = null;
+  try {
+    res = await env.DB.batch([
+      q("SELECT 1 AS ok"),
+      q(recencyAgg("solves", "-1 days")),
+      q(recencyAgg("daily_solves", "-1 days")),
+      // move_logs carries no recency delta -- split solved vs still-in-progress.
+      q(`SELECT COUNT(*) AS total,
+                COALESCE(SUM(solved = 1), 0) AS solved,
+                MAX(updated_at) AS latest
+           FROM move_logs`),
+      // client_errors windowed over 7 DAYS, not a day: errors are rare, so a 24h
+      // window would usually read 0 and hide a recent regression.
+      q(recencyAgg("client_errors", "-7 days")),
+      q(`SELECT substr(payload, 1, 240) AS preview, created_at
+           FROM client_errors ORDER BY id DESC LIMIT 1`),
+      // Every frontend build that reported a solve in the last 7 days (all of
+      // them, not a top-N), with its first/last sighting, newest-introduced first
+      // -- so the most recently deployed build sorts to the top. MIN/MAX over the
+      // window date the build's appearance; first_seen is what distinguishes
+      // "newer" even when two builds are both still reporting (last_seen ~ now for
+      // both). The version string is a short git hash, which does NOT sort by age.
+      q(`SELECT client_version AS v, COUNT(*) AS n,
+                MIN(created_at) AS first_seen, MAX(created_at) AS last_seen
+           FROM solves
+          WHERE created_at >= datetime('now', '-7 days')
+          GROUP BY client_version
+          ORDER BY first_seen DESC, n DESC`),
+      // Today's daily board: per-level submission counts for the current day index.
+      q("SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? GROUP BY level").bind(today),
+      // Daily submissions for the last 7 day-indices (today back through today-6).
+      q("SELECT day, COUNT(*) AS n FROM daily_solves WHERE day >= ? GROUP BY day ORDER BY day DESC").bind(today - 6),
+    ]);
+  } catch (e) {
+    dbOk = false;
+    dbErr = String((e && e.message) || e);
+  }
+  const pingMs = Date.now() - t0;
+
+  const head = {
+    ok: dbOk, nowMs: now, db: { ok: dbOk, error: dbErr, pingMs },
+    today: { day: today, label: dayLabel(today) },
+  };
+  if (!dbOk) return head;
+
+  const first = (r) => (r && r.results && r.results[0]) || {};
+  const rows = (r) => (r && r.results) || [];
+
+  const s = first(res[1]), dl = first(res[2]), m = first(res[3]),
+        er = first(res[4]), ep = first(res[5]);
+  const mTotal = m.total || 0, mSolved = m.solved || 0;
+  const todayCounts = rows(res[7]);
+
+  return {
+    ...head,
+    tables: {
+      solves:       { total: s.total || 0,  recent: s.recent || 0,  latest: s.latest || null },
+      daily_solves: { total: dl.total || 0, recent: dl.recent || 0, latest: dl.latest || null },
+      move_logs:    { total: mTotal, solved: mSolved, inProgress: mTotal - mSolved, latest: m.latest || null },
+      client_errors:{ total: er.total || 0, recent: er.recent || 0, latest: er.latest || null,
+                      lastPreview: ep.preview || null, lastAt: ep.created_at || null },
+    },
+    versions: rows(res[6]).map((r) => ({
+      version: r.v, count: r.n, firstSeen: r.first_seen, lastSeen: r.last_seen,
+    })),
+    board: DAILY_LEVEL_NAMES.map((name, i) => ({
+      name, count: (todayCounts.find((r) => r.level === i) || {}).n || 0,
+    })),
+    week: rows(res[8]).map((r) => ({ day: r.day, label: dayLabel(r.day), count: r.n })),
+  };
+}
+
+// The full HTML document shell. No <meta refresh> by design -- the page is
+// refreshed manually (the header carries a refresh link); the footer's generated-at
+// time is the only freshness cue needed.
+function statusDoc(body) {
+  return `<!doctype html><html lang="en"><head>` +
+    `<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta name="robots" content="noindex"><title>Sudoku backend status</title>` +
+    `<style>${STATUS_CSS}</style></head><body>${body}</body></html>`;
+}
+
+// Shown by GET /status when no key is supplied: a plain GET form that reloads as
+// /status?key=... A present-but-wrong key never reaches here -- it 401s in the route.
+function statusLoginHtml() {
+  return statusDoc(
+    `<header><h1>Sudoku backend</h1></header>` +
+    `<div class="sub">Enter the API key to view the status dashboard.</div>` +
+    `<form class="login" method="get" action="/status">` +
+    `<input type="password" name="key" placeholder="API key" autofocus autocomplete="off">` +
+    `<button type="submit">View status</button></form>`);
+}
+
+function statusHeader(d, refresh) {
+  const dot = d.db.ok ? "ok" : "bad";
+  const text = d.db.ok ? "Operational" : "Database error";
+  return `<header><h1>Sudoku backend</h1>` +
+    `<span class="status"><span class="dot ${dot}"></span>${text}</span></header>` +
+    `<div class="sub">D1 ping ${d.db.pingMs} ms &middot; day ${d.today.day} ` +
+    `(${esc(d.today.label)}) &middot; <a href="${refresh}">refresh</a></div>`;
+}
+
+// Render the collected status object as the HTML dashboard. `key` is echoed only
+// into the refresh link (it is already in the address bar -- no new exposure).
+function renderStatus(d, key) {
+  const refresh = `?key=${encodeURIComponent(key)}`;
+  if (!d.db.ok) {
+    return statusDoc(statusHeader(d, refresh) +
+      `<section class="panel err"><h2>Database error</h2>` +
+      `<pre class="errpre">${esc(d.db.error || "unknown")}</pre></section>`);
+  }
+
+  const now = d.nowMs, t = d.tables;
+  const errHot = t.client_errors.recent > 0;
+  const line = (txt, cls = "") => `<div class="line ${cls}">${txt}</div>`;
+  const card = (cls, title, big, lines) =>
+    `<div class="card ${cls}"><div class="card-h">${title}</div>` +
+    `<div class="big">${fmt(big)}</div>${lines.join("")}</div>`;
+
+  const cards =
+    card("", "Solves", t.solves.total, [
+      line(`+${fmt(t.solves.recent)} &middot; 24h`),
+      line(`last ${ago(t.solves.latest, now)}`),
+    ]) +
+    card("", "Daily solves", t.daily_solves.total, [
+      line(`+${fmt(t.daily_solves.recent)} &middot; 24h`),
+      line(`last ${ago(t.daily_solves.latest, now)}`),
+    ]) +
+    card("", "Move logs", t.move_logs.total, [
+      line(`${fmt(t.move_logs.solved)} solved`),
+      line(`${fmt(t.move_logs.inProgress)} in progress`),
+      line(`last ${ago(t.move_logs.latest, now)}`),
+    ]) +
+    card(errHot ? "hot" : "", "Client errors", t.client_errors.total, [
+      line(`+${fmt(t.client_errors.recent)} &middot; 7d`, errHot ? "bad" : ""),
+      line(`last ${ago(t.client_errors.latest, now)}`),
+    ]);
+
+  const board = d.board.map((r) =>
+    `<tr><td>${esc(r.name)}</td><td class="num">${fmt(r.count)}</td></tr>`).join("");
+
+  const weekMax = Math.max(1, ...d.week.map((w) => w.count));
+  const week = d.week.length
+    ? d.week.map((w) =>
+        `<tr><td class="day">${esc(w.label)}</td>` +
+        `<td class="barcell"><span class="bar" style="width:${Math.round(w.count / weekMax * 100)}%"></span></td>` +
+        `<td class="num">${fmt(w.count)}</td></tr>`).join("")
+    : `<tr><td colspan="3" class="muted">no submissions</td></tr>`;
+
+  const versionHead =
+    `<tr><th>Version</th><th class="num">Solves</th>` +
+    `<th class="when">First seen</th><th class="when">Last seen</th></tr>`;
+  const versions = d.versions.length
+    ? versionHead + d.versions.map((v) =>
+        `<tr><td class="mono">${esc(v.version)}</td><td class="num">${fmt(v.count)}</td>` +
+        `<td class="when">${ago(v.firstSeen, now)}</td>` +
+        `<td class="when">${ago(v.lastSeen, now)}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="muted">none in the last 7 days</td></tr>`;
+
+  const errPanel = t.client_errors.lastPreview
+    ? `<section class="panel ${errHot ? "warn" : ""}">` +
+      `<h2>Most recent client error <span class="muted">${ago(t.client_errors.lastAt, now)}</span></h2>` +
+      `<pre class="errpre">${esc(t.client_errors.lastPreview)}</pre></section>`
+    : "";
+
+  return statusDoc(
+    statusHeader(d, refresh) +
+    `<div class="grid">${cards}</div>` +
+    `<div class="panels">` +
+      `<section class="panel"><h2>Today's daily board ` +
+      `<span class="muted">${esc(d.today.label)}</span></h2><table>${board}</table></section>` +
+      `<section class="panel"><h2>Daily submissions <span class="muted">7 days</span></h2>` +
+      `<table>${week}</table></section>` +
+    `</div>` +
+    `<section class="panel"><h2>Client versions <span class="muted">last 7 days, newest first</span></h2>` +
+    `<table>${versions}</table></section>` +
+    errPanel +
+    `<footer>backend worker &middot; D1 "sudoku" &middot; generated ${esc(new Date(now).toISOString())}</footer>`);
+}
+
+const STATUS_CSS = `
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--amber:#d29922}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:1000px;padding:24px;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.mono,.errpre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
+h1{margin:0;font-size:18px;font-weight:600}
+.status{display:inline-flex;align-items:center;gap:8px;font-weight:600}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.dot.ok{background:var(--green)}
+.dot.bad{background:var(--red)}
+.sub{margin:4px 0 20px;color:var(--muted);font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
+.card.hot{border-color:var(--red)}
+.card-h{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.big{font-size:26px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.line{color:var(--muted);font-size:13px;margin-top:3px}
+.line.bad{color:var(--red)}
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:680px){.panels{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:12px}
+.panel.warn{border-color:var(--amber)}
+.panel.err{border-color:var(--red)}
+h2{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+h2 .muted{text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px}
+table{width:100%;border-collapse:collapse}
+td{padding:4px 0;border-bottom:1px solid var(--border)}
+th{padding:4px 0;border-bottom:1px solid var(--border);text-align:left;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
+.when{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+td.when{color:var(--muted);font-weight:400}
+.muted{color:var(--muted)}
+.day{white-space:nowrap;padding-right:10px}
+.barcell{width:100%;padding:4px 10px}
+.bar{display:inline-block;height:10px;min-width:2px;border-radius:3px;background:var(--accent);vertical-align:middle}
+.errpre{margin:0;padding:10px;max-height:180px;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:12px;color:var(--muted);white-space:pre-wrap;word-break:break-all}
+.login{display:flex;gap:8px;flex-wrap:wrap}
+.login input{flex:1;min-width:200px;padding:8px 10px;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-size:14px}
+.login button{padding:8px 14px;background:var(--accent);border:0;border-radius:6px;color:#0d1117;font-weight:600;cursor:pointer}
+footer{margin-top:20px;color:var(--muted);font-size:12px}
+`;
