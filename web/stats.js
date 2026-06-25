@@ -7,7 +7,7 @@
 // plus the generation seed when cheat mode is on (a debug aid).
 
 import * as store from "./store.js";
-import { formatDuration, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
+import { formatDuration, hintLabel, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
 import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
 import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
 import { dayLabel, levelName } from "./daily.js";
@@ -121,7 +121,7 @@ function historyCard(g) {
     title = techniqueName(idFor(g.kindIndex));
     modeLabel = g.mode === "drill" ? "Drill" : "Train";
   }
-  const meta = `${modeLabel} · ${formatDuration(g.elapsedMs)} · ${solvedDate(g)}`;
+  const meta = `${modeLabel} · ${formatDuration(g.elapsedMs)} · ${hintLabel(g)} · ${solvedDate(g)}`;
   const col = textColumn(title, meta);
   const badge = gradeBadge(g.grade);
   if (badge) col.appendChild(badge);

@@ -64,6 +64,8 @@ import {
 import { cheatOn, setCheatMode } from "./cheat.js";
 import {
   formatDuration,
+  hintLabel,
+  hintText,
   techniqueName,
   BRANCH_LABEL,
   TIER_ORDER,
@@ -315,7 +317,10 @@ function closeCardMenus(except) {
 }
 
 function continueMeta(g) {
-  const time = formatDuration(g.elapsedMs);
+  // The game is still in progress, so only surface hints once some were used --
+  // an unfinished puzzle hasn't earned the "hint-free" label yet.
+  const hints = (g.hints || 0) > 0 ? ` · ${hintLabel(g)}` : "";
+  const time = formatDuration(g.elapsedMs) + hints;
   const d = dailyOf(g);
   // The "Continue last puzzle" hero uses a generic title, so the daily identity
   // (that it IS a daily, which difficulty, which date) has to live in the meta.
@@ -498,9 +503,7 @@ function submitDaily(g, day) {
 // The solved-card sub-line: solve time, plus the dual-score hint tally so the
 // overview shows at a glance whether a solve was clean.
 function hintSubLabel(g) {
-  const time = formatDuration(g.elapsedMs);
-  const n = g.hints || 0;
-  return n === 0 ? `${time} · hint-free` : `${time} · ${n} ${n === 1 ? "hint" : "hints"}`;
+  return `${formatDuration(g.elapsedMs)} · ${hintLabel(g)}`;
 }
 
 // The per-card leaderboard slot. Rendered synchronously with a "loading" state and
@@ -618,12 +621,12 @@ function renderDailyBoard(box, board, g, state) {
       t.className = "lb-time";
       const ms = times[row - 1];
       t.textContent = ms == null ? "—" : formatDuration(ms);
-      // The dual score: a hint tally per row -- "clean" (green) for a hint-free
-      // solve, otherwise the count.
+      // The dual score: a hint tally per row, in the same wording as every other
+      // surface -- "hint-free" (green) for a clean solve, otherwise the count.
       const h = document.createElement("span");
       const n = hints[row - 1];
       h.className = "lb-hints" + (n === 0 ? " clean" : "");
-      h.textContent = ms == null ? "" : n === 0 ? "clean" : `${n}h`;
+      h.textContent = ms == null ? "" : hintText(n);
       line.append(r, t, h);
     }
     box.appendChild(line);

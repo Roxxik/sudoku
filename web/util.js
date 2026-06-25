@@ -11,6 +11,17 @@ export function formatDuration(ms) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+// The dual-score hint tally as a short label: "hint-free" when clean, else the
+// count. The single wording shared by every surface that shows a hint count --
+// the daily board + leaderboard, the Continue cards and the Stats history -- so
+// they never drift (no "clean" here vs "hint-free" there, no "1h" vs "1 hint").
+export function hintText(n) {
+  return n === 0 ? "hint-free" : `${n} ${n === 1 ? "hint" : "hints"}`;
+}
+export function hintLabel(g) {
+  return hintText(g.hints || 0);
+}
+
 // Title-case display name for a curriculum technique id (kebab-case from
 // `kinds::NAMES`). Wing/fish initialisms are upper-cased; "lc" expands to
 // "Locked Candidates"; everything else is word-capitalized.
