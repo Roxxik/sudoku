@@ -396,18 +396,31 @@ async function collectStatus(env, today, now) {
       q(recencyAgg("client_errors", "-7 days")),
       q(`SELECT substr(payload, 1, 240) AS preview, created_at
            FROM client_errors ORDER BY id DESC LIMIT 1`),
-      // Every frontend build that reported a solve in the last 7 days (all of
-      // them, not a top-N), with its first/last sighting, newest-introduced first
-      // -- so the most recently deployed build sorts to the top. MIN/MAX over the
-      // window date the build's appearance; first_seen is what distinguishes
-      // "newer" even when two builds are both still reporting (last_seen ~ now for
-      // both). The version string is a short git hash, which does NOT sort by age.
-      q(`SELECT client_version AS v, COUNT(*) AS n,
-                MIN(created_at) AS first_seen, MAX(created_at) AS last_seen
-           FROM solves
-          WHERE created_at >= datetime('now', '-7 days')
-          GROUP BY client_version
-          ORDER BY first_seen DESC, n DESC`),
+      // Every frontend build seen in the last 7 days (all of them, not a top-N),
+      // newest-introduced first -- so the most recently deployed build sorts to the
+      // top. first_seen is what distinguishes "newer" even when two builds are both
+      // still reporting (last_seen ~ now for both); the version string is a short
+      // git hash, which does NOT sort by age. Unioned over every table that carries
+      // client_version (solves + daily_solves + move_logs), keeping a per-table row
+      // count so a build that only synced an abandoned puzzle's move log -- never a
+      // solve -- still surfaces with a 0 in the Solves column. move_logs is keyed on
+      // updated_at (its client_version is the latest snapshot's writer); the
+      // append-only tables on created_at.
+      q(`SELECT v,
+                COALESCE(SUM(src = 'solves'), 0)       AS solves,
+                COALESCE(SUM(src = 'daily_solves'), 0) AS daily,
+                COALESCE(SUM(src = 'move_logs'), 0)    AS moves,
+                MIN(ts) AS first_seen, MAX(ts) AS last_seen
+           FROM (SELECT client_version AS v, created_at AS ts, 'solves' AS src FROM solves
+                  WHERE created_at >= datetime('now', '-7 days')
+                 UNION ALL
+                 SELECT client_version AS v, created_at AS ts, 'daily_solves' AS src FROM daily_solves
+                  WHERE created_at >= datetime('now', '-7 days')
+                 UNION ALL
+                 SELECT client_version AS v, updated_at AS ts, 'move_logs' AS src FROM move_logs
+                  WHERE updated_at >= datetime('now', '-7 days'))
+          GROUP BY v
+          ORDER BY first_seen DESC`),
       // Today's daily board: per-level submission counts for the current day index.
       q("SELECT level, COUNT(*) AS n FROM daily_solves WHERE day = ? GROUP BY level").bind(today),
       // Daily submissions for the last 7 day-indices (today back through today-6).
@@ -443,7 +456,8 @@ async function collectStatus(env, today, now) {
                       lastPreview: ep.preview || null, lastAt: ep.created_at || null },
     },
     versions: rows(res[6]).map((r) => ({
-      version: r.v, count: r.n, firstSeen: r.first_seen, lastSeen: r.last_seen,
+      version: r.v, solves: r.solves, daily: r.daily, moves: r.moves,
+      firstSeen: r.first_seen, lastSeen: r.last_seen,
     })),
     board: DAILY_LEVEL_NAMES.map((name, i) => ({
       name, count: (todayCounts.find((r) => r.level === i) || {}).n || 0,
@@ -530,14 +544,17 @@ function renderStatus(d, key) {
     : `<tr><td colspan="3" class="muted">no submissions</td></tr>`;
 
   const versionHead =
-    `<tr><th>Version</th><th class="num">Solves</th>` +
-    `<th class="when">First seen</th><th class="when">Last seen</th></tr>`;
+    `<tr><th>Version</th><th class="num">Solves</th><th class="num">Daily</th>` +
+    `<th class="num">Moves</th><th class="when">First seen</th><th class="when">Last seen</th></tr>`;
   const versions = d.versions.length
     ? versionHead + d.versions.map((v) =>
-        `<tr><td class="mono">${esc(v.version)}</td><td class="num">${fmt(v.count)}</td>` +
+        `<tr><td class="mono">${esc(v.version)}</td>` +
+        `<td class="num">${fmt(v.solves)}</td>` +
+        `<td class="num">${fmt(v.daily)}</td>` +
+        `<td class="num">${fmt(v.moves)}</td>` +
         `<td class="when">${ago(v.firstSeen, now)}</td>` +
         `<td class="when">${ago(v.lastSeen, now)}</td></tr>`).join("")
-    : `<tr><td colspan="4" class="muted">none in the last 7 days</td></tr>`;
+    : `<tr><td colspan="6" class="muted">none in the last 7 days</td></tr>`;
 
   const errPanel = t.client_errors.lastPreview
     ? `<section class="panel ${errHot ? "warn" : ""}">` +
