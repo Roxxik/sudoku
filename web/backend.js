@@ -559,61 +559,152 @@ export function recordDailySolve(solve) {
 // simply shows no board rather than breaking the page. The x-api-key header is the
 // same speed-bump gate the writes use; it makes the GET preflight (cached a day).
 
+// ---- Daily leaderboard read-through cache ----
+// The reads below are cached in localStorage with a short TTL: within TTL of the
+// last good fetch the cache is served directly (so reopening the page or revealing a
+// rank doesn't re-hit the backend more than once every few minutes per day/level),
+// and past the TTL a fresh fetch refreshes it. A fetch that FAILS (offline, a bad
+// response) falls back to the last board the device saw -- at ANY age -- rather than
+// going blank. A player who has since solved is spliced into that cached board by
+// projectedStanding, so they still see where they'd land with no connection. Only the
+// current day is ever rendered, so the cache is pruned to the most recent days.
+const DAILY_BOARD_CACHE_KEY = "sudoku.backend.daily.board.cache.v1";
+const DAILY_COUNTS_CACHE_KEY = "sudoku.backend.daily.counts.cache.v1";
+const DAILY_CACHE_TTL_MS = 5 * 60 * 1000; // at most one fetch per 5 min, per day/level
+const DAILY_CACHE_KEEP_DAYS = 2; // boards for older days are never displayed
+
+// A cache slot is a flat object keyed by day ("<day>" for counts, "<day>:<level>"
+// for boards). Load tolerates a missing/corrupt blob by returning an empty map.
+function loadDailyCache(key) {
+  let raw;
+  try { raw = localStorage.getItem(key); } catch { return {}; }
+  if (!raw) return {};
+  try {
+    const map = JSON.parse(raw);
+    return map && typeof map === "object" ? map : {};
+  } catch { return {}; }
+}
+
+// Write a map back, dropping every entry more than KEEP_DAYS behind `day` (the day
+// just fetched) so the cache can't grow without bound. Best-effort; a quota error
+// just skips the write (the live fetch already served the caller).
+function saveDailyCache(key, map, day) {
+  const kept = {};
+  for (const [k, v] of Object.entries(map)) {
+    const d = Number(k.split(":")[0]);
+    if (Number.isFinite(d) && day - d <= DAILY_CACHE_KEEP_DAYS) kept[k] = v;
+  }
+  try { localStorage.setItem(key, JSON.stringify(kept)); } catch {}
+}
+
 // Per-level solver counts for one puzzle-day: { level: n }. Drives the overview's
 // pre-solve teaser ("N solved today"), which deliberately ships counts only, no
-// times -- the times are the post-solve reward. Returns an object on success (a
-// day with no solves yet is a real {}), or NULL when the board can't be read at all
-// (unconfigured / offline / bad response) so the UI shows "unavailable" rather than
-// passing off "no backend" as "be the first".
+// times -- the times are the post-solve reward. Returns an object on success (a day
+// with no solves yet is a real {}) or a fresh-enough / last-known cached copy, and
+// NULL only when neither is available (unconfigured / offline with no cache) so the
+// UI shows "unavailable" rather than passing off "no backend" as "be the first".
 export async function fetchDailyCounts(day) {
   if (!CONFIGURED) return null;
+  const cached = readDailyCountsCache(day, DAILY_CACHE_TTL_MS);
+  if (cached) return cached; // within the TTL -> serve cache, skip the network
   const debug = cheatOn();
   try {
     const resp = await fetch(`${DAILY_ENDPOINT}?day=${encodeURIComponent(day)}`, {
       headers: { "x-api-key": API_KEY },
     });
     if (debug) console.log(`[backend] daily counts GET (day ${day}) -> ${resp.status}`);
-    if (!resp.ok) return null;
+    if (!resp.ok) return readDailyCountsCache(day);
     const body = await resp.json();
-    return body && body.counts && typeof body.counts === "object" ? body.counts : {};
+    const counts = body && body.counts && typeof body.counts === "object" ? body.counts : {};
+    writeDailyCountsCache(day, counts);
+    return counts;
   } catch (err) {
     if (debug) console.warn("[backend] daily counts GET failed:", err);
-    return null;
+    return readDailyCountsCache(day);
   }
+}
+
+// Read the cached counts for a day. With `maxAgeMs` set, the entry counts only when
+// younger than that (the TTL gate); without it, any age is returned (offline fall-back).
+function readDailyCountsCache(day, maxAgeMs = Infinity) {
+  const entry = loadDailyCache(DAILY_COUNTS_CACHE_KEY)[String(day)];
+  if (!entry || !entry.counts || typeof entry.counts !== "object") return null;
+  if (Date.now() - entry.ts > maxAgeMs) return null;
+  return entry.counts;
+}
+
+function writeDailyCountsCache(day, counts) {
+  const map = loadDailyCache(DAILY_COUNTS_CACHE_KEY);
+  map[String(day)] = { ts: Date.now(), counts };
+  saveDailyCache(DAILY_COUNTS_CACHE_KEY, map, day);
 }
 
 // The full ordered board for one (day, level): { count, times, hints, mine } in
 // (hints, then time) rank order (anonymous -- the table stores no identity). When
 // `solveId` is given, `mine` is the 0-based index of the caller's own row (or -1),
 // so the caller can tell whether its solve is already on the board and avoid
-// double-counting it when projecting a rank. Returns null on any failure (the
-// overview then falls back to the teaser).
+// double-counting it when projecting a rank. Within the TTL the cached board is
+// returned without a fetch; on a failed fetch the last cached board (any age) is
+// returned; null only when there is nothing to show (the overview then teases).
 export async function fetchDailyBoard(day, level, solveId) {
   if (!CONFIGURED) return null;
+  const cached = readDailyBoardCache(day, level, solveId, DAILY_CACHE_TTL_MS);
+  if (cached) return cached; // within the TTL -> serve cache, skip the network
   const debug = cheatOn();
   try {
     let qs = `day=${encodeURIComponent(day)}&level=${encodeURIComponent(level)}`;
     if (solveId) qs += `&solve_id=${encodeURIComponent(solveId)}`;
     const resp = await fetch(`${DAILY_ENDPOINT}?${qs}`, { headers: { "x-api-key": API_KEY } });
     if (debug) console.log(`[backend] daily board GET (day ${day}, level ${level}) -> ${resp.status}`);
-    if (!resp.ok) return null;
+    if (!resp.ok) return readDailyBoardCache(day, level, solveId);
     const body = await resp.json();
-    if (!body || !Array.isArray(body.times)) return null;
+    if (!body || !Array.isArray(body.times)) return readDailyBoardCache(day, level, solveId);
     // `hints` parallels `times` (same rank order) -- the dual-score axis. Tolerate an
     // older worker that omits it (all-zero column) or `mine` (treat as not found).
     const hints = Array.isArray(body.hints) && body.hints.length === body.times.length
       ? body.hints
       : body.times.map(() => 0);
-    return {
+    const board = {
       count: typeof body.count === "number" ? body.count : body.times.length,
       times: body.times,
       hints,
       mine: Number.isInteger(body.mine) ? body.mine : -1,
     };
+    writeDailyBoardCache(day, level, solveId, board);
+    return board;
   } catch (err) {
     if (debug) console.warn("[backend] daily board GET failed:", err);
-    return null;
+    return readDailyBoardCache(day, level, solveId);
   }
+}
+
+function boardCacheKey(day, level) {
+  return `${day}:${level}`;
+}
+
+// Read the cached board for a (day, level). `maxAgeMs` gates by age as above. `mine`
+// is solve-specific, so it is trusted only when the cache was taken for THIS solveId;
+// otherwise it is reported as -1 and projectedStanding splices the player in locally.
+function readDailyBoardCache(day, level, solveId, maxAgeMs = Infinity) {
+  const entry = loadDailyCache(DAILY_BOARD_CACHE_KEY)[boardCacheKey(day, level)];
+  if (!entry || !Array.isArray(entry.times)) return null;
+  if (Date.now() - entry.ts > maxAgeMs) return null;
+  const mine =
+    solveId && entry.solveId === solveId && Number.isInteger(entry.mine) ? entry.mine : -1;
+  return { count: entry.count, times: entry.times, hints: entry.hints, mine };
+}
+
+function writeDailyBoardCache(day, level, solveId, board) {
+  const map = loadDailyCache(DAILY_BOARD_CACHE_KEY);
+  map[boardCacheKey(day, level)] = {
+    ts: Date.now(),
+    solveId: solveId || null,
+    count: board.count,
+    times: board.times,
+    hints: board.hints,
+    mine: board.mine,
+  };
+  saveDailyCache(DAILY_BOARD_CACHE_KEY, map, day);
 }
 
 // Forget everything queued for PASSIVE upload. Called when the user opts OUT of
