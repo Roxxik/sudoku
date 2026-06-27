@@ -1,5 +1,7 @@
 "use strict";
 
+import { logStorageError } from "./util.js";
+
 // Cheat-mode state, shared by the play view (which toggles it and reacts in its
 // UI) and the stats view (which only reads it to decide whether to show the
 // debug seed). Kept here so there is one source of truth for the key and the
@@ -22,7 +24,8 @@ function privateHost() {
 function cheatStored() {
   try {
     return localStorage.getItem(CHEAT_KEY);
-  } catch {
+  } catch (err) {
+    logStorageError("read", CHEAT_KEY, err);
     return null;
   }
 }
@@ -43,7 +46,7 @@ export function cheatOn() {
 export function setCheatMode(on) {
   try {
     localStorage.setItem(CHEAT_KEY, on ? "1" : "0");
-  } catch {
-    /* ignore */
+  } catch (err) {
+    logStorageError("write", CHEAT_KEY, err);
   }
 }

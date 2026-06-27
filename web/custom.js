@@ -20,7 +20,7 @@ import {
   hasForce,
 } from "./spec.js";
 import { REVIEW_LESSONS, lessonUsages, lessonHasDrill } from "./review.js";
-import { techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
+import { techniqueName, TIER_ORDER, TIER_LABEL, logStorageError } from "./util.js";
 
 let curriculum = [];
 let showView = () => {};
@@ -62,8 +62,9 @@ function loadUsages() {
     ) {
       return arr;
     }
-  } catch {
+  } catch (err) {
     // Corrupt/old data: start blank.
+    logStorageError("read", USAGES_KEY, err);
   }
   return new Array(NUM_KINDS).fill(OFF);
 }
@@ -71,15 +72,17 @@ function loadUsages() {
 function saveUsages() {
   try {
     localStorage.setItem(USAGES_KEY, JSON.stringify(usages));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: the spec just won't persist this session.
+    logStorageError("write", USAGES_KEY, err);
   }
 }
 
 function loadForceAny() {
   try {
     return localStorage.getItem(FORCE_ANY_KEY) === "1";
-  } catch {
+  } catch (err) {
+    logStorageError("read", FORCE_ANY_KEY, err);
     return false;
   }
 }
@@ -87,8 +90,9 @@ function loadForceAny() {
 function saveForceAny() {
   try {
     localStorage.setItem(FORCE_ANY_KEY, forceAny ? "1" : "0");
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: the toggle just won't persist this session.
+    logStorageError("write", FORCE_ANY_KEY, err);
   }
 }
 

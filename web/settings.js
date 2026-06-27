@@ -1,5 +1,7 @@
 "use strict";
 
+import { logStorageError } from "./util.js";
+
 // App-wide settings, persisted to localStorage. Shared by the play view (which
 // reads them while you place) and the settings screen (home.js, which reads and
 // writes them). Kept DOM-free so there is one source of truth per key and its
@@ -18,7 +20,8 @@ const LIGHT_MODE_KEY = "sudoku.settings.lightMode";
 function stored(key) {
   try {
     return localStorage.getItem(key);
-  } catch {
+  } catch (err) {
+    logStorageError("read", key, err);
     return null;
   }
 }
@@ -26,8 +29,9 @@ function stored(key) {
 function store(key, on) {
   try {
     localStorage.setItem(key, on ? "1" : "0");
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: the setting just won't persist this session.
+    logStorageError("write", key, err);
   }
 }
 
@@ -74,8 +78,9 @@ export function highlightMode() {
 export function setHighlightMode(mode) {
   try {
     localStorage.setItem(HIGHLIGHT_KEY, mode);
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: the setting just won't persist this session.
+    logStorageError("write", HIGHLIGHT_KEY, err);
   }
 }
 

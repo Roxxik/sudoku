@@ -300,6 +300,13 @@ function wireVisibility() {
 // heavier (the board, stats, the generation worker client, the wasm bridge) is
 // dynamically imported afterwards; the navigation handlers await `heavyReady`.
 function boot() {
+  // Enforce the storage retention policy once, up front: reclaim the heavy board +
+  // move log of every already-solved game (older builds kept them) and any orphaned
+  // per-game keys, so a long-time player's store isn't carrying dozens of finished
+  // puzzles' undo timelines against the quota. Cheap and synchronous; runs before the
+  // first read so Home lists from an already-pruned index.
+  store.reclaimStorage();
+
   wireOverlay();
   wireVisibility();
 

@@ -1,5 +1,7 @@
 "use strict";
 
+import { logStorageError } from "./util.js";
+
 // Persistence for played puzzles. Everything the start page shows -- the
 // in-progress "Continue" list, the per-mode best times, the solved-count badges
 // in the tree, and the Stats page -- is derived from one flat list of game
@@ -24,8 +26,13 @@
 const INDEX_KEY = "sudoku.games.v1";
 const N = 81;
 
+// The per-game key prefixes, factored out so reclaimStorage can recognise a game's
+// keys by prefix when sweeping the whole localStorage namespace.
+const GAME_PREFIX = "sudoku.game.";
+const TRACK_PREFIX = "sudoku.track.";
+
 function gameKey(id) {
-  return `sudoku.game.${id}`;
+  return `${GAME_PREFIX}${id}`;
 }
 
 // The move-tracking timeline for a game lives under its own third key, separate
@@ -34,7 +41,7 @@ function gameKey(id) {
 // save path O(1). Frontend-only capture for the grader (see tracker.js); never
 // sent anywhere.
 function trackKey(id) {
-  return `sudoku.track.${id}`;
+  return `${TRACK_PREFIX}${id}`;
 }
 
 // The fields that live in the per-game heavy key rather than the index. These are
@@ -49,15 +56,17 @@ function loadIndex() {
   let raw;
   try {
     raw = localStorage.getItem(INDEX_KEY);
-  } catch {
+  } catch (err) {
+    logStorageError("read", INDEX_KEY, err);
     return [];
   }
   if (!raw) return [];
   let games;
   try {
     games = JSON.parse(raw);
-  } catch {
+  } catch (err) {
     // Corrupt/old data shouldn't brick the app; start fresh.
+    logStorageError("read", INDEX_KEY, err);
     return [];
   }
   if (!Array.isArray(games)) return [];
@@ -74,8 +83,9 @@ function loadIndex() {
 function saveIndex(games) {
   try {
     localStorage.setItem(INDEX_KEY, JSON.stringify(games));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: play still works this session, just isn't saved.
+    logStorageError("write", INDEX_KEY, err);
   }
 }
 
@@ -85,7 +95,8 @@ function readHeavy(id) {
   try {
     const raw = localStorage.getItem(gameKey(id));
     return raw ? JSON.parse(raw) || {} : {};
-  } catch {
+  } catch (err) {
+    logStorageError("read", gameKey(id), err);
     return {};
   }
 }
@@ -93,16 +104,17 @@ function readHeavy(id) {
 function writeHeavy(id, heavy) {
   try {
     localStorage.setItem(gameKey(id), JSON.stringify(heavy));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: tolerated, as with the index.
+    logStorageError("write", gameKey(id), err);
   }
 }
 
 function deleteHeavy(id) {
   try {
     localStorage.removeItem(gameKey(id));
-  } catch {
-    /* ignore */
+  } catch (err) {
+    logStorageError("delete", gameKey(id), err);
   }
 }
 
@@ -116,7 +128,8 @@ export function loadTrack(id) {
     if (!raw) return [];
     const data = JSON.parse(raw);
     return Array.isArray(data && data.events) ? data.events : [];
-  } catch {
+  } catch (err) {
+    logStorageError("read", trackKey(id), err);
     return [];
   }
 }
@@ -127,16 +140,17 @@ export function loadTrack(id) {
 export function saveTrack(id, events) {
   try {
     localStorage.setItem(trackKey(id), JSON.stringify({ v: 1, events }));
-  } catch {
+  } catch (err) {
     /* quota or privacy mode: the log just won't persist this session. */
+    logStorageError("write", trackKey(id), err);
   }
 }
 
 function deleteTrack(id) {
   try {
     localStorage.removeItem(trackKey(id));
-  } catch {
-    /* ignore */
+  } catch (err) {
+    logStorageError("delete", trackKey(id), err);
   }
 }
 
@@ -341,6 +355,57 @@ export function deleteGame(id) {
   saveIndex(loadIndex().filter((g) => g.id !== id));
   deleteHeavy(id);
   deleteTrack(id); // drop the move-tracking log along with the game
+}
+
+// Drop a game's heavy board + undo/redo timeline and its move-tracking log, while
+// KEEPING its light index entry. This is the retention boundary for a FINISHED
+// puzzle: the index record feeds the stats forever, but the editable working state
+// is meaningless once solved (a solved game is never reopened) and its move timeline
+// has already been handed to the backend, so neither has any further local use.
+// Called by play.onSolved and, retroactively, by reclaimStorage.
+export function discardWorkingState(id) {
+  deleteHeavy(id);
+  deleteTrack(id);
+}
+
+// One-time-per-load sweep that enforces the retention policy on data already on the
+// device. Two kinds of reclaimable keys are removed:
+//   - the working state (heavy + track) of every SOLVED game -- the same drop
+//     onSolved now does, applied retroactively to games solved by older builds;
+//   - any heavy/track key whose game id is no longer in the index (an orphan from an
+//     interrupted delete or a long-gone build).
+// Active games are left fully intact. Cheap: one index parse plus a single pass over
+// the key namespace. Returns the count of keys dropped (logged to the console so a
+// reclaim is visible). Run at startup before the first render.
+export function reclaimStorage() {
+  const status = new Map(loadIndex().map((g) => [g.id, g.status]));
+  // Snapshot the key list first: removing entries mid-iteration shifts the live
+  // localStorage indices and would skip keys.
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));
+  } catch (err) {
+    logStorageError("read", "<enumerate>", err);
+    return 0;
+  }
+  let removed = 0;
+  for (const key of keys) {
+    if (key == null) continue;
+    const prefix = key.startsWith(GAME_PREFIX) ? GAME_PREFIX : key.startsWith(TRACK_PREFIX) ? TRACK_PREFIX : null;
+    if (!prefix) continue;
+    const st = status.get(key.slice(prefix.length));
+    // Unknown id -> orphan; solved -> finished, working state no longer needed.
+    if (st === undefined || st === "solved") {
+      try {
+        localStorage.removeItem(key);
+        removed++;
+      } catch (err) {
+        logStorageError("delete", key, err);
+      }
+    }
+  }
+  if (removed) console.info(`[storage] reclaimStorage dropped ${removed} stale key(s)`);
+  return removed;
 }
 
 // Checkpoint the player's in-progress board as one keystroke's save. This is the

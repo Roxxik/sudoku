@@ -42,6 +42,9 @@ import { cheatOn } from "./cheat.js";
 // device. settings.js is DOM-free, so importing it here is safe.
 import { dataSharingOn } from "./settings.js";
 
+// Shared "never swallow a storage failure" logger (see util.logStorageError).
+import { logStorageError } from "./util.js";
+
 // True until the constants above are replaced with the deployed values. While
 // unconfigured we skip the POST entirely so the prototype doesn't fire a doomed
 // request (and log a console error) on every solve before the backend exists.
@@ -69,12 +72,13 @@ const OUTBOX_MAX = 100;
 
 function loadOutbox() {
   let raw;
-  try { raw = localStorage.getItem(OUTBOX_KEY); } catch { return []; }
+  try { raw = localStorage.getItem(OUTBOX_KEY); } catch (err) { logStorageError("read", OUTBOX_KEY, err); return []; }
   if (!raw) return [];
   try {
     const entries = JSON.parse(raw);
     return Array.isArray(entries) ? entries : [];
-  } catch {
+  } catch (err) {
+    logStorageError("read", OUTBOX_KEY, err);
     return [];
   }
 }
@@ -82,8 +86,9 @@ function loadOutbox() {
 function saveOutbox(entries) {
   try {
     localStorage.setItem(OUTBOX_KEY, JSON.stringify(entries));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: durability is best-effort; the solve flow is unaffected.
+    logStorageError("write", OUTBOX_KEY, err);
   }
 }
 
@@ -233,12 +238,13 @@ const MOVE_OUTBOX_MAX = 50; // distinct puzzles; coalescing bounds per-puzzle gr
 
 function loadMoveOutbox() {
   let raw;
-  try { raw = localStorage.getItem(MOVE_OUTBOX_KEY); } catch { return []; }
+  try { raw = localStorage.getItem(MOVE_OUTBOX_KEY); } catch (err) { logStorageError("read", MOVE_OUTBOX_KEY, err); return []; }
   if (!raw) return [];
   try {
     const entries = JSON.parse(raw);
     return Array.isArray(entries) ? entries : [];
-  } catch {
+  } catch (err) {
+    logStorageError("read", MOVE_OUTBOX_KEY, err);
     return [];
   }
 }
@@ -246,8 +252,9 @@ function loadMoveOutbox() {
 function saveMoveOutbox(entries) {
   try {
     localStorage.setItem(MOVE_OUTBOX_KEY, JSON.stringify(entries));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: durability is best-effort; the play flow is unaffected.
+    logStorageError("write", MOVE_OUTBOX_KEY, err);
   }
 }
 
@@ -383,12 +390,13 @@ function dailyPostingEnabled() {
 
 function loadDailyOutbox() {
   let raw;
-  try { raw = localStorage.getItem(DAILY_OUTBOX_KEY); } catch { return []; }
+  try { raw = localStorage.getItem(DAILY_OUTBOX_KEY); } catch (err) { logStorageError("read", DAILY_OUTBOX_KEY, err); return []; }
   if (!raw) return [];
   try {
     const entries = JSON.parse(raw);
     return Array.isArray(entries) ? entries : [];
-  } catch {
+  } catch (err) {
+    logStorageError("read", DAILY_OUTBOX_KEY, err);
     return [];
   }
 }
@@ -396,19 +404,21 @@ function loadDailyOutbox() {
 function saveDailyOutbox(entries) {
   try {
     localStorage.setItem(DAILY_OUTBOX_KEY, JSON.stringify(entries));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: durability is best-effort; the play flow is unaffected.
+    logStorageError("write", DAILY_OUTBOX_KEY, err);
   }
 }
 
 function loadDailyDone() {
   let raw;
-  try { raw = localStorage.getItem(DAILY_DONE_KEY); } catch { return []; }
+  try { raw = localStorage.getItem(DAILY_DONE_KEY); } catch (err) { logStorageError("read", DAILY_DONE_KEY, err); return []; }
   if (!raw) return [];
   try {
     const ids = JSON.parse(raw);
     return Array.isArray(ids) ? ids : [];
-  } catch {
+  } catch (err) {
+    logStorageError("read", DAILY_DONE_KEY, err);
     return [];
   }
 }
@@ -416,8 +426,9 @@ function loadDailyDone() {
 function saveDailyDone(ids) {
   try {
     localStorage.setItem(DAILY_DONE_KEY, JSON.stringify(ids));
-  } catch {
+  } catch (err) {
     // Quota or privacy mode: tolerated like the other writes.
+    logStorageError("write", DAILY_DONE_KEY, err);
   }
 }
 
@@ -577,12 +588,12 @@ const DAILY_CACHE_KEEP_DAYS = 2; // boards for older days are never displayed
 // for boards). Load tolerates a missing/corrupt blob by returning an empty map.
 function loadDailyCache(key) {
   let raw;
-  try { raw = localStorage.getItem(key); } catch { return {}; }
+  try { raw = localStorage.getItem(key); } catch (err) { logStorageError("read", key, err); return {}; }
   if (!raw) return {};
   try {
     const map = JSON.parse(raw);
     return map && typeof map === "object" ? map : {};
-  } catch { return {}; }
+  } catch (err) { logStorageError("read", key, err); return {}; }
 }
 
 // Write a map back, dropping every entry more than KEEP_DAYS behind `day` (the day
@@ -594,7 +605,7 @@ function saveDailyCache(key, map, day) {
     const d = Number(k.split(":")[0]);
     if (Number.isFinite(d) && day - d <= DAILY_CACHE_KEEP_DAYS) kept[k] = v;
   }
-  try { localStorage.setItem(key, JSON.stringify(kept)); } catch {}
+  try { localStorage.setItem(key, JSON.stringify(kept)); } catch (err) { logStorageError("write", key, err); }
 }
 
 // Per-level solver counts for one puzzle-day: { level: n }. Drives the overview's
@@ -707,14 +718,41 @@ function writeDailyBoardCache(day, level, solveId, board) {
   saveDailyCache(DAILY_BOARD_CACHE_KEY, map, day);
 }
 
+// Active eviction for the daily caches, run on load. saveDailyCache already prunes
+// on every write, but a device that opens the app without visiting the daily page
+// never triggers a write -- so without this, a board cached days ago would linger
+// until the page is next opened. Drop every entry older than KEEP_DAYS by wall-clock
+// (each entry carries its write `ts`), so the caches stay lean by reload, not just by
+// next-use. Self-contained -- no puzzle-day index needed.
+function pruneDailyCaches() {
+  const maxAgeMs = DAILY_CACHE_KEEP_DAYS * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  for (const key of [DAILY_BOARD_CACHE_KEY, DAILY_COUNTS_CACHE_KEY]) {
+    const map = loadDailyCache(key);
+    const kept = {};
+    let dropped = 0;
+    for (const [k, v] of Object.entries(map)) {
+      if (v && typeof v.ts === "number" && now - v.ts <= maxAgeMs) kept[k] = v;
+      else dropped++;
+    }
+    if (dropped) {
+      try {
+        localStorage.setItem(key, JSON.stringify(kept));
+      } catch (err) {
+        logStorageError("write", key, err);
+      }
+    }
+  }
+}
+
 // Forget everything queued for PASSIVE upload. Called when the user opts OUT of
 // sharing (Settings -> Share play data) so "off" leaves nothing pending on the
 // device -- not even a stale snapshot from a session when sharing was on. The daily
 // outbox is deliberately NOT cleared: a daily submission is an explicit act the
 // opt-out doesn't govern. Best-effort and quota-safe; clearing never affects play.
 export function clearOutboxes() {
-  try { localStorage.removeItem(OUTBOX_KEY); } catch {}
-  try { localStorage.removeItem(MOVE_OUTBOX_KEY); } catch {}
+  try { localStorage.removeItem(OUTBOX_KEY); } catch (err) { logStorageError("delete", OUTBOX_KEY, err); }
+  try { localStorage.removeItem(MOVE_OUTBOX_KEY); } catch (err) { logStorageError("delete", MOVE_OUTBOX_KEY, err); }
 }
 
 // Retry triggers beyond the lazy next-solve/next-sync flush: drain both queues when
@@ -726,4 +764,6 @@ if (typeof window !== "undefined") {
   flushOutbox();
   flushMoveOutbox();
   flushDailyOutbox();
+  // Evict stale daily-leaderboard cache on load (see pruneDailyCaches).
+  pruneDailyCaches();
 }

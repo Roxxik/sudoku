@@ -307,7 +307,11 @@ function elapsedMs() {
 // listing copy of elapsedMs/lastPlayedAt is refreshed less often, at pause (see
 // checkpointListing), which is enough to keep the start page current.
 function persist() {
-  if (!game) return;
+  // A finished puzzle has no working state worth checkpointing: onSolved drops the
+  // heavy key on purpose, and the in-memory board/timeline still linger, so a stray
+  // persist() (e.g. a pause on the way out, or a tab-hide over the solved dialog)
+  // would resurrect the very key we just reclaimed. Skip it once solved.
+  if (!game || finished) return;
   store.saveProgress(game.id, {
     value: value.slice(),
     centerMarks: centerMarks.map((s) => [...s]),
@@ -791,11 +795,11 @@ function onSolved() {
   closeHint();
   pause(); // freeze and persist the elapsed time
   const finalMs = elapsedMs();
-  // Close the timeline. Flush now (not just on the pause above): the solved
-  // dialog's Home button navigates away without a further pause, so this is the
-  // last guaranteed chance to persist the tail of the log.
+  // Close the timeline with the final `solved` event. No flush to localStorage here:
+  // syncMoves below reads the in-memory timeline (tracker.snapshot) for the upload,
+  // and the local track log is dropped at the end of this function anyway -- so
+  // persisting it would only write a key we immediately delete.
   tracker.track("solved", { elapsedMs: finalMs });
-  tracker.flush();
   game = store.updateGame(game.id, {
     status: "solved",
     solvedAt: Date.now(),
@@ -815,6 +819,17 @@ function onSolved() {
   // pause() above stopped the periodic sync and skipped its own (finished) sync,
   // so this is the one upload that carries solved:true.
   syncMoves(true);
+  // The puzzle is finished, so its heavy board + undo timeline and its local move log
+  // have no further use: the light index record carries everything the stats need, and
+  // a solved game is never reopened. The move timeline is safe to drop because
+  // syncMoves above already handed it off -- enqueued in the backend's durable outbox
+  // (or delivered) when sharing is on, and when sharing is off it was never destined to
+  // leave the device and nothing local reads a solved game's log. Drop both now instead
+  // of letting solved games pile up against the storage quota. discardSession first so
+  // the tracker can't re-persist the log we're about to delete (beginSession of the next
+  // game would otherwise flush this one back).
+  tracker.discardSession();
+  store.discardWorkingState(game.id);
   showSolved(finalMs);
 }
 

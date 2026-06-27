@@ -1,5 +1,15 @@
 "use strict";
 
+// localStorage is a hard-bounded resource whose failures are silent by default: a
+// write past the quota throws, and a swallowed throw loses data invisibly -- the
+// classic cause of "my progress reverted on reload". So no storage error is dropped
+// without a trace. A write failure is data loss (console.error); a read failure
+// degrades to a default and is only a warning.
+export function logStorageError(op, key, err) {
+  const log = op === "read" ? console.warn : console.error;
+  log(`[storage] ${op} failed for "${key}":`, err);
+}
+
 // Format a millisecond duration as m:ss (or h:mm:ss past an hour). Used for the
 // solved time and the Stats / badge timings.
 export function formatDuration(ms) {

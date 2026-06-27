@@ -93,6 +93,22 @@ function scheduleFlush() {
   }, FLUSH_DELAY_MS);
 }
 
+// Abandon the current session's in-memory log WITHOUT persisting it, and cancel any
+// pending debounced flush. Used when a game's working state is intentionally dropped
+// (play.onSolved): the timeline has already been handed to the backend, so the local
+// copy is redundant -- and clearing gameId here is what stops the next beginSession()
+// (which flushes the outgoing game first) from rewriting the track key we just
+// deleted. After this, track()/flush() are no-ops until the next beginSession().
+export function discardSession() {
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  events = [];
+  dirty = false;
+  gameId = null;
+}
+
 // Persist the log now (a no-op when nothing changed since the last write). Runs
 // on the debounce and is forced at pause / solve / game swap so a navigation or
 // tab-hide never loses the tail of the timeline.
