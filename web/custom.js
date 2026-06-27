@@ -27,6 +27,15 @@ let showView = () => {};
 let onGenerate = () => {};
 let onHome = () => {};
 
+// Last-state persistence. The builder is otherwise stateless across reloads, so
+// stash the usage array under one key; a malformed/old value falls back to a
+// blank (all-Off) spec rather than bricking the page. These keys are declared
+// BEFORE the loadUsages()/loadForceAny() initializers below: those run at
+// module-eval and read these consts, which sit in their temporal dead zone until
+// their own declaration executes (read them earlier and it throws).
+const USAGES_KEY = "sudoku.custom.usages";
+const FORCE_ANY_KEY = "sudoku.custom.forceAny";
+
 // The spec under construction, one usage code per kind. Persisted (see
 // loadUsages/saveUsages) so a half-built spec survives both a trip Home and a
 // page reload -- the builder reopens exactly where it was left.
@@ -43,12 +52,6 @@ let forceModeEl = null; // the "Require any" switch row, for programmatic refres
 
 const USAGE_LABEL = ["Off", "Allow", "Force", "Concede"];
 const USAGE_CLASS = ["off", "allow", "force", "concede"];
-
-// Last-state persistence. The builder is otherwise stateless across reloads, so
-// stash the usage array under one key; a malformed/old value falls back to a
-// blank (all-Off) spec rather than bricking the page.
-const USAGES_KEY = "sudoku.custom.usages";
-const FORCE_ANY_KEY = "sudoku.custom.forceAny";
 
 function loadUsages() {
   try {
