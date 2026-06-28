@@ -1256,7 +1256,7 @@ const HELP_TOUCH = [
   ["Pencil notes", "Tap Notes to switch between placing digits and pencilling notes."],
   ["Switch note style", "Double-tap Notes to swap between center notes and corner (Snyder) notes."],
   ["Convert corner notes", "Flick the Notes button straight up to turn the selection's corner notes into center notes, merged on top of any center notes already there."],
-  ["Flick to a note style", "Flick the Notes button left for corner (Snyder) notes, or right for center notes, to set which note style is active."],
+  ["Swap note style", "Flick the Notes button left or right to swap between center and corner (Snyder) notes."],
   ["Quick opposite", "With a digit locked, double-tap a cell to do the opposite of your current mode — pencil a note while placing, or place while noting."],
   ["Paint notes", "With a digit locked, a note gesture can sweep: press and drag to pencil that note across every cell the pointer crosses, all as one move. In Notes mode that's a single press-and-drag; while placing digits it's a double-tap-and-drag (placing a value stays one cell). The first cell sets the direction — add or clear — so cells that already match are left untouched."],
   ["Erase", "Tap Erase to clear the value and all notes from the selection, or re-tap a digit you placed. Flick Erase left to clear only corner notes, right to clear only center notes, or straight up to undo the selected cells — restoring the value and notes they had before your last change."],

@@ -1396,19 +1396,13 @@ function wireFlick(btn, handlers) {
   };
 }
 
-// Flicks on the Notes button: a sideways flick arms that mark kind (Left = Corner,
-// Right = Center, mirroring where each note sits in a cell) without touching
-// place/mark mode; a straight-up flick converts the selection's corners to centers.
+// Flicks on the Notes button: a sideways flick (either direction) toggles the
+// armed mark kind, Center <-> Corner, without touching place/mark mode; a
+// straight-up flick converts the selection's corners to centers.
 function wireNotesFlick() {
   return wireFlick(notesBtn, {
-    left: () => {
-      markKind = MODE_CORNER;
-      updateNotesButton();
-    },
-    right: () => {
-      markKind = MODE_CENTER;
-      updateNotesButton();
-    },
+    left: switchMarkKind,
+    right: switchMarkKind,
     up: cornersToCenters,
   });
 }
