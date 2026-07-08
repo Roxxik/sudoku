@@ -59,15 +59,12 @@ fn main() {
         // An optional pinned seed (u64 decimal string): present for the daily
         // puzzle, absent for ordinary generation (which draws its own).
         let seed = seed_field(&data, "seed");
-        // A `spec` array is the custom-spec path; otherwise it's a campaign
-        // request keyed by target/drill.
-        let reply = match usages_field(&data, "spec") {
+        // Every request carries a `spec` (an id-keyed usage map; see gen.js). There
+        // is no separate campaign path -- campaign builds its usages in JS like every
+        // other mode, so one generation path serves them all.
+        let reply = match spec_field(&data, "spec") {
             Some(usages) => generate_custom(&usages, bool_field(&data, "forceAny"), uncapped, seed),
-            None => {
-                let target = num_field(&data, "target").unwrap_or(-1.0);
-                let drill = bool_field(&data, "drill");
-                generate(target, drill, uncapped, seed)
-            }
+            None => err("request is missing its spec"),
         };
         // Best-effort: if the page already terminated us this never runs.
         let _ = scope_for_msg.post_message(&reply);
@@ -81,29 +78,6 @@ fn main() {
     let ready = Object::new();
     let _ = Reflect::set(&ready, &"ready".into(), &JsValue::TRUE);
     let _ = scope.post_message(&ready);
-}
-
-/// Generate one puzzle for `target` (a `lab::kinds` index) in train or drill
-/// mode, returning the reply object the page expects. `uncapped` lifts the
-/// attempt budget so the search runs until it succeeds (or the page terminates
-/// us); the only way out of a runaway uncapped search is `worker.terminate()`.
-///
-/// Uses the **isolated** spec builders (`train_isolated`/`drill_isolated`): an
-/// Expert target is required against every *easier* technique across all branches
-/// (so e.g. an X-Wing puzzle can't be solved with a Naked Pair instead). The
-/// legacy branch-scoped `train`/`drill` are kept for an in-flight debugging
-/// effort; see `generator-lab/src/spec/mod.rs`.
-fn generate(target: f64, drill: bool, uncapped: bool, seed: Option<u64>) -> JsValue {
-    if !(target >= 0.0) || target as usize >= lab::kinds::NUM {
-        return err(&format!("target kind {target} out of range (0..{})", lab::kinds::NUM));
-    }
-    let target = target as usize;
-    let spec = if drill {
-        lab::Spec::drill_isolated(target)
-    } else {
-        lab::Spec::train_isolated(target)
-    };
-    run_spec(&spec, uncapped, seed)
 }
 
 /// Generate one puzzle for an **explicit**, UI-built spec. `usages` is one code
@@ -252,10 +226,6 @@ fn set_grade(reply: &Object, signals: &lab::grade::Signals, rating: f64) {
     let _ = Reflect::set(reply, &"grade".into(), &grade.into());
 }
 
-fn num_field(data: &JsValue, key: &str) -> Option<f64> {
-    Reflect::get(data, &key.into()).ok().and_then(|v| v.as_f64())
-}
-
 fn bool_field(data: &JsValue, key: &str) -> bool {
     Reflect::get(data, &key.into())
         .ok()
@@ -273,18 +243,29 @@ fn seed_field(data: &JsValue, key: &str) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Read `key` as an array of small integers (the per-kind usage codes), or `None`
-/// when it's absent / not an array — which routes the request to the campaign
-/// path instead. Non-numeric entries fall back to 0 (off).
-fn usages_field(data: &JsValue, key: &str) -> Option<Vec<u8>> {
+/// Read `key` as the id-keyed usage map the page sends ({ "<kebab-id>": code }) and
+/// flatten it into a per-`lab::kinds` usage array (index = the id's position in
+/// `kinds::NAMES`; ids absent from the map stay 0 = off). Returns `None` when the
+/// field is absent or not an object. Keying by the technique's stable id -- not by
+/// position -- is what lets the JS kindIndex ordering drift from Rust (see
+/// web/curriculum.js).
+fn spec_field(data: &JsValue, key: &str) -> Option<Vec<u8>> {
     let v = Reflect::get(data, &key.into()).ok()?;
-    if !Array::is_array(&v) {
+    if !v.is_object() {
         return None;
     }
-    let arr: Array = v.unchecked_into();
-    let mut out = Vec::with_capacity(arr.length() as usize);
-    for i in 0..arr.length() {
-        out.push(arr.get(i).as_f64().unwrap_or(0.0) as u8);
+    let obj: Object = v.unchecked_into();
+    let mut out = vec![0u8; lab::kinds::NUM];
+    for entry in Object::entries(&obj).iter() {
+        let pair: Array = entry.unchecked_into(); // [key, value]
+        let id = match pair.get(0).as_string() {
+            Some(s) => s,
+            None => continue,
+        };
+        let code = pair.get(1).as_f64().unwrap_or(0.0) as u8;
+        if let Some(idx) = lab::kinds::NAMES.iter().position(|n| *n == id) {
+            out[idx] = code;
+        }
     }
     Some(out)
 }

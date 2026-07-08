@@ -201,7 +201,15 @@ function newId() {
 // ---- Game records ----
 // A game record, as seen by the rest of the app (getGame merges the two tiers):
 // {
-//   id, kindIndex, mode: "train"|"drill"|"custom",   (Beginner uses "train")
+//   id,
+//   kind: "campaign"|"review"|"daily"|"custom"|"imported" -- the mode discriminator,
+//         the single source of "what kind of game is this" (see modes.js modeOf).
+//         Absent on records from before this field; the one-time mode migration
+//         (modes.js) stamps it at boot, so live code treats it as always present.
+//   kindIndex: campaign only -- the curriculum kind (null otherwise),
+//   mode: "train"|"drill" for campaign and review (the sub-variant); "custom" on
+//         custom/daily/imported (a vestige -- identity comes from `kind`),
+//   lesson: review only -- the stable REVIEW_LESSONS key (null otherwise),
 //   solve_id: stable per-puzzle backend id minted at creation (the join key
 //             between the solves row and the move_logs row); absent on old records
 //             (onSolved mints a one-off id for those).
@@ -243,30 +251,34 @@ function newId() {
 // }
 // Fields tagged [heavy] live in the per-game key; the rest are the index entry.
 //
-// A CUSTOM game (mode "custom", built in custom.js) has no single curriculum
-// kind: kindIndex is null and three extra fields carry its spec --
-//   spec: number[16]      per-kind usage codes (re-generate the same spec),
-//   specMasks: {baseline, inScope, forced}  for the hint tree,
-//   label: string         a short title from its Forced techniques.
-// Campaign games leave all three null.
-//
-// A DAILY game (the Puzzle of the day) is a custom force_any game that ALSO carries
-//   daily: { day: number, level: number }
-// where `day` is the puzzle-day index (daily.js dayNumber) and `level` is the
-// difficulty's index into DAILY_LEVELS. The tag drives its Continue/history label
-// ("Daily · date · difficulty") and the daily page's already-played lookup; absent
-// on every non-daily game.
+// Per-kind fields (all null/absent when not applicable):
+//   spec: number[16]      the per-kind usage codes -- present on every spec-built
+//                         game (custom/review/daily), used to re-generate a similar
+//                         puzzle. Campaign builds its spec on the fly (campaign.js)
+//                         and does NOT store one; imported has none.
+//   specMasks: {baseline, inScope, forced}  the hint-tree masks. Stored on EVERY
+//                         generated game now (campaign included -- built in JS at
+//                         launch), so play.js reads them uniformly.
+//   forceAny: bool        the Forced kinds are one disjunction (review/daily).
+//   label: string         a short title (custom's Forced techniques; "Imported").
+//   daily: { day, level } daily only -- `day` is the puzzle-day index (daily.js
+//                         dayNumber), `level` the index into DAILY_LEVELS. Drives
+//                         the daily page's already-played lookup.
+// A CUSTOM game exposes its spec in the builder ("Open spec"); no other kind does.
 
-// Create and persist a fresh active game from a generated puzzle. `kindIndex` is
-// null for a custom game; `spec`/`specMasks`/`label` are the custom extras; `seed`
+// Create and persist a fresh active game from a generated puzzle. `kind` is the mode
+// discriminator (see modes.js); `kindIndex`/`mode` are the campaign sub-key, `lesson`
+// the review one, `spec`/`specMasks`/`label`/`daily` the spec-built extras; `seed`
 // and `attempts` are the worker's debug metadata (cheat-mode display). `value` is
 // an optional 81-cell starting placement (the "Play from Forced" head start —
 // digits the solver placed up to the first forced technique); it defaults to a
 // blank board. These are ordinary player placements, not givens, so Restart wipes
 // them back to the minimal clues.
 export function createGame({
+  kind = null,
   kindIndex = null,
-  mode,
+  mode = null,
+  lesson = null,
   spec = null,
   specMasks = null,
   forceAny = false,
@@ -290,8 +302,10 @@ export function createGame({
     // so mid-solve move-log syncs and the eventual solve row share one key. See
     // backend.recordMoves / recordSolve.
     solve_id: newId(),
+    kind,
     kindIndex,
     mode,
+    lesson: lesson || null,
     spec,
     specMasks,
     forceAny: !!forceAny,
@@ -447,6 +461,13 @@ export function updateGame(id, patch) {
   return getGame(id);
 }
 
+// Every game record (the raw index), unfiltered and unsorted. The one-time mode
+// migration (modes.migrateModes) uses this to stamp `kind` on legacy records; the
+// listing selectors below are the usual filtered/sorted reads.
+export function allGames() {
+  return loadIndex();
+}
+
 // In-progress games, most-recently-PLAYED first -- the "Continue last" target
 // and the "Continue a puzzle" list. Falls back to createdAt for old records that
 // predate lastPlayedAt.
@@ -482,42 +503,7 @@ export function solvedGames() {
     .sort((a, b) => key(b) - key(a));
 }
 
-// ---- Aggregates for badges and the Stats page ----
-
-// Per (kindIndex, start) summary over SOLVED games, where `start` splits each mode
-// by whether it was a plain Play or a "Play from Forced":
-//   { [kindIndex]: { train, trainForced, drill, drillForced } }
-// each value { count, bestMs, avgMs, lastMs }. Starts with no solves are omitted.
-// A plain Play and a forced-start solve are distinct accomplishments, so they
-// never share a bucket. bestMs is the fastest solve, avgMs the mean.
-export function statsByKind() {
-  const out = {};
-  for (const g of loadIndex()) {
-    if (g.status !== "solved") continue;
-    // Custom-spec games aren't a single curriculum kind, so they stay out of the
-    // per-kind badges and Stats table.
-    if (typeof g.kindIndex !== "number") continue;
-    const k = (out[g.kindIndex] ||= {});
-    const key = g.mode + (g.fromForced ? "Forced" : "");
-    const m = (k[key] ||= { count: 0, bestMs: Infinity, avgMs: 0, lastMs: 0, _sum: 0 });
-    m.count += 1;
-    m._sum += g.elapsedMs;
-    m.avgMs = m._sum / m.count;
-    m.bestMs = Math.min(m.bestMs, g.elapsedMs);
-    if ((g.solvedAt || 0) >= (m._lastAt || 0)) {
-      m.lastMs = g.elapsedMs;
-      m._lastAt = g.solvedAt || 0;
-    }
-  }
-  return out;
-}
-
-// Total solved count for one kind across every mode/start -- the technique-row
-// and tier/branch badges.
-export function solvedCountForKind(stats, kindIndex) {
-  const k = stats[kindIndex];
-  if (!k) return 0;
-  let n = 0;
-  for (const m of Object.values(k)) n += m.count || 0;
-  return n;
-}
+// ---- Aggregates ----
+// The per-mode stat buckets that feed the tree badges and the Stats page now live in
+// modes.js (statsBuckets over solvedGames()), so they can dispatch through the mode
+// registry. store.js stays mode-agnostic: it just serves the raw game lists above.

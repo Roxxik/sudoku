@@ -19,12 +19,21 @@ export const REVIEW_TIER = "expert";
 // into one disjunctive set. Tuned to the user's grouping by shape and difficulty;
 // the lessons are cleanly difficulty-banded (Lesson 1 easiest), which is what lets
 // `easierExpertIds` define a Drill variant for every lesson past the first.
+// `key` is the stable identifier stored on a Review game (never the display name or
+// the array index, so lessons can be renamed or reordered without stranding saves).
 export const REVIEW_LESSONS = [
-  { name: "Lesson 1", ids: ["naked-pair", "x-wing", "hidden-pair"] },
-  { name: "Lesson 2", ids: ["naked-triple", "swordfish", "hidden-triple"] },
-  { name: "Lesson 3", ids: ["xy-wing", "xyz-wing"] },
-  { name: "Lesson 4", ids: ["naked-quad", "jellyfish", "hidden-quad"] },
+  { key: "lesson1", name: "Lesson 1", ids: ["naked-pair", "x-wing", "hidden-pair"] },
+  { key: "lesson2", name: "Lesson 2", ids: ["naked-triple", "swordfish", "hidden-triple"] },
+  { key: "lesson3", name: "Lesson 3", ids: ["xy-wing", "xyz-wing"] },
+  { key: "lesson4", name: "Lesson 4", ids: ["naked-quad", "jellyfish", "hidden-quad"] },
 ];
+
+// A lesson by its stored `key`, or null (e.g. a save from a future build with lessons
+// this one doesn't know). Drives the mode registry's Review title + stats from a
+// game's stored `lesson` field.
+export function reviewLessonByKey(key) {
+  return REVIEW_LESSONS.find((l) => l.key === key) || null;
+}
 
 // The basics every Review puzzle leans on (the whole Trunk: singles + both
 // locked-candidates orientations), allowed so a puzzle is solvable up to the
@@ -67,33 +76,21 @@ export function lessonHasDrill(curriculum, lesson) {
 }
 
 // Identify a stored game as a Review lesson from its usage array (`game.spec`):
-// returns { name, mode } when it matches a lesson/mode, else null. Recognizing a
-// game by its spec rather than a stored marker means games made before any marker
-// existed are still identified, and the Train/Drill mode is recovered too (the two
-// produce different specs). Callers should also require the game's `forceAny` to
-// be set — the matching spec under a plain conjunction is a different puzzle.
+// returns { key, mode } when it matches a lesson/mode, else null. This spec-matching
+// exists ONLY for the one-time mode migration (modes.js), which recovers the lesson
+// key + Train/Drill mode of Review games saved before those fields were stored; new
+// Review games carry `kind:"review"` + `lesson` + `mode` outright.
 export function reviewIdentity(curriculum, usages) {
   if (!Array.isArray(usages)) return null;
   for (const lesson of REVIEW_LESSONS) {
     for (const mode of ["train", "drill"]) {
       if (mode === "drill" && !lessonHasDrill(curriculum, lesson)) continue;
       if (usagesEqual(usages, lessonUsages(curriculum, lesson, mode))) {
-        return { name: lesson.name, mode };
+        return { key: lesson.key, mode };
       }
     }
   }
   return null;
-}
-
-// "Review · Lesson 2" — the display title for a Review game (the tier is implied,
-// as it is for a technique game's "Swordfish · Train").
-export function reviewTitle(identity) {
-  return `Review · ${identity.name}`;
-}
-
-// "Train" / "Drill" for a Review game's mode segment.
-export function reviewModeLabel(identity) {
-  return identity.mode === "drill" ? "Drill" : "Train";
 }
 
 function usagesEqual(a, b) {

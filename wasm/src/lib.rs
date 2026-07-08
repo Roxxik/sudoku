@@ -18,7 +18,6 @@
 use serde::Serialize;
 use sudoku_core::board::{ALL_DIGITS, UnitKind};
 use sudoku_core::{Deduction, Step, all_techniques};
-use sudoku_core::lab;
 use wasm_bindgen::prelude::*;
 
 /// A Sudoku position the UI hands to [`hint`]. Constructed from the 81 placed
@@ -140,41 +139,6 @@ pub fn solve_line(line: &str) -> Result<JsValue, JsValue> {
         givens,
     };
     serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-/// Returns the masks for the given spec's baseline, in-scope, and forced techniques.
-#[wasm_bindgen(js_name = specMasks)]
-pub fn spec_masks(target: u32, drill: bool) -> Result<JsValue, JsValue> {
-    let target = target as usize;
-    if target >= lab::kinds::NUM {
-        return Err(JsValue::from_str(&format!(
-            "target kind {} out of range (0..{})",
-            target,
-            lab::kinds::NUM
-        )));
-    }
-    let spec = if drill {
-        lab::Spec::drill_isolated(target)
-    } else {
-        lab::Spec::train_isolated(target)
-    };
-    let data = SpecMaskData {
-        baseline: spec.baseline_mask(),
-        in_scope: spec.in_scope_mask(),
-        forced: spec.forced_mask(),
-    };
-    serde_wasm_bindgen::to_value(&data).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
-#[derive(Serialize)]
-struct SpecMaskData {
-    /// Allowed | Forced (`1 << kind`).
-    baseline: u32,
-    /// Allowed | Forced | Conceded.
-    #[serde(rename = "inScope")]
-    in_scope: u32,
-    /// Forced only.
-    forced: u32,
 }
 
 #[derive(Serialize)]

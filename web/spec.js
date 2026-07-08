@@ -38,20 +38,6 @@ export function masksFromUsages(usages) {
   return { baseline, inScope, forced };
 }
 
-// Inverse of masksFromUsages: recover a usage array from the three masks. The
-// force count collapses to 1 (all any builder uses), which is lossless here.
-// Used to seed the editor from a campaign preset's isolated masks.
-export function usagesFromMasks(masks) {
-  const usages = new Array(NUM_KINDS).fill(OFF);
-  for (let i = 0; i < NUM_KINDS; i++) {
-    const bit = 1 << i;
-    if (masks.forced & bit) usages[i] = FORCE;
-    else if (masks.baseline & bit) usages[i] = ALLOW;
-    else if (masks.inScope & bit) usages[i] = CONCEDE;
-  }
-  return usages;
-}
-
 // Indices of the Forced techniques -- the spec's headline requirement, used to
 // label the generated puzzle.
 export function forcedIndices(usages) {

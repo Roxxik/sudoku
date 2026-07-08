@@ -12,10 +12,10 @@ generator-lab/web/results.jsonl
 .claude/
 # Python bytecode caches (e.g. the grader-tuning analysis scripts).
 __pycache__/
-# Pregenerated at build by Trunk pre_build hooks: curriculum from lab::kinds,
-# version from the git commit (web/version.js -> backend client_version), and the
-# backend endpoint/key (web/backend-config.js, retargetable per build env).
-/web/curriculum.js
+# Pregenerated at build by Trunk pre_build hooks: version from the git commit
+# (web/version.js -> backend client_version) and the backend endpoint/key
+# (web/backend-config.js, retargetable per build env). curriculum.js is now
+# hand-authored source (web/curriculum.js), no longer generated.
 /web/version.js
 /web/backend-config.js
 

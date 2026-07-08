@@ -10,16 +10,16 @@
 // generation worker (which rebuilds an explicit Spec) and to the play view's hint
 // tree (via the stored masks).
 
-import { bindings, ready } from "./wasm.js";
 import {
   OFF,
   NUM_KINDS,
-  usagesFromMasks,
   masksFromUsages,
   forcedIndices,
   hasForce,
 } from "./spec.js";
+import { campaignUsages } from "./campaign.js";
 import { REVIEW_LESSONS, lessonUsages, lessonHasDrill } from "./review.js";
+import { DAILY_LEVELS, dailyUsages } from "./daily.js";
 import { techniqueName, TIER_ORDER, TIER_LABEL, logStorageError } from "./util.js";
 
 let curriculum = [];
@@ -110,7 +110,6 @@ export function initCustom(opts) {
 // Open the builder. With no argument it paints from the current `usages` (kept
 // between opens so a half-built spec survives a trip Home); pass a usage array
 // (e.g. resurfaced from a solved custom game in Stats) to load that spec instead.
-// Presets are enabled once the wasm bridge (which computes them) is up.
 export function openCustom(initial) {
   if (Array.isArray(initial)) {
     usages = initial.slice();
@@ -118,9 +117,6 @@ export function openCustom(initial) {
   }
   renderBody();
   showView("customView");
-  ready().then(() => {
-    if (presetSel) presetSel.disabled = false;
-  });
 }
 
 function renderBody() {
@@ -149,7 +145,6 @@ function presetRow() {
 
   const sel = document.createElement("select");
   sel.id = "customPreset";
-  sel.disabled = true; // enabled once the wasm bridge has loaded (presets call it)
   sel.appendChild(option("", "Choose a preset…"));
   sel.appendChild(option("blank", "Blank (all off)"));
   for (const tier of TIER_ORDER) {
@@ -176,6 +171,13 @@ function presetRow() {
     }
   });
   sel.appendChild(reviewGroup);
+  // The daily difficulties as force_any templates too (the same builder path). Like
+  // the Review presets they only seed the chips -- launching still mints a plain
+  // custom game, never a dated daily.
+  const dailyGroup = document.createElement("optgroup");
+  dailyGroup.label = "Puzzle of the day";
+  DAILY_LEVELS.forEach((level, i) => dailyGroup.appendChild(option(`daily:${i}`, level.name)));
+  sel.appendChild(dailyGroup);
   sel.addEventListener("change", () => applyPreset(sel.value));
   presetSel = sel;
 
@@ -196,17 +198,16 @@ function applyPreset(value) {
     if (!lesson) return;
     usages = lessonUsages(curriculum, lesson, mode);
     forceAny = true;
+  } else if (value.startsWith("daily:")) {
+    // A daily difficulty's force_any set (the same builder path as Review).
+    const level = DAILY_LEVELS[Number(value.split(":")[1])];
+    if (!level) return;
+    usages = dailyUsages(curriculum, level);
+    forceAny = true;
   } else {
+    // A campaign technique's isolated train/drill spec, built in JS (campaign.js).
     const [idxStr, mode] = value.split(":");
-    const w = bindings();
-    if (!w) return;
-    let masks;
-    try {
-      masks = w.specMasks(Number(idxStr), mode === "drill");
-    } catch {
-      return; // bridge hiccup: leave the chips as they were
-    }
-    usages = usagesFromMasks(masks);
+    usages = campaignUsages(curriculum, Number(idxStr), mode);
     forceAny = false; // a single-technique preset is a plain conjunction
   }
   saveUsages();

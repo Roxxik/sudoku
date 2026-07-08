@@ -10,6 +10,9 @@
 import * as store from "./store.js";
 import * as home from "./home.js";
 import CURRICULUM from "./curriculum.js";
+import { campaignUsages } from "./campaign.js";
+import { masksFromUsages } from "./spec.js";
+import { migrateModes } from "./modes.js";
 
 // Heavy/non-Home modules, bound once `heavyReady` resolves.
 let wasm, gen, play, stats, custom;
@@ -70,7 +73,7 @@ async function importPuzzle() {
     return;
   }
   const game = store.createGame({
-    mode: "custom",
+    kind: "imported",
     label: "Imported",
     puzzle: result.puzzle,
     solution: result.solution,
@@ -86,22 +89,11 @@ function goPlay() {
 
 // The spec's ALLOWED techniques (baseline minus the forced ones) for a forced-start
 // launch -- only these advance the board, so the head start follows the intended
-// path and stops at the forced technique. A custom spec carries its own masks; a
-// campaign launch reads the isolated builder's masks (the spec generateLab actually
-// used) via the warmed wasm bridge. Null on any miss -> the caller falls back to a
-// plain start.
-function allowedMaskFor(req) {
-  let masks = req.specMasks;
-  if (!masks) {
-    const w = wasm && wasm.bindings();
-    if (!w) return null;
-    try {
-      masks = w.specMasks(req.kindIndex, req.mode === "drill");
-    } catch {
-      return null;
-    }
-  }
-  return masks.baseline & ~masks.forced;
+// path and stops at the forced technique. Every mode now carries its spec masks
+// (campaign builds them in JS via campaignUsages, exactly like Custom/Review/Daily),
+// so this is a plain derivation. Null when there are no masks -> a plain start.
+function allowedMask(masks) {
+  return masks ? masks.baseline & ~masks.forced : null;
 }
 
 // Open Settings from the play view: freeze the solve clock, and route the
@@ -171,11 +163,17 @@ async function launch(req, uncapped = false) {
   await heavyReady; // need gen + play wired
   lastLaunch = req;
   showLoading(uncapped ? "Still searching…" : "Generating puzzle…");
+  // Every mode generates from the same explicit usage array. Campaign builds it in
+  // JS (campaign.js) rather than sending a privileged kindIndex to the worker;
+  // Custom/Review/Daily bring their own. The spec masks (hint tree + forced-start
+  // head start) fall straight out of the usages and are stored on the record, so
+  // every mode carries them the same way.
+  const isCampaign = typeof req.kindIndex === "number";
+  const usages = isCampaign ? campaignUsages(CURRICULUM, req.kindIndex, req.mode) : req.usages;
+  const specMasks = isCampaign ? masksFromUsages(usages) : req.specMasks;
   let result;
   try {
-    const genReq = req.usages
-      ? { usages: req.usages, uncapped, forceAny: req.forceAny }
-      : { target: req.kindIndex, drill: req.mode === "drill", uncapped };
+    const genReq = { usages, uncapped, forceAny: req.forceAny };
     // A daily request carries a pinned seed so every device generates the same
     // puzzle; ordinary requests omit it and the worker draws its own.
     if (req.seed != null) genReq.seed = req.seed;
@@ -198,7 +196,7 @@ async function launch(req, uncapped = false) {
   let startValue = null;
   if (req.fromForced) {
     await wasm.ready(); // the head start runs on the main-thread solver bridge
-    const allowed = allowedMaskFor(req);
+    const allowed = allowedMask(specMasks);
     if (allowed) {
       startValue = play.forcedStartValues(result.puzzle, allowed);
       if (startValue) {
@@ -213,14 +211,12 @@ async function launch(req, uncapped = false) {
   hideLoading();
   // The worker also returns debug metadata (decimal-string u64 seed + the attempt
   // count) for the cheat-mode display.
-  const game = req.usages
+  const game = isCampaign
     ? store.createGame({
-        mode: "custom",
-        spec: req.usages,
-        specMasks: req.specMasks,
-        forceAny: !!req.forceAny,
-        label: req.label,
-        daily: req.daily || null,
+        kind: "campaign",
+        kindIndex: req.kindIndex,
+        mode: req.mode,
+        specMasks,
         puzzle: result.puzzle,
         solution: result.solution,
         givens: result.givens,
@@ -231,8 +227,14 @@ async function launch(req, uncapped = false) {
         fromForced: !!req.fromForced,
       })
     : store.createGame({
-        kindIndex: req.kindIndex,
-        mode: req.mode,
+        kind: req.kind || "custom",
+        mode: req.mode || "custom",
+        lesson: req.lesson || null,
+        spec: usages,
+        specMasks,
+        forceAny: !!req.forceAny,
+        label: req.label,
+        daily: req.daily || null,
         puzzle: result.puzzle,
         solution: result.solution,
         givens: result.givens,
@@ -246,15 +248,28 @@ async function launch(req, uncapped = false) {
   goPlay();
 }
 
-// Re-generate a fresh puzzle for an existing game's spec (the play view's "New
-// puzzle"). A custom game replays its stored usage array; a campaign game its
-// (kindIndex, mode).
+// Re-generate a fresh puzzle for an existing game (the play view's "New puzzle").
+// A campaign game replays its (kindIndex, mode); a Review game keeps its lesson +
+// mode so the new puzzle stays a Review game; other spec games (a daily's pinned
+// puzzle isn't reproducible as "another like it", so it drops to custom) replay
+// their usage array as a plain custom puzzle. An imported/specless game has nothing
+// to regenerate.
 function regenerate(g) {
-  launch(
-    g.spec
-      ? { usages: g.spec, label: g.label, specMasks: g.specMasks, forceAny: g.forceAny }
-      : { kindIndex: g.kindIndex, mode: g.mode }
-  );
+  if (typeof g.kindIndex === "number") {
+    launch({ kindIndex: g.kindIndex, mode: g.mode });
+    return;
+  }
+  if (!Array.isArray(g.spec)) return; // imported / specless: nothing to replay
+  const review = g.kind === "review";
+  launch({
+    kind: review ? "review" : "custom",
+    lesson: review ? g.lesson : null,
+    mode: review ? g.mode : null,
+    usages: g.spec,
+    label: g.label,
+    specMasks: g.specMasks,
+    forceAny: g.forceAny,
+  });
 }
 
 async function resume(gameId) {
@@ -306,6 +321,12 @@ function boot() {
   // puzzles' undo timelines against the quota. Cheap and synchronous; runs before the
   // first read so Home lists from an already-pruned index.
   store.reclaimStorage();
+
+  // Stamp the persisted `kind` discriminator (plus recovered Review lesson/mode and
+  // backfilled campaign spec masks) onto records from older builds, so every surface
+  // reads the mode as a field instead of re-sniffing it. Runs before the first render;
+  // idempotent on later boots.
+  migrateModes();
 
   wireOverlay();
   wireVisibility();

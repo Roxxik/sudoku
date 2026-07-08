@@ -13,8 +13,8 @@ import * as store from "./store.js";
 import * as backend from "./backend.js";
 import * as tracker from "./tracker.js";
 import { formatDuration, techniqueName } from "./util.js";
-import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
-import { levelName, dailyUnrankableReason, projectedStanding } from "./daily.js";
+import { modeOf } from "./modes.js";
+import { dailyUnrankableReason, projectedStanding } from "./daily.js";
 import { copyText, gradeName, gradeBadge } from "./ui.js";
 import { cheatOn, setCheatMode } from "./cheat.js";
 import { eliminateCandidatesOn, showTimerOn, highlightMode, disableFinishedDigitsOn, hintFromMarksOn, lightModeOn } from "./settings.js";
@@ -1840,7 +1840,7 @@ function openHint(reason = "auto") {
   // First layer: confirm the board's health (all good / stale marks) without
   // revealing what's possible. Revealing drills into the technique tree; stale
   // marks add a button to point them out on the board.
-  const masks = specMasksFor(wasm);
+  const masks = specMasksFor();
   const wrong = wrongMarkCells();
   const stale = staleMarkCells();
   // A wrong pencil mark (one that excludes the correct digit) is solution-derived,
@@ -1998,7 +1998,7 @@ function renderTechStage() {
       steps = [];
     }
   }
-  const masks = specMasksFor(wasm);
+  const masks = specMasksFor();
   hintTitle("Available moves");
   if (steps.length) {
     body.replaceChildren(techStage(groupSteps(steps), masks));
@@ -2486,7 +2486,7 @@ function setupDailySolved() {
 // after, so it reads as a one-shot reveal; Home remains to leave.
 async function revealDailyStanding() {
   const g = game;
-  const d = dailyOf(g);
+  const d = g.daily;
   if (!d) return;
   const btn = document.getElementById("dailySolvedSubmit");
   const rankEl = document.getElementById("dailySolvedRank");
@@ -2594,29 +2594,12 @@ export function loadGame(g) {
 }
 
 function setTitle(g) {
-  // The play view title shows what the player is working on.
+  // The play view title shows what the player is working on -- the mode's identity
+  // line from the registry (technique + Train/Drill, a Review lesson + mode, a Daily
+  // difficulty, a custom label).
   const h = document.getElementById("playTitle");
   if (!h) return;
-  if (g.mode === "custom") {
-    // A daily puzzle is a force_any custom game under the hood, but it isn't
-    // "Custom" to the player -- title it by its difficulty. Checked before reviewOf
-    // because Expert I's spec is identical to Review Lesson 1's.
-    const d = dailyOf(g);
-    if (d) {
-      h.textContent = `Daily · ${levelName(d.level)}`;
-      return;
-    }
-    const r = reviewOf(g);
-    if (r) {
-      h.textContent = `${reviewTitle(r)} · ${reviewModeLabel(r)}`;
-      return;
-    }
-    h.textContent = g.label ? `Custom · ${g.label}` : "Custom";
-    return;
-  }
-  const name = techniqueName(curriculumIdFor(g.kindIndex));
-  const mode = g.mode === "drill" ? "Drill" : "Train";
-  h.textContent = `${name} · ${mode}`;
+  h.textContent = modeOf(g).line(g);
 }
 
 // The difficulty pill shown inline in the play title: the band the generator
@@ -2691,30 +2674,6 @@ function gradeLineText() {
   return parts.join(" · ");
 }
 
-// kindIndex -> kebab id, filled in by initPlay from the curriculum.
-let idByKind = {};
-function curriculumIdFor(kindIndex) {
-  return idByKind[kindIndex] || "";
-}
-
-// The full curriculum records (with tier/difficulty), needed to recognize a
-// Review game from its spec. Set in initPlay.
-let curriculumList = [];
-
-// A custom game that is actually a Review lesson (force_any over a lesson's set):
-// its { name, mode }, else null. Used so the title shows the lesson, not "Custom".
-// A daily game wins first (Expert I's spec matches Review Lesson 1's).
-function reviewOf(g) {
-  if (dailyOf(g)) return null;
-  if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
-  return reviewIdentity(curriculumList, g.spec);
-}
-
-// A daily game's { day, level } tag, or null -- the play view's "is this the
-// Puzzle of the day" check, matching home.js / stats.js.
-function dailyOf(g) {
-  return g && g.daily && typeof g.daily.day === "number" ? g.daily : null;
-}
 
 // The hint's player-facing tier comes from the step's curriculum difficulty
 // (so it covers every solver technique, not just the 16 in the campaign). Same
@@ -2737,39 +2696,22 @@ function displayName(id) {
   return techniqueName(ID_ALIAS[id] || id);
 }
 
-// Core cli_name -> lab::kinds index, so a hint step can be matched against the
-// puzzle's spec masks. Techniques the solver finds but the lab doesn't model
-// (skyscraper, finned/turbot fish, ...) aren't here -> treated as out-of-scope.
-const LAB_KIND = {
-  "naked-single": 0,
-  "hidden-single": 1,
-  pointing: 2,
-  claiming: 3,
-  "naked-pair": 4,
-  "hidden-pair": 5,
-  "naked-triple": 6,
-  "hidden-triple": 7,
-  "naked-quad": 8,
-  "hidden-quad": 9,
-  "x-wing": 10,
-  swordfish: 11,
-  jellyfish: 12,
-  "xy-wing": 13,
-  "xyz-wing": 14,
-  "w-wing": 15,
-};
+// Core cli_name -> kind index (the bit position in the spec masks), so a hint step
+// can be matched against the puzzle's spec masks. Derived from the curriculum in
+// initPlay (via ID_ALIAS for the cli_name<->id spelling of locked candidates), so it
+// shares ONE JS source of kind ordering with masksFromUsages (see web/curriculum.js)
+// -- if the curriculum is reordered, this map follows. Techniques the solver finds
+// but the curriculum doesn't model (skyscraper, finned/turbot fish, ...) aren't here
+// -> treated as out-of-scope.
+let LAB_KIND = {};
 
-// The spec masks driving the hint tree's Allowed/Conceded split. A custom game
-// stores its own masks on the record (its spec isn't a single curriculum kind);
-// a campaign game derives them from (kindIndex, mode) via the wasm bridge. Null
-// on any failure, which the hint path treats as "everything in scope".
-function specMasksFor(wasm) {
-  if (game && game.specMasks) return game.specMasks;
-  try {
-    return wasm.specMasks(game.kindIndex, game.mode === "drill");
-  } catch {
-    return null;
-  }
+// The spec masks driving the hint tree's Allowed/Conceded split. Every game carries
+// its own masks on the record: campaign builds them in JS at launch (masksFromUsages
+// over campaignUsages), exactly like Custom/Review/Daily, and older campaign records
+// get them backfilled by the mode migration. Null when absent -> the hint path treats
+// everything as in scope.
+function specMasksFor() {
+  return (game && game.specMasks) || null;
 }
 
 // Whether a hint group is part of the puzzle's intended toolbox -- Allowed or
@@ -3115,7 +3057,7 @@ function wireSolved() {
 // daily, predates the stable solve_id, or can't be ranked (cheat / late -- those
 // get a would-be rank only, never an upload).
 function submitDaily(g) {
-  const d = dailyOf(g);
+  const d = g.daily;
   if (!d || !g.solve_id || dailyUnrankableReason(g)) return;
   backend.recordDailySolve({
     solve_id: g.solve_id,
@@ -3135,9 +3077,12 @@ export function initPlay({ curriculum, onHome: home, onNewPuzzle: newPuzzle, onS
   onNewPuzzle = newPuzzle;
   onSettings = settings;
   onHelp = help || (() => {});
-  idByKind = {};
-  for (const t of curriculum) idByKind[t.kindIndex] = t.id;
-  curriculumList = curriculum; // full records (tier/difficulty) for review id-ing
+  // Rebuild the hint-tree's cli_name -> kind index map from the curriculum, so it
+  // shares one JS source of kind ordering with the spec masks (see LAB_KIND).
+  LAB_KIND = {};
+  const cliById = {}; // curriculum id -> core cli_name (reverse of ID_ALIAS)
+  for (const [cli, id] of Object.entries(ID_ALIAS)) cliById[id] = cli;
+  for (const t of curriculum) LAB_KIND[cliById[t.id] || t.id] = t.kindIndex;
 
   // Stamp every tracked event with the solve-elapsed clock (pauses excluded).
   tracker.setClock(elapsedMs);

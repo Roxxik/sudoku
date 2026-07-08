@@ -9,17 +9,28 @@
 import * as store from "./store.js";
 import { formatDuration, hintLabel, techniqueName, TIER_ORDER, TIER_LABEL } from "./util.js";
 import { miniBoard, textColumn, copyText, gradeBadge } from "./ui.js";
-import { reviewIdentity, reviewTitle, reviewModeLabel } from "./review.js";
-import { dayLabel, levelName } from "./daily.js";
+import {
+  modeOf,
+  isCustom,
+  statsBuckets,
+  campaignStats,
+  reviewStats,
+  dailyStats,
+  countOf,
+  mergeBuckets,
+  avgOf,
+} from "./modes.js";
+import { REVIEW_LESSONS } from "./review.js";
+import { DAILY_LEVELS, levelName } from "./daily.js";
 import { cheatOn } from "./cheat.js";
 
-// Per-kind stat buckets, in display order: each mode split into a plain Play and a
-// Play-from-Forced (the head start is tracked separately, matching statsByKind).
-const STAT_STARTS = [
-  ["train", "Train"],
-  ["trainForced", "Train · forced"],
-  ["drill", "Drill"],
-  ["drillForced", "Drill · forced"],
+// The Stats screen collapses each mode's plain Play and Play-from-Forced into one row
+// (the aggregator keeps them apart for the campaign/Review buttons; the forced split
+// is a home-page detail, not a stats-screen one). Each entry maps a row label to the
+// fine keys it folds together.
+const MERGED_STARTS = [
+  ["Train", ["train", "trainForced"]],
+  ["Drill", ["drill", "drillForced"]],
 ];
 
 let curriculum = [];
@@ -33,11 +44,11 @@ export function initStats(opts) {
 
 export function renderStats() {
   const body = document.getElementById("statsBody");
-  const stats = store.statsByKind();
+  const stats = statsBuckets(store.solvedGames());
   body.replaceChildren();
 
-  // Headline totals across every solved puzzle -- custom games included (they're
-  // solved too, even though they have no row in the per-kind tables below).
+  // Headline totals across every solved puzzle -- custom/imported included (they're
+  // solved too, even though they have no per-mode rows below).
   const solved = store.solvedGames();
   if (solved.length === 0) {
     const p = document.createElement("p");
@@ -49,31 +60,59 @@ export function renderStats() {
   const totalMs = solved.reduce((sum, g) => sum + (g.elapsedMs || 0), 0);
   body.appendChild(summaryCard(solved.length, totalMs));
 
-  // One section per tier, in curriculum order; rows only for solved kinds.
+  // Campaign: one section per tier (curriculum order), rows per solved kind.
   for (const tier of TIER_ORDER) {
     const entries = curriculum
-      .filter((t) => t.tier === tier && stats[t.kindIndex])
+      .filter((t) => t.tier === tier && countOf(campaignStats(stats, t.kindIndex)) > 0)
       .sort((a, b) => a.difficulty - b.difficulty);
     if (entries.length === 0) continue;
-
-    const h = document.createElement("h2");
-    h.className = "stats-tier";
-    h.textContent = TIER_LABEL[tier];
-    body.appendChild(h);
-
-    const table = document.createElement("table");
-    table.className = "stats-table";
-    table.appendChild(headerRow());
-    for (const t of entries) {
-      for (const [key, label] of STAT_STARTS) {
-        const m = stats[t.kindIndex][key];
-        if (m) table.appendChild(dataRow(t, label, m));
-      }
-    }
-    body.appendChild(table);
+    const rows = [];
+    for (const t of entries) rows.push(...mergedRows(campaignStats(stats, t.kindIndex), techniqueName(t.id)));
+    body.append(sectionHeading(TIER_LABEL[tier]), statsTable(rows));
   }
 
+  // Review: rows per lesson (Train/Drill merged), if any solved.
+  const reviewRows = [];
+  for (const lesson of REVIEW_LESSONS) reviewRows.push(...mergedRows(reviewStats(stats, lesson.key), lesson.name));
+  if (reviewRows.length) body.append(sectionHeading("Review"), statsTable(reviewRows));
+
+  // Daily: a row per difficulty level, if any solved (no Train/Drill split there).
+  const daily = dailyStats(stats);
+  const dailyRows = [];
+  for (let i = 0; i < DAILY_LEVELS.length; i++) {
+    const m = daily[String(i)];
+    if (m) dailyRows.push(dataRow(levelName(i), "Daily", m));
+  }
+  if (dailyRows.length) body.append(sectionHeading("Puzzle of the day"), statsTable(dailyRows));
+
   body.appendChild(historySection());
+}
+
+// The Train/Drill rows for one group object (a campaign kind or a Review lesson),
+// each folding its plain Play + Play-from-Forced solves; a start with no solves is
+// skipped.
+function mergedRows(groupObj, name) {
+  const rows = [];
+  for (const [label, keys] of MERGED_STARTS) {
+    const m = mergeBuckets(...keys.map((k) => groupObj[k]));
+    if (m) rows.push(dataRow(name, label, m));
+  }
+  return rows;
+}
+
+function sectionHeading(text) {
+  const h = document.createElement("h2");
+  h.className = "stats-tier";
+  h.textContent = text;
+  return h;
+}
+
+function statsTable(rows) {
+  const table = document.createElement("table");
+  table.className = "stats-table";
+  table.appendChild(headerRow());
+  for (const r of rows) table.appendChild(r);
+  return table;
 }
 
 // ---- Solved-puzzle history ----
@@ -98,29 +137,12 @@ function historySection() {
 function historyCard(g) {
   const card = document.createElement("div");
   card.className = "hist-item";
-  // A custom game isn't a single curriculum kind: title it by its spec label and
-  // mark the mode "Custom" (campaign games show their technique + Train/Drill). A
-  // Review lesson is a custom game under the hood, but identifiable by its spec —
-  // show its lesson + Train/Drill rather than "Custom".
-  const isCustom = g.mode === "custom";
-  const daily = dailyOf(g);
-  const review = reviewOf(g);
-  let title, modeLabel;
-  if (daily) {
-    // A daily card reads as its difficulty + the puzzle's date (not "Custom",
-    // even though it's a force_any custom game under the hood).
-    title = `Daily · ${levelName(daily.level)}`;
-    modeLabel = dayLabel(daily.day);
-  } else if (review) {
-    title = reviewTitle(review);
-    modeLabel = reviewModeLabel(review);
-  } else if (isCustom) {
-    title = g.label || "Custom";
-    modeLabel = "Custom";
-  } else {
-    title = techniqueName(idFor(g.kindIndex));
-    modeLabel = g.mode === "drill" ? "Drill" : "Train";
-  }
+  // Title + mode label come from the mode registry: a daily's difficulty + the
+  // puzzle's date, a Review lesson + Train/Drill, a custom label, or a technique +
+  // Train/Drill.
+  const m = modeOf(g);
+  const title = m.title(g);
+  const modeLabel = m.statsLabel(g);
   const meta = `${modeLabel} · ${formatDuration(g.elapsedMs)} · ${hintLabel(g)} · ${solvedDate(g)}`;
   const col = textColumn(title, meta);
   const badge = gradeBadge(g.grade);
@@ -143,9 +165,9 @@ function historyCard(g) {
 // The card's right-hand actions: every card can copy its puzzle; a custom card
 // also offers "Open spec" to resurface its spec in the builder.
 function cardActions(g) {
-  // Review and daily games read as campaign games, so they don't expose the
-  // custom-spec "Open spec" affordance even though they're custom specs underneath.
-  if (g.mode !== "custom" || !Array.isArray(g.spec) || reviewOf(g) || dailyOf(g)) return copyButton(g);
+  // Only a custom game exposes the "Open spec" affordance; every other kind (review,
+  // daily, campaign, imported) just gets the copy button.
+  if (!isCustom(g)) return copyButton(g);
   const wrap = document.createElement("div");
   wrap.className = "hist-actions";
   wrap.append(openSpecButton(g), copyButton(g));
@@ -186,23 +208,6 @@ function solvedDate(g) {
   return new Date(g.solvedAt || g.createdAt).toLocaleDateString();
 }
 
-function idFor(kindIndex) {
-  return curriculum.find((t) => t.kindIndex === kindIndex)?.id || "";
-}
-
-// A custom game that is actually a Review lesson: its { name, mode }, else null.
-// The daily tag wins first -- Expert I's spec matches Review Lesson 1's, so a
-// daily would otherwise mislabel as a Review lesson.
-function reviewOf(g) {
-  if (dailyOf(g)) return null;
-  if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
-  return reviewIdentity(curriculum, g.spec);
-}
-
-// A daily game's { day, level } tag, or null.
-function dailyOf(g) {
-  return g && g.daily && typeof g.daily.day === "number" ? g.daily : null;
-}
 
 function summaryCard(totalSolved, totalMs) {
   const card = document.createElement("div");
@@ -231,14 +236,14 @@ function headerRow() {
   return tr;
 }
 
-function dataRow(t, modeLabel, m) {
+function dataRow(name, modeLabel, m) {
   const tr = document.createElement("tr");
   const cells = [
-    [techniqueName(t.id), "col-tech"],
+    [name, "col-tech"],
     [modeLabel, "col-mode"],
     [String(m.count), "col-num"],
     [formatDuration(m.bestMs), "col-num"],
-    [formatDuration(m.avgMs), "col-num"],
+    [formatDuration(avgOf(m)), "col-num"],
   ];
   for (const [text, cls] of cells) {
     const td = document.createElement("td");

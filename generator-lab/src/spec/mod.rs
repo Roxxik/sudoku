@@ -224,7 +224,7 @@ impl Spec {
         s.force(target, 1)
     }
 
-    // ---- Cross-branch isolated builders (the future canonical train/drill) ----
+    // ---- Cross-branch isolated builders (DEPRECATED — grader reference only) ----
     //
     // `train_isolated`/`drill_isolated` are the in-progress replacements for
     // `train`/`drill`. They differ in ONE way, and only for Expert targets: the
@@ -242,11 +242,14 @@ impl Spec {
     // not a teaching problem and conceding it would only cost yield.
     //
     // The legacy `train`/`drill` above are deliberately UNCHANGED — a separate
-    // debugging effort relies on their exact branch-scoped semantics — and for now
-    // only the frontend wasm bridge calls these `_isolated` variants. When these
-    // become canonical (and the legacy pair is retired), MIRROR the same change
-    // into core's parallel copy `Spec::train`/`Spec::drill` in `core/src/spec.rs`,
-    // which the CLI and core's curriculum/play machinery use.
+    // debugging effort relies on their exact branch-scoped semantics.
+    //
+    // DEPRECATED. The frontend no longer calls these: the campaign now builds its
+    // spec in JS (`campaignUsages` in web/campaign.js), which is the live source of
+    // truth and MAY drift from this copy. These remain only as the grader's reference
+    // — the grade.rs tests and the grade_diag example grade the campaign specs through
+    // them — and reconciling the grader with the JS definition is future work. Until
+    // then treat this as a duplicate, not the source.
 
     /// Cross-branch [`train`](Self::train) (future canonical). Identical to `train`,
     /// but additionally **concedes** every Expert peer *easier* than the target,

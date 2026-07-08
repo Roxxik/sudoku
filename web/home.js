@@ -45,10 +45,8 @@ import {
   lessonSubtitle,
   lessonLabel,
   joinNames,
-  reviewIdentity,
-  reviewTitle,
-  reviewModeLabel,
 } from "./review.js";
+import { modeOf, isCustom, statsBuckets, campaignStats, reviewStats, countOf } from "./modes.js";
 import {
   DAILY_LEVELS,
   dailyUsages,
@@ -56,7 +54,6 @@ import {
   dailyLabel,
   dayNumber,
   dayLabel,
-  levelName,
   leaderboardWindow,
   projectedStanding,
   dailyUnrankableReason,
@@ -129,13 +126,12 @@ function groupCurriculum(list) {
 
 // ---- Start page ----
 export function renderHome() {
-  const stats = store.statsByKind();
+  const stats = statsBuckets(store.solvedGames());
   renderDailyEntry();
   renderTiers(stats);
   renderContinue();
-  // The Stats page also hosts the solved-puzzle history (a debug aid), so it
-  // earns its button as soon as anything -- campaign or custom -- has been
-  // solved. Custom games are excluded from statsByKind, so count solved games.
+  // The Stats page also hosts the solved-puzzle history (a debug aid), so it earns
+  // its button as soon as anything -- any mode -- has been solved.
   document.getElementById("statsBtn").hidden = store.solvedGames().length === 0;
   showHome();
 }
@@ -234,9 +230,9 @@ function cardMenu(g) {
   const list = document.createElement("ul");
   list.className = "menu-list";
   list.hidden = true;
-  // Custom games can resurface their spec; campaign/imported/Review/daily games
-  // can't (a daily is a fixed puzzle, not a user-editable spec).
-  if (g.mode === "custom" && Array.isArray(g.spec) && !reviewOf(g) && !dailyOf(g)) {
+  // Only a custom game can resurface its spec; campaign/imported/Review/daily can't
+  // (a daily is a fixed puzzle, not a user-editable spec).
+  if (isCustom(g)) {
     list.appendChild(menuItemLi("Open spec", () => onOpenSpec(g.spec)));
   }
   list.appendChild(exportItemLi(g));
@@ -316,45 +312,21 @@ function closeCardMenus(except) {
   }
 }
 
+// The card meta line: the mode's identity (from the registry) plus the running time
+// and, once any were used, the hint tally. The "Continue last puzzle" hero uses a
+// generic title, so the identity has to live here -- modeOf(g).line carries it (which
+// difficulty a daily is, which lesson/mode a review is, the technique + mode of a
+// campaign game). An in-progress puzzle hasn't earned the "hint-free" label, so hints
+// only show once some were used.
 function continueMeta(g) {
-  // The game is still in progress, so only surface hints once some were used --
-  // an unfinished puzzle hasn't earned the "hint-free" label yet.
   const hints = (g.hints || 0) > 0 ? ` · ${hintLabel(g)}` : "";
-  const time = formatDuration(g.elapsedMs) + hints;
-  const d = dailyOf(g);
-  // The "Continue last puzzle" hero uses a generic title, so the daily identity
-  // (that it IS a daily, which difficulty, which date) has to live in the meta.
-  if (d) return `Daily · ${levelName(d.level)} · ${dayLabel(d.day)} · ${time}`;
-  const r = reviewOf(g);
-  if (r) return `${reviewTitle(r)} · ${reviewModeLabel(r)} · ${time}`;
-  if (g.mode === "custom") return `Custom · ${time}`;
-  const mode = g.mode === "drill" ? "Drill" : "Train";
-  return `${techniqueName(idFor(g.kindIndex))} · ${mode} · ${time}`;
+  return `${modeOf(g).line(g)} · ${formatDuration(g.elapsedMs)}${hints}`;
 }
 
-// The title for a game card: a daily puzzle's difficulty, else a Review lesson's
-// name, else a custom game's own label, else its technique name.
+// The title for a game card, from the mode registry: a daily's difficulty, a Review
+// lesson's name, a custom game's label, or a technique name.
 function gameTitle(g) {
-  const d = dailyOf(g);
-  if (d) return `Daily · ${levelName(d.level)}`;
-  const r = reviewOf(g);
-  if (r) return reviewTitle(r);
-  return g.mode === "custom" ? g.label || "Custom" : techniqueName(idFor(g.kindIndex));
-}
-
-// A custom game that is actually a Review lesson: its { name, mode }, else null.
-// A daily game is a force_any custom game too -- and Expert I's spec is identical
-// to Review Lesson 1's -- so the daily tag wins first to keep the labels apart.
-function reviewOf(g) {
-  if (dailyOf(g)) return null;
-  if (g.mode !== "custom" || !g.forceAny || !Array.isArray(g.spec)) return null;
-  return reviewIdentity(curriculum, g.spec);
-}
-
-// A daily game's { day, level } tag, or null. The single source of truth for "is
-// this the Puzzle of the day" across the labels and the card menu.
-function dailyOf(g) {
-  return g && g.daily && typeof g.daily.day === "number" ? g.daily : null;
+  return modeOf(g).title(g);
 }
 
 // ---- Puzzle of the day ----
@@ -667,6 +639,7 @@ function launchDaily(level, index) {
   const day = dayNumber();
   const usages = dailyUsages(curriculum, level);
   onLaunchSpec({
+    kind: "daily",
     usages,
     label: dailyLabel(level),
     specMasks: masksFromUsages(usages),
@@ -702,7 +675,7 @@ function openBranchOrTechniques(tier, branch, back) {
 }
 
 function openBranches(tier) {
-  const stats = store.statsByKind();
+  const stats = statsBuckets(store.solvedGames());
   setCampaignTitle(TIER_LABEL[tier]);
   const grid = document.createElement("div");
   grid.className = "nav-grid";
@@ -726,7 +699,7 @@ function openBranches(tier) {
       navButton(
         "Review",
         "Mixed practice — a puzzle that needs any one of a set",
-        0,
+        reviewRollup(stats),
         () => openReview(tier, () => openBranches(tier))
       )
     );
@@ -747,7 +720,7 @@ function openBranches(tier) {
 // than one). Each row is a nav-button to that technique's page, badged with its
 // solved count. `back` is the level above (the branch list, or Home).
 function openTechniqueList(tier, branch, back) {
-  const stats = store.statsByKind();
+  const stats = statsBuckets(store.solvedGames());
   const multiBranch = Object.keys(grouped[tier]).length > 1;
   setCampaignTitle(
     multiBranch ? `${TIER_LABEL[tier]} · ${BRANCH_LABEL[branch]}` : TIER_LABEL[tier]
@@ -759,7 +732,7 @@ function openTechniqueList(tier, branch, back) {
       navButton(
         techniqueName(t.id),
         null,
-        store.solvedCountForKind(stats, t.kindIndex),
+        countOf(campaignStats(stats, t.kindIndex)),
         () => openTechnique(tier, branch, t, () => openTechniqueList(tier, branch, back))
       )
     );
@@ -774,7 +747,7 @@ function openTechniqueList(tier, branch, back) {
 // note on what Train vs Drill mean here, and any aliases / extra notes at the
 // bottom. `back` returns to whichever level opened it.
 function openTechnique(tier, branch, t, back) {
-  const stats = store.statsByKind();
+  const stats = statsBuckets(store.solvedGames());
   setCampaignTitle(techniqueName(t.id));
 
   const page = document.createElement("div");
@@ -809,11 +782,12 @@ function openTechnique(tier, branch, t, back) {
 // page, subtitled with its techniques. `back` is the branch list that opened it.
 function openReview(tier, back) {
   setCampaignTitle(`${TIER_LABEL[tier]} · Review`);
+  const stats = statsBuckets(store.solvedGames());
   const grid = document.createElement("div");
   grid.className = "nav-grid";
   for (const lesson of REVIEW_LESSONS) {
     grid.appendChild(
-      navButton(lesson.name, lessonSubtitle(lesson), 0, () =>
+      navButton(lesson.name, lessonSubtitle(lesson), countOf(reviewStats(stats, lesson.key)), () =>
         openReviewLesson(tier, lesson, () => openReview(tier, back))
       )
     );
@@ -836,6 +810,7 @@ function openReview(tier, back) {
 // does. `back` returns to the lesson list.
 function openReviewLesson(tier, lesson, back) {
   setCampaignTitle(lesson.name);
+  const stats = statsBuckets(store.solvedGames());
 
   const page = document.createElement("div");
   page.className = "tech-page";
@@ -851,8 +826,8 @@ function openReviewLesson(tier, lesson, back) {
   // nothing easier in scope (Lesson 1) there is nothing to isolate, so it's
   // Train-only — mirroring a technique page's `hasDrill`.
   const hasDrill = lessonHasDrill(curriculum, lesson);
-  page.appendChild(reviewModeRow(lesson, "train"));
-  if (hasDrill) page.appendChild(reviewModeRow(lesson, "drill"));
+  page.appendChild(reviewModeRow(lesson, "train", stats));
+  if (hasDrill) page.appendChild(reviewModeRow(lesson, "drill", stats));
 
   page.appendChild(reviewModeNote(hasDrill));
 
@@ -862,7 +837,7 @@ function openReviewLesson(tier, lesson, back) {
 }
 
 // One Review mode (Train or Drill) as a row: its label over the start buttons.
-function reviewModeRow(lesson, mode) {
+function reviewModeRow(lesson, mode, stats) {
   const row = document.createElement("div");
   row.className = "mode-row";
 
@@ -873,8 +848,8 @@ function reviewModeRow(lesson, mode) {
 
   const btns = document.createElement("div");
   btns.className = "mode-buttons";
-  btns.appendChild(reviewButton(lesson, mode, "Play", false));
-  btns.appendChild(reviewButton(lesson, mode, "Play from Forced", true));
+  btns.appendChild(reviewButton(lesson, mode, "Play", false, stats));
+  btns.appendChild(reviewButton(lesson, mode, "Play from Forced", true, stats));
   row.appendChild(btns);
   return row;
 }
@@ -899,10 +874,11 @@ function reviewModeNote(hasDrill) {
   return box;
 }
 
-// A Review start button. Unlike a technique's play button it carries no solved
-// badge: a lesson generates a `force_any` (custom) game, which isn't tracked per
-// kind. The empty sub keeps its height in line with the technique buttons.
-function reviewButton(lesson, mode, label, fromForced) {
+// A Review start button, badged with this lesson/mode/start's solved count + best
+// time -- mirroring a technique's Play button. Review games are tracked per (lesson,
+// mode) now, and a plain Play and a Play-from-Forced count separately (as on the
+// technique page).
+function reviewButton(lesson, mode, label, fromForced, stats) {
   const btn = document.createElement("button");
   btn.className = "mode-btn";
   btn.addEventListener("click", () => launchLesson(lesson, mode, fromForced));
@@ -914,6 +890,13 @@ function reviewButton(lesson, mode, label, fromForced) {
 
   const sub = document.createElement("span");
   sub.className = "mb-sub";
+  const m = reviewStats(stats, lesson.key)[mode + (fromForced ? "Forced" : "")];
+  if (m && m.count > 0) {
+    btn.classList.add("solved");
+    sub.textContent = `${m.count} solved · ${formatDuration(m.bestMs)}`;
+  } else {
+    sub.textContent = "";
+  }
   btn.appendChild(sub);
   return btn;
 }
@@ -927,6 +910,9 @@ function reviewButton(lesson, mode, label, fromForced) {
 function launchLesson(lesson, mode, fromForced) {
   const usages = lessonUsages(curriculum, lesson, mode);
   onLaunchSpec({
+    kind: "review",
+    lesson: lesson.key,
+    mode,
     usages,
     label: lessonLabel(lesson),
     specMasks: masksFromUsages(usages),
@@ -971,7 +957,7 @@ function playButton(t, mode, label, fromForced, stats) {
 
   const sub = document.createElement("span");
   sub.className = "mb-sub";
-  const m = stats[t.kindIndex]?.[mode + (fromForced ? "Forced" : "")];
+  const m = campaignStats(stats, t.kindIndex)[mode + (fromForced ? "Forced" : "")];
   if (m && m.count > 0) {
     btn.classList.add("solved");
     sub.textContent = `${m.count} solved · ${formatDuration(m.bestMs)}`;
@@ -1381,10 +1367,14 @@ function badge(text) {
 
 function rollup(stats, entries) {
   let n = 0;
-  for (const e of entries) n += store.solvedCountForKind(stats, e.kindIndex);
+  for (const e of entries) n += countOf(campaignStats(stats, e.kindIndex));
   return n;
 }
 
-function idFor(kindIndex) {
-  return curriculum.find((t) => t.kindIndex === kindIndex)?.id || "";
+// The total solved count across every Review lesson -- the Review section's rollup
+// badge in the Expert branch list.
+function reviewRollup(stats) {
+  let n = 0;
+  for (const lesson of REVIEW_LESSONS) n += countOf(reviewStats(stats, lesson.key));
+  return n;
 }

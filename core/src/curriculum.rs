@@ -198,8 +198,10 @@ pub fn stage_by_key(key: &str) -> Option<&'static Stage> {
 ///     peer for a drill to set apart from train, so its drill collapses onto its
 ///     train; only Train is surfaced (e.g. X-Wing, Naked Pair, XY-Wing).
 ///
-/// The build-time `gen_curriculum` example and the wasm `curriculum()` export both
-/// read this, so the Home tree's per-technique mode buttons can't drift.
+/// The Rust-side reference for the campaign's per-technique Drill availability.
+/// The frontend now owns its own copy (`hasDrill` in `web/curriculum.js`, which
+/// is hand-authored); this stays for the Rust tests and the grader's campaign-spec
+/// tooling. The two copies MAY drift — see the header of `web/curriculum.js`.
 pub fn lab_kind_has_drill(idx: usize) -> bool {
     use crate::lab::kinds::{self, Tier};
     let tier = kinds::tier_of(idx);
