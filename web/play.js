@@ -813,7 +813,7 @@ function onSolved() {
     seed: game.seed,            // may be null on old records
     puzzle: game.puzzle,
     solution: game.solution,
-    solve_ms: finalMs,
+    solve_ms: Math.round(finalMs), // elapsedMs() is a float (performance.now()); the backend's solve_ms is INTEGER
   });
   // Final move-timeline sync, now that the `solved` event is in the log. The
   // pause() above stopped the periodic sync and skipped its own (finished) sync,
