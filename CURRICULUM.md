@@ -29,6 +29,15 @@ Two ordering subtleties worth knowing:
   2.3). For *subsets*, naked is *easier* than hidden (you see N cells holding N
   candidates directly; hidden requires inferring the complement — SE: Naked Pair
   3.0 < Hidden Pair 3.4, and so on).
+  *Scope of the singles half:* it prices the cost of writing pencil marks, which
+  holds on paper but barely exists in this app — swiping every digit across the
+  board and removing stale marks pencils the whole grid in ~4 s, and nearly all
+  players do it before their first placement. In their move logs, at a fixed
+  number of available singles, naked-only and hidden-only cells take the same
+  time; a cell that is both is found about twice as fast
+  ([`docs/grader-human-movelogs.md`](docs/grader-human-movelogs.md)). The scores
+  stay as they are: they order what to *teach*, and a paper solver still meets
+  the singles in this order.
 - **The tree view is not globally difficulty-sorted; only the linear view is.**
   Tier cuts fall on SE thresholds, so the *tiers* don't invert spotting-difficulty
   (every Intermediate technique is below every Expert one). But the three Expert

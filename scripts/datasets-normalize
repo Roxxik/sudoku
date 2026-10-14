@@ -216,6 +216,11 @@ def main():
         catalog_groups.append(entry)
         print(f"  {g['id']:24s} n={len(rows):>5}  -> normalized/{fname}")
 
+    # Keep the app/ groups scripts/movelog-analyze merged in (their CSVs live here too).
+    old = OUT / "catalog.json"
+    if old.exists():
+        catalog_groups += [g for g in json.loads(old.read_text())["groups"] if g["id"].startswith("app/")]
+
     catalog = {
         "description": "External human-difficulty Sudoku datasets, normalized for grader "
                        "tuning. Each group is one partial order; rank is defined WITHIN a "

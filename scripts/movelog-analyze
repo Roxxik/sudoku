@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+"""Replay the uploaded move logs into board states and turn them into grader data.
+
+The app uploads every puzzle's move timeline to the backend's move_logs table (web/tracker.js,
+docs/backend-prototype.md "Move-log sync"). This script downloads/reads that database, replays
+each solved log exactly as web/play.js applies it -- placed digits AND pencil marks, through the
+undo/redo history -- and emits two things. Findings and caveats: docs/grader-human-movelogs.md.
+
+1. Human dataset groups for the grader harness, under datasets/normalized/ (gitignored), in the
+   same shape scripts/datasets-normalize writes (one row per puzzle: puzzle,label_value,
+   label_raw,weight; label higher = harder; weight = number of solves averaged):
+     app/solve_time         mean solve seconds over clean solves (no hint reveal at any stage)
+     app/solve_time_hinted  mean solve seconds over all solves, hint reveals allowed
+     app/hint_reveals       mean number of hint reveals (any stage) per solve
+   Cheat-mode solves and solves that used applyStep / fillCandidates / eraseMistakes are never
+   counted. Score them with the existing per-bucket scoreboard:
+     cargo run --release -p generator-lab --example datasets_correlate -- --no-pelanek
+
+2. A report (stdout + datasets/movelogs/report.txt) of what the scoreboard cannot show:
+   replay validation, the solve-time noise ceiling (two players on one puzzle), the singles
+   timing table, and the per-technique help levels on genuinely hard moments.
+
+Validation is two separate checks, so a drifting port can't hide behind a noisy log:
+  - PORT: this script's Python copies of play.js's wrong-mark / stale-mark logic are run
+    against play.js's OWN functions (extracted and executed under node) on every hint-open
+    state. Any disagreement means play.js changed -- a hard failure. (--no-js-check skips it.)
+  - LOG: each replay is compared with what the app logged -- the final grid at the solve,
+    every hintOpen's health status and every removeStaleMarks cell list. A disagreeing solve
+    is excluded from everything; below MIN_AGREEMENT of solves agreeing the run fails.
+
+Usage:
+  scripts/movelog-analyze [--download] [--no-js-check] [DB]
+    DB          a SQL dump (scripts/db-download) or a .sqlite file;
+                default datasets/movelogs/sudoku-dump.sql
+    --download  refresh the default dump from the remote D1 first (needs wrangler login)
+
+Needs python3, cargo (for core's movelog_probe example) and node (for the port check).
+"""
+
+import csv
+import json
+import sqlite3
+import statistics
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+WORK = REPO / "datasets" / "movelogs"
+NORM = REPO / "datasets" / "normalized"
+DEFAULT_DUMP = WORK / "sudoku-dump.sql"
+PLAY_JS = REPO / "web" / "play.js"
+
+# Share of solved logs whose replay must agree with everything the app logged.
+MIN_AGREEMENT = 0.98
+# A placement interval longer than this is treated as the player being away.
+AWAY_MS = 300_000
+
+ROW = [i // 9 for i in range(81)]
+COL = [i % 9 for i in range(81)]
+BOX = [(i // 27) * 3 + (i % 9) // 3 for i in range(81)]
+PEERS = [[j for j in range(81) if j != i and (ROW[i] == ROW[j] or COL[i] == COL[j] or BOX[i] == BOX[j])]
+         for i in range(81)]
+ALL = 0x1FF
+SINGLES = {"naked-single", "hidden-single"}
+LC = {"pointing", "claiming"}
+ASSISTS = {"applyStep", "fillCandidates", "eraseMistakes"}
+# Hint-reveal stages that only name the technique; later stages (unit/cell/deduction) locate it.
+NAME_STAGES = {"tier", "name"}
+
+
+def bit(d):
+    return 1 << (d - 1)
+
+
+def popcount(m):
+    return bin(m).count("1")
+
+
+# --- statistics (stdlib only) ---------------------------------------------------------------
+
+
+def frac_ranks(xs):
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    r = [0.0] * len(xs)
+    i = 0
+    while i < len(xs):
+        j = i + 1
+        while j < len(xs) and xs[order[j]] == xs[order[i]]:
+            j += 1
+        for k in order[i:j]:
+            r[k] = (i + j - 1) / 2
+        i = j
+    return r
+
+
+def spearman(xs, ys):
+    if len(xs) < 3:
+        return float("nan")
+    rx, ry = frac_ranks(xs), frac_ranks(ys)
+    mx, my = statistics.fmean(rx), statistics.fmean(ry)
+    sxy = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    sxx = sum((a - mx) ** 2 for a in rx)
+    syy = sum((b - my) ** 2 for b in ry)
+    return sxy / (sxx * syy) ** 0.5 if sxx and syy else float("nan")
+
+
+# --- board state: a port of play.js's value + pencil-mark model ------------------------------
+
+
+class State:
+    """Placed digits plus center marks (candidate sets) and corner marks (Snyder pins), as
+    9-bit masks per cell -- the three arrays play.js snapshots for undo."""
+
+    def __init__(self, givens):
+        self.v = givens[:]
+        self.c = [0] * 81
+        self.n = [0] * 81
+
+    def copy(self):
+        s = State.__new__(State)
+        s.v, s.c, s.n = self.v[:], self.c[:], self.n[:]
+        return s
+
+    def line(self):
+        return "".join(str(d) if d else "." for d in self.v)
+
+
+def grid_cand(st, i):
+    """play.js candidatesFor: digits no peer has placed."""
+    used = 0
+    for j in PEERS[i]:
+        if st.v[j]:
+            used |= bit(st.v[j])
+    return ALL & ~used
+
+
+def corner_pins(st):
+    """play.js cornerPins: allowed(i) = digits not pinned elsewhere in the box, plus the cell's
+    own corner marks."""
+    cell = [0] * 81
+    boxu = [0] * 9
+    for i in range(81):
+        if st.v[i] == 0 and st.n[i]:
+            cell[i] = st.n[i]
+            boxu[BOX[i]] |= st.n[i]
+    return lambda i: (~boxu[BOX[i]] & ALL) | cell[i]
+
+
+def candidates_at(st, i, allowed):
+    """play.js candidatesAt -> (mask, specified)."""
+    mask, specified = ALL, False
+    if st.c[i]:
+        mask &= st.c[i]
+        specified = True
+    a = allowed(i)
+    if a != ALL:
+        mask &= a
+        specified = True
+    return mask, specified
+
+
+def wrong_mark_cells(st, sol):
+    allowed = corner_pins(st)
+    out = []
+    for i in range(81):
+        if st.v[i]:
+            continue
+        mask, specified = candidates_at(st, i, allowed)
+        if specified and not mask & bit(sol[i]):
+            out.append(i)
+    return out
+
+
+def stale_mark_detail(st):
+    """play.js staleMarkDetail -> [(cell, center digits, corner digits)]."""
+    allowed = corner_pins(st)
+    out = []
+    for i in range(81):
+        if st.v[i] or (st.c[i] == 0 and st.n[i] == 0):
+            continue
+        cand, pa = grid_cand(st, i), allowed(i)
+        center = [d for d in range(1, 10) if st.c[i] & bit(d) and not (cand & pa & bit(d))]
+        corner = [d for d in range(1, 10) if st.n[i] & bit(d) and not cand & bit(d)]
+        if center or corner:
+            out.append((i, center, corner))
+    return out
+
+
+def health(st, sol):
+    """The status openHint logs, in its order: contradiction, wrong entry, solved, wrong
+    marks, stale marks, ok."""
+    for i in range(81):
+        if st.v[i] and any(st.v[j] == st.v[i] for j in PEERS[i]):
+            return "logical"
+    if any(st.v[i] and st.v[i] != sol[i] for i in range(81)):
+        return "solvedError"
+    if all(st.v):
+        return "solved"
+    if wrong_mark_cells(st, sol):
+        return "wrong"
+    if stale_mark_detail(st):
+        return "stale"
+    return "ok"
+
+
+def solver_masks(st, sol, from_marks):
+    """play.js solverBoard's candidate masks (0 = unspecified); a mask that would exclude the
+    solution digit is dropped, as there."""
+    masks = [0] * 81
+    if not from_marks:
+        return masks
+    allowed = corner_pins(st)
+    for i in range(81):
+        if st.v[i]:
+            continue
+        mask, specified = candidates_at(st, i, allowed)
+        if specified and mask & bit(sol[i]):
+            masks[i] = mask
+    return masks
+
+
+def clear_peer_marks(st, i, d):
+    for j in PEERS[i]:
+        st.c[j] &= ~bit(d)
+        st.n[j] &= ~bit(d)
+
+
+# --- replay -----------------------------------------------------------------------------------
+
+
+def replay(solve_id, puzzle, solution, events):
+    """Replay one solved log. Returns a dict with the solve summary, its placement moments,
+    the log-agreement checks and the hint-open states for the port check."""
+    givens = [0 if ch == "." else int(ch) for ch in puzzle]
+    sol = [int(ch) for ch in solution]
+    st = State(givens)
+    hist, redo = [], []
+    settings = {}
+    checks = Counter()
+    js_states = []
+    moments = []
+    cheat = assisted = False
+    reveals = 0
+    place_idx = 0
+    last_place_t = 0
+    start_masks = [0] * 81  # hint-engine masks right after the previous placement
+    iv = dict(open=0, list=0, name=0, loc=0)
+    first_note_t = stale_t = None
+    note_cells = 0
+    final_ms = None
+
+    def push():
+        hist.append(st.copy())
+        redo.clear()
+
+    for k, e in enumerate(events):
+        ty, t = e["type"], e["t"]
+        if ty == "session":
+            settings.update(e.get("settings") or {})
+            cheat = cheat or bool(e.get("cheat"))
+        elif ty == "settingChange":
+            settings[e["key"]] = e["value"]
+        elif ty == "cheatToggle":
+            cheat = cheat or bool(e.get("on"))
+        elif ty in ("place", "clear"):
+            cells = e["cells"]
+            if ty == "place":
+                correct_before = all(v == 0 or v == s for v, s in zip(st.v, sol))
+                if correct_before and len(cells) == 1 and sol[cells[0]] == e["digit"]:
+                    moments.append(dict(
+                        solve_id=solve_id, idx=place_idx, dt=t - last_place_t, cell=cells[0],
+                        state=st.line(), masks=start_masks, clean=not (cheat or assisted),
+                        level=("location" if iv["loc"] else "name" if iv["name"] else
+                               "list" if iv["list"] else "open" if iv["open"] else "none"),
+                    ))
+                place_idx += 1
+                last_place_t = t
+                iv = dict(open=0, list=0, name=0, loc=0)
+            push()
+            for i in cells:
+                if givens[i]:
+                    continue
+                if ty == "place":
+                    st.v[i] = e["digit"]
+                    st.c[i] = st.n[i] = 0
+                else:
+                    st.v[i] = 0
+            if ty == "place":
+                if settings.get("eliminate", True):
+                    for i in cells:
+                        clear_peer_marks(st, i, e["digit"])
+                start_masks = solver_masks(st, sol, settings.get("hintFromMarks", True))
+        elif ty == "note":
+            push()
+            marks = st.n if e["kind"] == "corner" else st.c
+            for i in e["cells"]:
+                if givens[i]:
+                    continue
+                if e["op"] == "add":
+                    if st.v[i] == 0:
+                        marks[i] |= bit(e["digit"])
+                else:
+                    marks[i] &= ~bit(e["digit"])
+            if first_note_t is None:
+                first_note_t = t
+            if stale_t is None:
+                note_cells += len(e["cells"])
+        elif ty in ("erase", "eraseMistakes"):
+            push()
+            for i in e["cells"]:
+                if not givens[i]:
+                    st.v[i] = 0
+                    st.c[i] = st.n[i] = 0
+        elif ty == "eraseCorners":
+            push()
+            for i in e["cells"]:
+                st.n[i] = 0
+        elif ty == "eraseCenters":
+            push()
+            for i in e["cells"]:
+                st.c[i] = 0
+        elif ty == "cornersToCenters":
+            push()
+            for i in e["cells"]:
+                st.c[i] |= st.n[i]
+                st.n[i] = 0
+        elif ty == "removeStaleMarks":
+            detail = stale_mark_detail(st)
+            checks["stale_ok" if sorted(i for i, _, _ in detail) == sorted(e["cells"]) else "stale_bad"] += 1
+            if stale_t is None:
+                stale_t = t
+            push()
+            for i, center, corner in detail:
+                for d in center:
+                    st.c[i] &= ~bit(d)
+                for d in corner:
+                    st.n[i] &= ~bit(d)
+        elif ty == "undoSelected":
+            prev = hist[-1] if hist else State(givens)
+            push()
+            for i in e["cells"]:
+                st.v[i], st.c[i], st.n[i] = prev.v[i], prev.c[i], prev.n[i]
+        elif ty == "applyStep":
+            push()
+            for d in e["deductions"]:
+                i = d["cell"]
+                if givens[i]:
+                    continue
+                if d["kind"] == "place":
+                    st.v[i] = d["digit"]
+                    st.c[i] = st.n[i] = 0
+                    clear_peer_marks(st, i, d["digit"])
+                else:
+                    st.c[i] &= ~bit(d["digit"])
+                    st.n[i] &= ~bit(d["digit"])
+        elif ty == "fillCandidates":
+            push()
+            for i in range(81):
+                if st.v[i] == 0:
+                    st.c[i] = grid_cand(st, i)
+        elif ty == "restart":
+            push()
+            st = State(givens)
+            last_place_t = t
+            start_masks = [0] * 81
+        elif ty in ("undo", "undoToClear"):
+            for _ in range(e.get("steps", 1)):
+                if hist:
+                    redo.append(st)
+                    st = hist.pop()
+        elif ty in ("redo", "redoAll"):
+            for _ in range(e.get("steps", 1)):
+                if redo:
+                    hist.append(st)
+                    st = redo.pop()
+        elif ty == "hintOpen":
+            iv["open"] += 1
+            checks["health_ok" if health(st, sol) == e.get("health") else "health_bad"] += 1
+            js_states.append(dict(value=st.v[:], given=givens, solution=sol, center=st.c[:],
+                                  corner=st.n[:], wrong=wrong_mark_cells(st, sol),
+                                  stale=[i for i, _, _ in stale_mark_detail(st)]))
+        elif ty == "hintShowTechniques":
+            iv["list"] += 1
+        elif ty == "hintReveal":
+            reveals += 1
+            iv["name" if e.get("stage") in NAME_STAGES else "loc"] += 1
+        elif ty == "solved":
+            final_ms = e.get("elapsedMs")
+        if ty in ASSISTS:
+            assisted = True
+
+    # The solving placement itself is never logged (the win fires inside the commit and ends
+    # the session first), so a correct replay ends one empty cell short of the solution.
+    diff = [i for i in range(81) if st.v[i] != sol[i]]
+    checks["final_ok" if len(diff) == 0 or (len(diff) == 1 and st.v[diff[0]] == 0) else "final_bad"] += 1
+    swipe_fill = stale_t is not None and note_cells >= 200
+    return dict(
+        solve_id=solve_id, puzzle=puzzle, final_ms=final_ms, cheat=cheat, assisted=assisted,
+        reveals=reveals, moments=moments, checks=checks, js_states=js_states,
+        swipe_fill_s=(stale_t - first_note_t) / 1000 if swipe_fill else None,
+    )
+
+
+# --- external steps ---------------------------------------------------------------------------
+
+
+def open_db(path):
+    if path.suffix == ".sql":
+        con = sqlite3.connect(":memory:")
+        con.executescript(path.read_text())
+        return con
+    return sqlite3.connect(path)
+
+
+JS_CHECK = r"""
+// Run play.js's own wrong/stale-mark functions on replayed states (movelog-analyze port check).
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[1], "utf8");
+const states = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+function extract(name) {
+  const at = src.indexOf(`function ${name}(`);
+  if (at < 0) throw new Error(`play.js no longer defines ${name}()`);
+  let i = src.indexOf("{", at), depth = 0;
+  for (; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}" && --depth === 0) break;
+  }
+  return src.slice(at, i + 1);
+}
+const names = ["boxOf", "isPeer", "digitAt", "cornerPins", "candidatesAt",
+  "candidatesExcludeSolution", "wrongMarkCells", "candidatesFor", "staleMarkDetail"];
+const toSet = (m) => new Set([1, 2, 3, 4, 5, 6, 7, 8, 9].filter((d) => m & (1 << (d - 1))));
+const run = new Function("st", "toSet", `const N = 81; const value = st.value;
+  const given = st.given; const solution = st.solution;
+  const centerMarks = st.center.map(toSet); const cornerMarks = st.corner.map(toSet);
+  ${names.map(extract).join("\n")}
+  return [wrongMarkCells(), staleMarkDetail().map((e) => e.cell)];`);
+let bad = 0;
+for (const st of states) {
+  const [wrong, stale] = run(st, toSet);
+  if (JSON.stringify(wrong) !== JSON.stringify(st.wrong) ||
+      JSON.stringify(stale) !== JSON.stringify(st.stale)) bad++;
+}
+console.log(JSON.stringify({ n: states.length, bad }));
+"""
+
+
+def js_port_check(states):
+    path = WORK / "jscheck-states.json"
+    path.write_text(json.dumps(states))
+    res = subprocess.run(["node", "-e", JS_CHECK, str(PLAY_JS), str(path)],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.exit(f"movelog-analyze: node port check failed to run:\n{res.stderr}")
+    return json.loads(res.stdout)
+
+
+def run_probe(lines):
+    subprocess.run(["cargo", "build", "--release", "-q", "-p", "sudoku-core", "--example", "movelog_probe"],
+                   cwd=REPO, check=True)
+    res = subprocess.run([str(REPO / "target" / "release" / "examples" / "movelog_probe")],
+                         input="\n".join(lines) + "\n", capture_output=True, text=True, check=True)
+    return [line.split("\t") for line in res.stdout.splitlines()]
+
+
+# --- outputs ----------------------------------------------------------------------------------
+
+GROUPS = [
+    dict(id="app/solve_time", metric="mean solve seconds",
+         notes="Clean solves only: no hint reveal at any stage (opening the panel / the technique "
+               "list is allowed), no cheat, no applyStep/fillCandidates/eraseMistakes."),
+    dict(id="app/solve_time_hinted", metric="mean solve seconds",
+         notes="All non-cheat, non-assisted solves, hint reveals allowed. On hard puzzles this is "
+               "mostly hint-assisted time."),
+    dict(id="app/hint_reveals", metric="mean hint reveals per solve",
+         notes="Same solves as app/solve_time_hinted; label = hintReveal events at any stage."),
+]
+
+
+def write_groups(solves):
+    by = {g["id"]: defaultdict(list) for g in GROUPS}
+    for s in solves:
+        if s["cheat"] or s["assisted"] or s["final_ms"] is None:
+            continue
+        secs = s["final_ms"] / 1000
+        if s["reveals"] == 0:
+            by["app/solve_time"][s["puzzle"]].append(secs)
+        by["app/solve_time_hinted"][s["puzzle"]].append(secs)
+        by["app/hint_reveals"][s["puzzle"]].append(s["reveals"])
+    NORM.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for g in GROUPS:
+        fname = g["id"].replace("/", "__") + ".csv"
+        rows = sorted(by[g["id"]].items())
+        with open(NORM / fname, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["puzzle", "label_value", "label_raw", "weight"])
+            for puzzle, vals in rows:
+                mean = round(statistics.fmean(vals), 3)
+                w.writerow([puzzle, mean, mean, len(vals)])
+        entries.append(dict(
+            id=g["id"], dataset="app-movelogs", source="this app's backend move_logs (D1)",
+            scheme=g["metric"], label_kind="continuous",
+            label_origin="human (this app's players, anonymous; few distinct players)",
+            notes=g["notes"] + " One row per puzzle, weight = solves averaged.",
+            n=len(rows), file=fname, generated_by="scripts/movelog-analyze",
+        ))
+    # Merge into the catalog datasets-normalize writes, replacing earlier app/ entries.
+    cat_path = NORM / "catalog.json"
+    catalog = json.loads(cat_path.read_text()) if cat_path.exists() else {"groups": []}
+    catalog["groups"] = [g for g in catalog["groups"] if not g["id"].startswith("app/")] + entries
+    cat_path.write_text(json.dumps(catalog, indent=2))
+    return entries
+
+
+def pct(x):
+    return f"{100 * x:3.0f}%"
+
+
+def main():
+    args = sys.argv[1:]
+    download = "--download" in args
+    js_check = "--no-js-check" not in args
+    paths = [a for a in args if not a.startswith("--")]
+    db_path = Path(paths[0]) if paths else DEFAULT_DUMP
+    WORK.mkdir(parents=True, exist_ok=True)
+    if download:
+        subprocess.run([str(REPO / "scripts" / "db-download"), str(DEFAULT_DUMP)], check=True)
+        db_path = DEFAULT_DUMP
+    if not db_path.exists():
+        sys.exit(f"movelog-analyze: no database at {db_path} (run with --download)")
+
+    con = open_db(db_path)
+    rows = con.execute(
+        """select m.solve_id, m.puzzle, s.solution, m.events, s.created_at
+           from move_logs m join solves s using(solve_id) where m.solved = 1 order by s.created_at"""
+    ).fetchall()
+    n_logs, n_solved = con.execute("select count(*), sum(solved) from move_logs").fetchone()
+
+    solves, js_states = [], []
+    checks = Counter()
+    for solve_id, puzzle, solution, events, created_at in rows:
+        r = replay(solve_id, puzzle, solution, json.loads(events))
+        r["created_at"] = created_at
+        checks.update(r["checks"])
+        js_states += r["js_states"]
+        if not any(k.endswith("_bad") for k in r["checks"]):
+            solves.append(r)
+    agreement = len(solves) / len(rows)
+
+    out = []
+    p = out.append
+    p("# Move-log analysis (scripts/movelog-analyze)")
+    p(f"move logs {n_logs}, solved {n_solved}, solved with a solves row {len(rows)}")
+    p(f"replay vs log: final grid {checks['final_ok']}/{checks['final_ok'] + checks['final_bad']}, "
+      f"hintOpen health {checks['health_ok']}/{checks['health_ok'] + checks['health_bad']}, "
+      f"removeStaleMarks cells {checks['stale_ok']}/{checks['stale_ok'] + checks['stale_bad']}")
+    p(f"solves agreeing on every check: {len(solves)}/{len(rows)} ({agreement:.1%}); the rest are excluded")
+    if js_check:
+        res = js_port_check(js_states)
+        p(f"port check vs play.js under node: {res['n'] - res['bad']}/{res['n']} hint-open states agree")
+        if res["bad"]:
+            sys.exit("\n".join(out) + "\nmovelog-analyze: the Python mark logic no longer matches play.js -- update the port")
+    if agreement < MIN_AGREEMENT:
+        sys.exit("\n".join(out) + f"\nmovelog-analyze: replay agreement below {MIN_AGREEMENT:.0%} -- "
+                 "play.js or the tracker changed in a way this replay doesn't model")
+
+    # --- datasets
+    entries = write_groups(solves)
+    p("")
+    p("## Dataset groups (score with datasets_correlate)")
+    for e in entries:
+        p(f"  {e['id']:24s} n={e['n']:4d} puzzles -> datasets/normalized/{e['file']}")
+
+    # --- noise ceiling: two different solves of one puzzle
+    clean = [s for s in solves if not (s["cheat"] or s["assisted"]) and s["reveals"] == 0 and s["final_ms"]]
+    per_puzzle = defaultdict(list)
+    for s in clean:
+        per_puzzle[s["puzzle"]].append(s["final_ms"])
+    pairs = [v[:2] for v in per_puzzle.values() if len(v) >= 2]
+    p("")
+    p("## Noise ceiling")
+    p(f"clean solves of the same puzzle, first vs second: n={len(pairs)} pairs, "
+      f"Spearman {spearman([a for a, _ in pairs], [b for _, b in pairs]):+.2f}")
+    p("  (how well one player's time predicts another's -- the bar a grader can't usefully beat)")
+    fills = [s["swipe_fill_s"] for s in solves if s["swipe_fill_s"] is not None]
+    if fills:
+        p(f"swipe-fill pencilling (all digits swiped, then remove stale marks): {len(fills)}/{len(solves)} "
+          f"solves, median {statistics.median(fills):.0f}s")
+
+    # --- probe every placement moment
+    moments = [m for s in solves for m in s["moments"]]
+    probe = run_probe([f"{m['state']}\t{','.join(map(str, m['masks']))}\t{m['cell']}" for m in moments])
+    for m, (gate_m, gate_g, diff, singles, ns, hs, t_ns, t_hs) in zip(moments, probe):
+        m.update(gate_m=gate_m, gate_g=gate_g, difficulty=int(diff), singles=int(singles),
+                 ns=int(ns), hs=int(hs), t_ns=t_ns == "1", t_hs=t_hs == "1")
+
+    # Per-solve pace: median interval of unaided singles placements, so times read in units of
+    # the player's own easy move.
+    paces = defaultdict(list)
+    for m in moments:
+        if m["idx"] > 0 and m["gate_g"] in SINGLES and m["level"] == "none" and m["dt"] < AWAY_MS:
+            paces[m["solve_id"]].append(m["dt"])
+    pace = {k: statistics.median(v) for k, v in paces.items() if v}
+
+    p("")
+    p("## Singles: time to the next placement, in units of the player's own median single")
+    widths = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 6), (7, 9), (10, 81)]
+    cells = defaultdict(list)
+    kinds = defaultdict(list)
+    for m in moments:
+        if m["idx"] == 0 or m["gate_g"] not in SINGLES or m["level"] != "none" or m["dt"] >= AWAY_MS:
+            continue
+        if m["solve_id"] not in pace:
+            continue
+        x = m["dt"] / pace[m["solve_id"]]
+        for lo, hi in widths:
+            if lo <= m["singles"] <= hi:
+                cells[(lo, hi)].append(x)
+        if m["singles"] <= 2:
+            kind = "both" if m["ns"] + m["hs"] > m["singles"] else "naked only" if m["hs"] == 0 else \
+                "hidden only" if m["ns"] == 0 else "mixed"
+            kinds[(m["singles"], kind)].append(x)
+    labels = [str(lo) if lo == hi else f"{lo}-{hi}" if hi < 81 else f"{lo}+" for lo, hi in widths]
+    p("singles available  " + "  ".join(f"{lab:>6s}" for lab in labels))
+    p("median time        " + "  ".join(f"{statistics.median(cells[w]):6.2f}" if cells[w] else "     -" for w in widths))
+    p("moments            " + "  ".join(f"{len(cells[w]):6d}" for w in widths))
+    p("naked vs hidden at a fixed number of available singles (cells that are both: 'both'):")
+    for w in (1, 2):
+        p(f"  {w} available: " + ", ".join(
+            f"{k} {statistics.median(kinds[(w, k)]):.2f} (n={len(kinds[(w, k)])})"
+            for k in ("naked only", "hidden only", "both") if kinds[(w, k)]))
+
+    # --- help levels on hard moments, judged against the player's own notes
+    p("")
+    p("## Hard moments: help used before the placement, by the technique the player's notes needed")
+    p("  (help = highest of: panel opened / technique list / name revealed / location revealed)")
+    levels = ["none", "open", "list", "name", "location"]
+    by_tech = defaultdict(list)
+    diff_of = {}
+    for m in moments:
+        if m["gate_m"] in SINGLES or m["gate_m"] == "none" or not m["clean"]:
+            continue
+        by_tech[m["gate_m"]].append(m)
+        diff_of[m["gate_m"]] = m["difficulty"]
+    p(f"{'technique':15s} {'grader':>6s} {'moments':>7s} {'solves':>6s} " + " ".join(f"{lv:>8s}" for lv in levels)
+      + f" {'median':>7s}")
+    for tech in sorted(by_tech, key=lambda t: diff_of[t]):
+        ms = by_tech[tech]
+        c = Counter(m["level"] for m in ms)
+        p(f"{tech:15s} {diff_of[tech]:6d} {len(ms):7d} {len({m['solve_id'] for m in ms}):6d} "
+          + " ".join(f"{pct(c[lv] / len(ms)):>8s}" for lv in levels)
+          + f" {statistics.median(m['dt'] for m in ms) / 60000:6.1f}m")
+    hard = [m for m in moments if m["gate_g"] not in SINGLES | LC and m["gate_g"] != "none" and m["clean"]]
+    already = sum(1 for m in hard if m["gate_m"] in SINGLES)
+    p(f"moments hard on the bare grid but already reduced to singles by the player's notes: {already}/{len(hard)}")
+
+    text = "\n".join(out) + "\n"
+    (WORK / "report.txt").write_text(text)
+    print(text, end="")
+
+
+if __name__ == "__main__":
+    main()
