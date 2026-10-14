@@ -558,6 +558,12 @@ function renderDailyBoard(box, board, g, state) {
   const { times, hints, rank, total } = projectedStanding(
     board.times, board.hints, g.hints || 0, Math.round(g.elapsedMs), board.mine
   );
+  // The display-name column, aligned to the same rows: the server's names as-is when
+  // the player's row is already on the board, else the player's current name spliced
+  // in at their projected rank (a pending or would-be row isn't in board.names).
+  const names = board.mine >= 0
+    ? board.names
+    : [...board.names.slice(0, rank - 1), settings.playerName() || null, ...board.names.slice(rank - 1)];
 
   // First (and so far only) ranked solver: a "#1 of 1" one-row board says nothing,
   // so mark the milestone instead (the mirror of the "Be the first to solve"
@@ -593,13 +599,18 @@ function renderDailyBoard(box, board, g, state) {
       t.className = "lb-time";
       const ms = times[row - 1];
       t.textContent = ms == null ? "—" : formatDuration(ms);
+      // The optional display name; empty for an anonymous row, where the span just
+      // fills the gap so the hint column stays right-aligned.
+      const nm = document.createElement("span");
+      nm.className = "lb-name";
+      nm.textContent = names[row - 1] || "";
       // The dual score: a hint tally per row, in the same wording as every other
       // surface -- "hint-free" (green) for a clean solve, otherwise the count.
       const h = document.createElement("span");
       const n = hints[row - 1];
       h.className = "lb-hints" + (n === 0 ? " clean" : "");
       h.textContent = ms == null ? "" : hintText(n);
-      line.append(r, t, h);
+      line.append(r, t, nm, h);
     }
     box.appendChild(line);
   }
@@ -1058,6 +1069,13 @@ export function openSettings(onBack) {
   document
     .getElementById("settingsBody")
     .replaceChildren(
+      settingText(
+        "Player name",
+        "Shown next to your time on the daily leaderboard. Leave empty to stay anonymous. Applies to solves you submit from now on.",
+        settings.playerName(),
+        settings.PLAYER_NAME_MAX,
+        settings.setPlayerName
+      ),
       settingToggle(
         "Light mode",
         "Use the light colour theme. Turn off for the dark theme.",
@@ -1217,6 +1235,40 @@ function settingSelect(name, desc, options, initial, onChange) {
   return row;
 }
 
+// A labelled row carrying a single-line text input on the right. Writes through
+// `onChange` on every edit (the setter normalizes), so there is no save button;
+// the field shows the normalized value again once it loses focus. A <div> for the
+// same reason as settingSelect.
+function settingText(name, desc, initial, maxLength, onChange) {
+  const row = document.createElement("div");
+  row.className = "setting-row";
+
+  const text = document.createElement("div");
+  text.className = "setting-text";
+  const title = document.createElement("span");
+  title.className = "setting-name";
+  title.textContent = name;
+  const sub = document.createElement("span");
+  sub.className = "setting-desc";
+  sub.textContent = desc;
+  text.append(title, sub);
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "setting-input";
+  input.value = initial;
+  input.maxLength = maxLength;
+  input.placeholder = "Anonymous";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.setAttribute("aria-label", name);
+  input.addEventListener("input", () => onChange(input.value));
+  input.addEventListener("change", () => { input.value = input.value.trim(); });
+
+  row.append(text, input);
+  return row;
+}
+
 // ---- How to play ----
 // A static reference: the rules, a few "good to know" tips, then the play-view
 // controls described for the current device (touch gestures on a coarse pointer,
@@ -1289,13 +1341,15 @@ let privacyReturn = showHome;
 
 // The privacy disclaimer, rendered with the same titled-list helper as Help.
 // Keep this in step with what backend.js actually uploads (recordSolve /
-// recordMoves) and with the "Share play data" setting (settings.js): the page is
+// recordMoves / recordDailySolve) and with the "Share play data" and "Player name"
+// settings (settings.js): the page is
 // the user-facing promise that gating backs up. Plain-language for now -- a small,
 // friends-only app -- to be reworded when it grows.
 const PRIVACY = [
   ["Off by default", "Nothing about your play leaves this device unless you turn on “Share play data” in Settings. It is a pure opt-in: off until you choose otherwise, and turning it back off drops anything still waiting to be sent."],
   ["What is shared", "Only when you opt in, and only your solve times and the actions you take while solving — the same move history that already powers your hints and stats. Nothing more."],
-  ["What is never collected", "No IP address, no name or email, no account, and not even an anonymous per-user id. What is sent cannot be tied back to you or your device."],
+  ["Daily leaderboard", "Tapping Submit on a daily puzzle sends that solve's time and hint count to the shared leaderboard, whatever the setting above. If you set a player name in Settings, it is sent along and shown next to your time; leave it empty to stay anonymous."],
+  ["What is never collected", "No IP address, no email, no name beyond the optional leaderboard name you choose, no account, and not even an anonymous per-user id. What is sent cannot be tied back to you or your device."],
   ["Why it is collected", "Purely to make the puzzles and the difficulty grading better. The data is used only to improve this app — it is not sold or shared with anyone else."],
   ["Data minimality", "Only the bare minimum needed for that. If a piece of information is not needed to improve the app, it is not collected in the first place."],
   ["A small project", "This is a little app shared among friends."],

@@ -40,7 +40,7 @@ import { cheatOn } from "./cheat.js";
 // default OFF. Posting is gated on this on TOP of CONFIGURED, so an opted-out
 // user -- the default -- never enqueues or sends anything: no data leaves the
 // device. settings.js is DOM-free, so importing it here is safe.
-import { dataSharingOn } from "./settings.js";
+import { dataSharingOn, playerName } from "./settings.js";
 
 // Shared "never swallow a storage failure" logger (see util.logStorageError).
 import { logStorageError } from "./util.js";
@@ -448,7 +448,7 @@ function markDailyDone(ids) {
 }
 
 // Mirror of the worker's validDaily(): (day, level) name the puzzle, seed optional,
-// hints the dual score, client_version stamped by us.
+// hints the dual score, name the optional display name, client_version stamped by us.
 function validDailyPayload(s) {
   return !!s
     && typeof s.solve_id === "string" && s.solve_id.length > 0
@@ -457,7 +457,8 @@ function validDailyPayload(s) {
     && typeof s.puzzle === "string"   && s.puzzle.length === 81
     && Number.isInteger(s.solve_ms)
     && (s.seed == null || typeof s.seed === "string")
-    && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0));
+    && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0))
+    && (s.name == null || typeof s.name === "string");
 }
 
 // The submit state of one daily, by its solve_id, for the overview button:
@@ -539,13 +540,16 @@ async function flushDailyOutbox() {
 // Submit a solved daily for upload. Enqueue-then-flush like recordSolve, coalescing
 // by solve_id so a double tap (or submitting from both the win screen and the
 // overview) can't duplicate. Fire-and-forget: never throws, never awaits into the
-// UI. `solve` is { solve_id, day, level, seed, puzzle, solution, solve_ms }.
+// UI. `solve` is { solve_id, day, level, seed, puzzle, solution, solve_ms }. The
+// player's display name (Settings) is stamped on here, at submit time; with no name
+// set the field is omitted and the row stays anonymous.
 export function recordDailySolve(solve) {
   if (!dailyPostingEnabled()) {
     if (cheatOn()) console.log("[backend] daily solve not recorded: backend not configured");
     return;
   }
-  const entry = { ...solve, client_version: VERSION };
+  const name = playerName();
+  const entry = { ...solve, ...(name ? { name } : {}), client_version: VERSION };
   if (!validDailyPayload(entry)) {
     if (cheatOn()) console.warn("[backend] daily solve failed client validation; not queued:", entry);
     reportFailure({ kind: "invalid_daily_solve", solve: entry });
@@ -675,10 +679,16 @@ export async function fetchDailyBoard(day, level, solveId) {
     const hints = Array.isArray(body.hints) && body.hints.length === body.times.length
       ? body.hints
       : body.times.map(() => 0);
+    // `names` likewise: the optional display names, null where unset (or all-null
+    // from an older worker).
+    const names = Array.isArray(body.names) && body.names.length === body.times.length
+      ? body.names
+      : body.times.map(() => null);
     const board = {
       count: typeof body.count === "number" ? body.count : body.times.length,
       times: body.times,
       hints,
+      names,
       mine: Number.isInteger(body.mine) ? body.mine : -1,
     };
     writeDailyBoardCache(day, level, solveId, board);
@@ -702,7 +712,9 @@ function readDailyBoardCache(day, level, solveId, maxAgeMs = Infinity) {
   if (Date.now() - entry.ts > maxAgeMs) return null;
   const mine =
     solveId && entry.solveId === solveId && Number.isInteger(entry.mine) ? entry.mine : -1;
-  return { count: entry.count, times: entry.times, hints: entry.hints, mine };
+  // A cache written before names existed has none -> an all-anonymous column.
+  const names = Array.isArray(entry.names) ? entry.names : entry.times.map(() => null);
+  return { count: entry.count, times: entry.times, hints: entry.hints, names, mine };
 }
 
 function writeDailyBoardCache(day, level, solveId, board) {
@@ -713,6 +725,7 @@ function writeDailyBoardCache(day, level, solveId, board) {
     count: board.count,
     times: board.times,
     hints: board.hints,
+    names: board.names,
     mine: board.mine,
   };
   saveDailyCache(DAILY_BOARD_CACHE_KEY, map, day);

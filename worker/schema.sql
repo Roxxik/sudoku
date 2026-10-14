@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS move_logs (
 -- creation) is the idempotency key: a resent submission is an INSERT OR IGNORE
 -- no-op. Only rankable solves are uploaded: a cheat-tainted or late solve (finished
 -- after its day rolled over) stays on-device and is shown a would-be rank instead.
+-- `name` is the optional player name from Settings, captured at submit time and shown
+-- on the board; NULL when the player set none. On an existing database add it with:
+--   ALTER TABLE daily_solves ADD COLUMN name TEXT;
 CREATE TABLE IF NOT EXISTS daily_solves (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   solve_id   TEXT    NOT NULL UNIQUE,     -- stable per-puzzle id; resubmit -> idempotent no-op
@@ -65,6 +68,7 @@ CREATE TABLE IF NOT EXISTS daily_solves (
   puzzle     TEXT    NOT NULL,            -- 81 chars, '.' = empty (seed-drift check)
   solve_ms   INTEGER NOT NULL,            -- final elapsedMs
   hints      INTEGER NOT NULL DEFAULT 0,  -- dual-score axis: distinct hint reveals (0 = clean)
+  name       TEXT,                        -- optional player name (Settings), NULL = anonymous
   client_version TEXT NOT NULL,           -- frontend build that submitted this solve
   created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );

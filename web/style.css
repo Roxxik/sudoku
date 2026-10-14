@@ -508,6 +508,20 @@ button.setting-row:active { background: var(--cell-sel); }
   cursor: pointer;
 }
 
+/* The text variant: a single-line input sitting where the switch would. */
+.setting-input {
+  flex: none;
+  width: 45%;
+  max-width: 12em;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 0.95rem;
+}
+
 /* ---- Home: campaign tree ---- */
 .campaign { display: flex; flex-direction: column; gap: 8px; }
 
@@ -657,8 +671,10 @@ summary > span:first-of-type { flex: 1; }
   color: var(--text);
   margin-bottom: 4px;
 }
-/* One rank row: rank number left, time next, hint tally right. Tabular figures so
-   times align; the time flexes to push the hint column to the right edge. */
+/* One rank row: rank number left, time next, then the optional player name, hint
+   tally right. Tabular figures so times align; the time gets a min-width so names
+   start in one column, and the name flexes (empty for anonymous rows) to push the
+   hint column to the right edge. */
 .lb-row {
   display: flex;
   gap: 10px;
@@ -667,7 +683,15 @@ summary > span:first-of-type { flex: 1; }
   font-variant-numeric: tabular-nums;
 }
 .lb-rank { color: var(--mark); min-width: 2.2em; }
-.lb-time { color: var(--text); flex: 1; }
+.lb-time { color: var(--text); min-width: 3.6em; }
+.lb-name {
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* The dual-score column: muted hint count, green when the solve was hint-free. */
 .lb-hints { color: var(--mark); font-size: 0.85rem; }
 .lb-hints.clean { color: var(--ok); }

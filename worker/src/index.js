@@ -19,6 +19,11 @@ const MAX_ERROR_BYTES = 64 * 1024;
 // (400s the batch) rather than truncating the timeline silently.
 const MAX_LOG_BYTES = 512 * 1024;
 
+// Cap on a daily submission's optional display name. The client trims and limits
+// it to 20 chars (web/settings.js PLAYER_NAME_MAX); this is the looser server-side
+// guard for the public-writable /daily endpoint.
+const MAX_NAME_LEN = 32;
+
 // --- Status dashboard ---------------------------------------------------------
 // The day boundary and difficulty roster mirror web/daily.js (DAILY_RESET_MS,
 // DAY_MS, the dayNumber math and the DAILY_LEVELS order/names), so GET /status can
@@ -162,10 +167,10 @@ export default {
     // gate and batch shape as /solves; INSERT OR IGNORE on the unique solve_id
     // makes a resent submission idempotent.
     if (url.pathname === "/daily") {
-      // Read path: the daily leaderboard. Two shapes, both anonymous (no identity is
-      // stored -- see daily_solves):
-      //   GET /daily?day=D                     -> { day, counts: { level: n } }          (overview teaser)
-      //   GET /daily?day=D&level=L[&solve_id=S] -> { day, level, count, times, hints, mine } (one board)
+      // Read path: the daily leaderboard. Two shapes, both anonymous unless the
+      // player chose a display name (no other identity is stored -- see daily_solves):
+      //   GET /daily?day=D                     -> { day, counts: { level: n } }                 (overview teaser)
+      //   GET /daily?day=D&level=L[&solve_id=S] -> { day, level, count, times, hints, names, mine } (one board)
       // Same key gate as the writes. The board ships the FULL ordered list (times +
       // the parallel hints column): the client needs the total and the rows around
       // the player's rank to render its window, and at friends-scale that is a few
@@ -194,16 +199,18 @@ export default {
         if (level === null) return cors(new Response("bad level", { status: 400 }));
         // The board ranks by HINTS first, then time: a clean solve outranks any
         // hinted one, ties broken by the faster time. `hints` parallels `times` in
-        // that rank order (the dual-score column). solve_id is read only to locate
-        // the caller's own row index (`mine`); it is never echoed back.
+        // that rank order (the dual-score column), as does `names` (the optional
+        // display name, null when unset). solve_id is read only to locate the
+        // caller's own row index (`mine`); it is never echoed back.
         const sid = url.searchParams.get("solve_id");
         const rows = await env.DB.prepare(
-          "SELECT solve_id, solve_ms, hints FROM daily_solves WHERE day = ? AND level = ? ORDER BY hints, solve_ms, created_at"
+          "SELECT solve_id, solve_ms, hints, name FROM daily_solves WHERE day = ? AND level = ? ORDER BY hints, solve_ms, created_at"
         ).bind(day, level).all();
         const times = rows.results.map((r) => r.solve_ms);
         const hints = rows.results.map((r) => r.hints);
+        const names = rows.results.map((r) => r.name ?? null);
         const mine = sid ? rows.results.findIndex((r) => r.solve_id === sid) : -1;
-        return cors(new Response(JSON.stringify({ day, level, count: times.length, times, hints, mine }), {
+        return cors(new Response(JSON.stringify({ day, level, count: times.length, times, hints, names, mine }), {
           status: 200, headers: { "content-type": "application/json" },
         }));
       }
@@ -220,10 +227,10 @@ export default {
       let inserted = 0;
       if (solves.length) {
         const stmt = env.DB.prepare(
-          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solve_ms, hints, client_version) VALUES (?,?,?,?,?,?,?,?)"
+          "INSERT OR IGNORE INTO daily_solves (solve_id, day, level, seed, puzzle, solve_ms, hints, name, client_version) VALUES (?,?,?,?,?,?,?,?,?)"
         );
         const res = await env.DB.batch(
-          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solve_ms, s.hints ?? 0, s.client_version))
+          solves.map((s) => stmt.bind(s.solve_id, s.day, s.level, s.seed ?? null, s.puzzle, s.solve_ms, s.hints ?? 0, s.name?.trim() || null, s.client_version))
         );
         inserted = res.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
       }
@@ -287,7 +294,9 @@ function valid(s) {
 // Shape check for a /daily entry. (day, level) name the daily puzzle (both required
 // integers); the seed merely reproduces the puzzle and may be null. `hints` (dual
 // score) is optional -- an older client omits it, defaulting at bind time -- but if
-// present must be a non-negative integer.
+// present must be a non-negative integer. `name` (the optional display name) is
+// likewise optional: a string of at most MAX_NAME_LEN chars with no control
+// characters; blank is stored as NULL (anonymous).
 function validDaily(s) {
   return s && typeof s.solve_id === "string" && s.solve_id.length > 0
     && Number.isInteger(s.day)
@@ -296,6 +305,7 @@ function validDaily(s) {
     && Number.isInteger(s.solve_ms)
     && (s.seed == null || typeof s.seed === "string")
     && (s.hints == null || (Number.isInteger(s.hints) && s.hints >= 0))
+    && (s.name == null || (typeof s.name === "string" && s.name.length <= MAX_NAME_LEN && !/[\u0000-\u001f\u007f]/.test(s.name)))
     && typeof s.client_version === "string" && s.client_version.length > 0;
 }
 

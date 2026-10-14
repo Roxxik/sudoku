@@ -13,6 +13,7 @@ const HIGHLIGHT_KEY = "sudoku.settings.highlight";
 const DISABLE_FINISHED_KEY = "sudoku.settings.disableFinishedDigits";
 const HINT_FROM_MARKS_KEY = "sudoku.settings.hintFromMarks";
 const SHARE_DATA_KEY = "sudoku.settings.shareData";
+const PLAYER_NAME_KEY = "sudoku.settings.playerName";
 // Keep this string in sync with the inline theme bootstrap in index.html, which
 // reads it before any module loads (to paint the right theme without a flash).
 const LIGHT_MODE_KEY = "sudoku.settings.lightMode";
@@ -123,6 +124,29 @@ export function dataSharingOn() {
 
 export function setDataSharing(on) {
   store(SHARE_DATA_KEY, on);
+}
+
+// The player's display name on the daily leaderboard. Optional: default empty,
+// which submits anonymously (the board shows rank, time and hints only). Stored
+// trimmed and capped at PLAYER_NAME_MAX chars; an empty name removes the key. The
+// name is sent with each daily submission, so changing it affects future
+// submissions only. Mirrors the worker's MAX_NAME_LEN (a looser server cap).
+export const PLAYER_NAME_MAX = 20;
+
+export function playerName() {
+  return (stored(PLAYER_NAME_KEY) || "").trim().slice(0, PLAYER_NAME_MAX);
+}
+
+export function setPlayerName(name) {
+  // Control characters would be rejected by the worker; drop them here.
+  const clean = String(name || "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, PLAYER_NAME_MAX);
+  try {
+    if (clean) localStorage.setItem(PLAYER_NAME_KEY, clean);
+    else localStorage.removeItem(PLAYER_NAME_KEY);
+  } catch (err) {
+    // Quota or privacy mode: the setting just won't persist this session.
+    logStorageError("write", PLAYER_NAME_KEY, err);
+  }
 }
 
 // The colour theme: on -> light (default), off -> dark. Default ON -- an absent
